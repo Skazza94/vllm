@@ -365,6 +365,148 @@ class LinearTimingProvider:
         )
 
 
+# Dense bf16 tensor-core peak and HBM bandwidth per GPU (SXM parts).
+GPU_PRESETS: dict[str, dict[str, float]] = {
+    "a100": {"peak_tflops": 312.0, "hbm_tbps": 2.039},
+    "h100": {"peak_tflops": 989.0, "hbm_tbps": 3.35},
+    "h200": {"peak_tflops": 989.0, "hbm_tbps": 4.8},
+    "b200": {"peak_tflops": 2250.0, "hbm_tbps": 8.0},
+}
+# KV cache dtypes packing elements below a byte, or with per-token scales:
+# their size is not their storage dtype's.
+PACKED_KV_DTYPES = ("int4", "nvfp4", "turboquant", "int8_per_token_head", "fp8_per_token_head")
+
+
+@dataclass(frozen=True)
+class ModelGeometry:
+    """What a roofline needs of a dense model, per tensor-parallel rank."""
+
+    num_layers: int
+    hidden_size: int
+    num_heads: int
+    num_kv_heads: int
+    head_size: int
+    intermediate_size: int
+    vocab_size: int
+    weight_bytes: float
+    """Bytes per weight (dtype size)."""
+    kv_bytes: float
+    """Bytes per KV cache element."""
+
+    @classmethod
+    def from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        if model.use_mla or model.is_moe or model.is_hybrid or model.is_attention_free:
+            raise ValueError(
+                "The roofline timing provider models dense attention models "
+                "(no MLA, MoE, hybrid or attention-free ones)."
+            )
+        tp = parallel.tensor_parallel_size
+        text = model.hf_text_config
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype.startswith(PACKED_KV_DTYPES):
+            raise ValueError(f"The roofline timing provider does not model {cache_dtype} KV.")
+        weight_bytes = model.dtype.itemsize
+        return cls(
+            num_layers=model.get_num_layers(parallel),
+            hidden_size=model.get_hidden_size(),
+            num_heads=model.get_num_attention_heads(parallel),
+            num_kv_heads=model.get_num_kv_heads(parallel),
+            head_size=model.get_head_size(),
+            intermediate_size=text.intermediate_size // tp,
+            vocab_size=model.get_vocab_size() // tp,
+            weight_bytes=weight_bytes,
+            kv_bytes=kv_cache_dtype_str_to_dtype(cache_dtype, model).itemsize,
+        )
+
+    @property
+    def layer_params(self) -> int:
+        """Linear-layer weights of one decoder layer on this rank."""
+        q_and_o = 2 * self.hidden_size * self.num_heads * self.head_size
+        k_and_v = 2 * self.hidden_size * self.num_kv_heads * self.head_size
+        mlp = 3 * self.hidden_size * self.intermediate_size
+        return q_and_o + k_and_v + mlp
+
+    @property
+    def kv_bytes_per_token(self) -> float:
+        """K and V of one token across all layers on this rank."""
+        return self.num_layers * 2 * self.num_kv_heads * self.head_size * self.kv_bytes
+
+
+class RooflineTimingProvider:
+    """Roofline model of a dense transformer, one GPU per tensor-parallel rank:
+    a step takes ``fixed_us`` plus the longer of its FLOPs at ``peak_tflops *
+    compute_efficiency`` and its bytes at ``hbm_tbps * bandwidth_efficiency``.
+
+    FLOPs: 2 per weight per token through the decoder layers, the LM head for
+    the tokens sampled, and attention (QK^T and AV) over each request's
+    context. Bytes: every weight once per step, the KV each request reads
+    (its context) and writes. Not modeled: activations, communication
+    between ranks, kernel efficiency varying with batch shape. ``gpu`` picks
+    a preset of `GPU_PRESETS`; ``peak_tflops`` and ``hbm_tbps`` override it.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        gpu: str | None = None,
+        peak_tflops: float | None = None,
+        hbm_tbps: float | None = None,
+        compute_efficiency: float = 0.6,
+        bandwidth_efficiency: float = 0.8,
+        fixed_us: float = 20.0,
+        host_us: float = 0.0,
+        geometry: ModelGeometry | None = None,
+    ) -> None:
+        if gpu is not None and gpu not in GPU_PRESETS:
+            raise ValueError(f"Unknown GPU {gpu!r}; presets: {sorted(GPU_PRESETS)}.")
+        preset = GPU_PRESETS[gpu] if gpu else {}
+        peak = peak_tflops if peak_tflops is not None else preset.get("peak_tflops")
+        bandwidth = hbm_tbps if hbm_tbps is not None else preset.get("hbm_tbps")
+        if not peak or not bandwidth:
+            raise ValueError("The roofline timing provider needs gpu, or peak_tflops and hbm_tbps.")
+        self.flops_per_s = peak * 1e12 * compute_efficiency
+        self.bytes_per_s = bandwidth * 1e12 * bandwidth_efficiency
+        self.fixed_us = fixed_us
+        self.host = HostTimeModel(fixed_us=host_us)
+        self.geometry = geometry or ModelGeometry.from_config(vllm_config)
+
+    def estimate(self, step: StepDescriptor) -> StepCost:
+        g = self.geometry
+        sampled = sum(
+            1
+            for r in step.requests
+            if r.num_computed_tokens + r.num_scheduled_tokens >= r.num_prompt_tokens
+        )
+        # Query-key pairs: each new token attends to the context and to the
+        # new tokens before it.
+        pairs = sum(
+            r.num_scheduled_tokens * r.num_computed_tokens
+            + r.num_scheduled_tokens * (r.num_scheduled_tokens + 1) // 2
+            for r in step.requests
+        )
+        context = sum(r.num_computed_tokens + r.num_scheduled_tokens for r in step.requests)
+        lm_head = g.hidden_size * g.vocab_size
+        flops = (
+            2 * g.num_layers * g.layer_params * step.num_tokens
+            + 2 * lm_head * sampled
+            + 4 * g.num_layers * g.num_heads * g.head_size * pairs
+        )
+        memory = (g.num_layers * g.layer_params + lm_head) * g.weight_bytes
+        memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
+        compute_us = flops / self.flops_per_s * 1e6
+        memory_us = memory / self.bytes_per_s * 1e6
+        return StepCost(
+            device_s=(self.fixed_us + max(compute_us, memory_us)) * 1e-6,
+            host_s=self.host.host_s(step),
+            breakdown={"compute_us": compute_us, "memory_us": memory_us},
+        )
+
+
 def _step_features(step: StepDescriptor) -> tuple[float, float, float]:
     """Coarse batch features used for nearest-neighbour lookups."""
     past = sum(r.num_computed_tokens for r in step.requests)
@@ -573,6 +715,7 @@ class ReplayTimingProvider:
 BUILTIN_TIMING_PROVIDERS: dict[str, type] = {
     "zero": ZeroTimingProvider,
     "linear": LinearTimingProvider,
+    "roofline": RooflineTimingProvider,
     "table": TableTimingProvider,
     "replay": ReplayTimingProvider,
 }
