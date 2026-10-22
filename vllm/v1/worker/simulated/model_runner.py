@@ -97,6 +97,9 @@ class SimulatedModelRunner(GPUModelRunner):
         log_path = step_log_path(vllm_config)
         self.step_log = StepLogWriter(log_path) if log_path else None
         self.fallback_token_id = sim.fallback_token_id
+        # Real KV transfers: real KV tensors that the native connector registers
+        # and moves; only compute is simulated.
+        self._real_kv_transfer = sim.kv_transfer_mode == "real"
         self._pending_step: _PendingStep | None = None
         self._step_index = 0
         self._warming_up = False
@@ -136,6 +139,22 @@ class SimulatedModelRunner(GPUModelRunner):
         is_profiling: bool,
         kv_cache_allocation_context: AbstractContextManager | None,
     ) -> None:
+        if self._real_kv_transfer:
+            # The native path allocates the tensors, binds their layouts and
+            # installs the connector that registers their memory for NIXL.
+            super().initialize_kv_cache_tensors(
+                is_profiling=is_profiling,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+            )
+            logger.info(
+                "Initialized real KV cache for KV transfers: %d groups, %d "
+                "blocks, %d tensors on %s.",
+                len(self.kv_cache_config.kv_cache_groups),
+                self.kv_cache_config.num_blocks,
+                len(self.kv_caches),
+                self.device,
+            )
+            return
         self.kv_caches = []
         logger.info(
             "Initialized virtual KV cache: %d groups, %d blocks; no tensors allocated.",
@@ -155,12 +174,17 @@ class SimulatedModelRunner(GPUModelRunner):
             self._kv_transfers = connector.transfers
 
     def _init_kv_zero_meta(self) -> None:
-        """No KV tensors, nothing to zero."""
+        """Without real KV tensors there is nothing to zero."""
+        if self._real_kv_transfer:
+            super()._init_kv_zero_meta()
 
     def _apply_kv_cache_memory_updates(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        """No KV tensors, nothing to update."""
+        """Zero new blocks and apply copy-on-write copies to real KV tensors;
+        without them there is nothing to update."""
+        if self._real_kv_transfer:
+            super()._apply_kv_cache_memory_updates(scheduler_output)
 
     def warming_up_model(self) -> None:
         logger.info("Skipping model warmup under simulated execution.")

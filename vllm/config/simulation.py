@@ -79,6 +79,12 @@ class SimulationConfig:
     """Simulated KV transfer timing, or a step log recorded with the
     connector to fit it from."""
 
+    kv_transfer_mode: Literal["simulated", "real"] = "simulated"
+    """`simulated`: the NIXL connector's worker side is modeled and moves no
+    data; `kv_transfer_timing` gives the transfer times. `real`: the native
+    NIXL connector registers real KV cache tensors and moves them between
+    instances, while compute stays simulated."""
+
     fallback_token_id: int = Field(default=0, ge=0)
     """Output token of requests without `trace_decode_token_ids`."""
 
@@ -148,6 +154,11 @@ class SimulationConfig:
     def _verify_kv_transfer(self, vllm_config: "VllmConfig") -> None:
         kv_transfer = vllm_config.kv_transfer_config
         if kv_transfer is None:
+            if self.kv_transfer_mode == "real":
+                raise ValueError(
+                    "kv_transfer_mode real needs a kv_transfer_config with the "
+                    "NixlConnector."
+                )
             return
         from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
         from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -184,6 +195,9 @@ class SimulationConfig:
             raise ValueError(
                 f"Simulated {connector} does not support the {self.clock} clock."
             )
+        if self.kv_transfer_mode == "real":
+            self._verify_real_kv_transfer(vllm_config)
+            return
         module_path = kv_transfer.kv_connector_module_path
         if module_path not in (None, kv_nixl.__name__):
             raise ValueError(
@@ -191,3 +205,67 @@ class SimulationConfig:
                 f"kv_connector_module_path {module_path} cannot be set."
             )
         kv_transfer.kv_connector_module_path = kv_nixl.__name__
+
+    def _verify_real_kv_transfer(self, vllm_config: "VllmConfig") -> None:
+        """Check what real NIXL transfers under simulated compute support so
+        far: pull transfers of CPU KV buffers, between single-rank instances of
+        a dense full-attention model. The native connector stays in place."""
+        from vllm.platforms import current_platform
+
+        kv_transfer = vllm_config.kv_transfer_config
+        assert kv_transfer is not None
+        problems = []
+        if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
+            problems.append(
+                f"the pull-mode NixlConnector, not {kv_transfer.kv_connector}"
+            )
+        if kv_transfer.kv_connector_module_path is not None:
+            problems.append(
+                "the native connector, without kv_connector_module_path "
+                f"({kv_transfer.kv_connector_module_path})"
+            )
+        if not current_platform.is_cpu() or kv_transfer.kv_buffer_device != "cpu":
+            problems.append(
+                "CPU KV buffers (the CPU platform and kv_buffer_device cpu), not "
+                f"{current_platform.device_type} with {kv_transfer.kv_buffer_device}"
+            )
+        if self.clock != "real":
+            problems.append(f"the real clock, not {self.clock}")
+        if self.kv_transfer_timing is not None:
+            problems.append(
+                "no kv_transfer_timing: transfers take their actual time"
+            )
+        cache = vllm_config.cache_config
+        if cache.kv_cache_memory_bytes is None:
+            problems.append("an explicit kv_cache_memory_bytes")
+        if cache.enable_prefix_caching:
+            problems.append("prefix caching disabled")
+        parallel = vllm_config.parallel_config
+        sizes = {
+            "TP": parallel.tensor_parallel_size,
+            "PP": parallel.pipeline_parallel_size,
+            "DP": parallel.data_parallel_size,
+            "PCP": parallel.prefill_context_parallel_size,
+            "DCP": parallel.decode_context_parallel_size,
+        }
+        if any(size != 1 for size in sizes.values()):
+            parallel_sizes = ", ".join(f"{k}={v}" for k, v in sizes.items())
+            problems.append(f"one rank, not {parallel_sizes}")
+        model = vllm_config.model_config
+        if (
+            model.use_mla
+            or model.is_hybrid
+            or model.is_attention_free
+            or model.is_moe
+            or model.get_sliding_window() is not None
+        ):
+            problems.append(
+                "a dense full-attention model (no MLA, hybrid, attention-free, "
+                "MoE or sliding-window models)"
+            )
+        if vllm_config.speculative_config is not None:
+            problems.append("no speculative decoding")
+        if problems:
+            raise ValueError(
+                "kv_transfer_mode real currently needs " + "; ".join(problems) + "."
+            )
