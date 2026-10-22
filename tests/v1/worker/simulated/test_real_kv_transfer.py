@@ -114,6 +114,136 @@ def test_real_mode_needs_a_connector(model_dir):
         engine_config(model_dir, kv_transfer_config=None)
 
 
+def test_real_mode_needs_simulated_execution(model_dir):
+    with pytest.raises(ValueError, match="needs simulate_forward"):
+        engine_config(model_dir, simulation={"simulate_forward": False})
+
+
+def test_real_mode_rejects_an_explicit_offloading_connector(model_dir):
+    """Regression: the simulated-only OffloadingConnector branch returned
+    before the real-mode checks, accepting the virtual clock."""
+    with pytest.raises(ValueError, match="pull-mode NixlConnector.*the real clock"):
+        engine_config(
+            model_dir,
+            simulation={"clock": "virtual"},
+            kv_transfer={"kv_connector": "OffloadingConnector", "kv_role": "kv_both"},
+        )
+
+
+def test_real_mode_rejects_offloading_that_would_replace_nixl(model_dir):
+    """Regression: kv_offloading_size passed with the NixlConnector, then
+    VllmConfig replaced it with an offloading connector (kv_role kv_both)."""
+    with pytest.raises(ValueError, match="no KV offloading"):
+        engine_config(model_dir, kv_offloading_size=1)
+
+
+class RecordingConnector:
+    """Stands in for the NIXL connector: keeps the KV tensors registered with it."""
+
+    registered: list[dict] = []
+
+    @classmethod
+    def make(cls):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+            KVConnectorMetadata,
+        )
+
+        class Metadata(KVConnectorMetadata):
+            pass
+
+        class Connector(KVConnectorBase_V1):
+            def register_kv_caches(self, kv_caches):
+                cls.registered.append(dict(kv_caches))
+
+            def start_load_kv(self, forward_context, **kwargs):
+                pass
+
+            def wait_for_layer_load(self, layer_name):
+                pass
+
+            def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+                pass
+
+            def wait_for_save(self):
+                pass
+
+            def get_num_new_matched_tokens(self, request, num_computed_tokens):
+                return 0, False
+
+            def update_state_after_alloc(self, request, blocks, num_external_tokens):
+                pass
+
+            def build_connector_meta(self, scheduler_output):
+                return Metadata()
+
+        return Connector
+
+
+def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch):
+    """An in-process engine in real mode allocates real CPU KV tensors within
+    the KV budget and registers them with the connector; a request then runs
+    its simulated steps over them."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    connector = RecordingConnector.make()
+    RecordingConnector.registered.clear()
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    budget = 8 * 1024**2
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        max_model_len=256,
+        block_size=32,
+        kv_cache_memory_bytes=budget,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_consumer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        assert len(RecordingConnector.registered) == 1
+        caches = RecordingConnector.registered[0]
+        # One cache per attention layer of the two-layer model.
+        assert len(caches) == 2
+        storages = {}
+        for name, tensor in caches.items():
+            assert tensor.device.type == "cpu" and not tensor.is_meta, name
+            assert tensor.numel() > 0 and tensor.data_ptr() != 0, name
+            storage = tensor.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+        allocated = sum(storages.values())
+        assert 0 < allocated <= budget
+        # Real, writable memory: a pattern written through one view reads back.
+        tensor = next(iter(caches.values()))
+        tensor.fill_(3)
+        assert float(tensor.sum()) == 3 * tensor.numel()
+        tensor.zero_()
+
+        output = llm.generate(
+            [{"prompt_token_ids": [5] * 40}],
+            SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(output[0].outputs[0].token_ids) == 2
+    finally:
+        del llm
+
+
 @pytest.mark.parametrize("real", [True, False])
 def test_runner_uses_native_kv_tensors_only_in_real_mode(monkeypatch, real):
     """Real mode allocates and registers KV tensors, zeroes new blocks and

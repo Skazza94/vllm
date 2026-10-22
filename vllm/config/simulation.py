@@ -120,6 +120,11 @@ class SimulationConfig:
             if parallel.worker_cls == "auto":
                 parallel.worker_cls = _RECORDING_WORKER
         if not self.simulate_forward:
+            if self.kv_transfer_mode == "real":
+                raise ValueError(
+                    "kv_transfer_mode real applies to simulated execution; it "
+                    "needs simulate_forward."
+                )
             return
 
         if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
@@ -152,13 +157,12 @@ class SimulationConfig:
             load_config.device = "meta"
 
     def _verify_kv_transfer(self, vllm_config: "VllmConfig") -> None:
+        if self.kv_transfer_mode == "real":
+            # Before any simulated-only branch, so none of them can skip it.
+            self._verify_real_kv_transfer(vllm_config)
+            return
         kv_transfer = vllm_config.kv_transfer_config
         if kv_transfer is None:
-            if self.kv_transfer_mode == "real":
-                raise ValueError(
-                    "kv_transfer_mode real needs a kv_transfer_config with the "
-                    "NixlConnector."
-                )
             return
         from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
         from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -195,9 +199,6 @@ class SimulationConfig:
             raise ValueError(
                 f"Simulated {connector} does not support the {self.clock} clock."
             )
-        if self.kv_transfer_mode == "real":
-            self._verify_real_kv_transfer(vllm_config)
-            return
         module_path = kv_transfer.kv_connector_module_path
         if module_path not in (None, kv_nixl.__name__):
             raise ValueError(
@@ -213,8 +214,19 @@ class SimulationConfig:
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
-        assert kv_transfer is not None
+        if kv_transfer is None:
+            raise ValueError(
+                "kv_transfer_mode real needs a kv_transfer_config with the "
+                "NixlConnector."
+            )
         problems = []
+        if vllm_config.cache_config.kv_offloading_size is not None:
+            # Validated before VllmConfig turns it into an offloading
+            # connector (kv_role kv_both), which would replace the NIXL one.
+            problems.append(
+                f"no KV offloading (kv_offloading_size "
+                f"{vllm_config.cache_config.kv_offloading_size})"
+            )
         if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
             problems.append(
                 f"the pull-mode NixlConnector, not {kv_transfer.kv_connector}"
