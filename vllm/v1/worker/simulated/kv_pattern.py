@@ -170,6 +170,8 @@ class PatternChecker:
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,
             "blocks": len(expected.block_ids),
+            # Decode's physical blocks: shows block reuse across requests.
+            "block_ids": expected.block_ids,
             "layers": len(self.views),
             "bytes": total,
             "mismatched_bytes": mismatched_bytes,

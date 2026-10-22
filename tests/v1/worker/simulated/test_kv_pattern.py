@@ -125,6 +125,7 @@ def test_received_blocks_match_by_logical_block(sides):
     (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
     assert result["ok"], result
     assert result["blocks"] == 2 and result["layers"] == 2
+    assert result["block_ids"] == [1, 2]
     assert result["bytes"] == 2 * 2 * decode[LAYERS[0]].shape[1]
 
 
