@@ -3,6 +3,7 @@
 """Byte checks of real KV transfers: pattern on prefill, sentinel and
 comparison on decode."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,11 @@ from vllm.v1.worker.simulated.kv_pattern import (
     block_views,
     pattern,
 )
+from vllm.v1.worker.simulated.kv_transfer import (
+    connector_kv_events,
+    scheduled_kv_events,
+)
+from vllm.v1.worker.simulated.timing import StepLogWriter
 
 LAYERS = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
 PREFILL_ID = "cmpl-abc-0-81bb7a28"
@@ -193,3 +199,54 @@ def test_failed_receive_is_reported(sides):
     (result,) = checker.after_step(KVConnectorOutput(failed_recving={DECODE_ID}))
     assert result == {"req_id": DECODE_ID, "ok": False, "error": "receive failed"}
     assert checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID})) == []
+
+
+def test_notification_only_reads_are_not_checked(sides):
+    # A request aborted before decode allocated blocks only notifies prefill.
+    _, decode = sides
+    checker = PatternChecker(decode)
+    checker.before_step(recv_step([], [3, 5]))
+    assert checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID})) == []
+
+
+def test_kv_events_follow_a_request_lifecycle():
+    step = recv_step([1, 2], [3, 5])
+    step.kv_connector_metadata.reqs_to_recv["cmpl-notify-0-1"] = ReqMeta(
+        local_block_ids=([],),
+        local_physical_block_ids=([],),
+        tp_size=1,
+        remote=step.kv_connector_metadata.reqs_to_recv[DECODE_ID].remote,
+    )
+    step.scheduled_new_reqs = [SimpleNamespace(req_id=DECODE_ID, block_ids=([1, 2],))]
+    step.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=["cmpl-old-0-1", "cmpl-pre-0-1"],
+        new_block_ids=[([7],), ([4, 6],)],
+        resumed_req_ids={"cmpl-pre-0-1"},
+    )
+    step.finished_req_ids = {"cmpl-done-0-1"}
+    assert scheduled_kv_events(step) == {
+        "allocated": {DECODE_ID: [1, 2], "cmpl-old-0-1": [7], "cmpl-pre-0-1": [4, 6]},
+        "resumed": ["cmpl-pre-0-1"],
+        "reads_posted": [DECODE_ID],
+        # The aborted request only frees prefill's blocks, named by prefill's id.
+        "prefill_notified": [PREFILL_ID],
+        "finished": ["cmpl-done-0-1"],
+    }
+    # Decode's blocks for a read are logged when the read is posted.
+    step.scheduled_new_reqs = []
+    assert scheduled_kv_events(step)["allocated"][DECODE_ID] == [1, 2]
+    assert connector_kv_events(
+        KVConnectorOutput(finished_recving={DECODE_ID}, finished_sending={"cmpl-p-0-1"})
+    ) == {"reads_done": [DECODE_ID], "reads_failed": [], "sends_done": ["cmpl-p-0-1"]}
+    assert connector_kv_events(None) == {}
+
+
+def test_kv_events_records_leave_out_empty_events(tmp_path):
+    log = StepLogWriter(str(tmp_path / "steps.jsonl"))
+    log.write_kv_events({"allocated": {}, "finished": [], "reads_done": []}, 1.0, 0.5)
+    log.write_kv_events({"allocated": {}, "reads_failed": [DECODE_ID]}, 2.0, 1.5)
+    log.close()
+    lines = (tmp_path / "steps.jsonl").read_text().splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"kv_events": {"reads_failed": [DECODE_ID]}, "t_scheduled": 1.5, "t": 2.0}
+    ]

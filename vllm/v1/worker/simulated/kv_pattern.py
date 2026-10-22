@@ -121,7 +121,7 @@ class PatternChecker:
         connector sees the step's metadata)."""
         metadata = scheduler_output.kv_connector_metadata
         for req_id, meta in getattr(metadata, "reqs_to_recv", {}).items():
-            if meta.remote is None or not meta.local_block_ids:
+            if meta.remote is None or not any(meta.local_block_ids):
                 continue
             block_ids = list(meta.local_block_ids[0])
             computed = meta.local_num_computed_blocks

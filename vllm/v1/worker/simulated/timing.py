@@ -759,6 +759,19 @@ class StepLogWriter:
         if results:
             self._f.flush()
 
+    def write_kv_events(
+        self, events: dict[str, object], t: float, t_scheduled: float
+    ) -> None:
+        """Append a step's request lifecycle events (`scheduled_kv_events`,
+        `connector_kv_events`), leaving out empty ones. The scheduler's took
+        effect by `t_scheduled`, the step's start; the connector's (reads
+        posted, transfers ended, notifications sent) by `t`, its end."""
+        events = {kind: ids for kind, ids in events.items() if ids}
+        if events:
+            rec = {"kv_events": events, "t_scheduled": t_scheduled, "t": t}
+            self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            self._f.flush()
+
     def write_kv_post(self, reads: int, runs: int, seconds: float, t: float) -> None:
         """Append the NIXL reads a decode rank posted in a step: their count,
         runs of consecutive blocks (see `PostCost`) and the time posting took,

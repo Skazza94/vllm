@@ -5,6 +5,9 @@ step's forward and sampling replaced by its predicted time and trace or
 fallback tokens."""
 
 import dataclasses
+import faulthandler
+import os
+import sys
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -36,6 +39,8 @@ from vllm.v1.worker.simulated.kv_pattern import (
 from vllm.v1.worker.simulated.kv_transfer import (
     SimulatedTransfers,
     completed_transfers,
+    connector_kv_events,
+    scheduled_kv_events,
     simulated_kv_connector,
 )
 from vllm.v1.worker.simulated.timing import (
@@ -107,6 +112,16 @@ class SimulatedModelRunner(GPUModelRunner):
         self._real_kv_transfer = sim.kv_transfer_mode == "real"
         self._kv_filler: PatternFiller | None = None
         self._kv_checker: PatternChecker | None = None
+        # Real KV transfers: this step's lifecycle events, logged with the
+        # connector's once it has posted the step's reads.
+        self._kv_events: dict[str, object] | None = None
+        self._kv_events_scheduled_at = 0.0
+        self._reads_in_flight: set[str] = set()
+        # Debugging aid: dump every thread's Python stack when the engine
+        # thread has not come back for this long while reads are in flight
+        # (a transfer call that blocks the engine).
+        stall = os.environ.get("VLLM_SIM_STALL_DUMP_SECONDS")
+        self._stall_dump_s = float(stall) if stall and self._real_kv_transfer else None
         self._pending_step: _PendingStep | None = None
         self._step_index = 0
         self._warming_up = False
@@ -282,6 +297,7 @@ class SimulatedModelRunner(GPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | None:
+        self._arm_stall_dump()
         if self._kv_checker is not None:
             # Before the connector sees this step's reads.
             self._kv_checker.before_step(scheduler_output)
@@ -292,6 +308,9 @@ class SimulatedModelRunner(GPUModelRunner):
         if self._kv_filler is not None:
             # After the runner zeroed this step's new blocks.
             self._kv_filler.after_update(scheduler_output)
+        if self._real_kv_transfer and self.step_log is not None:
+            self._kv_events = scheduled_kv_events(scheduler_output)
+            self._kv_events_scheduled_at = t_entry
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Nothing to run; the engine core uses this output directly and
@@ -443,10 +462,32 @@ class SimulatedModelRunner(GPUModelRunner):
             checks = self._kv_checker.after_step(kv_output)
             if self.step_log is not None and checks:
                 self.step_log.write_kv_checks(checks, self.clock.now())
+        events, self._kv_events = self._kv_events, None
+        if self.step_log is not None and events is not None:
+            # Async reads are posted by post_forward(): the record comes after.
+            events.update(connector_kv_events(kv_output))
+            self.step_log.write_kv_events(
+                events, self.clock.now(), self._kv_events_scheduled_at
+            )
+            self._reads_in_flight.update(events["reads_posted"])  # type: ignore[arg-type]
+            self._reads_in_flight.difference_update(
+                events.get("reads_done", ()),  # type: ignore[arg-type]
+                events.get("reads_failed", ()),  # type: ignore[arg-type]
+            )
+        if self._stall_dump_s is not None:
+            faulthandler.cancel_dump_traceback_later()
+            if self._reads_in_flight:
+                # Until the next step starts.
+                self._arm_stall_dump()
         transfers = completed_transfers(kv_output)
         if self.step_log is not None and transfers:
             self.step_log.write_transfers(transfers, self.clock.now())
         return kv_output
+
+    def _arm_stall_dump(self) -> None:
+        # Not while warming up (no step log): kernel compilation is slow.
+        if self._stall_dump_s is not None and self.step_log is not None:
+            faulthandler.dump_traceback_later(self._stall_dump_s, file=sys.stderr)
 
     def _skip_to_transfer(self) -> None:
         """With nothing to run, skip to the next KV transfer completion, but

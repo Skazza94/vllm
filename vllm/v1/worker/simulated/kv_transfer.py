@@ -10,7 +10,7 @@ moves no data completes each transfer after its modeled duration:
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import torch
@@ -46,6 +46,9 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 from vllm.v1.worker.simulated.timing import Clock, load_step_log
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -261,6 +264,57 @@ def completed_transfers(
     else:
         return None
     return transfers or None
+
+
+def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object]:
+    """A step's request lifecycle as the scheduler sent it, for a step log's
+    `kv_events` record: blocks newly allocated to each request, the requests
+    resumed after a preemption (their blocks replaced), the remote reads this
+    step posts, the producer requests told to free their blocks without a
+    read (by their remote id), and the requests finished (completed or
+    aborted) since the previous step."""
+    allocated: dict[str, list[int]] = {
+        new.req_id: list(new.block_ids[0])
+        for new in scheduler_output.scheduled_new_reqs
+        if new.block_ids and new.block_ids[0]
+    }
+    cached = scheduler_output.scheduled_cached_reqs
+    for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
+        if new_ids is not None and new_ids[0]:
+            allocated.setdefault(req_id, []).extend(new_ids[0])
+    reqs_to_recv = getattr(scheduler_output.kv_connector_metadata, "reqs_to_recv", {})
+    reads, notified = [], []
+    for req_id, meta in reqs_to_recv.items():
+        if meta.remote is None:
+            continue
+        if any(meta.local_block_ids):
+            reads.append(req_id)
+            # Allocated when the request arrived; its first scheduled step,
+            # after the read, lists them again.
+            allocated.setdefault(req_id, list(meta.local_block_ids[0]))
+        else:
+            # Aborted before decode allocated blocks: only frees prefill's.
+            notified.append(meta.remote.request_id)
+    return {
+        "allocated": allocated,
+        "resumed": sorted(cached.resumed_req_ids),
+        "reads_posted": sorted(reads),
+        "prefill_notified": sorted(notified),
+        "finished": sorted(scheduler_output.finished_req_ids),
+    }
+
+
+def connector_kv_events(kv_output: KVConnectorOutput | None) -> dict[str, object]:
+    """The transfers the connector reported done in a step: reads finished or
+    failed (decode) and sends whose blocks the producer may free (prefill:
+    read by every consumer, or lease expired)."""
+    if kv_output is None:
+        return {}
+    return {
+        "reads_done": sorted(kv_output.finished_recving or ()),
+        "reads_failed": sorted(kv_output.failed_recving or ()),
+        "sends_done": sorted(kv_output.finished_sending or ()),
+    }
 
 
 _LOAD, _STORE = 0, 1
