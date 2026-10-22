@@ -9,17 +9,21 @@ into each request's blocks as they are allocated. A decode instance
 sentinel before the read is posted, then compares them with the pattern once
 the connector reports the read finished, before any later step touches them.
 
-The pattern of a block depends on the prefill request's id, the layer and
-the block's position in the request (its logical block), never on physical
-block ids, which differ between the instances. It covers whole blocks, so K
-and V (packed in each block) and every layer are compared. Pattern bytes are
+The pattern of a block is a pseudo-random byte stream seeded by a 128-bit
+hash of the prefill request's id, the layer and the block's position in the
+request (its logical block), never of physical block ids, which differ
+between the instances. Every byte depends on that whole identity, so a block
+of another request, layer or position, or a shifted range, does not match
+(by chance with negligible probability). Blocks are compared whole, so K
+and V (packed in each block) and every layer are covered. Pattern bytes are
 never zero and the sentinel is zero, so a block the read did not reach fails.
 """
 
-import zlib
+import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
@@ -56,10 +60,16 @@ def block_views(
 
 
 def pattern(request_id: str, layer: str, logical_block: int, size: int) -> torch.Tensor:
-    """The expected bytes of a request's logical block in one layer: never zero."""
-    seed = zlib.crc32(f"{get_base_request_id(request_id)}|{layer}|{logical_block}".encode())
-    positions = torch.arange(size, dtype=torch.int64)
-    return ((positions * 131 + seed) % 255 + 1).to(torch.uint8)
+    """The expected bytes of a request's logical block in one layer: never zero.
+
+    PCG64 (numpy's portable generator) seeded by the identity's 128-bit
+    BLAKE2b hash; both instances run the same numpy, so they agree."""
+    identity = f"{get_base_request_id(request_id)}|{layer}|{logical_block}".encode()
+    seed = int.from_bytes(hashlib.blake2b(identity, digest_size=16).digest(), "little")
+    stream = np.random.Generator(np.random.PCG64(seed)).integers(
+        1, 256, size, dtype=np.uint8
+    )
+    return torch.from_numpy(stream)
 
 
 @dataclass

@@ -85,6 +85,31 @@ def test_pattern_is_nonzero_and_distinct():
     assert not torch.equal(a, pattern("cmpl-other-0-81bb7a28", LAYERS[0], 0, 256))
 
 
+def test_patterns_of_different_blocks_never_coincide():
+    """Regression: an arithmetic pattern had only 255 distinct blocks, so a
+    block of another request could match. Distinct identities must differ in
+    almost every byte, and a pattern must vary along the block."""
+    size = 64 * 1024
+    identities = [
+        (f"cmpl-{request}-0-81bb7a28", layer, logical)
+        for request in range(40)
+        for layer in LAYERS
+        for logical in range(4)
+    ]
+    blocks = torch.stack([pattern(*identity, size) for identity in identities])
+    assert int((blocks == SENTINEL).sum()) == 0
+    first = blocks[:, :16].numpy().tobytes()
+    assert len({first[i * 16 : (i + 1) * 16] for i in range(len(identities))}) == len(
+        identities
+    )
+    for other in range(1, len(identities)):
+        # Unrelated streams agree on about 1/255 of their bytes.
+        assert int((blocks[0] == blocks[other]).sum()) < size // 64
+    # Not a short period: shifting a block does not reproduce it.
+    for shift in (1, 64, 255, 256, 4096):
+        assert int((blocks[0][shift:] == blocks[0][:-shift]).sum()) < size // 64
+
+
 def test_block_views_need_block_major_tensors():
     with pytest.raises(ValueError, match="block-major"):
         block_views({"layer": torch.zeros(2, 8, 4)}, 8)
@@ -121,6 +146,33 @@ def test_bad_transfers_fail(sides, pairs, corrupt):
     (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
     assert not result["ok"]
     assert result["mismatched_bytes"] > 0 and result["mismatched_blocks"]
+
+
+def test_a_block_of_another_request_fails(sides):
+    """Regression for the reviewer's case: a block of the 63-token request
+    placed where the 65-token request's block belongs."""
+    prefill, decode = sides
+    other = "cmpl-2639b8b9-5010-4d39-a15b-3a54d956c503-0-b88c99a0"
+    PatternFiller(prefill).after_update(new_request_step(other, [0, 1]))
+    checker = PatternChecker(decode)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+    transfer(prefill, decode, [(1, 3), (2, 1)])  # logical 1 comes from `other`
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+    assert [block[1:3] for block in result["mismatched_blocks"]] == [[1, 2], [1, 2]]
+
+
+def test_a_shifted_region_fails(sides):
+    """A block whose bytes landed a few bytes off (e.g. a wrong offset)."""
+    prefill, decode = sides
+    checker = PatternChecker(decode)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+    transfer(prefill, decode, [(1, 3), (2, 5)])
+    for view in decode.values():
+        view[2] = torch.roll(view[2].clone(), 4)
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+    assert {block[1] for block in result["mismatched_blocks"]} == {1}
 
 
 def test_prefix_hit_offsets_the_logical_blocks(sides):
