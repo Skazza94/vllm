@@ -76,6 +76,10 @@ _WARMUP_PROMPT_LEN = 2
 _PLACEHOLDER_DRAFT = -1
 
 
+# The name logged for native threads started with the KV connector.
+CONNECTOR_THREAD = "native (KV connector: NIXL and its backends)"
+
+
 @dataclass
 class _PendingStep:
     input_batch: InputBatch
@@ -120,6 +124,8 @@ class SimulatedModelRunner(GPUModelRunner):
         self._kv_events_scheduled_at = 0.0
         self._reads_in_flight: set[str] = set()
         self._logged_threads: set[int] = set()
+        # Set by the worker: native threads started with the KV connector.
+        self.connector_threads: set[int] = set()
         # Debugging aid: dump every thread's Python stack when the engine
         # thread has not come back for this long while reads are in flight
         # (a transfer call that blocks the engine).
@@ -500,15 +506,21 @@ class SimulatedModelRunner(GPUModelRunner):
 
     def _log_new_threads(self) -> None:
         """Log Python threads that started since the last step (some start
-        lazily, e.g. on a first handshake); the process's other threads are
-        native (NIXL, its backends, torch)."""
+        lazily, e.g. on a first handshake), and the native threads started
+        with the KV connector; the process's other threads are native too
+        (torch, gloo, ZMQ)."""
         assert self.step_log is not None
         new = {
-            thread.native_id: thread.name
+            tid: CONNECTOR_THREAD
+            for tid in self.connector_threads
+            if tid not in self._logged_threads
+        }
+        new.update(
+            (thread.native_id, thread.name)
             for thread in threading.enumerate()
             if thread.native_id is not None
             and thread.native_id not in self._logged_threads
-        }
+        )
         if new:
             self._logged_threads.update(new)
             self.step_log.write_threads(new, self.clock.now())

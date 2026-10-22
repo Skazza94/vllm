@@ -3,6 +3,8 @@
 """Worker for simulated execution: no weights, no KV tensors, no forward."""
 
 # ruff: noqa: E402
+import os
+
 import torch
 
 from vllm.platforms import current_platform
@@ -23,6 +25,13 @@ from vllm.v1.worker.simulated.model_runner import SimulatedModelRunner
 from vllm.v1.worker.worker_base import CompilationTimes
 
 logger = init_logger(__name__)
+
+
+def _thread_ids() -> set[int]:
+    try:
+        return {int(tid) for tid in os.listdir("/proc/self/task")}
+    except OSError:
+        return set()
 
 
 class SimulatedWorker(Worker):
@@ -58,9 +67,13 @@ class SimulatedWorker(Worker):
         # Engines simulated in one process (disaggregated instances) each
         # build their own connector, which is a process global.
         kv_transfer_state.set_kv_transfer_group(None)
+        before = _thread_ids()
         super().initialize_from_config(kv_cache_config)
         if kv_transfer_state.has_kv_transfer_group():
             self._kv_connector = kv_transfer_state.get_kv_transfer_group()
+            # Native threads the connector started (NIXL and its backends),
+            # which a profiler cannot tell apart by name.
+            self.model_runner.connector_threads = _thread_ids() - before
 
     def shutdown(self) -> None:
         # Shut down this engine's connector, not the last one built.
