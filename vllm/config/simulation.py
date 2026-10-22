@@ -85,6 +85,17 @@ class SimulationConfig:
     NIXL connector registers real KV cache tensors and moves them between
     instances, while compute stays simulated."""
 
+    kv_pattern_fill: bool = False
+    """Real KV transfers, prefill instance: write a deterministic pattern into
+    each request's KV blocks as they are allocated, so that a decode instance
+    can check the bytes it receives (`kv_pattern_check`). Costs a write of
+    every block; leave it off when measuring performance."""
+
+    kv_pattern_check: bool = False
+    """Real KV transfers, decode instance: fill the blocks a read lands in
+    with a sentinel, and compare them with the prefill instance's pattern when
+    the read finishes. Results go to the step log (`kv_check` records)."""
+
     fallback_token_id: int = Field(default=0, ge=0)
     """Output token of requests without `trace_decode_token_ids`."""
 
@@ -119,6 +130,12 @@ class SimulationConfig:
                 raise ValueError("record_step_timing needs a CUDA-alike platform.")
             if parallel.worker_cls == "auto":
                 parallel.worker_cls = _RECORDING_WORKER
+        if (self.kv_pattern_fill or self.kv_pattern_check) and (
+            self.kv_transfer_mode != "real"
+        ):
+            raise ValueError(
+                "kv_pattern_fill and kv_pattern_check need kv_transfer_mode real."
+            )
         if not self.simulate_forward:
             if self.kv_transfer_mode == "real":
                 raise ValueError(
@@ -277,6 +294,12 @@ class SimulationConfig:
             )
         if vllm_config.speculative_config is not None:
             problems.append("no speculative decoding")
+        if self.kv_pattern_fill and kv_transfer.kv_role != "kv_producer":
+            problems.append("kv_role kv_producer for kv_pattern_fill")
+        if self.kv_pattern_check and kv_transfer.kv_role != "kv_consumer":
+            problems.append("kv_role kv_consumer for kv_pattern_check")
+        if self.kv_pattern_check and self.log_path is None:
+            problems.append("log_path for kv_pattern_check's results")
         if problems:
             raise ValueError(
                 "kv_transfer_mode real currently needs " + "; ".join(problems) + "."

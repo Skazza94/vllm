@@ -5,6 +5,7 @@
 import json
 
 import pytest
+import torch
 
 from vllm.platforms import current_platform
 
@@ -109,6 +110,20 @@ def test_real_mode_rejections(model_dir, simulation, kv_transfer, kwargs, error)
         engine_config(model_dir, simulation, kv_transfer, **kwargs)
 
 
+@pytest.mark.parametrize(
+    "simulation, kv_transfer, error",
+    [
+        ({"kv_transfer_mode": "simulated", "kv_pattern_fill": True}, {}, "need kv_transfer_mode real"),
+        ({"kv_pattern_fill": True}, {"kv_role": "kv_consumer"}, "kv_producer for kv_pattern_fill"),
+        ({"kv_pattern_check": True, "log_path": "/tmp/steps"}, {"kv_role": "kv_producer"}, "kv_consumer for kv_pattern_check"),
+        ({"kv_pattern_check": True}, {}, "log_path for kv_pattern_check"),
+    ],
+)
+def test_pattern_options_need_real_mode_and_their_role(model_dir, simulation, kv_transfer, error):
+    with pytest.raises(ValueError, match=error):
+        engine_config(model_dir, simulation, kv_transfer)
+
+
 def test_real_mode_needs_a_connector(model_dir):
     with pytest.raises(ValueError, match="needs a kv_transfer_config"):
         engine_config(model_dir, kv_transfer_config=None)
@@ -178,6 +193,62 @@ class RecordingConnector:
                 return Metadata()
 
         return Connector
+
+
+def test_producer_writes_the_pattern_into_its_kv_tensors(model_dir, monkeypatch):
+    """With kv_pattern_fill, a prefill engine's real KV tensors hold each
+    request's pattern in the blocks the request was given."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+
+    connector = RecordingConnector.make()
+    RecordingConnector.registered.clear()
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        max_model_len=256,
+        block_size=32,
+        kv_cache_memory_bytes=8 * 1024**2,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        (output,) = llm.generate(
+            [{"prompt_token_ids": [5] * 70}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        caches = RecordingConnector.registered[0]
+        num_blocks = next(iter(caches.values())).shape[0]
+        views = block_views(caches, num_blocks)
+        # 70 tokens span logical blocks 0..2; each holds its pattern somewhere.
+        for layer, view in views.items():
+            for logical in range(3):
+                want = pattern(output.request_id, layer, logical, view.shape[1])
+                assert any(torch.equal(view[b], want) for b in range(num_blocks)), (
+                    layer,
+                    logical,
+                )
+    finally:
+        del llm
 
 
 def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch):

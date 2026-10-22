@@ -751,6 +751,14 @@ class StepLogWriter:
         self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self._f.flush()
 
+    def write_kv_checks(self, results: list[dict], t: float) -> None:
+        """Append the byte checks of received KV blocks (one record each)."""
+        for result in results:
+            rec = {"kv_check": result, "t": t}
+            self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        if results:
+            self._f.flush()
+
     def write_kv_post(self, reads: int, runs: int, seconds: float, t: float) -> None:
         """Append the NIXL reads a decode rank posted in a step: their count,
         runs of consecutive blocks (see `PostCost`) and the time posting took,

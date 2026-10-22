@@ -28,6 +28,11 @@ from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.simulated.kv_pattern import (
+    PatternChecker,
+    PatternFiller,
+    block_views,
+)
 from vllm.v1.worker.simulated.kv_transfer import (
     SimulatedTransfers,
     completed_transfers,
@@ -100,6 +105,8 @@ class SimulatedModelRunner(GPUModelRunner):
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.
         self._real_kv_transfer = sim.kv_transfer_mode == "real"
+        self._kv_filler: PatternFiller | None = None
+        self._kv_checker: PatternChecker | None = None
         self._pending_step: _PendingStep | None = None
         self._step_index = 0
         self._warming_up = False
@@ -155,6 +162,7 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.device,
             )
             return
+
         self.kv_caches = []
         logger.info(
             "Initialized virtual KV cache: %d groups, %d blocks; no tensors allocated.",
@@ -172,6 +180,23 @@ class SimulatedModelRunner(GPUModelRunner):
             )
             self.kv_connector = connector
             self._kv_transfers = connector.transfers
+
+    def _make_kv_connector(self, kv_caches_dict):  # type: ignore[override]
+        """Real KV transfers: the native connector; with pattern checks, also
+        the views of the tensors it registers."""
+        sim = self.vllm_config.simulation_config
+        if sim.kv_pattern_fill or sim.kv_pattern_check:
+            views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks)
+            if sim.kv_pattern_fill:
+                self._kv_filler = PatternFiller(views)
+            if sim.kv_pattern_check:
+                self._kv_checker = PatternChecker(views)
+            logger.info(
+                "KV pattern %s over %d layers.",
+                "fill" if sim.kv_pattern_fill else "check",
+                len(views),
+            )
+        return super()._make_kv_connector(kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
         """Without real KV tensors there is nothing to zero."""
@@ -257,10 +282,16 @@ class SimulatedModelRunner(GPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | None:
+        if self._kv_checker is not None:
+            # Before the connector sees this step's reads.
+            self._kv_checker.before_step(scheduler_output)
         # Blocks until any stores the scheduler must flush have completed.
         self.kv_connector.pre_forward(scheduler_output)
         t_entry = self.clock.now()
         self._update_request_states(scheduler_output)
+        if self._kv_filler is not None:
+            # After the runner zeroed this step's new blocks.
+            self._kv_filler.after_update(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Nothing to run; the engine core uses this output directly and
@@ -407,6 +438,11 @@ class SimulatedModelRunner(GPUModelRunner):
         """Run the KV connector's end-of-step hooks: submit this step's loads
         and stores, and collect the transfers that have completed."""
         kv_output = self.kv_connector.post_forward(finished_req_ids)
+        if self._kv_checker is not None:
+            # Received blocks are compared before any later step can run.
+            checks = self._kv_checker.after_step(kv_output)
+            if self.step_log is not None and checks:
+                self.step_log.write_kv_checks(checks, self.clock.now())
         transfers = completed_transfers(kv_output)
         if self.step_log is not None and transfers:
             self.step_log.write_transfers(transfers, self.clock.now())
