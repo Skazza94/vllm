@@ -488,7 +488,10 @@ RUN git init -q /src/mooncake && cd /src/mooncake && \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/mooncake \
         -DBUILD_SHARED_LIBS=ON -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
         -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
-        -DUSE_TCP=ON -DUSE_TENT=ON && \
+        -DUSE_TCP=ON -DUSE_TENT=ON \
+        # TENT's own metrics (per-transport READ latency, size and stage
+        # histograms), served over HTTP when TENT_METRICS_HTTP_PORT is reachable.
+        -DTENT_METRICS_ENABLED=ON && \
     ninja -C /tmp/mooncake-build -j "${max_jobs}" && \
     ninja -C /tmp/mooncake-build install && \
     # NIXL's Mooncake plugin finds libtransfer_engine and its header on the default paths.
