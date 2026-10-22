@@ -1239,7 +1239,12 @@ class MooncakeConnectorWorker:
         self.vllm_config = vllm_config
         # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
         # may change the current CUDA device during engine.initialize().
-        self.device_id = torch.accelerator.current_device_index()
+        # The CPU platform has no accelerator; its KV buffers are host memory.
+        self.device_id = (
+            torch.accelerator.current_device_index()
+            if torch.accelerator.is_available()
+            else 0
+        )
         current_platform.set_device(self.device_id)
 
         self.engine = TransferEngine()
