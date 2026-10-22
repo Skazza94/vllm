@@ -8,6 +8,7 @@ import dataclasses
 import faulthandler
 import os
 import sys
+import threading
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -40,6 +41,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     SimulatedTransfers,
     completed_transfers,
     connector_kv_events,
+    kv_layout,
     scheduled_kv_events,
     simulated_kv_connector,
 )
@@ -117,6 +119,7 @@ class SimulatedModelRunner(GPUModelRunner):
         self._kv_events: dict[str, object] | None = None
         self._kv_events_scheduled_at = 0.0
         self._reads_in_flight: set[str] = set()
+        self._logged_threads: set[int] = set()
         # Debugging aid: dump every thread's Python stack when the engine
         # thread has not come back for this long while reads are in flight
         # (a transfer call that blocks the engine).
@@ -210,6 +213,16 @@ class SimulatedModelRunner(GPUModelRunner):
                 "KV pattern %s over %d layers.",
                 "fill" if sim.kv_pattern_fill else "check",
                 len(views),
+            )
+        if self.step_log is not None:
+            self.step_log.write_kv_layout(
+                kv_layout(
+                    kv_caches_dict,
+                    self.kv_cache_config.num_blocks,
+                    self.cache_config.block_size,
+                    self.cache_config.get_resolved_kv_cache_layout().name,
+                ),
+                self.clock.now(),
             )
         return super()._make_kv_connector(kv_caches_dict)
 
@@ -309,6 +322,7 @@ class SimulatedModelRunner(GPUModelRunner):
             # After the runner zeroed this step's new blocks.
             self._kv_filler.after_update(scheduler_output)
         if self._real_kv_transfer and self.step_log is not None:
+            self._log_new_threads()
             self._kv_events = scheduled_kv_events(scheduler_output)
             self._kv_events_scheduled_at = t_entry
 
@@ -483,6 +497,21 @@ class SimulatedModelRunner(GPUModelRunner):
         if self.step_log is not None and transfers:
             self.step_log.write_transfers(transfers, self.clock.now())
         return kv_output
+
+    def _log_new_threads(self) -> None:
+        """Log Python threads that started since the last step (some start
+        lazily, e.g. on a first handshake); the process's other threads are
+        native (NIXL, its backends, torch)."""
+        assert self.step_log is not None
+        new = {
+            thread.native_id: thread.name
+            for thread in threading.enumerate()
+            if thread.native_id is not None
+            and thread.native_id not in self._logged_threads
+        }
+        if new:
+            self._logged_threads.update(new)
+            self.step_log.write_threads(new, self.clock.now())
 
     def _arm_stall_dump(self) -> None:
         # Not while warming up (no step log): kernel compilation is slow.

@@ -238,7 +238,8 @@ def completed_transfers(
 ) -> dict[str, dict[str, float]] | None:
     """The KV transfers that completed in a step, per direction, as a step log's
     `kv_transfers` record holds them: CPU offloading's loads and stores, or a
-    NIXL decode instance's reads."""
+    NIXL decode instance's reads (with each read's bytes, seconds, seconds to
+    post and descriptors)."""
     if kv_output is None:
         return None
     meta = kv_output.kv_connector_worker_meta
@@ -254,16 +255,45 @@ def completed_transfers(
             if s.sizes
         }
     elif isinstance(stats, NixlKVConnectorStats) and stats.num_successful_transfers:
+        data = stats.data
         transfers = {
             "load": {
                 "count": stats.num_successful_transfers,
-                "bytes": sum(stats.data["bytes_transferred"]),
-                "seconds": sum(stats.data["transfer_duration"]),
+                "bytes": sum(data["bytes_transferred"]),
+                "seconds": sum(data["transfer_duration"]),
+                "each": [
+                    list(read)
+                    for read in zip(
+                        data["bytes_transferred"],
+                        data["transfer_duration"],
+                        data["post_duration"],
+                        data["num_descriptors"],
+                    )
+                ],
             }
         }
     else:
         return None
     return transfers or None
+
+
+def kv_layout(
+    kv_caches: dict[str, torch.Tensor], num_blocks: int, block_size: int, layout: str
+) -> dict[str, object]:
+    """The KV cache a connector registers, for a step log's `kv_layout`
+    record: what each block of each layer is in bytes and tokens."""
+    first = next(iter(kv_caches.values()))
+    layer_bytes = first.numel() * first.element_size()
+    return {
+        "layers": len(kv_caches),
+        "num_blocks": num_blocks,
+        "block_size": block_size,
+        "layout": layout,
+        "dtype": str(first.dtype).removeprefix("torch."),
+        "shape": list(first.shape),
+        "block_bytes": layer_bytes // num_blocks,
+        "bytes": layer_bytes * len(kv_caches),
+    }
 
 
 def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object]:

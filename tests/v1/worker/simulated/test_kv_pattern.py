@@ -24,9 +24,10 @@ from vllm.v1.worker.simulated.kv_pattern import (
 )
 from vllm.v1.worker.simulated.kv_transfer import (
     connector_kv_events,
+    kv_layout,
     scheduled_kv_events,
 )
-from vllm.v1.worker.simulated.timing import StepLogWriter
+from vllm.v1.worker.simulated.timing import StepLogWriter, load_step_log
 
 LAYERS = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
 PREFILL_ID = "cmpl-abc-0-81bb7a28"
@@ -250,3 +251,52 @@ def test_kv_events_records_leave_out_empty_events(tmp_path):
     assert [json.loads(line) for line in lines] == [
         {"kv_events": {"reads_failed": [DECODE_ID]}, "t_scheduled": 1.5, "t": 2.0}
     ]
+
+
+def test_kv_layout_describes_the_registered_blocks():
+    assert kv_layout(caches(), 8, 4, "LBHNC") == {
+        "layers": 2,
+        "num_blocks": 8,
+        "block_size": 4,
+        "layout": "LBHNC",
+        "dtype": "float32",
+        "shape": [8, 2, 4, 8],
+        "block_bytes": 2 * 4 * 8 * 4,
+        "bytes": 2 * 8 * 2 * 4 * 8 * 4,
+    }
+
+
+def test_step_records_leave_out_other_records(tmp_path):
+    log = StepLogWriter(str(tmp_path / "steps.jsonl"))
+    log.write_kv_layout({"layers": 2}, 0.5)
+    log.write_kv_events({"finished": [DECODE_ID]}, 1.0, 0.9)
+    log.write_kv_checks([{"req_id": DECODE_ID, "ok": True}], 1.0)
+    log.write_threads({1234: "Thread-1 (process_output_sockets)"}, 1.0)
+    log.close()
+    with (tmp_path / "steps.jsonl").open("a") as f:
+        f.write(json.dumps({"device_s": 0.01, "host_s": 0.0}) + "\n")
+    assert load_step_log(str(tmp_path / "steps.jsonl")) == [{"device_s": 0.01, "host_s": 0.0}]
+
+
+def test_nixl_reads_are_logged_one_by_one():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
+        NixlKVConnectorStats,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import completed_transfers
+
+    stats = NixlKVConnectorStats()
+    for bytes_, us, post_us, descs in ((393216, 2000, 150, 2), (262144, 1500, 100, 2)):
+        stats.record_transfer(
+            SimpleNamespace(
+                xferDuration=us, postDuration=post_us, totalBytes=bytes_, descCount=descs
+            )
+        )
+    output = KVConnectorOutput(kv_connector_stats=stats)
+    assert completed_transfers(output) == {
+        "load": {
+            "count": 2,
+            "bytes": 655360,
+            "seconds": 0.0035,
+            "each": [[393216, 0.002, 0.00015, 2], [262144, 0.0015, 0.0001, 2]],
+        }
+    }

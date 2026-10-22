@@ -443,7 +443,13 @@ def load_step_log(
     lines = Path(path).read_text().splitlines()
     records = [json.loads(line) for line in lines if line.strip()]
     if kind == "step":
-        return [r for r in records if "kv_transfers" not in r and "kv_post" not in r]
+        # Every other record is a kv_ one (kv_transfers, kv_post, kv_check, ...)
+        # or a `threads` one.
+        return [
+            r
+            for r in records
+            if "threads" not in r and not any(key.startswith("kv_") for key in r)
+        ]
     return [r for r in records if kind in r]
 
 
@@ -771,6 +777,19 @@ class StepLogWriter:
             rec = {"kv_events": events, "t_scheduled": t_scheduled, "t": t}
             self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
             self._f.flush()
+
+    def write_threads(self, threads: dict[int, str], t: float) -> None:
+        """Append the process's Python threads that started since the last
+        such record, by native id: a profiler sees only their ids."""
+        rec = {"threads": {str(tid): name for tid, name in threads.items()}, "t": t}
+        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._f.flush()
+
+    def write_kv_layout(self, layout: dict[str, object], t: float) -> None:
+        """Append the KV cache as the connector registers it (`kv_layout`)."""
+        rec = {"kv_layout": layout, "t": t}
+        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._f.flush()
 
     def write_kv_post(self, reads: int, runs: int, seconds: float, t: float) -> None:
         """Append the NIXL reads a decode rank posted in a step: their count,
