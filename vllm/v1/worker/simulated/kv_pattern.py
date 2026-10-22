@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
 from vllm.logger import init_logger
+from vllm.v1.worker.simulated.kv_transfer import requested_reads
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -115,38 +116,51 @@ class PatternChecker:
 
     views: dict[str, torch.Tensor]
     pending: dict[str, _Expected] = field(default_factory=dict)
+    # Pending reads whose blocks the connector reported invalid.
+    lost: set[str] = field(default_factory=set)
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         """Fill the blocks of the reads this step will post (call before the
         connector sees the step's metadata)."""
-        metadata = scheduler_output.kv_connector_metadata
-        for req_id, meta in getattr(metadata, "reqs_to_recv", {}).items():
-            if meta.remote is None or not any(meta.local_block_ids):
+        for read in requested_reads(scheduler_output.kv_connector_metadata):
+            if not read.block_ids:
                 continue
-            block_ids = list(meta.local_block_ids[0])
-            computed = meta.local_num_computed_blocks
             for view in self.views.values():
-                view[block_ids] = SENTINEL
-            self.pending[req_id] = _Expected(
-                remote_request_id=meta.remote.request_id,
-                first_logical_block=computed[0] if computed else 0,
-                block_ids=block_ids,
+                view[read.block_ids] = SENTINEL
+            self.pending[read.req_id] = _Expected(
+                remote_request_id=read.remote_request_id,
+                first_logical_block=read.first_logical_block,
+                block_ids=read.block_ids,
             )
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
-        """Compare the reads the connector reported finished or failed."""
+        """Compare the reads the connector reported finished or failed. A read
+        reported finished whose blocks were reported invalid, in this poll or
+        an earlier one, failed (Mooncake reports failed loads that way)."""
         if kv_output is None:
             return []
+        if invalid := kv_output.invalid_block_ids:
+            self.lost.update(
+                req_id
+                for req_id, expected in self.pending.items()
+                if invalid & set(expected.block_ids)
+            )
         results = []
         for req_id in kv_output.failed_recving or set():
             expected = self.pending.pop(req_id, None)
+            self.lost.discard(req_id)
             if expected is not None:
                 results.append(
                     {"req_id": req_id, "ok": False, "error": "receive failed"}
                 )
         for req_id in kv_output.finished_recving or set():
             expected = self.pending.pop(req_id, None)
-            if expected is not None:
+            if expected is None:
+                continue
+            if req_id in self.lost:
+                self.lost.discard(req_id)
+                results.append({"req_id": req_id, "ok": False, "error": "receive failed"})
+            else:
                 results.append(self._compare(req_id, expected))
         for result in results:
             if not result["ok"]:

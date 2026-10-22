@@ -23,7 +23,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     pattern,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
-    connector_kv_events,
+    ReadsInFlight,
     kv_layout,
     scheduled_kv_events,
 )
@@ -236,10 +236,10 @@ def test_kv_events_follow_a_request_lifecycle():
     # Decode's blocks for a read are logged when the read is posted.
     step.scheduled_new_reqs = []
     assert scheduled_kv_events(step)["allocated"][DECODE_ID] == [1, 2]
-    assert connector_kv_events(
+    assert ReadsInFlight().events(
         KVConnectorOutput(finished_recving={DECODE_ID}, finished_sending={"cmpl-p-0-1"})
     ) == {"reads_done": [DECODE_ID], "reads_failed": [], "sends_done": ["cmpl-p-0-1"]}
-    assert connector_kv_events(None) == {}
+    assert ReadsInFlight().events(None) == {}
 
 
 def test_kv_events_records_leave_out_empty_events(tmp_path):
@@ -300,3 +300,116 @@ def test_nixl_reads_are_logged_one_by_one():
             "each": [[393216, 0.002, 0.00015, 2], [262144, 0.0015, 0.0001, 2]],
         }
     }
+
+
+def mooncake_step(req_id, local, transfer_id="xfer-abc"):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+        MooncakeConnectorMetadata,
+    )
+
+    metadata = MooncakeConnectorMetadata()
+    metadata.add_new_req(
+        req_id,
+        [local],
+        {
+            "transfer_id": transfer_id,
+            "remote_engine_id": "prefill",
+            "remote_bootstrap_addr": "http://10.0.0.1:8998",
+        },
+    )
+    return SimpleNamespace(kv_connector_metadata=metadata)
+
+
+def test_mooncake_pulls_are_checked_by_the_shared_base_request_id(sides):
+    # Prefill wrote PREFILL_ID's pattern; decode's id shares its base.
+    prefill, decode = sides
+    checker = PatternChecker(decode)
+    checker.before_step(mooncake_step(DECODE_ID, [1, 2, 4]))
+    assert all(int(view[[1, 2, 4]].sum()) == 0 for view in decode.values())
+    transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert result["ok"], result
+    assert result["remote_request_id"] == DECODE_ID
+
+
+def test_mooncake_requests_are_lifecycle_events():
+    step = mooncake_step(DECODE_ID, [1, 2])
+    step.scheduled_new_reqs = []
+    step.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=[], new_block_ids=[], resumed_req_ids=set()
+    )
+    step.finished_req_ids = set()
+    events = scheduled_kv_events(step)
+    assert (events["reads_posted"], events["allocated"]) == ([DECODE_ID], {DECODE_ID: [1, 2]})
+    # A request that only frees prefill's blocks, under an id of its own:
+    # named by the transfer id it shares with the real one.
+    notify = mooncake_step("a5fc471726e14fb7", [], transfer_id="xfer-abc")
+    notify.scheduled_new_reqs = []
+    notify.scheduled_cached_reqs = step.scheduled_cached_reqs
+    notify.finished_req_ids = set()
+    assert scheduled_kv_events(notify)["prefill_notified"] == ["xfer-abc"]
+
+
+def test_mooncake_sends_and_failed_receives_are_logged():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+        MooncakeKVConnectorStats,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import completed_transfers
+
+    sender = MooncakeKVConnectorStats()
+    sender.data["transfer_duration"] = [0.002]
+    sender.data["bytes_transferred"] = [393216]
+    sender.data["num_descriptors"] = [3]
+    assert completed_transfers(KVConnectorOutput(kv_connector_stats=sender)) == {
+        "send": {
+            "count": 1,
+            "bytes": 393216,
+            "seconds": 0.002,
+            "each": [[393216, 0.002, None, 3]],
+        }
+    }
+    receiver = MooncakeKVConnectorStats()
+    receiver.data["num_failed_recvs"] = [1]
+    assert completed_transfers(KVConnectorOutput(kv_connector_stats=receiver)) == {
+        "load": {"count": 0, "bytes": 0, "seconds": 0.0, "failed": 1}
+    }
+
+
+def test_a_load_reported_finished_with_invalid_blocks_failed(sides):
+    # Mooncake reports a failed load as finished, its blocks as invalid.
+    _, decode = sides
+    checker = PatternChecker(decode)
+    checker.before_step(mooncake_step(DECODE_ID, [1, 2]))
+    failed = KVConnectorOutput(finished_recving={DECODE_ID}, invalid_block_ids={2})
+    (result,) = checker.after_step(failed)
+    assert result == {"req_id": DECODE_ID, "ok": False, "error": "receive failed"}
+    reads = ReadsInFlight({DECODE_ID: [1, 2]})
+    assert reads.events(failed) == {
+        "reads_done": [],
+        "reads_failed": [DECODE_ID],
+        "sends_done": [],
+    }
+    assert not reads
+    # Another request's invalid blocks do not touch this one.
+    other = KVConnectorOutput(finished_recving={DECODE_ID}, invalid_block_ids={7})
+    assert ReadsInFlight({DECODE_ID: [1, 2]}).events(other)["reads_done"] == [DECODE_ID]
+
+
+def test_invalid_blocks_reported_a_poll_before_the_load_finished(sides):
+    # The failure is kept until the connector reports the load finished, and
+    # recorded then.
+    _, decode = sides
+    checker = PatternChecker(decode)
+    checker.before_step(mooncake_step(DECODE_ID, [1, 2]))
+    reads = ReadsInFlight({DECODE_ID: [1, 2]})
+    invalid = KVConnectorOutput(invalid_block_ids={2})
+    assert checker.after_step(invalid) == []
+    assert reads.events(invalid) == {"reads_done": [], "reads_failed": [], "sends_done": []}
+    finished = KVConnectorOutput(finished_recving={DECODE_ID})
+    (result,) = checker.after_step(finished)
+    assert result == {"req_id": DECODE_ID, "ok": False, "error": "receive failed"}
+    assert reads.events(finished)["reads_failed"] == [DECODE_ID]
+    assert not checker.lost and not reads.lost
+    # The next read into the same blocks is checked afresh.
+    reads.blocks[DECODE_ID] = [1, 2]
+    assert reads.events(finished)["reads_done"] == [DECODE_ID]

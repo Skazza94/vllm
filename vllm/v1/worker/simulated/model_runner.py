@@ -38,9 +38,9 @@ from vllm.v1.worker.simulated.kv_pattern import (
     block_views,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
+    ReadsInFlight,
     SimulatedTransfers,
     completed_transfers,
-    connector_kv_events,
     kv_layout,
     scheduled_kv_events,
     simulated_kv_connector,
@@ -122,7 +122,8 @@ class SimulatedModelRunner(GPUModelRunner):
         # connector's once it has posted the step's reads.
         self._kv_events: dict[str, object] | None = None
         self._kv_events_scheduled_at = 0.0
-        self._reads_in_flight: set[str] = set()
+        # Real KV transfers in flight on this consumer: request -> its blocks.
+        self._reads_in_flight = ReadsInFlight()
         self._logged_threads: set[int] = set()
         # Set by the worker: native threads started with the KV connector.
         self.connector_threads: set[int] = set()
@@ -485,14 +486,12 @@ class SimulatedModelRunner(GPUModelRunner):
         events, self._kv_events = self._kv_events, None
         if self.step_log is not None and events is not None:
             # Async reads are posted by post_forward(): the record comes after.
-            events.update(connector_kv_events(kv_output))
+            allocated: dict[str, list[int]] = events["allocated"]  # type: ignore[assignment]
+            for req_id in events["reads_posted"]:  # type: ignore[attr-defined]
+                self._reads_in_flight.blocks[req_id] = allocated[req_id]
+            events.update(self._reads_in_flight.events(kv_output))
             self.step_log.write_kv_events(
                 events, self.clock.now(), self._kv_events_scheduled_at
-            )
-            self._reads_in_flight.update(events["reads_posted"])  # type: ignore[arg-type]
-            self._reads_in_flight.difference_update(
-                events.get("reads_done", ()),  # type: ignore[arg-type]
-                events.get("reads_failed", ()),  # type: ignore[arg-type]
             )
         if self._stall_dump_s is not None:
             faulthandler.cancel_dump_traceback_later()

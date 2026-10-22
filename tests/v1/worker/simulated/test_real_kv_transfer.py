@@ -91,7 +91,7 @@ def test_simulated_mode_is_the_default_and_unchanged(model_dir):
 @pytest.mark.parametrize(
     "simulation, kv_transfer, kwargs, error",
     [
-        ({}, {"kv_connector": "NixlPushConnector"}, {}, "pull-mode NixlConnector"),
+        ({}, {"kv_connector": "NixlPushConnector"}, {}, "one of NixlConnector"),
         (
             {},
             {"kv_connector_module_path": SIMULATED_NIXL},
@@ -137,7 +137,7 @@ def test_real_mode_needs_simulated_execution(model_dir):
 def test_real_mode_rejects_an_explicit_offloading_connector(model_dir):
     """Regression: the simulated-only OffloadingConnector branch returned
     before the real-mode checks, accepting the virtual clock."""
-    with pytest.raises(ValueError, match="pull-mode NixlConnector.*the real clock"):
+    with pytest.raises(ValueError, match="one of NixlConnector.*the real clock"):
         engine_config(
             model_dir,
             simulation={"clock": "virtual"},

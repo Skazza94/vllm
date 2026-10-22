@@ -9,7 +9,7 @@ moves no data completes each transfer after its modeled duration:
 
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
@@ -21,6 +21,9 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+    MooncakeKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
@@ -206,7 +209,8 @@ def transfer_rates_from_log(path: str) -> tuple[TransferRate, TransferRate | Non
     rows: dict[str, list[tuple[float, float, float]]] = {"load": [], "store": []}
     for rec in load_step_log(path, kind="kv_transfers"):
         for direction, t in rec["kv_transfers"].items():
-            rows[direction].append((t["count"], t["bytes"], t["seconds"]))
+            if direction in rows:  # not a connector's `send`
+                rows[direction].append((t["count"], t["bytes"], t["seconds"]))
     rates: list[TransferRate | None] = []
     for direction, direction_rows in rows.items():
         a = np.asarray(direction_rows, dtype=np.float64).reshape(-1, 3)
@@ -237,9 +241,11 @@ def completed_transfers(
     kv_output: KVConnectorOutput | None,
 ) -> dict[str, dict[str, float]] | None:
     """The KV transfers that completed in a step, per direction, as a step log's
-    `kv_transfers` record holds them: CPU offloading's loads and stores, or a
-    NIXL decode instance's reads (with each read's bytes, seconds, seconds to
-    post and descriptors)."""
+    `kv_transfers` record holds them: CPU offloading's loads and stores, a
+    NIXL decode instance's reads (`load`) or a Mooncake prefill instance's
+    writes (`send`), the latter two with each transfer's bytes, seconds,
+    seconds to post (NIXL only) and descriptors, and the transfers that
+    failed."""
     if kv_output is None:
         return None
     meta = kv_output.kv_connector_worker_meta
@@ -254,24 +260,32 @@ def completed_transfers(
             )
             if s.sizes
         }
-    elif isinstance(stats, NixlKVConnectorStats) and stats.num_successful_transfers:
+    elif isinstance(stats, (NixlKVConnectorStats, MooncakeKVConnectorStats)):
         data = stats.data
-        transfers = {
-            "load": {
+        nixl = isinstance(stats, NixlKVConnectorStats)
+        transfers = {}
+        failed = len(data["num_failed_transfers"])
+        if stats.num_successful_transfers or failed:
+            posts = data["post_duration"] if nixl else [None] * stats.num_successful_transfers
+            transfers["load" if nixl else "send"] = {
                 "count": stats.num_successful_transfers,
                 "bytes": sum(data["bytes_transferred"]),
                 "seconds": sum(data["transfer_duration"]),
                 "each": [
-                    list(read)
-                    for read in zip(
+                    list(transfer)
+                    for transfer in zip(
                         data["bytes_transferred"],
                         data["transfer_duration"],
-                        data["post_duration"],
+                        posts,
                         data["num_descriptors"],
                     )
                 ],
+                **({"failed": failed} if failed else {}),
             }
-        }
+        # Mooncake's consumer counts the transfers it waited for in vain.
+        failed_recvs = 0 if nixl else len(data["num_failed_recvs"])
+        if failed_recvs:
+            transfers["load"] = {"count": 0, "bytes": 0, "seconds": 0.0, "failed": failed_recvs}
     else:
         return None
     return transfers or None
@@ -296,6 +310,46 @@ def kv_layout(
     }
 
 
+@dataclass(frozen=True)
+class RequestedRead:
+    """A transfer of a producer's KV into a consumer request's blocks, as the
+    consumer's connector metadata asks for it this step."""
+
+    req_id: str
+    block_ids: list[int]
+    """Local blocks it fills; empty when it only frees the producer's."""
+    remote_request_id: str
+    """The producer's request id. Mooncake's metadata does not carry it: the
+    consumer's own id stands in (both share the client's base request id), or,
+    for a request with no blocks (one that only frees the producer's, under
+    an id of its own), the transfer id the two share."""
+    first_logical_block: int
+
+
+def requested_reads(metadata: object) -> list[RequestedRead]:
+    """The transfers a consumer requests in a step: NIXL's READs
+    (``reqs_to_recv`` by request), or Mooncake's pulls, which the producer
+    serves by writing (``reqs_to_recv`` by producer engine, then request)."""
+    reads = []
+    for key, value in getattr(metadata, "reqs_to_recv", {}).items():
+        if isinstance(value, dict):  # Mooncake
+            for req_id, meta in value.items():
+                blocks = list(meta.local_block_ids[0]) if meta.local_block_ids else []
+                remote = req_id if blocks else meta.transfer_id
+                reads.append(RequestedRead(req_id, blocks, remote, 0))
+        elif value.remote is not None:  # NIXL
+            computed = value.local_num_computed_blocks
+            reads.append(
+                RequestedRead(
+                    key,
+                    list(value.local_block_ids[0]) if any(value.local_block_ids) else [],
+                    value.remote.request_id,
+                    computed[0] if computed else 0,
+                )
+            )
+    return reads
+
+
 def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object]:
     """A step's request lifecycle as the scheduler sent it, for a step log's
     `kv_events` record: blocks newly allocated to each request, the requests
@@ -312,19 +366,16 @@ def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object
     for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
         if new_ids is not None and new_ids[0]:
             allocated.setdefault(req_id, []).extend(new_ids[0])
-    reqs_to_recv = getattr(scheduler_output.kv_connector_metadata, "reqs_to_recv", {})
     reads, notified = [], []
-    for req_id, meta in reqs_to_recv.items():
-        if meta.remote is None:
-            continue
-        if any(meta.local_block_ids):
-            reads.append(req_id)
+    for read in requested_reads(scheduler_output.kv_connector_metadata):
+        if read.block_ids:
+            reads.append(read.req_id)
             # Allocated when the request arrived; its first scheduled step,
-            # after the read, lists them again.
-            allocated.setdefault(req_id, list(meta.local_block_ids[0]))
+            # after the transfer, lists them again.
+            allocated.setdefault(read.req_id, read.block_ids)
         else:
             # Aborted before decode allocated blocks: only frees prefill's.
-            notified.append(meta.remote.request_id)
+            notified.append(read.remote_request_id)
     return {
         "allocated": allocated,
         "resumed": sorted(cached.resumed_req_ids),
@@ -334,17 +385,40 @@ def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object
     }
 
 
-def connector_kv_events(kv_output: KVConnectorOutput | None) -> dict[str, object]:
-    """The transfers the connector reported done in a step: reads finished or
-    failed (decode) and sends whose blocks the producer may free (prefill:
-    read by every consumer, or lease expired)."""
-    if kv_output is None:
-        return {}
-    return {
-        "reads_done": sorted(kv_output.finished_recving or ()),
-        "reads_failed": sorted(kv_output.failed_recving or ()),
-        "sends_done": sorted(kv_output.finished_sending or ()),
-    }
+@dataclass
+class ReadsInFlight:
+    """Decode's posted reads, their blocks by request, until the connector
+    reports them done or failed. Mooncake reports a failed load as finished
+    and its blocks as invalid, in the same poll or an earlier one: a read any
+    of whose blocks were reported invalid while it was in flight failed, when
+    the connector reports it finished."""
+
+    blocks: dict[str, list[int]] = field(default_factory=dict)
+    lost: set[str] = field(default_factory=set)
+
+    def __bool__(self) -> bool:
+        return bool(self.blocks)
+
+    def events(self, kv_output: KVConnectorOutput | None) -> dict[str, object]:
+        """The transfers the connector reported done in a step: reads finished
+        or failed (decode) and sends whose blocks the producer may free
+        (prefill: read by every consumer, or lease expired)."""
+        if kv_output is None:
+            return {}
+        if invalid := kv_output.invalid_block_ids:
+            self.lost.update(
+                req_id for req_id, blocks in self.blocks.items() if invalid & set(blocks)
+            )
+        done = set(kv_output.finished_recving or ())
+        failed = set(kv_output.failed_recving or ()) | (done & self.lost)
+        for req_id in done | failed:
+            self.blocks.pop(req_id, None)
+            self.lost.discard(req_id)
+        return {
+            "reads_done": sorted(done - failed),
+            "reads_failed": sorted(failed),
+            "sends_done": sorted(kv_output.finished_sending or ()),
+        }
 
 
 _LOAD, _STORE = 0, 1

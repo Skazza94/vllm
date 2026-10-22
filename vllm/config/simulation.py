@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 _SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 _RECORDING_WORKER = "vllm.v1.worker.simulated.recording.RecordingWorker"
+# Native connectors that move real KV under kv_transfer_mode real: NIXL's
+# decode-pulled READs, or Mooncake's prefill-written transfers.
+REAL_KV_CONNECTORS = ("NixlConnector", "NixlPullConnector", "MooncakeConnector")
 
 
 @config
@@ -81,9 +84,9 @@ class SimulationConfig:
 
     kv_transfer_mode: Literal["simulated", "real"] = "simulated"
     """`simulated`: the NIXL connector's worker side is modeled and moves no
-    data; `kv_transfer_timing` gives the transfer times. `real`: the native
-    NIXL connector registers real KV cache tensors and moves them between
-    instances, while compute stays simulated."""
+    data; `kv_transfer_timing` gives the transfer times. `real`: a native
+    connector (`REAL_KV_CONNECTORS`) registers real KV cache tensors and moves
+    them between instances, while compute stays simulated."""
 
     kv_pattern_fill: bool = False
     """Real KV transfers, prefill instance: write a deterministic pattern into
@@ -225,28 +228,30 @@ class SimulationConfig:
         kv_transfer.kv_connector_module_path = kv_nixl.__name__
 
     def _verify_real_kv_transfer(self, vllm_config: "VllmConfig") -> None:
-        """Check what real NIXL transfers under simulated compute support so
-        far: pull transfers of CPU KV buffers, between single-rank instances of
-        a dense full-attention model. The native connector stays in place."""
+        """Check what real transfers under simulated compute support so far:
+        CPU KV buffers moved by a native connector (NIXL or Mooncake) between
+        single-rank instances of a dense full-attention model. The native
+        connector stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
         if kv_transfer is None:
             raise ValueError(
-                "kv_transfer_mode real needs a kv_transfer_config with the "
-                "NixlConnector."
+                "kv_transfer_mode real needs a kv_transfer_config with one of "
+                + ", ".join(REAL_KV_CONNECTORS)
+                + "."
             )
         problems = []
         if vllm_config.cache_config.kv_offloading_size is not None:
             # Validated before VllmConfig turns it into an offloading
-            # connector (kv_role kv_both), which would replace the NIXL one.
+            # connector (kv_role kv_both), which would replace the native one.
             problems.append(
                 f"no KV offloading (kv_offloading_size "
                 f"{vllm_config.cache_config.kv_offloading_size})"
             )
-        if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
+        if kv_transfer.kv_connector not in REAL_KV_CONNECTORS:
             problems.append(
-                f"the pull-mode NixlConnector, not {kv_transfer.kv_connector}"
+                f"one of {', '.join(REAL_KV_CONNECTORS)}, not {kv_transfer.kv_connector}"
             )
         if kv_transfer.kv_connector_module_path is not None:
             problems.append(

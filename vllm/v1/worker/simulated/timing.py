@@ -912,7 +912,7 @@ class StepLogWriter:
         self, events: dict[str, object], t: float, t_scheduled: float
     ) -> None:
         """Append a step's request lifecycle events (`scheduled_kv_events`,
-        `connector_kv_events`), leaving out empty ones. The scheduler's took
+        `ReadsInFlight.events`), leaving out empty ones. The scheduler's took
         effect by `t_scheduled`, the step's start; the connector's (reads
         posted, transfers ended, notifications sent) by `t`, its end."""
         events = {kind: ids for kind, ids in events.items() if ids}
