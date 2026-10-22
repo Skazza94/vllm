@@ -488,12 +488,18 @@ RUN git init -q /src/mooncake && cd /src/mooncake && \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/mooncake \
         -DBUILD_SHARED_LIBS=ON -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
         -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF \
-        -DUSE_TCP=ON -DUSE_TENT=ON \
+        -DUSE_TCP=ON -DUSE_TENT=ON -DPYTHON_EXECUTABLE=/opt/venv/bin/python \
         # TENT's own metrics (per-transport READ latency, size and stage
         # histograms), served over HTTP when TENT_METRICS_HTTP_PORT is reachable.
         -DTENT_METRICS_ENABLED=ON && \
     ninja -C /tmp/mooncake-build -j "${max_jobs}" && \
     ninja -C /tmp/mooncake-build install && \
+    # vLLM's MooncakeConnector imports Mooncake's Python transfer engine: the
+    # package as Mooncake's wheel lays it out (scripts/build_wheel.sh).
+    mkdir -p /opt/mooncake-python/mooncake && \
+    cp /src/mooncake/mooncake-wheel/mooncake/*.py /opt/mooncake-python/mooncake/ && \
+    cp /tmp/mooncake-build/mooncake-integration/engine.*.so /opt/mooncake-python/mooncake/engine.so && \
+    cp /tmp/mooncake-build/mooncake-common/libasio.so /opt/mooncake-python/mooncake/ && \
     # NIXL's Mooncake plugin finds libtransfer_engine and its header on the default paths.
     cp -a /opt/mooncake/. /usr/local/ && ldconfig
 
@@ -536,16 +542,18 @@ RUN apt-get update -y && \
 COPY --from=kv-transfer-build /opt/mooncake/lib /opt/mooncake/lib
 COPY --from=kv-transfer-build /opt/nixl /opt/nixl
 COPY --from=kv-transfer-build /opt/nixl-python /opt/nixl-python
+COPY --from=kv-transfer-build /opt/mooncake-python /opt/mooncake-python
 ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
 ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
 ENV LD_LIBRARY_PATH=/opt/nixl/lib:/opt/mooncake/lib \
     NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
 LABEL ai.vllm.build.nixl-revision="${NIXL_REVISION}" \
       ai.vllm.build.mooncake-revision="${MOONCAKE_REVISION}"
-# Fail the build if a NIXL or Mooncake library cannot load, the Python API is
+# Fail the build if a NIXL or Mooncake library cannot load, a Python API is
 # missing, or the Mooncake plugin was not built.
-RUN cp -a /opt/nixl-python/. "$(python -c 'import site; print(site.getsitepackages()[0])')/" && \
-    rm -rf /opt/nixl-python && \
+RUN cp -a /opt/nixl-python/. /opt/mooncake-python/. "$(python -c 'import site; print(site.getsitepackages()[0])')/" && \
+    rm -rf /opt/nixl-python /opt/mooncake-python && \
+    python -c "from mooncake.engine import TransferEngine; TransferEngine()" && \
     ! ldd /opt/nixl/lib/*.so* /opt/nixl/lib/plugins/*.so /opt/mooncake/lib/*.so* | grep "not found" && \
     python -c "from nixl._api import nixl_agent; import importlib.metadata as m; print('nixl', m.version('nixl'))" && \
     ls /opt/nixl/lib/plugins | grep -q Mooncake
