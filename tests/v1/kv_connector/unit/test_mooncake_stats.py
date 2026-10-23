@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -239,6 +240,19 @@ def test_send_blocks_records_success():
     assert data["bytes_transferred"] == [1024 + 2048]
     assert data["num_descriptors"] == [2]
     assert data["num_failed_transfers"] == []
+    # No ready time given: no wait; the end, on time.monotonic().
+    assert data["wait_duration"] == [None]
+    assert data["transfer_end"][0] == pytest.approx(time.monotonic(), abs=5)
+
+
+def test_send_blocks_records_the_wait_since_ready():
+    worker = _bare_worker()
+    worker.engine.batch_transfer_sync_write.return_value = 0
+
+    worker._send_blocks("host:1234", [0x1000], [0x2000], [4096], time.monotonic() - 0.5)
+
+    (wait,) = worker.xfer_stats.data["wait_duration"]
+    assert 0.5 <= wait < 5
 
 
 def test_send_blocks_records_failure():

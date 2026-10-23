@@ -297,7 +297,7 @@ def test_nixl_reads_are_logged_one_by_one():
             "count": 2,
             "bytes": 655360,
             "seconds": 0.0035,
-            "each": [[393216, 0.002, 0.00015, 2], [262144, 0.0015, 0.0001, 2]],
+            "each": [[393216, 0.002, 0.00015, 2, None], [262144, 0.0015, 0.0001, 2, None]],
         }
     }
 
@@ -357,17 +357,23 @@ def test_mooncake_sends_and_failed_receives_are_logged():
     from vllm.v1.worker.simulated.kv_transfer import completed_transfers
 
     sender = MooncakeKVConnectorStats()
-    sender.data["transfer_duration"] = [0.002]
-    sender.data["bytes_transferred"] = [393216]
-    sender.data["num_descriptors"] = [3]
+    sender.record_transfer(0.002, 393216, 3, wait_s=0.0005, end=12.5)
     assert completed_transfers(KVConnectorOutput(kv_connector_stats=sender)) == {
         "send": {
             "count": 1,
             "bytes": 393216,
             "seconds": 0.002,
-            "each": [[393216, 0.002, None, 3]],
+            "each": [[393216, 0.002, 0.0005, 3, 12.5]],
         }
     }
+    # Stats from before the wait and end were recorded.
+    old = MooncakeKVConnectorStats(
+        data={"transfer_duration": [0.002], "bytes_transferred": [1], "num_descriptors": [1],
+              "num_failed_transfers": [], "num_failed_recvs": [], "num_kv_expired_reqs": []}
+    )
+    assert completed_transfers(KVConnectorOutput(kv_connector_stats=old))["send"]["each"] == [
+        [1, 0.002, None, 1, None]
+    ]
     receiver = MooncakeKVConnectorStats()
     receiver.data["num_failed_recvs"] = [1]
     assert completed_transfers(KVConnectorOutput(kv_connector_stats=receiver)) == {

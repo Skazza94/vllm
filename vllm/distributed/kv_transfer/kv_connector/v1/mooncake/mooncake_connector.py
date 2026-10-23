@@ -689,6 +689,8 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    # When its blocks became ready to send (time.monotonic()).
+    ready_time: float | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -1740,6 +1742,15 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                # The write can start once its last request is ready.
+                ready_at = max(
+                    (
+                        send_meta.ready_time
+                        for _, send_meta in ok_ready_reqs
+                        if send_meta.ready_time is not None
+                    ),
+                    default=None,
+                )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -1747,6 +1758,7 @@ class MooncakeConnectorWorker:
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    ready_at,
                 )
 
                 if ret_value != 0:
@@ -2049,7 +2061,11 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
+        ready_at: float | None = None,
     ) -> int:
+        """Write the blocks; ``ready_at`` (time.monotonic()), when its
+        requests' blocks were all ready, times the wait before the write."""
+        started = time.monotonic()
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -2060,6 +2076,8 @@ class MooncakeConnectorWorker:
                 duration_s=duration,
                 total_bytes=sum(lengths),
                 num_descs=len(src_ptrs),
+                wait_s=None if ready_at is None else max(0.0, started - ready_at),
+                end=time.monotonic(),
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
@@ -2713,6 +2731,7 @@ class MooncakeConnectorWorker:
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
+                send_meta.ready_time = time.monotonic()
                 send_meta.ready.set()
             else:
                 # From update_state_after_alloc(),

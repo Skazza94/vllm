@@ -244,8 +244,9 @@ def completed_transfers(
     `kv_transfers` record holds them: CPU offloading's loads and stores, a
     NIXL decode instance's reads (`load`) or a Mooncake prefill instance's
     writes (`send`), the latter two with each transfer's bytes, seconds,
-    seconds to post (NIXL only) and descriptors, and the transfers that
-    failed."""
+    seconds before it (NIXL: posting it; Mooncake: from its requests' blocks
+    being ready to the write starting), descriptors and end (Mooncake, on
+    time.monotonic()), and the transfers that failed."""
     if kv_output is None:
         return None
     meta = kv_output.kv_connector_worker_meta
@@ -266,7 +267,9 @@ def completed_transfers(
         transfers = {}
         failed = len(data["num_failed_transfers"])
         if stats.num_successful_transfers or failed:
-            posts = data["post_duration"] if nixl else [None] * stats.num_successful_transfers
+            unknown = [None] * stats.num_successful_transfers
+            before = data["post_duration"] if nixl else data.get("wait_duration", unknown)
+            ends = unknown if nixl else data.get("transfer_end", unknown)
             transfers["load" if nixl else "send"] = {
                 "count": stats.num_successful_transfers,
                 "bytes": sum(data["bytes_transferred"]),
@@ -276,8 +279,9 @@ def completed_transfers(
                     for transfer in zip(
                         data["bytes_transferred"],
                         data["transfer_duration"],
-                        posts,
+                        before,
                         data["num_descriptors"],
+                        ends,
                     )
                 ],
                 **({"failed": failed} if failed else {}),

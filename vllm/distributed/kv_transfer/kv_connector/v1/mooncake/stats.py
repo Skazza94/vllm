@@ -81,20 +81,34 @@ class MooncakeKVConnectorStats(KVConnectorStats):
         self._lock = threading.Lock()
 
     def reset(self):
-        self.data: dict[str, list[float | int]] = {
+        self.data: dict[str, list[float | int | None]] = {
             "transfer_duration": [],
             "bytes_transferred": [],
             "num_descriptors": [],
+            # Per transfer, when known: seconds from its requests' blocks
+            # being ready to the write starting, and when it ended
+            # (time.monotonic()).
+            "wait_duration": [],
+            "transfer_end": [],
             "num_failed_transfers": [],
             "num_failed_recvs": [],
             "num_kv_expired_reqs": [],
         }
 
-    def record_transfer(self, duration_s: float, total_bytes: int, num_descs: int):
+    def record_transfer(
+        self,
+        duration_s: float,
+        total_bytes: int,
+        num_descs: int,
+        wait_s: float | None = None,
+        end: float | None = None,
+    ):
         with self._lock:
             self.data["transfer_duration"].append(duration_s)
             self.data["bytes_transferred"].append(total_bytes)
             self.data["num_descriptors"].append(num_descs)
+            self.data["wait_duration"].append(wait_s)
+            self.data["transfer_end"].append(end)
 
     # Each failure appends a single unit, which MooncakePromMetrics sums into
     # one counter increment.

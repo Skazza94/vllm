@@ -510,7 +510,7 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         ) as mock_send_blocks:
             await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
 
-        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:]
+        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:4]
         assert src_ptrs == [0x1000 + 10 * block_len]
         assert dst_ptrs == [0xB000 + 20 * block_len]
         assert lengths == [block_len]
@@ -1383,7 +1383,9 @@ async def test_heterogeneous_pp_waits_for_consumer_without_shared_layers():
                     assert worker.finished_sending_reqs == (
                         set() if pp_rank == 0 else {"p-req"}
                     )
-                send.assert_called_once_with("consumer:1234", [0x1100], [0x2200], [256])
+                send.assert_called_once_with(
+                    "consumer:1234", [0x1100], [0x2200], [256], None
+                )
         finally:
             worker.shutdown()
             worker.is_kv_consumer = True
@@ -1470,6 +1472,7 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
+                None,  # no ready time: the test set its requests ready
             )
             mock_socket.send_multipart.assert_called_once()
 
@@ -1502,6 +1505,7 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
+                None,  # no ready time: the test set its requests ready
             )
             mock_socket.send_multipart.assert_called_once()
 
