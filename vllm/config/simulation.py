@@ -272,8 +272,10 @@ class SimulationConfig:
         cache = vllm_config.cache_config
         if cache.kv_cache_memory_bytes is None:
             problems.append("an explicit kv_cache_memory_bytes")
-        if cache.enable_prefix_caching:
-            problems.append("prefix caching disabled")
+        if cache.enable_prefix_caching and (self.kv_pattern_fill or self.kv_pattern_check):
+            # The pattern is the request's: a block cached for another
+            # request holds another pattern.
+            problems.append("prefix caching disabled for kv_pattern_fill and kv_pattern_check")
         parallel = vllm_config.parallel_config
         sizes = {
             "TP": parallel.tensor_parallel_size,

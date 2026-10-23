@@ -101,7 +101,12 @@ def test_simulated_mode_is_the_default_and_unchanged(model_dir):
         ({}, {"kv_buffer_device": "cuda"}, {}, "CPU KV buffers"),
         ({"kv_transfer_timing": {"load_gbps": 1}}, {}, {}, "no kv_transfer_timing"),
         ({}, {}, {"kv_cache_memory_bytes": None}, "explicit kv_cache_memory_bytes"),
-        ({}, {}, {"enable_prefix_caching": True}, "prefix caching disabled"),
+        (
+            {"kv_pattern_check": True, "log_path": "/tmp/steps"},
+            {"kv_role": "kv_consumer"},
+            {"enable_prefix_caching": True},
+            "prefix caching disabled for kv_pattern_fill",
+        ),
         ({"clock": "virtual"}, {}, {}, "the real clock"),
     ],
 )
@@ -122,6 +127,12 @@ def test_real_mode_rejections(model_dir, simulation, kv_transfer, kwargs, error)
 def test_pattern_options_need_real_mode_and_their_role(model_dir, simulation, kv_transfer, error):
     with pytest.raises(ValueError, match=error):
         engine_config(model_dir, simulation, kv_transfer)
+
+
+def test_real_mode_allows_prefix_caching(model_dir):
+    config = engine_config(model_dir, enable_prefix_caching=True)
+    assert config.cache_config.enable_prefix_caching
+    assert config.simulation_config.kv_transfer_mode == "real"
 
 
 def test_real_mode_needs_a_connector(model_dir):
