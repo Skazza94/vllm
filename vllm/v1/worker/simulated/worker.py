@@ -71,7 +71,7 @@ class SimulatedWorker(Worker):
         super().initialize_from_config(kv_cache_config)
         if kv_transfer_state.has_kv_transfer_group():
             self._kv_connector = kv_transfer_state.get_kv_transfer_group()
-            # Native threads the connector started (NIXL and its backends),
+            # Native threads the connector started (its transfer engine),
             # which a profiler cannot tell apart by name.
             self.model_runner.connector_threads = _thread_ids() - before
 

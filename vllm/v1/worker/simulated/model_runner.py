@@ -77,7 +77,7 @@ _PLACEHOLDER_DRAFT = -1
 
 
 # The name logged for native threads started with the KV connector.
-CONNECTOR_THREAD = "native (KV connector: NIXL and its backends)"
+CONNECTOR_THREAD = "native (KV connector: its transfer engine)"
 
 
 @dataclass
