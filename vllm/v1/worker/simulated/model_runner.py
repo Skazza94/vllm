@@ -112,6 +112,16 @@ class SimulatedModelRunner(GPUModelRunner):
             self.clock = clock
         log_path = step_log_path(vllm_config)
         self.step_log = StepLogWriter(log_path) if log_path else None
+        if self.step_log is not None:
+            assumptions = getattr(self.timing_provider, "assumptions", None)
+            self.step_log.write_timing(
+                {
+                    "provider": sim.timing,
+                    "args": dict(sim.timing_args),
+                    **(assumptions() if assumptions else {}),
+                },
+                self.clock.now(),
+            )
         self.fallback_token_id = sim.fallback_token_id
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.

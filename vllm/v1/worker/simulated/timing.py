@@ -474,6 +474,20 @@ class RooflineTimingProvider:
         self.fixed_us = fixed_us
         self.host = HostTimeModel(fixed_us=host_us)
         self.geometry = geometry or ModelGeometry.from_config(vllm_config)
+        self._assumptions = {
+            "gpu": gpu,
+            "peak_tflops": peak,
+            "hbm_tbps": bandwidth,
+            "compute_efficiency": compute_efficiency,
+            "bandwidth_efficiency": bandwidth_efficiency,
+            "fixed_us": fixed_us,
+            "host_us": host_us,
+        }
+
+    def assumptions(self) -> dict[str, Any]:
+        """What the step times rest on, resolved: the GPU's figures (preset or
+        overridden), efficiencies, fixed costs and the model's geometry."""
+        return {**self._assumptions, "geometry": asdict(self.geometry)}
 
     def estimate(self, step: StepDescriptor) -> StepCost:
         g = self.geometry
@@ -585,12 +599,14 @@ def load_step_log(
     lines = Path(path).read_text().splitlines()
     records = [json.loads(line) for line in lines if line.strip()]
     if kind == "step":
-        # Every other record is a kv_ one (kv_transfers, kv_post, kv_check, ...)
-        # or a `threads` one.
+        # Every other record is a kv_ one (kv_transfers, kv_post, kv_check, ...),
+        # a `threads` one or the `timing` one.
         return [
             r
             for r in records
-            if "threads" not in r and not any(key.startswith("kv_") for key in r)
+            if "threads" not in r
+            and "timing" not in r
+            and not any(key.startswith("kv_") for key in r)
         ]
     return [r for r in records if kind in r]
 
@@ -925,6 +941,13 @@ class StepLogWriter:
         """Append the process's Python threads that started since the last
         such record, by native id: a profiler sees only their ids."""
         rec = {"threads": {str(tid): name for tid, name in threads.items()}, "t": t}
+        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._f.flush()
+
+    def write_timing(self, timing: dict[str, object], t: float) -> None:
+        """Append the timing provider and what its step times rest on
+        (`timing`), once, as the runner starts."""
+        rec = {"timing": timing, "t": t}
         self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self._f.flush()
 

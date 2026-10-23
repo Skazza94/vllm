@@ -112,3 +112,15 @@ def test_presets_and_overrides():
         RooflineTimingProvider(None, gpu="tpu", geometry=QWEN_7B)
     with pytest.raises(ValueError, match="needs gpu"):
         RooflineTimingProvider(None, geometry=QWEN_7B)
+
+
+def test_assumptions_are_resolved():
+    assumptions = h100(compute_efficiency=0.5, hbm_tbps=4.0).assumptions()
+    assert assumptions["gpu"] == "h100"
+    assert assumptions["peak_tflops"] == 989.0  # the preset's
+    assert assumptions["hbm_tbps"] == 4.0  # overridden
+    assert assumptions["compute_efficiency"] == 0.5
+    assert assumptions["bandwidth_efficiency"] == 0.8
+    assert assumptions["fixed_us"] == 20.0
+    assert assumptions["geometry"]["kv_bytes"] == 2
+    assert assumptions["geometry"]["num_kv_heads"] == 4

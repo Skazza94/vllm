@@ -266,8 +266,9 @@ def test_pipeline_stages_overlap_consecutive_steps():
 
 def _host_log(path, host_us) -> str:
     """A step log of prefill and decode steps whose host time is
-    `host_us(num_reqs, prefill_tokens)`."""
+    `host_us(num_reqs, prefill_tokens)`, after the runner's `timing` record."""
     writer = StepLogWriter(str(path))
+    writer.write_timing({"provider": "linear", "args": {}}, 0.0)
     for i, (num_decode, prefill) in enumerate([(1, 0), (4, 0), (2, 512), (8, 128)]):
         reqs = [sim_req(f"d{j}", 1, 100, 50) for j in range(num_decode)]
         if prefill:
