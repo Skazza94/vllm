@@ -264,6 +264,9 @@ def test_send_blocks_records_failure():
     assert ret == 1
     assert worker.xfer_stats.num_successful_transfers == 0
     assert worker.xfer_stats.data["num_failed_transfers"] == [1]
+    assert worker.xfer_stats.data["failed_bytes"] == [4096]
+    assert worker.xfer_stats.data["failed_descriptors"] == [1]
+    assert worker.xfer_stats.data["failed_start"][0] == pytest.approx(time.monotonic(), abs=5)
 
 
 def test_get_kv_connector_stats_returns_none_when_empty():

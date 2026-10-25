@@ -2081,7 +2081,9 @@ class MooncakeConnectorWorker:
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
-            self.xfer_stats.record_failed_transfer()
+            self.xfer_stats.record_failed_transfer(
+                total_bytes=sum(lengths), num_descs=len(src_ptrs), start=started
+            )
             logger.warning(
                 "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
                 remote_session,

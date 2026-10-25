@@ -374,6 +374,20 @@ def test_mooncake_sends_and_failed_receives_are_logged():
     assert completed_transfers(KVConnectorOutput(kv_connector_stats=old))["send"]["each"] == [
         [1, 0.002, None, 1, None]
     ]
+    # A failed write: its bytes and descriptors, to compare with the
+    # transport's limits.
+    failing = MooncakeKVConnectorStats()
+    failing.record_failed_transfer(total_bytes=176160768, num_descs=2688, start=7.5)
+    assert completed_transfers(KVConnectorOutput(kv_connector_stats=failing)) == {
+        "send": {
+            "count": 0,
+            "bytes": 0,
+            "seconds": 0,
+            "each": [],
+            "failed": 1,
+            "failed_each": [[176160768, 2688, 7.5]],
+        }
+    }
     receiver = MooncakeKVConnectorStats()
     receiver.data["num_failed_recvs"] = [1]
     assert completed_transfers(KVConnectorOutput(kv_connector_stats=receiver)) == {

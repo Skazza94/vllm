@@ -246,7 +246,8 @@ def completed_transfers(
     writes (`send`), the latter two with each transfer's bytes, seconds,
     seconds before it (NIXL: posting it; Mooncake: from its requests' blocks
     being ready to the write starting), descriptors and end (Mooncake, on
-    time.monotonic()), and the transfers that failed."""
+    time.monotonic()), and the transfers that failed (Mooncake: each one's
+    bytes, descriptors and start, `failed_each`)."""
     if kv_output is None:
         return None
     meta = kv_output.kv_connector_worker_meta
@@ -286,6 +287,15 @@ def completed_transfers(
                 ],
                 **({"failed": failed} if failed else {}),
             }
+            failed_each = list(
+                zip(
+                    data.get("failed_bytes", []),
+                    data.get("failed_descriptors", []),
+                    data.get("failed_start", []),
+                )
+            )
+            if not nixl and failed_each:
+                transfers["send"]["failed_each"] = [list(f) for f in failed_each]
         # Mooncake's consumer counts the transfers it waited for in vain.
         failed_recvs = 0 if nixl else len(data["num_failed_recvs"])
         if failed_recvs:

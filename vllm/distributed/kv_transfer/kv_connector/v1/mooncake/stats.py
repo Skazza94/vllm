@@ -91,6 +91,11 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             "wait_duration": [],
             "transfer_end": [],
             "num_failed_transfers": [],
+            # Per failed transfer, when known: its bytes, descriptors and
+            # start (time.monotonic()).
+            "failed_bytes": [],
+            "failed_descriptors": [],
+            "failed_start": [],
             "num_failed_recvs": [],
             "num_kv_expired_reqs": [],
         }
@@ -112,9 +117,17 @@ class MooncakeKVConnectorStats(KVConnectorStats):
 
     # Each failure appends a single unit, which MooncakePromMetrics sums into
     # one counter increment.
-    def record_failed_transfer(self):
+    def record_failed_transfer(
+        self,
+        total_bytes: int | None = None,
+        num_descs: int | None = None,
+        start: float | None = None,
+    ):
         with self._lock:
             self.data["num_failed_transfers"].append(1)
+            self.data["failed_bytes"].append(total_bytes)
+            self.data["failed_descriptors"].append(num_descs)
+            self.data["failed_start"].append(start)
 
     def record_failed_recv(self):
         with self._lock:
