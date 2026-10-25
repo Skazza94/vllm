@@ -117,6 +117,27 @@ def test_patterns_of_different_blocks_never_coincide():
         assert int((blocks[0][shift:] == blocks[0][:-shift]).sum()) < size // 64
 
 
+def test_chunked_prefill_blocks_continue_the_request_pattern():
+    # Chunked prefill: the scheduler allocates a request's blocks over
+    # several steps; later ones carry the next logical blocks' pattern.
+    views = block_views(caches(), 8)
+    filler = PatternFiller(views)
+    filler.after_update(new_request_step(PREFILL_ID, [3, 5]))
+    chunk = new_request_step("unused", [])
+    chunk.scheduled_new_reqs = []
+    chunk.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=[PREFILL_ID], new_block_ids=[([1, 6],)], resumed_req_ids=set()
+    )
+    filler.after_update(chunk)
+    for layer, view in views.items():
+        for logical, block in enumerate([3, 5, 1, 6]):
+            assert torch.equal(view[block], pattern(PREFILL_ID, layer, logical, view.shape[1]))
+    # A step that allocates the request nothing leaves its blocks as they are.
+    chunk.scheduled_cached_reqs.new_block_ids = [None]
+    filler.after_update(chunk)
+    assert filler.blocks[PREFILL_ID] == [3, 5, 1, 6]
+
+
 def test_block_views_need_block_major_tensors():
     with pytest.raises(ValueError, match="block-major"):
         block_views({"layer": torch.zeros(2, 8, 4)}, 8)
