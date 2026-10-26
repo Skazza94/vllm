@@ -14,6 +14,7 @@ if current_platform.is_cpu():
     # cpu_worker.py; must precede its import.
     import vllm.v1.worker.cpu.shm  # noqa: F401
 
+from vllm.config.vllm import set_current_vllm_config
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.logger import init_logger
@@ -68,7 +69,9 @@ class SimulatedWorker(Worker):
         # build their own connector, which is a process global.
         kv_transfer_state.set_kv_transfer_group(None)
         before = _thread_ids()
-        super().initialize_from_config(kv_cache_config)
+        # The attention backend's kernel block sizes depend on the simulation.
+        with set_current_vllm_config(self.vllm_config):
+            super().initialize_from_config(kv_cache_config)
         if kv_transfer_state.has_kv_transfer_group():
             self._kv_connector = kv_transfer_state.get_kv_transfer_group()
             # Native threads the connector started (its transfer engine),

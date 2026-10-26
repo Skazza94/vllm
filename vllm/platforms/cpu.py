@@ -30,6 +30,8 @@ from .interface import (
 
 # The CPU attention backend's block size granularity (CPUAttentionBackend).
 _CPU_ATTN_BLOCK_MULTIPLE = 32
+# Simulated execution: FlashAttention's smallest block on GPU.
+_SIMULATED_BLOCK_MULTIPLE = 16
 
 logger = init_logger(__name__)
 
@@ -312,16 +314,22 @@ class CpuPlatform(Platform):
                     cache_config.block_size,
                 )
             cache_config.block_size = 256
+        elif simulated:
+            # Simulated steps never run the CPU kernels, so blocks may be as
+            # small as a GPU's.
+            if (
+                cache_config.user_specified_block_size
+                and cache_config.block_size % _SIMULATED_BLOCK_MULTIPLE != 0
+            ):
+                raise ValueError(
+                    "Simulated execution on the CPU platform needs a KV block "
+                    f"size that is a multiple of {_SIMULATED_BLOCK_MULTIPLE}, "
+                    f"got {cache_config.block_size}."
+                )
         elif (
             cache_config.user_specified_block_size
             and cache_config.block_size % _CPU_ATTN_BLOCK_MULTIPLE != 0
         ):
-            if simulated:
-                raise ValueError(
-                    "Simulated execution on the CPU platform needs a KV block "
-                    f"size that is a multiple of {_CPU_ATTN_BLOCK_MULTIPLE}, "
-                    f"got {cache_config.block_size}."
-                )
             logger.warning(
                 "CPU backend prefers block_size is multiples of 32, "
                 "otherwise the performance is not optimized."

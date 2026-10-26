@@ -14,6 +14,7 @@ from vllm import envs
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
+    get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
 from vllm.logger import init_logger
@@ -44,6 +45,9 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+# The smallest KV block a simulation allows: FlashAttention's on GPU.
+_SIMULATED_BLOCK_MULTIPLE = 16
+
 
 class CPUAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
@@ -62,6 +66,11 @@ class CPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        config = get_current_vllm_config_or_none()
+        if config is not None and config.simulation_config.simulate_forward:
+            # Simulated steps never run these kernels: the KV cache only holds
+            # blocks, as large as a GPU's (FlashAttention: multiples of 16).
+            return [MultipleOf(_SIMULATED_BLOCK_MULTIPLE)]
         return [MultipleOf(32)]
 
     @classmethod

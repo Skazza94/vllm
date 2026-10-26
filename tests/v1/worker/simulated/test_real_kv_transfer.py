@@ -135,6 +135,12 @@ def test_real_mode_allows_prefix_caching(model_dir):
     assert config.simulation_config.kv_transfer_mode == "real"
 
 
+def test_simulated_blocks_need_a_multiple_of_16(model_dir):
+    assert engine_config(model_dir, block_size=16).cache_config.block_size == 16
+    with pytest.raises(ValueError, match="multiple of 16"):
+        engine_config(model_dir, block_size=8)
+
+
 def test_real_mode_needs_a_connector(model_dir):
     with pytest.raises(ValueError, match="needs a kv_transfer_config"):
         engine_config(model_dir, kv_transfer_config=None)
@@ -262,10 +268,12 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(model_dir, monkeypatch)
         del llm
 
 
-def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch):
+@pytest.mark.parametrize("block_size", [32, 16])
+def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch, block_size):
     """An in-process engine in real mode allocates real CPU KV tensors within
     the KV budget and registers them with the connector; a request then runs
-    its simulated steps over them."""
+    its simulated steps over them. Blocks may be as small as a GPU's (16),
+    below what the CPU attention kernels need: simulated steps never run them."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
@@ -281,7 +289,7 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch
         skip_tokenizer_init=True,
         dtype="float32",
         max_model_len=256,
-        block_size=32,
+        block_size=block_size,
         kv_cache_memory_bytes=budget,
         enable_prefix_caching=False,
         enforce_eager=True,
@@ -305,6 +313,8 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch
         storages = {}
         for name, tensor in caches.items():
             assert tensor.device.type == "cpu" and not tensor.is_meta, name
+            # [blocks, KV heads, block size, K and V]: the GPU's block geometry.
+            assert tensor.shape[2] == block_size, (name, tuple(tensor.shape))
             assert tensor.numel() > 0 and tensor.data_ptr() != 0, name
             storage = tensor.untyped_storage()
             storages[storage.data_ptr()] = storage.nbytes()
