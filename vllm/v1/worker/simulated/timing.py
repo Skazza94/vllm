@@ -378,8 +378,70 @@ PACKED_KV_DTYPES = ("int4", "nvfp4", "turboquant", "int8_per_token_head", "fp8_p
 
 
 @dataclass(frozen=True)
+class ExpertGeometry:
+    """One layer's routed experts on this rank."""
+
+    local_experts: int
+    global_experts: int
+    top_k: int
+    params_per_expert: int
+    """Weights of one expert's gate/up and down projections, logical
+    (unpadded)."""
+
+    def expected_read(self, num_tokens: int) -> float:
+        """Local experts a step's tokens are expected to route to, each token
+        to `top_k` of the global experts, independently and uniformly."""
+        return self.local_experts * (
+            1.0 - (1.0 - self.top_k / self.global_experts) ** num_tokens
+        )
+
+
+@dataclass(frozen=True)
+class LayerGeometry:
+    """One decoder layer's matrix multiplications on this rank."""
+
+    dense_params: int
+    """Weights every token goes through: attention projections, dense MLP,
+    shared experts, router."""
+    experts: tuple[ExpertGeometry, ...] = ()
+
+
+# How an MoE step's expert reads are estimated, as recorded with the geometry.
+ROUTING_MODEL = {
+    "model": "independent_uniform_top_k",
+    "experts_read_per_layer": (
+        "local_experts * (1 - (1 - top_k / global_experts) ** step_tokens)"
+    ),
+    "flops_per_token_per_layer": "2 * (dense_params + top_k * params_per_expert)",
+    "not_modeled": ["routing skew (error direction unknown)", "expert parallelism"],
+}
+
+
+class UnsupportedModelLayout(ValueError):
+    """The built model's decoder layers cannot be told apart."""
+
+
+def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
+    """Consecutive layers of one geometry, as ``first``-``last`` ranges."""
+    groups: list[dict[str, Any]] = []
+    for index, layer in enumerate(layers):
+        if groups and layers[groups[-1]["last"]] == layer:
+            groups[-1]["last"] = index
+        else:
+            groups.append(
+                {
+                    "first": index,
+                    "last": index,
+                    "dense_params": layer.dense_params,
+                    "experts": [asdict(e) for e in layer.experts],
+                }
+            )
+    return groups
+
+
+@dataclass(frozen=True)
 class ModelGeometry:
-    """What a roofline needs of a dense model, per tensor-parallel rank."""
+    """What a roofline needs of a model, per tensor-parallel rank."""
 
     num_layers: int
     hidden_size: int
@@ -392,17 +454,118 @@ class ModelGeometry:
     """Bytes per weight (dtype size)."""
     kv_bytes: float
     """Bytes per KV cache element."""
+    layers: tuple[LayerGeometry, ...] | None = None
+    """Each decoder layer's matrix multiplications, from the built model;
+    None: `layer_params` for every layer (a dense model's config)."""
 
     @classmethod
     def from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
+        """A dense model's geometry from its config."""
+        if vllm_config.model_config.is_moe:
+            raise ValueError(
+                "The roofline timing provider needs an MoE model's built "
+                "layers: ModelGeometry.from_model."
+            )
+        return cls._from_config(vllm_config)
+
+    @classmethod
+    def from_model(cls, vllm_config: VllmConfig, model: Any) -> ModelGeometry:
+        """The geometry of the built model (simulation builds it on the meta
+        device, with this rank's shapes): each decoder layer's matrix
+        multiplications at their logical sizes, the routed experts' apart.
+        Embeddings are lookups and norms no matrix multiplications; the LM
+        head stays `vocab_size`, run for the sampled tokens only."""
+        import torch
+
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts,
+        )
+        from vllm.model_executor.layers.linear import LinearBase
+
+        geometry = cls._from_config(vllm_config)
+        num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        # The decoder: the list of the model's layer count named "layers", or
+        # the only such list under any name (EXAONE's transformer.h).
+        lists = [
+            (name.rpartition(".")[2], module)
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.ModuleList) and len(module) == num_layers
+        ]
+        named = [module for name, module in lists if name == "layers"]
+        candidates = named if named else [module for _, module in lists]
+        if len(candidates) != 1:
+            raise UnsupportedModelLayout(
+                f"The roofline timing provider cannot tell the decoder layers "
+                f"apart: {len(lists)} module lists of {num_layers} modules, "
+                f"{len(named)} named 'layers'."
+            )
+        layers = []
+        for layer in candidates[0]:
+            dense, experts = 0, []
+            # modules() yields a module referenced twice (a shared expert's
+            # gate, say) once.
+            for module in layer.modules():
+                if isinstance(module, RoutedExperts):
+                    moe = module.moe_config
+                    hidden = moe.hidden_dim_unpadded or moe.hidden_dim
+                    intermediate = (
+                        moe.intermediate_size_per_partition_unpadded
+                        or moe.intermediate_size_per_partition
+                    )
+                    projections = 3 if moe.is_act_and_mul else 2
+                    experts.append(
+                        ExpertGeometry(
+                            local_experts=moe.num_local_experts,
+                            global_experts=moe.num_experts,
+                            top_k=moe.experts_per_token,
+                            params_per_expert=projections * hidden * intermediate,
+                        )
+                    )
+                elif isinstance(module, LinearBase):
+                    inputs = getattr(
+                        module, "input_size_per_partition", module.input_size
+                    )
+                    outputs = getattr(module, "output_partition_sizes", None) or [
+                        getattr(module, "output_size_per_partition", module.output_size)
+                    ]
+                    dense += inputs * sum(outputs)
+                elif isinstance(module, torch.nn.Linear):
+                    dense += module.in_features * module.out_features
+            layers.append(LayerGeometry(dense, tuple(experts)))
+        if any(layer.experts for layer in layers):
+            cls._check_moe(vllm_config)
+        return dataclasses.replace(geometry, layers=tuple(layers))
+
+    @staticmethod
+    def _check_moe(vllm_config: VllmConfig) -> None:
+        import torch
+
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        if parallel.world_size_across_dp > 1 or parallel.enable_expert_parallel:
+            raise ValueError(
+                "The roofline timing provider models MoE models on one rank "
+                "(no TP, PP, DP or EP) so far."
+            )
+        if model.quantization is not None or model.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError(
+                "The roofline timing provider models MoE models with "
+                f"unquantized bf16 or fp16 weights, not {model.quantization or model.dtype}."
+            )
+
+    @classmethod
+    def _from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
         model = vllm_config.model_config
         parallel = vllm_config.parallel_config
-        if model.use_mla or model.is_moe or model.is_hybrid or model.is_attention_free:
+        if model.use_mla or model.is_hybrid or model.is_attention_free:
             raise ValueError(
-                "The roofline timing provider models dense attention models "
-                "(no MLA, MoE, hybrid or attention-free ones)."
+                "The roofline timing provider models dense and MoE attention "
+                "models (no MLA, hybrid or attention-free ones)."
             )
         tp = parallel.tensor_parallel_size
         text = model.hf_text_config
@@ -416,7 +579,7 @@ class ModelGeometry:
             num_heads=model.get_num_attention_heads(parallel),
             num_kv_heads=model.get_num_kv_heads(parallel),
             head_size=model.get_head_size(),
-            intermediate_size=text.intermediate_size // tp,
+            intermediate_size=getattr(text, "intermediate_size", 0) // tp,
             vocab_size=model.get_vocab_size() // tp,
             weight_bytes=weight_bytes,
             kv_bytes=kv_cache_dtype_str_to_dtype(cache_dtype, model).itemsize,
@@ -431,23 +594,62 @@ class ModelGeometry:
         return q_and_o + k_and_v + mlp
 
     @property
+    def token_params(self) -> int:
+        """Decoder weights a token goes through: every layer's dense ones and
+        `top_k` of its experts."""
+        if self.layers is None:
+            return self.num_layers * self.layer_params
+        return sum(
+            layer.dense_params
+            + sum(e.top_k * e.params_per_expert for e in layer.experts)
+            for layer in self.layers
+        )
+
+    def weights_read(self, num_tokens: int) -> float:
+        """Decoder weights a step of `num_tokens` tokens reads: every layer's
+        dense ones and the experts its tokens are expected to route to."""
+        if self.layers is None:
+            return self.num_layers * self.layer_params
+        return sum(
+            layer.dense_params
+            + sum(e.expected_read(num_tokens) * e.params_per_expert for e in layer.experts)
+            for layer in self.layers
+        )
+
+    def describe(self) -> dict[str, Any]:
+        """The geometry as recorded: consecutive layers of one geometry
+        grouped."""
+        described = asdict(self)
+        described["source"] = "config" if self.layers is None else "built model"
+        if self.layers is not None:
+            described["layers"] = _group_layers(self.layers)
+            if any(layer.experts for layer in self.layers):
+                described["routing"] = ROUTING_MODEL
+        return described
+
+    @property
     def kv_bytes_per_token(self) -> float:
         """K and V of one token across all layers on this rank."""
         return self.num_layers * 2 * self.num_kv_heads * self.head_size * self.kv_bytes
 
 
 class RooflineTimingProvider:
-    """Roofline model of a dense transformer, one GPU per tensor-parallel rank:
-    a step takes ``fixed_us`` plus the longer of its FLOPs at ``peak_tflops *
-    compute_efficiency`` and its bytes at ``hbm_tbps * bandwidth_efficiency``.
+    """Roofline model of a dense or MoE transformer, one GPU per
+    tensor-parallel rank (MoE: one rank): a step takes ``fixed_us`` plus the
+    longer of its FLOPs at ``peak_tflops * compute_efficiency`` and its bytes
+    at ``hbm_tbps * bandwidth_efficiency``.
 
-    FLOPs: 2 per weight per token through the decoder layers, the LM head for
-    the tokens sampled, and attention (QK^T and AV) over each request's
-    context. Bytes: every weight once per step, the KV each request reads
-    (its context) and writes. Not modeled: activations, communication
-    between ranks, kernel efficiency varying with batch shape. ``gpu`` picks
-    a preset of `GPU_PRESETS`; ``peak_tflops`` and ``hbm_tbps`` override it.
-    """
+    FLOPs: 2 per weight per token through the decoder layers (an MoE
+    layer's dense weights and ``top_k`` of its experts), the LM head for the
+    tokens sampled, and attention (QK^T and AV) over each request's context.
+    Bytes: the dense weights once per step, the experts the step's tokens
+    are expected to route to (each token independently and uniformly), the
+    KV each request reads (its context) and writes. Not modeled:
+    activations, communication between ranks, kernel efficiency varying with
+    batch shape, routing skew (fewer experts read, but uneven work: the
+    error's direction is unknown). ``gpu`` picks a preset of `GPU_PRESETS`;
+    ``peak_tflops`` and ``hbm_tbps`` override it. An MoE model's geometry
+    comes from its built layers (`bind_model`)."""
 
     def __init__(
         self,
@@ -473,7 +675,11 @@ class RooflineTimingProvider:
         self.bytes_per_s = bandwidth * 1e12 * bandwidth_efficiency
         self.fixed_us = fixed_us
         self.host = HostTimeModel(fixed_us=host_us)
-        self.geometry = geometry or ModelGeometry.from_config(vllm_config)
+        self._vllm_config = vllm_config
+        # An MoE model's geometry comes from its built layers (bind_model).
+        self.geometry: ModelGeometry | None = geometry
+        if geometry is None and not vllm_config.model_config.is_moe:
+            self.geometry = ModelGeometry.from_config(vllm_config)
         self._assumptions = {
             "gpu": gpu,
             "peak_tflops": peak,
@@ -484,13 +690,33 @@ class RooflineTimingProvider:
             "host_us": host_us,
         }
 
+    def bind_model(self, model: Any) -> None:
+        """Take each layer's geometry from the built model, before any step
+        is timed. A dense model whose decoder layers cannot be told apart
+        keeps its config's; an MoE model needs its layers."""
+        try:
+            self.geometry = ModelGeometry.from_model(self._vllm_config, model)
+        except UnsupportedModelLayout as error:
+            if self._vllm_config.model_config.is_moe:
+                raise
+            logger.warning("%s Timing the dense model from its config.", error)
+            self.geometry = ModelGeometry.from_config(self._vllm_config)
+
+    def _bound(self) -> ModelGeometry:
+        if self.geometry is None:
+            raise RuntimeError(
+                "The roofline timing provider has no geometry: bind_model() "
+                "the built model first."
+            )
+        return self.geometry
+
     def assumptions(self) -> dict[str, Any]:
         """What the step times rest on, resolved: the GPU's figures (preset or
         overridden), efficiencies, fixed costs and the model's geometry."""
-        return {**self._assumptions, "geometry": asdict(self.geometry)}
+        return {**self._assumptions, "geometry": self._bound().describe()}
 
     def estimate(self, step: StepDescriptor) -> StepCost:
-        g = self.geometry
+        g = self._bound()
         sampled = sum(
             1
             for r in step.requests
@@ -506,11 +732,11 @@ class RooflineTimingProvider:
         context = sum(r.num_computed_tokens + r.num_scheduled_tokens for r in step.requests)
         lm_head = g.hidden_size * g.vocab_size
         flops = (
-            2 * g.num_layers * g.layer_params * step.num_tokens
+            2 * g.token_params * step.num_tokens
             + 2 * lm_head * sampled
             + 4 * g.num_layers * g.num_heads * g.head_size * pairs
         )
-        memory = (g.num_layers * g.layer_params + lm_head) * g.weight_bytes
+        memory = (g.weights_read(step.num_tokens) + lm_head) * g.weight_bytes
         memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
         compute_us = flops / self.flops_per_s * 1e6
         memory_us = memory / self.bytes_per_s * 1e6

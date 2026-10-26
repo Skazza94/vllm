@@ -112,16 +112,6 @@ class SimulatedModelRunner(GPUModelRunner):
             self.clock = clock
         log_path = step_log_path(vllm_config)
         self.step_log = StepLogWriter(log_path) if log_path else None
-        if self.step_log is not None:
-            assumptions = getattr(self.timing_provider, "assumptions", None)
-            self.step_log.write_timing(
-                {
-                    "provider": sim.timing,
-                    "args": dict(sim.timing_args),
-                    **(assumptions() if assumptions else {}),
-                },
-                self.clock.now(),
-            )
         self.fallback_token_id = sim.fallback_token_id
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.
@@ -215,6 +205,25 @@ class SimulatedModelRunner(GPUModelRunner):
             )
             self.kv_connector = connector
             self._kv_transfers = connector.transfers
+
+    def load_model(self, *args, **kwargs) -> None:  # type: ignore[override]
+        super().load_model(*args, **kwargs)
+        # Step times may rest on the built model (each layer's weights):
+        # resolve them before any step is timed, then record them.
+        bind = getattr(self.timing_provider, "bind_model", None)
+        if bind is not None:
+            bind(self.get_model())
+        if self.step_log is not None:
+            sim = self.vllm_config.simulation_config
+            assumptions = getattr(self.timing_provider, "assumptions", None)
+            self.step_log.write_timing(
+                {
+                    "provider": sim.timing,
+                    "args": dict(sim.timing_args),
+                    **(assumptions() if assumptions else {}),
+                },
+                self.clock.now(),
+            )
 
     def _make_kv_connector(self, kv_caches_dict):  # type: ignore[override]
         """Real KV transfers: the native connector; with pattern checks, also
