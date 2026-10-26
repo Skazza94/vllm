@@ -230,8 +230,8 @@ class SimulationConfig:
     def _verify_real_kv_transfer(self, vllm_config: "VllmConfig") -> None:
         """Check what real transfers under simulated compute support so far:
         CPU KV buffers moved by a native connector (NIXL or Mooncake) between
-        single-rank instances of a dense full-attention model. The native
-        connector stays in place."""
+        single-rank instances of a full-attention model, dense or MoE (its
+        experts hold no KV). The native connector stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -292,12 +292,11 @@ class SimulationConfig:
             model.use_mla
             or model.is_hybrid
             or model.is_attention_free
-            or model.is_moe
             or model.get_sliding_window() is not None
         ):
             problems.append(
-                "a dense full-attention model (no MLA, hybrid, attention-free, "
-                "MoE or sliding-window models)"
+                "a full-attention model, dense or MoE (no MLA, hybrid, "
+                "attention-free or sliding-window models)"
             )
         if vllm_config.speculative_config is not None:
             problems.append("no speculative decoding")

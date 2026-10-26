@@ -40,6 +40,41 @@ def model_dir(tmp_path_factory):
     return str(directory)
 
 
+@pytest.fixture(scope="module")
+def moe_model_dir(tmp_path_factory):
+    """A tiny Qwen3-MoE configuration: dense attention, 8 experts, top-2."""
+    directory = tmp_path_factory.mktemp("tiny-qwen3-moe")
+    (directory / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "model_type": "qwen3_moe",
+                "vocab_size": 128,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "norm_topk_prob": True,
+                "max_position_embeddings": 256,
+                "torch_dtype": "float32",
+            }
+        )
+    )
+    return str(directory)
+
+
+@pytest.fixture(params=["model_dir", "moe_model_dir"])
+def any_model_dir(request):
+    """The dense model, then the MoE one: their KV caches are alike."""
+    return request.getfixturevalue(request.param)
+
+
 def engine_config(model_dir, simulation=None, kv_transfer=None, **kwargs):
     from vllm.engine.arg_utils import EngineArgs
 
@@ -141,6 +176,41 @@ def test_simulated_blocks_need_a_multiple_of_16(model_dir):
         engine_config(model_dir, block_size=8)
 
 
+def test_real_mode_accepts_moe_models_but_not_mla(moe_model_dir, tmp_path):
+    config = engine_config(moe_model_dir)
+    assert config.model_config.is_moe
+    assert config.simulation_config.kv_transfer_mode == "real"
+    # DeepSeek-V2: MLA (and MoE).
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV2ForCausalLM"],
+                "model_type": "deepseek_v2",
+                "vocab_size": 128,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "kv_lora_rank": 64,
+                "q_lora_rank": None,
+                "qk_nope_head_dim": 32,
+                "qk_rope_head_dim": 16,
+                "v_head_dim": 32,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+                "torch_dtype": "float32",
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="no MLA"):
+        engine_config(str(tmp_path))
+
+
 def test_real_mode_needs_a_connector(model_dir):
     with pytest.raises(ValueError, match="needs a kv_transfer_config"):
         engine_config(model_dir, kv_transfer_config=None)
@@ -212,7 +282,7 @@ class RecordingConnector:
         return Connector
 
 
-def test_producer_writes_the_pattern_into_its_kv_tensors(model_dir, monkeypatch):
+def test_producer_writes_the_pattern_into_its_kv_tensors(any_model_dir, monkeypatch):
     """With kv_pattern_fill, a prefill engine's real KV tensors hold each
     request's pattern in the blocks the request was given."""
     from vllm import LLM, SamplingParams
@@ -226,7 +296,7 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(model_dir, monkeypatch)
     )
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     llm = LLM(
-        model=model_dir,
+        model=any_model_dir,
         skip_tokenizer_init=True,
         dtype="float32",
         max_model_len=256,
@@ -269,7 +339,9 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(model_dir, monkeypatch)
 
 
 @pytest.mark.parametrize("block_size", [32, 16])
-def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch, block_size):
+def test_real_mode_allocates_and_registers_cpu_kv_tensors(
+    any_model_dir, monkeypatch, block_size
+):
     """An in-process engine in real mode allocates real CPU KV tensors within
     the KV budget and registers them with the connector; a request then runs
     its simulated steps over them. Blocks may be as small as a GPU's (16),
@@ -285,7 +357,7 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(model_dir, monkeypatch
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     budget = 8 * 1024**2
     llm = LLM(
-        model=model_dir,
+        model=any_model_dir,
         skip_tokenizer_init=True,
         dtype="float32",
         max_model_len=256,
