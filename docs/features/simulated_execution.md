@@ -351,9 +351,10 @@ TRITON_CPU_BACKEND=1 vllm serve Qwen/Qwen3-235B-A22B --simulate-forward \
 Ranks need no devices, so a layout larger than any one GPU host runs on a
 CPU host. Simulated workers share the host's cores instead of each taking a
 NUMA node, and keep the modeled GPU deployment's settings (async scheduling,
-the in-process executor) rather than the CPU platform's. The exception is the
-KV block size, which the CPU attention backend needs to be a multiple of 32:
-pass `--block-size` to match the deployment where it uses a larger one.
+the in-process executor) rather than the CPU platform's: an MLA model keeps
+its chunked prefill and prefix caching, and its blocks are not forced to the
+CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
+GPU's smallest: pass `--block-size` to match the deployment.
 Layers still pick the CPU platform's attention backends and kernels, so a
 model needing one it lacks (sparse MLA, decode context parallelism, NVFP4 or
 MXFP4 weights, online FP8 quantization) fails to build there. The CPU build needs Python 3.11 or newer.

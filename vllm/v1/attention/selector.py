@@ -200,6 +200,7 @@ def get_attn_backend(
         _run_kv_cache_dtype=(
             cache_config.cache_dtype if cache_config is not None else None
         ),
+        _simulate_forward=vllm_config.simulation_config.simulate_forward,
     )
 
 
@@ -210,9 +211,11 @@ def _cached_get_attn_backend(
     num_heads: int | None = None,
     *,
     _run_kv_cache_dtype: CacheDType | None = None,
+    _simulate_forward: bool = False,
 ) -> type[AttentionBackend]:
-    # Some platform selectors inspect the run-wide cache dtype. Keep it in the
-    # cache key even though they read the value from the current config.
+    # Some platform selectors inspect the run-wide cache dtype, or whether the
+    # run is simulated (the CPU platform's MLA choice). Keep them in the cache
+    # key even though they read the values from the current config.
     from vllm.platforms import current_platform
 
     attention_cls = current_platform.get_attn_backend_cls(

@@ -231,8 +231,9 @@ class SimulationConfig:
         """Check what real transfers under simulated compute support so far:
         CPU KV buffers moved by a native connector (NIXL or Mooncake) between
         instances of a full-attention model, dense or MoE (its experts hold
-        no KV), on one rank or tensor-parallel ones. The native connector
-        stays in place."""
+        no KV), or of a dense MLA one (one latent per token and layer, which
+        every tensor-parallel rank holds whole), on one rank or
+        tensor-parallel ones. The native connector stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -298,15 +299,20 @@ class SimulationConfig:
                 f"MooncakeConnector for tensor parallelism, not {kv_transfer.kv_connector}"
             )
         model = vllm_config.model_config
+        # DeepSeek-V3.2's and V4's MLA is sparse: an indexer picks the tokens.
+        sparse_mla = model.use_mla and (
+            getattr(model.hf_text_config, "index_topk", None) is not None
+            or getattr(model.hf_config, "model_type", None) == "deepseek_v4"
+        )
         if (
-            model.use_mla
+            sparse_mla
             or model.is_hybrid
             or model.is_attention_free
             or model.get_sliding_window() is not None
         ):
             problems.append(
-                "a full-attention model, dense or MoE (no MLA, hybrid, "
-                "attention-free or sliding-window models)"
+                "a full-attention model, dense, MoE or dense MLA (no sparse "
+                "MLA, hybrid, attention-free or sliding-window models)"
             )
         if vllm_config.speculative_config is not None:
             problems.append("no speculative decoding")

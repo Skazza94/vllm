@@ -24,6 +24,8 @@ Key design points:
 * The CPU decode kernel only supports ``head_dim=576``,
   ``v_head_dim=512`` and ``block_size=16`` today; the platform layer
   forces ``block_size=16`` for MLA models.
+* Simulated execution never runs these kernels: it keeps chunked prefill
+  and prefix caching, and its blocks may be any multiple of 16.
 """
 
 from typing import ClassVar
@@ -31,6 +33,7 @@ from typing import ClassVar
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -45,6 +48,14 @@ from vllm.v1.attention.backend import (
 )
 
 logger = init_logger(__name__)
+
+# The smallest KV block a simulation allows: FlashAttention's on GPU.
+_SIMULATED_BLOCK_MULTIPLE = 16
+
+
+def _simulated() -> bool:
+    config = get_current_vllm_config_or_none()
+    return config is not None and config.simulation_config.simulate_forward
 
 
 class CPUMLABackend(MLACommonBackend):
@@ -65,10 +76,16 @@ class CPUMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        if _simulated():
+            # Simulated steps never run the decode kernel: each block stays
+            # whole, as large as a GPU's (multiples of 16).
+            return [MultipleOf(_SIMULATED_BLOCK_MULTIPLE)]
         return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
+        if block_size is not None and _simulated():
+            return block_size % _SIMULATED_BLOCK_MULTIPLE == 0
         return block_size is None or block_size == 16
 
     @staticmethod

@@ -165,8 +165,15 @@ class CpuPlatform(Platform):
                     f"--kv-cache-dtype {kv_cache_dtype} is not supported by "
                     "MLA attention on CPU."
                 )
+            from vllm.config import get_current_vllm_config_or_none
+
+            # A simulation never runs the MLA kernels: the reference backend
+            # keeps its KV cache the same on every host.
+            config = get_current_vllm_config_or_none()
+            simulated = config is not None and config.simulation_config.simulate_forward
             amx_available = (
-                cls.get_cpu_architecture() == CpuArchEnum.X86
+                not simulated
+                and cls.get_cpu_architecture() == CpuArchEnum.X86
                 and torch.cpu._is_amx_tile_supported()
             )
             if amx_available and selected_backend != AttentionBackendEnum.CPU_MLA:
@@ -268,8 +275,11 @@ class CpuPlatform(Platform):
         # block size (DeepseekV4SparseMLABackend/DeepseekV4IndexerBackend),
         # so it needs the same override-regardless-of-preference treatment
         # as CPU MLA, just with a different value.
+        # A simulation's MLA blocks follow its own rule (below): its steps
+        # never run these kernels.
         cpu_mla_enabled = (
-            not is_deepseek_v4
+            not simulated
+            and not is_deepseek_v4
             and model_config is not None
             and getattr(model_config, "use_mla", False)
         )
@@ -557,6 +567,7 @@ class CpuPlatform(Platform):
             model_config is not None
             and model_config.use_mla
             and not amx_mla_or_dsv4_enabled
+            and not simulated
         ):
             logger.info_once(
                 "MLA is enabled on a non-GPU platform; forcing chunked "

@@ -72,9 +72,44 @@ def moe_model_dir(tmp_path_factory):
     return str(directory)
 
 
-@pytest.fixture(params=["model_dir", "moe_model_dir"])
+# A tiny DeepSeek-V2 (MLA and MoE) with DeepSeek's latent: kv_lora_rank 512
+# plus a 64-wide rope key, 576 elements per token and layer.
+DEEPSEEK_V2 = {
+    "architectures": ["DeepseekV2ForCausalLM"],
+    "model_type": "deepseek_v2",
+    "vocab_size": 128,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "moe_intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "kv_lora_rank": 512,
+    "q_lora_rank": None,
+    "qk_nope_head_dim": 32,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 32,
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "first_k_dense_replace": 1,
+    "max_position_embeddings": 256,
+    "torch_dtype": "float32",
+}
+LATENT = 512 + 64
+
+
+@pytest.fixture(scope="module")
+def mla_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("tiny-deepseek-v2")
+    (directory / "config.json").write_text(json.dumps(DEEPSEEK_V2))
+    return str(directory)
+
+
+@pytest.fixture(params=["model_dir", "moe_model_dir", "mla_model_dir"])
 def any_model_dir(request):
-    """The dense model, then the MoE one: their KV caches are alike."""
+    """The dense model, the MoE one, then the MLA one: blocks of each layer's
+    KV, K and V heads or one latent."""
     return request.getfixturevalue(request.param)
 
 
@@ -179,39 +214,36 @@ def test_simulated_blocks_need_a_multiple_of_16(model_dir):
         engine_config(model_dir, block_size=8)
 
 
-def test_real_mode_accepts_moe_models_but_not_mla(moe_model_dir, tmp_path):
+def test_real_mode_accepts_moe_and_dense_mla_models(moe_model_dir, mla_model_dir, tmp_path):
     config = engine_config(moe_model_dir)
     assert config.model_config.is_moe
     assert config.simulation_config.kv_transfer_mode == "real"
-    # DeepSeek-V2: MLA (and MoE).
+    config = engine_config(mla_model_dir)
+    assert config.model_config.use_mla
+    # DeepSeek-V3.2: an indexer makes its MLA sparse.
     (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["DeepseekV2ForCausalLM"],
-                "model_type": "deepseek_v2",
-                "vocab_size": 128,
-                "hidden_size": 256,
-                "intermediate_size": 512,
-                "moe_intermediate_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 2,
-                "kv_lora_rank": 64,
-                "q_lora_rank": None,
-                "qk_nope_head_dim": 32,
-                "qk_rope_head_dim": 16,
-                "v_head_dim": 32,
-                "n_routed_experts": 4,
-                "n_shared_experts": 1,
-                "num_experts_per_tok": 2,
-                "first_k_dense_replace": 1,
-                "max_position_embeddings": 256,
-                "torch_dtype": "float32",
-            }
-        )
+        json.dumps({**DEEPSEEK_V2, "index_topk": 64, "index_n_heads": 2, "index_head_dim": 64})
     )
-    with pytest.raises(ValueError, match="no MLA"):
+    with pytest.raises(ValueError, match="no sparse MLA"):
         engine_config(str(tmp_path))
+
+
+def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
+    """The CPU platform forces MLA to 16-token blocks, without chunked prefill
+    or prefix caching, for its own kernels; a simulation never runs them."""
+    config = engine_config(
+        mla_model_dir,
+        block_size=64,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=128,
+    )
+    assert config.cache_config.block_size == 64
+    assert config.cache_config.enable_prefix_caching
+    assert config.scheduler_config.enable_chunked_prefill
+    assert config.scheduler_config.max_num_batched_tokens == 128
+    with pytest.raises(ValueError, match="multiple of 16"):
+        engine_config(mla_model_dir, block_size=8)
 
 
 def test_real_mode_allows_tensor_parallelism_only_over_mooncake(model_dir):
@@ -441,7 +473,8 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(
         storages = {}
         for name, tensor in caches.items():
             assert tensor.device.type == "cpu" and not tensor.is_meta, name
-            # [blocks, KV heads, block size, K and V]: the GPU's block geometry.
+            # [blocks, KV heads, block size, K and V], or MLA's [blocks, 1,
+            # block size, latent]: the GPU's block geometry.
             assert tensor.shape[2] == block_size, (name, tuple(tensor.shape))
             assert tensor.numel() > 0 and tensor.data_ptr() != 0, name
             storage = tensor.untyped_storage()
@@ -462,6 +495,89 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(
         assert len(output[0].outputs[0].token_ids) == 2
     finally:
         del llm
+
+
+@pytest.mark.parametrize("simulated_first", [False, True])
+def test_mla_backend_choice_is_cached_per_mode(monkeypatch, simulated_first):
+    """On an AMX host ordinary runs take AMX_MLA and simulations CPU_MLA,
+    whichever selects first: the selector's cache keys on the mode."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.simulation import SimulationConfig
+    from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+
+    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: True)
+    configs = [
+        (VllmConfig(), "AMX_MLA"),
+        (VllmConfig(simulation_config=SimulationConfig(simulate_forward=True)), "CPU_MLA"),
+    ]
+    if simulated_first:
+        configs.reverse()
+    _cached_get_attn_backend.cache_clear()
+    try:
+        for config, name in configs * 2:
+            with set_current_vllm_config(config):
+                backend = get_attn_backend(LATENT, torch.bfloat16, "auto", use_mla=True)
+            assert backend.get_name() == name, config.simulation_config.simulate_forward
+    finally:
+        _cached_get_attn_backend.cache_clear()
+
+
+@pytest.mark.parametrize("amx", [True, False])
+def test_mla_blocks_stay_whole_on_any_host(mla_model_dir, monkeypatch, tmp_path, amx):
+    """Without AMX the CPU MLA kernel takes 16-token blocks only, with AMX
+    multiples of 32: a simulation registers the latent in the blocks it asks
+    for (64 tokens here) on either host, and logs their bytes."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    connector = RecordingConnector.make()
+    RecordingConnector.registered.clear()
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    monkeypatch.setattr(torch.cpu, "_is_amx_tile_supported", lambda: amx)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=mla_model_dir,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        max_model_len=256,
+        block_size=64,
+        kv_cache_memory_bytes=8 * 1024**2,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_consumer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        caches = RecordingConnector.registered[0]
+        assert len(caches) == 2
+        num_blocks = next(iter(caches.values())).shape[0]
+        for name, tensor in caches.items():
+            # [blocks, one latent "head", block size, latent].
+            assert tuple(tensor.shape) == (num_blocks, 1, 64, LATENT), name
+        llm.generate(
+            [{"prompt_token_ids": [5] * 100}],
+            SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+    finally:
+        del llm
+    (layout,) = [r["kv_layout"] for r in log_records(log) if "kv_layout" in r]
+    assert layout["shape"] == [num_blocks, 1, 64, LATENT]
+    assert layout["block_bytes"] == 64 * LATENT * 4  # float32
+    assert layout["bytes"] == 2 * num_blocks * 64 * LATENT * 4
 
 
 @pytest.mark.parametrize("real", [True, False])
@@ -570,12 +686,16 @@ def log_records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+@pytest.mark.parametrize("model", ["model_dir", "mla_model_dir"])
 def test_tensor_parallel_ranks_register_and_log_their_own_kv(
-    model_dir, monkeypatch, tmp_path, stand_in_connector
+    model, request, monkeypatch, tmp_path, stand_in_connector
 ):
     """On 2 ranks each worker registers its own KV heads (1 of the model's 2),
-    logs them in its own step log and serves TENT's metrics on its own port."""
+    or the whole MLA latent, which every rank holds; logs them in its own
+    step log and serves TENT's metrics on its own port."""
     from vllm import LLM, SamplingParams
+
+    model_dir = request.getfixturevalue(model)
 
     stand_in_connector(recording_connector)
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -619,8 +739,13 @@ def test_tensor_parallel_ranks_register_and_log_their_own_kv(
         (layout,) = [r["kv_layout"] for r in records if "kv_layout" in r]
         assert (layout["tp_rank"], layout["tp_size"]) == (rank, 2)
         assert layout["tent_metrics_port"] == str(9100 + rank)
-        # [blocks, KV heads, block size, K and V]: 1 of the model's 2 heads.
-        assert layout["shape"][1] == 1, layout
+        if model == "mla_model_dir":
+            # [blocks, 1, block size, latent]: not split across ranks.
+            assert layout["shape"][1:] == [1, 32, LATENT], layout
+            assert layout["block_bytes"] == 32 * LATENT * 4
+        else:
+            # [blocks, KV heads, block size, K and V]: 1 of the model's 2 heads.
+            assert layout["shape"][1] == 1, layout
         assert any("step" in r for r in records)
 
 
