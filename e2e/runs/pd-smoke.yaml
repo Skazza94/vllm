@@ -1,0 +1,61 @@
+# Example run (the only one tracked; copy it to make others): a short
+# byte-checked prefill/decode run on the pd-two-rails topology, both sides'
+# KV on data0, HTTP on control.
+#
+#   python -m harness up topologies/pd-two-rails.yaml   # from e2e/, first
+#   python -m harness pd runs/pd-smoke.yaml
+#
+# Prefill and decode run `vllm serve` with simulated compute and real KV
+# transfers (MooncakeConnector over TENT's hp_tcp, bound to the node's KV
+# network address; TENT's other transports off). HTTP, Mooncake's bootstrap
+# and the proxy use the control network. The client node runs
+# MooncakeConnector's proxy and `vllm bench serve --dataset-name random`.
+#
+# Checks (verdict.json, `problems` empty when it passes): every request
+# completed; with kv_check, decode byte-checked every request with no
+# mismatch; the connector failed no transfer and moved at least the checked
+# bytes; each KV network's router carried its ranks' bytes and the control
+# router less than 10% of them. Under tensor parallelism each rank is
+# checked on its own (its byte checks, layout, rail and TENT counters).
+# Output: results/<name>-<timestamp>/ (bench.json, step logs, server and
+# proxy logs, routers.json, tent.json, verdict.json).
+
+name: pd-smoke
+topology: pd-two-rails  # its name: the topology must be up
+
+# A Hugging Face model directory (config and tokenizer, no weights), relative
+# to this file; ../../models/ holds the fetched ones.
+model: ../../models/Qwen--Qwen2.5-7B-Instruct/a09a35458c702b33eeacc393d103063234e8bc28
+
+# Each side's node and KV network. Under tensor parallelism kv_network may be
+# a list, one network per rank (rank r of both sides on the same network).
+prefill: {node: prefill0, kv_network: data0}
+decode: {node: decode0, kv_network: data0}
+client: client
+control_network: control
+
+# Prefill writes a known pattern into its KV blocks and decode checks every
+# byte it receives (default true).
+kv_check: true
+
+# proxy: path/to/proxy.py   # default: vllm/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py
+# startup_timeout: 600      # seconds for the servers to come up
+
+server:  # both servers; defaults shown where set
+  gpu: h100                   # roofline GPU preset: a100, h100, h200, b200
+  block_size: 16              # tokens per KV block (a multiple of 16)
+  kv_cache_memory_bytes: 2147483648  # KV cache per rank (default 2 GiB)
+  max_model_len: 4096
+  max_num_batched_tokens: 2048
+  max_num_seqs: 32
+  # tensor_parallel_size: 1   # > 1 needs a topology with --shm-size 4g
+  # dtype: auto
+  # hp_tcp_args: {max_outstanding_tasks: 1048576}  # extra hp_tcp settings
+  # env: {VLLM_LOGGING_LEVEL: DEBUG}               # extra server environment
+
+workload:  # vllm bench serve --dataset-name random
+  input_len: 1024
+  output_len: 16
+  num_prompts: 40
+  concurrency: 4
+  # seed: 0

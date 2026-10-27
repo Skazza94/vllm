@@ -1,0 +1,6 @@
+.venv/*
+**/__pycache__/*
+models/*
+!models/README.md
+datasets/*
+!datasets/README.md

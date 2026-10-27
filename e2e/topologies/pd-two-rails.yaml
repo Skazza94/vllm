@@ -1,0 +1,67 @@
+# Example topology (the only one tracked; copy it to make others):
+# a prefill and a decode node with two data rails (one per tensor-parallel
+# rank, say) and a control network the client shares.
+#
+#   python -m harness up topologies/pd-two-rails.yaml   # from e2e/
+#   python -m harness status pd-two-rails
+#   python -m harness exec pd-two-rails prefill0 ip -br addr
+#   python -m harness down pd-two-rails
+#
+# Every network is a star: one router container in the middle and one veth
+# from each of the network's nodes to it, no bridges. Link k of a network
+# (its k-th node, in spec order) is a /31 of its subnet: the router holds
+# the even address, the node the odd one. A node's interface is named after
+# the network and routes only that subnet (no default route). Each node's
+# /etc/hosts has <node>.<network>, and /e2e/topology.json describes the
+# topology. Containers start with --network none; the host wires them with
+# `sudo nsenter ... ip/tc`, so password-less sudo for ip, tc and nsenter is
+# needed. Veths are memory copies, not NICs: no absolute network numbers.
+
+# Lowercase letters, digits and dashes; prefixes the containers' names
+# (<name>-<node>, <name>-router-<network>).
+name: pd-two-rails
+
+# Nodes' default image (default vllm-sim:cpu, built by
+# ../build-docker-vllm.sh).
+image: vllm-sim:cpu
+
+# Routers' image (default python:3.12-slim) and their cpuset (default none).
+# router_image: python:3.12-slim
+routers:
+  cpus: "15"
+
+networks:
+  # Names are interface names: a letter, then up to 14 letters or digits.
+  control:
+    subnet: 10.250.0.0/24  # required; subnets must not overlap
+  data0:
+    subnet: 10.100.0.0/24
+    mtu: 9000  # default 1500
+    # Optional egress shaping of each link, both ways (tc netem): a path
+    # between two nodes crosses two links, so it sees the rate once and the
+    # delay twice.
+    # rate: 100gbit     # tc rate: bit, kbit, mbit, gbit or tbit
+    # delay: 50us       # tc time: us, ms or s
+    # queue_limit: 10000  # netem's queue, in packets (default 10000)
+  data1:
+    subnet: 10.101.0.0/24
+    mtu: 9000
+
+nodes:
+  # Names: lowercase letters, digits and dashes, not starting with router-.
+  prefill0:
+    networks: [control, data0, data1]  # required, each at most once
+    cpus: "0-6"     # docker --cpuset-cpus (default: no limit)
+    memory: 24g     # docker --memory (default: no limit)
+    # image: vllm-sim:cpu  # this node's image (default: the spec's)
+    # Extra `docker run` options, for example a larger /dev/shm (needed for
+    # tensor parallelism) or sources mounted over the image's:
+    # docker_args: ["--shm-size", "4g",
+    #   "-v", "/abs/path/vllm-sim/vllm/vllm/v1/worker/simulated:/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/simulated:ro"]
+  decode0:
+    networks: [control, data0, data1]
+    cpus: "7-13"
+    memory: 24g
+  client:
+    networks: [control]
+    cpus: "14"

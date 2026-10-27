@@ -1,0 +1,58 @@
+"""Command line: python -m harness {up,down,status,exec,pd} ..."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+from . import pd
+from . import spec as specs
+from . import topology
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m harness", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    up = commands.add_parser("up", help="create a topology from its spec")
+    up.add_argument("spec")
+    down = commands.add_parser("down", help="remove a topology")
+    down.add_argument("name", help="the topology's name, or its spec")
+    status = commands.add_parser("status", help="a topology's containers and addresses")
+    status.add_argument("name", help="the topology's name, or its spec")
+    run = commands.add_parser("exec", help="run a command in one of a topology's nodes")
+    run.add_argument("name", help="the topology's name, or its spec")
+    run.add_argument("node")
+    run.add_argument("argv", nargs=argparse.REMAINDER)
+    prefill_decode = commands.add_parser("pd", help="a prefill/decode run of the vLLM simulator in an up topology")
+    prefill_decode.add_argument("run", help="the run config")
+    args = parser.parse_args(argv)
+
+    if args.command == "up":
+        print(json.dumps(topology.up(specs.load(args.spec)), indent=2))
+        return 0
+    if args.command == "pd":
+        print(json.dumps(pd.execute(pd.load(args.run)), indent=2))
+        return 0
+    name = _name(args.name)
+    if args.command == "down":
+        removed = topology.down(name)
+        print(f"removed {len(removed)} container(s)")
+    elif args.command == "status":
+        print(json.dumps({"containers": topology.containers(name), **topology.load_state(name)}, indent=2))
+    else:
+        container = topology.load_state(name)["nodes"][args.node]["container"]
+        sys.stdout.write(topology.exec_in(container, args.argv, timeout=None))
+    return 0
+
+
+def _name(value: str) -> str:
+    """A topology's name, given it or its spec file."""
+
+    if value.endswith((".yaml", ".yml")):
+        return specs.load(value).name
+    return value
+
+
+if __name__ == "__main__":
+    sys.exit(main())
