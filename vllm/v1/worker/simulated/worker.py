@@ -3,9 +3,7 @@
 """Worker for simulated execution: no weights, no KV tensors, no forward."""
 
 # ruff: noqa: E402
-import json
 import os
-from pathlib import Path
 
 import torch
 
@@ -30,6 +28,7 @@ from vllm.v1.worker.worker_base import CompilationTimes
 logger = init_logger(__name__)
 
 
+_TENT_METRICS_KEY = "metrics/http_port"
 _TENT_METRICS_PORT = "TENT_METRICS_HTTP_PORT"
 _TENT_METRICS_BASE_PORT = "VLLM_SIM_TENT_METRICS_BASE_PORT"
 # TENT's MetricsConfig::http_port.
@@ -43,59 +42,32 @@ def _thread_ids() -> set[int]:
         return set()
 
 
-def _tent_conf() -> dict | None:
-    """MC_TENT_CONF as TENT reads it: a file's JSON, or inline JSON."""
-    value = os.environ.get("MC_TENT_CONF")
-    if not value:
-        return None
-    try:
-        text = Path(value).read_text() if os.path.exists(value) else value
-        conf = json.loads(text)
-    except (OSError, ValueError):
-        return None
-    return conf if isinstance(conf, dict) else None
-
-
 def _rank_tent_metrics_port() -> None:
     """Every rank's transfer engine serves TENT's metrics on its own port:
     the base port plus its tensor-parallel rank. TENT takes the port from
     MC_TENT_CONF's metrics/http_port (nested, else the flat key), else
     TENT_METRICS_HTTP_PORT, else its default; whichever it would use is
     offset."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
     from vllm.distributed.parallel_state import get_tp_group
 
-    conf = _tent_conf()
-    found = _conf_metrics_port(conf) if conf else None
+    def number(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    conf = tent_config.load()
+    found = tent_config.lookup(conf, _TENT_METRICS_KEY, number) if conf else None
     base = os.environ.get(_TENT_METRICS_BASE_PORT) or str(
-        (found and found[1])
+        (found and int(found[1]))
         or os.environ.get(_TENT_METRICS_PORT)
         or _TENT_DEFAULT_METRICS_PORT
     )
     os.environ[_TENT_METRICS_BASE_PORT] = base
     port = int(base) + get_tp_group().rank_in_group
     os.environ[_TENT_METRICS_PORT] = str(port)
-    if found is not None and found[1] != port:
+    if found is not None and int(found[1]) != port:
         assert conf is not None
-        if found[0] == "nested":
-            conf["metrics"]["http_port"] = port
-        else:
-            conf["metrics/http_port"] = port
-        os.environ["MC_TENT_CONF"] = json.dumps(conf)
-
-
-def _conf_metrics_port(conf: dict) -> tuple[str, int] | None:
-    """Where TENT's Config::get finds metrics/http_port, and its value: the
-    nested path first, then the flat key (each only if a number)."""
-
-    def number(value: object) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-    metrics = conf.get("metrics")
-    if isinstance(metrics, dict) and number(metrics.get("http_port")):
-        return "nested", int(metrics["http_port"])
-    if number(conf.get("metrics/http_port")):
-        return "flat", int(conf["metrics/http_port"])
-    return None
+        tent_config.store(conf, _TENT_METRICS_KEY, port, nested=found[0])
+        tent_config.save(conf)
 
 
 class SimulatedWorker(Worker):

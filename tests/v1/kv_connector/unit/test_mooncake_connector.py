@@ -4,6 +4,8 @@
 import asyncio
 import contextlib
 import errno
+import json
+import os
 import socket
 import threading
 import time
@@ -44,9 +46,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _pp_mismatch_hides_packed_layers,
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
+    bind_hp_tcp,
+    rank_kv_address,
     should_launch_bootstrap_server,
     simulated_tp_mismatch,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -3052,3 +3057,132 @@ async def test_simulated_prefill_refuses_a_decode_of_another_tp_size():
     assert identity == b"decode"
     assert response.status == MooncakeXferResponseStatus.ERROR
     assert "local TP 1 and remote TP 2" in response.err_msg
+
+
+def test_tent_config_reads_nested_keys_before_flat_ones(monkeypatch, tmp_path):
+    conf = {"metrics": {"http_port": 9300}, "metrics/http_port": 9400, "a/b": 1}
+    assert tent_config.lookup(conf, "metrics/http_port") == (True, 9300)
+    assert tent_config.lookup(conf, "a/b") == (False, 1)
+    assert tent_config.lookup(conf, "missing/key") is None
+    # A value TENT cannot convert falls through to the flat key.
+    odd = {"metrics": {"http_port": "x"}, "metrics/http_port": 9400}
+    assert tent_config.lookup(odd, "metrics/http_port", lambda v: isinstance(v, int)) == (
+        False,
+        9400,
+    )
+    tent_config.store(conf, "transports/hp_tcp/bind_address", "10.0.0.1")
+    assert conf["transports"] == {"hp_tcp": {"bind_address": "10.0.0.1"}}
+    tent_config.store(conf, "a/b", 2, nested=False)
+    assert conf["a/b"] == 2
+    # MC_TENT_CONF: a file's path or inline JSON.
+    monkeypatch.delenv(tent_config.ENV, raising=False)
+    assert tent_config.load() is None
+    (tmp_path / "tent.json").write_text('{"x": 1}')
+    monkeypatch.setenv(tent_config.ENV, str(tmp_path / "tent.json"))
+    assert tent_config.load() == {"x": 1}
+    monkeypatch.setenv(tent_config.ENV, '{"y": 2}')
+    assert tent_config.load() == {"y": 2}
+    monkeypatch.setenv(tent_config.ENV, "{")
+    assert tent_config.load() is None
+
+
+def _rank_addresses_config(addresses):
+    return KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"rank_addresses": addresses},
+    )
+
+
+def test_each_tensor_parallel_rank_takes_its_own_address():
+    addresses = ["10.100.0.1", "10.101.0.1"]
+    config = _rank_addresses_config(addresses)
+    assert [rank_kv_address(config, rank, 2) for rank in (0, 1)] == addresses
+    assert rank_kv_address(KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_producer"), 0, 2) is None
+    with pytest.raises(ValueError, match="one address per tensor-parallel rank"):
+        rank_kv_address(config, 0, 4)
+    # An integer or bool would parse as IPv4; leading zeros are ambiguous.
+    for bad in ("data1", "10.101.000.1", 174_391_297, True):
+        with pytest.raises(ValueError, match="not an IPv4 address"):
+            rank_kv_address(_rank_addresses_config(["10.100.0.1", bad]), 0, 2)
+
+
+@pytest.mark.parametrize("existing", [None, "inline", "flat"])
+def test_hp_tcp_binds_the_rank_address_only(monkeypatch, existing):
+    monkeypatch.delenv(tent_config.ENV, raising=False)
+    monkeypatch.delenv("MOONCAKE_LOCAL_HOSTNAME", raising=False)
+    # The shared address the rank's RPC server would otherwise advertise.
+    others = {
+        "rpc_server_hostname": "10.100.0.1",
+        "transports": {"hp_tcp": {"enable": True, "connections_per_peer": 4}},
+    }
+    if existing == "inline":
+        monkeypatch.setenv(tent_config.ENV, json.dumps(others))
+    elif existing == "flat":
+        # A flat key TENT would read if the nested one were missing.
+        monkeypatch.setenv(
+            tent_config.ENV, json.dumps({"transports/hp_tcp/bind_address": "0.0.0.0"})
+        )
+
+    bind_hp_tcp("10.101.0.1")
+
+    conf = json.loads(os.environ[tent_config.ENV])
+    for key, value in (
+        ("rpc_server_hostname", "10.101.0.1"),
+        ("transports/hp_tcp/bind_address", "10.101.0.1"),
+        ("transports/hp_tcp/advertise_address", "10.101.0.1"),
+        ("transports/hp_tcp/rail_addresses", ["10.101.0.1"]),
+    ):
+        assert tent_config.lookup(conf, key) == (True, value)
+    if existing == "inline":
+        hp_tcp = conf["transports"]["hp_tcp"]
+        assert (hp_tcp["enable"], hp_tcp["connections_per_peer"]) == (True, 4)
+
+
+def test_a_worker_uses_its_rank_address(monkeypatch):
+    """TP rank 1 of 2 with its own address: its host and TENT's hp_tcp."""
+    monkeypatch.setenv(tent_config.ENV, json.dumps({"rpc_server_hostname": "10.100.0.1"}))
+    monkeypatch.delenv("MOONCAKE_LOCAL_HOSTNAME", raising=False)
+    addresses = ["10.100.0.1", "10.101.0.1"]
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=maybe_update_block_size(16),
+        kv_connector_extra_config={"rank_addresses": addresses},
+    )
+    initialized: list[str] = []
+
+    class RecordingEngine(FakeMooncakeWrapper):
+        def initialize(self, local_hostname, *args):
+            initialized.append(local_hostname)
+            return 0
+
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch(f"{module}.TransferEngine", RecordingEngine),
+        patch(f"{module}.get_tensor_model_parallel_rank", return_value=1),
+        patch(f"{module}.get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
+    ):
+        worker = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        try:
+            assert worker.hostname == "10.101.0.1"
+            assert initialized == ["10.101.0.1"]
+            conf = json.loads(os.environ[tent_config.ENV])
+            assert conf["transports"]["hp_tcp"]["rail_addresses"] == ["10.101.0.1"]
+            assert conf["rpc_server_hostname"] == "10.101.0.1"
+        finally:
+            worker.shutdown()
+
+
+def test_the_legacy_local_hostname_follows_the_rank_address(monkeypatch):
+    # TENT applies MOONCAKE_LOCAL_HOSTNAME over the config's RPC hostname.
+    monkeypatch.delenv(tent_config.ENV, raising=False)
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "10.100.0.1")
+    bind_hp_tcp("10.101.0.1")
+    assert os.environ["MOONCAKE_LOCAL_HOSTNAME"] == "10.101.0.1"
+    assert json.loads(os.environ[tent_config.ENV])["rpc_server_hostname"] == "10.101.0.1"
