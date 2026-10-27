@@ -372,6 +372,15 @@ GPU_PRESETS: dict[str, dict[str, float]] = {
     "h200": {"peak_tflops": 989.0, "hbm_tbps": 4.8},
     "b200": {"peak_tflops": 2250.0, "hbm_tbps": 8.0},
 }
+# Each GPU's link to the others of its NVLink domain (SXM parts): the
+# published bidirectional bandwidth halved, GB/s per direction. Physical
+# peaks: `interconnect_efficiency` scales them to what collectives achieve.
+INTERCONNECT_PRESETS: dict[str, dict[str, Any]] = {
+    "a100": {"interconnect": "NVLink 3", "interconnect_gbs": 300.0},
+    "h100": {"interconnect": "NVLink 4", "interconnect_gbs": 450.0},
+    "h200": {"interconnect": "NVLink 4", "interconnect_gbs": 450.0},
+    "b200": {"interconnect": "NVLink 5", "interconnect_gbs": 900.0},
+}
 # KV cache dtypes packing elements below a byte, or with per-token scales:
 # their size is not their storage dtype's.
 PACKED_KV_DTYPES = ("int4", "nvfp4", "turboquant", "int8_per_token_head", "fp8_per_token_head")
@@ -454,6 +463,10 @@ class ModelGeometry:
     """Bytes per weight (dtype size)."""
     kv_bytes: float
     """Bytes per KV cache element."""
+    activation_bytes: float = 2
+    """Bytes per activation element (the model's dtype, whatever its weights'
+    or KV's)."""
+    tensor_parallel_size: int = 1
     layers: tuple[LayerGeometry, ...] | None = None
     """Each decoder layer's matrix multiplications, from the built model;
     None: `layer_params` for every layer (a dense model's config)."""
@@ -542,10 +555,17 @@ class ModelGeometry:
 
         model = vllm_config.model_config
         parallel = vllm_config.parallel_config
-        if parallel.world_size_across_dp > 1 or parallel.enable_expert_parallel:
+        # Pure TP keeps every expert on each rank, its matrices split. DCP
+        # reuses the TP ranks, so the world size does not show it.
+        if (
+            parallel.world_size_across_dp > parallel.tensor_parallel_size
+            or parallel.enable_expert_parallel
+            or parallel.decode_context_parallel_size > 1
+            or parallel.prefill_context_parallel_size > 1
+        ):
             raise ValueError(
-                "The roofline timing provider models MoE models on one rank "
-                "(no TP, PP, DP or EP) so far."
+                "The roofline timing provider models MoE models under tensor "
+                "parallelism only (no PP, DP, EP, PCP or DCP) so far."
             )
         if model.quantization is not None or model.dtype not in (
             torch.bfloat16,
@@ -583,6 +603,8 @@ class ModelGeometry:
             vocab_size=model.get_vocab_size() // tp,
             weight_bytes=weight_bytes,
             kv_bytes=kv_cache_dtype_str_to_dtype(cache_dtype, model).itemsize,
+            activation_bytes=model.dtype.itemsize,
+            tensor_parallel_size=tp,
         )
 
     @property
@@ -635,21 +657,25 @@ class ModelGeometry:
 
 class RooflineTimingProvider:
     """Roofline model of a dense or MoE transformer, one GPU per
-    tensor-parallel rank (MoE: one rank): a step takes ``fixed_us`` plus the
-    longer of its FLOPs at ``peak_tflops * compute_efficiency`` and its bytes
-    at ``hbm_tbps * bandwidth_efficiency``.
+    tensor-parallel rank: a step takes ``fixed_us`` plus the longer of its
+    FLOPs at ``peak_tflops * compute_efficiency`` and its bytes at
+    ``hbm_tbps * bandwidth_efficiency``, plus its communication.
 
     FLOPs: 2 per weight per token through the decoder layers (an MoE
     layer's dense weights and ``top_k`` of its experts), the LM head for the
     tokens sampled, and attention (QK^T and AV) over each request's context.
     Bytes: the dense weights once per step, the experts the step's tokens
     are expected to route to (each token independently and uniformly), the
-    KV each request reads (its context) and writes. Not modeled:
-    activations, communication between ranks, kernel efficiency varying with
-    batch shape, routing skew (fewer experts read, but uneven work: the
-    error's direction is unknown). ``gpu`` picks a preset of `GPU_PRESETS`;
-    ``peak_tflops`` and ``hbm_tbps`` override it. An MoE model's geometry
-    comes from its built layers (`bind_model`)."""
+    KV each request reads (its context) and writes. Under tensor
+    parallelism, each layer's two all-reduces are added to the step (a
+    no-overlap approximation: `communication_s`) at the interconnect's
+    peak (`INTERCONNECT_PRESETS`, or ``interconnect_gbs``) times
+    ``interconnect_efficiency``, plus ``collective_latency_us`` each. Not
+    modeled: activations, embedding and logits collectives, kernel
+    efficiency varying with batch shape, routing skew (fewer experts read,
+    but uneven work: the error's direction is unknown). ``gpu`` picks a
+    preset of `GPU_PRESETS`; ``peak_tflops`` and ``hbm_tbps`` override it.
+    An MoE model's geometry comes from its built layers (`bind_model`)."""
 
     def __init__(
         self,
@@ -663,6 +689,9 @@ class RooflineTimingProvider:
         fixed_us: float = 20.0,
         host_us: float = 0.0,
         geometry: ModelGeometry | None = None,
+        interconnect_gbs: float | None = None,
+        interconnect_efficiency: float = 0.8,
+        collective_latency_us: float = 10.0,
     ) -> None:
         if gpu is not None and gpu not in GPU_PRESETS:
             raise ValueError(f"Unknown GPU {gpu!r}; presets: {sorted(GPU_PRESETS)}.")
@@ -675,11 +704,53 @@ class RooflineTimingProvider:
         self.bytes_per_s = bandwidth * 1e12 * bandwidth_efficiency
         self.fixed_us = fixed_us
         self.host = HostTimeModel(fixed_us=host_us)
+        for name, value, low in (
+            ("interconnect_gbs", interconnect_gbs, None),
+            ("interconnect_efficiency", interconnect_efficiency, None),
+            ("collective_latency_us", collective_latency_us, 0.0),
+        ):
+            if value is None:
+                continue
+            if not math.isfinite(value) or (value < low if low is not None else value <= 0):
+                bound = "a finite nonnegative" if low is not None else "a finite positive"
+                raise ValueError(f"{name} must be {bound} number, got {value}.")
+        link = INTERCONNECT_PRESETS.get(gpu, {}) if gpu else {}
+        link_gbs = interconnect_gbs if interconnect_gbs is not None else link.get("interconnect_gbs")
+        self.collective_bytes_per_s = (
+            link_gbs * 1e9 * interconnect_efficiency if link_gbs else None
+        )
+        self.collective_latency_s = collective_latency_us * 1e-6
+        self._communication = {
+            "model": "no_overlap_approximation",
+            "collectives": (
+                "2 all-reduces per decoder layer (attention output, MLP or MoE "
+                "output) of scheduled_tokens x hidden_size x activation_bytes"
+            ),
+            "time": (
+                "2 * layers * (latency + 2 * (N - 1) / N * payload / "
+                "effective_bandwidth), 0 for N = 1; added to the step"
+            ),
+            "algorithm_factor": "2 (N - 1) / N: a ring all-reduce's bus bandwidth (NCCL)",
+            "omitted": [
+                "embedding and LM-head (logits) collectives",
+                "overlap with compute",
+                "expert parallelism's dispatch and combine",
+            ],
+            "topology": "all tensor-parallel ranks in one NVLink domain",
+            "interconnect": link.get("interconnect") if interconnect_gbs is None else None,
+            "interconnect_gbs": link_gbs,
+            "interconnect_efficiency": interconnect_efficiency,
+            "effective_gbs": link_gbs * interconnect_efficiency if link_gbs else None,
+            "collective_latency_us": collective_latency_us,
+            "latency_rank_dependence": "none: one latency per collective",
+        }
         self._vllm_config = vllm_config
         # An MoE model's geometry comes from its built layers (bind_model).
         self.geometry: ModelGeometry | None = geometry
         if geometry is None and not vllm_config.model_config.is_moe:
             self.geometry = ModelGeometry.from_config(vllm_config)
+        if self.geometry is not None:
+            self._check_interconnect(self.geometry)
         self._assumptions = {
             "gpu": gpu,
             "peak_tflops": peak,
@@ -701,6 +772,29 @@ class RooflineTimingProvider:
                 raise
             logger.warning("%s Timing the dense model from its config.", error)
             self.geometry = ModelGeometry.from_config(self._vllm_config)
+        self._check_interconnect(self.geometry)
+
+    def _check_interconnect(self, geometry: ModelGeometry) -> None:
+        if geometry.tensor_parallel_size > 1 and self.collective_bytes_per_s is None:
+            raise ValueError(
+                "The roofline timing provider needs an interconnect for tensor "
+                "parallelism: a gpu preset, or interconnect_gbs."
+            )
+
+    def communication_s(self, num_tokens: int) -> float:
+        """A step's tensor-parallel all-reduces, under the no-overlap
+        approximation: 0 on one rank."""
+        g = self._bound()
+        n = g.tensor_parallel_size
+        if n == 1:
+            return 0.0
+        assert self.collective_bytes_per_s is not None
+        payload = num_tokens * g.hidden_size * g.activation_bytes
+        per_collective = (
+            self.collective_latency_s
+            + 2 * (n - 1) / n * payload / self.collective_bytes_per_s
+        )
+        return 2 * g.num_layers * per_collective
 
     def _bound(self) -> ModelGeometry:
         if self.geometry is None:
@@ -713,7 +807,11 @@ class RooflineTimingProvider:
     def assumptions(self) -> dict[str, Any]:
         """What the step times rest on, resolved: the GPU's figures (preset or
         overridden), efficiencies, fixed costs and the model's geometry."""
-        return {**self._assumptions, "geometry": self._bound().describe()}
+        return {
+            **self._assumptions,
+            "communication": self._communication,
+            "geometry": self._bound().describe(),
+        }
 
     def estimate(self, step: StepDescriptor) -> StepCost:
         g = self._bound()
@@ -740,10 +838,15 @@ class RooflineTimingProvider:
         memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
         compute_us = flops / self.flops_per_s * 1e6
         memory_us = memory / self.bytes_per_s * 1e6
+        communication_us = self.communication_s(step.num_tokens) * 1e6
         return StepCost(
-            device_s=(self.fixed_us + max(compute_us, memory_us)) * 1e-6,
+            device_s=(self.fixed_us + max(compute_us, memory_us) + communication_us) * 1e-6,
             host_s=self.host.host_s(step),
-            breakdown={"compute_us": compute_us, "memory_us": memory_us},
+            breakdown={
+                "compute_us": compute_us,
+                "memory_us": memory_us,
+                "communication_us": communication_us,
+            },
         )
 
 

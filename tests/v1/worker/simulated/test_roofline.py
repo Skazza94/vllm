@@ -44,9 +44,9 @@ def test_geometry_of_a_dense_model():
     assert (28 * QWEN_7B.layer_params + 3584 * 152064) * 2 == WEIGHT_BYTES
 
 
-def qwen_7b_config(cache_dtype):
+def qwen_7b_config(cache_dtype, dtype=torch.bfloat16):
     model = SimpleNamespace(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         use_mla=False,
         is_moe=False,
         is_hybrid=False,
@@ -253,9 +253,9 @@ def write_config(directory, config):
     return str(directory)
 
 
-def timing_record(tmp_path, model_dir, monkeypatch):
+def timing_record(tmp_path, model_dir, monkeypatch, tensor_parallel_size=1):
     """The timing record an in-process simulated engine writes, after one
-    request's steps."""
+    request's steps (the output rank's)."""
     from vllm import LLM, SamplingParams
 
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -268,6 +268,7 @@ def timing_record(tmp_path, model_dir, monkeypatch):
         block_size=16,
         kv_cache_memory_bytes=8 * 1024**2,
         enforce_eager=True,
+        tensor_parallel_size=tensor_parallel_size,
         simulation_config={
             "simulate_forward": True,
             "timing": "roofline",
@@ -313,29 +314,29 @@ def test_a_built_dense_model_matches_its_config(tmp_path, monkeypatch):
     ]
 
 
+QWEN2_MOE = {
+    "architectures": ["Qwen2MoeForCausalLM"],
+    "model_type": "qwen2_moe",
+    "hidden_size": 64,
+    "intermediate_size": 96,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 48,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [0],
+    "norm_topk_prob": False,
+    "tie_word_embeddings": False,
+}
+
+
 def test_a_built_moe_model_counts_each_weight_once(tmp_path, monkeypatch):
     # Layer 0 dense (mlp_only_layers), 1-3 MoE with a shared expert whose
     # gate the block also holds: counted once.
-    model_dir = write_config(
-        tmp_path / "qwen2-moe",
-        {
-            "architectures": ["Qwen2MoeForCausalLM"],
-            "model_type": "qwen2_moe",
-            "hidden_size": 64,
-            "intermediate_size": 96,
-            "moe_intermediate_size": 32,
-            "shared_expert_intermediate_size": 48,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "num_experts": 8,
-            "num_experts_per_tok": 2,
-            "decoder_sparse_step": 1,
-            "mlp_only_layers": [0],
-            "norm_topk_prob": False,
-            "tie_word_embeddings": False,
-        },
-    )
+    model_dir = write_config(tmp_path / "qwen2-moe", QWEN2_MOE)
     geometry = timing_record(tmp_path, model_dir, monkeypatch)["geometry"]
     assert geometry["source"] == "built model"
     assert geometry["routing"]["model"] == "independent_uniform_top_k"
@@ -411,3 +412,171 @@ def test_an_moe_model_whose_layers_are_not_found_is_rejected():
     provider = RooflineTimingProvider(config, gpu="h100")
     with pytest.raises(UnsupportedModelLayout, match="decoder layers"):
         provider.bind_model(torch.nn.Module())
+
+
+def test_one_rank_communicates_nothing():
+    for step in (
+        sim_step(0, sim_req("r", 1000, 0, 1000)),
+        sim_step(0, sim_req("r", 1, 999, 1000)),
+    ):
+        cost = h100().estimate(step)
+        assert cost.breakdown["communication_us"] == 0
+        assert cost.device_s == pytest.approx(
+            (20 + max(cost.breakdown["compute_us"], cost.breakdown["memory_us"])) * 1e-6
+        )
+
+
+@pytest.mark.parametrize("ranks", [2, 4])
+def test_tensor_parallel_ranks_all_reduce_twice_per_layer(ranks):
+    geometry = dataclasses.replace(QWEN_7B, tensor_parallel_size=ranks)
+    provider = RooflineTimingProvider(None, gpu="h100", geometry=geometry)
+    cost = provider.estimate(sim_step(0, sim_req("r", 1000, 0, 1000)))
+    payload = 1000 * 3584 * 2  # tokens x hidden x bf16 activations
+    per_collective = 10e-6 + 2 * (ranks - 1) / ranks * payload / (450e9 * 0.8)
+    communication_us = 2 * 28 * per_collective * 1e6
+    assert cost.breakdown["communication_us"] == pytest.approx(communication_us)
+    assert cost.device_s == pytest.approx(
+        (
+            20
+            + max(cost.breakdown["compute_us"], cost.breakdown["memory_us"])
+            + communication_us
+        )
+        * 1e-6
+    )
+    # Overrides: the link's peak, efficiency and latency.
+    slow = RooflineTimingProvider(
+        None,
+        gpu="h100",
+        geometry=geometry,
+        interconnect_gbs=45.0,
+        interconnect_efficiency=1.0,
+        collective_latency_us=0.0,
+    ).estimate(sim_step(0, sim_req("r", 1000, 0, 1000)))
+    assert slow.breakdown["communication_us"] == pytest.approx(
+        2 * 28 * 2 * (ranks - 1) / ranks * payload / 45e9 * 1e6
+    )
+
+
+def test_all_reduces_carry_the_hidden_width_in_the_activation_dtype():
+    # Qwen3-30B-A3B: 32 query heads of 128 (4096 wide), hidden width 2048.
+    config = qwen_7b_config("fp8", dtype=torch.float32)
+    geometry = ModelGeometry.from_config(config)
+    assert (geometry.activation_bytes, geometry.kv_bytes, geometry.weight_bytes) == (4, 1, 4)
+    qwen3 = dataclasses.replace(
+        QWEN_7B, hidden_size=2048, num_heads=32, tensor_parallel_size=2
+    )
+    for activation_bytes in (2, 4):
+        provider = RooflineTimingProvider(
+            None,
+            gpu="h100",
+            geometry=dataclasses.replace(qwen3, activation_bytes=activation_bytes),
+            collective_latency_us=0.0,
+        )
+        assert provider.communication_s(100) == pytest.approx(
+            2 * 28 * (2 * 1 / 2) * 100 * 2048 * activation_bytes / (450e9 * 0.8)
+        )
+
+
+def test_tensor_parallelism_needs_an_interconnect():
+    geometry = dataclasses.replace(QWEN_7B, tensor_parallel_size=2)
+    with pytest.raises(ValueError, match="interconnect"):
+        RooflineTimingProvider(None, peak_tflops=989.0, hbm_tbps=3.35, geometry=geometry)
+    # One rank needs none.
+    RooflineTimingProvider(None, peak_tflops=989.0, hbm_tbps=3.35, geometry=QWEN_7B)
+
+
+def test_communication_assumptions_are_recorded():
+    communication = h100().assumptions()["communication"]
+    assert communication["model"] == "no_overlap_approximation"
+    assert communication["interconnect"] == "NVLink 4"
+    assert communication["interconnect_gbs"] == 450.0
+    assert communication["interconnect_efficiency"] == 0.8
+    assert communication["effective_gbs"] == pytest.approx(360.0)
+    assert communication["collective_latency_us"] == 10.0
+    assert "embedding and LM-head (logits) collectives" in communication["omitted"]
+
+
+def test_tensor_parallel_moe_keeps_every_expert_with_its_matrices_split(
+    tmp_path, monkeypatch
+):
+    # QWEN2_MOE on 2 ranks: heads, MLPs and expert matrices halved; the
+    # router and shared-expert gate replicated; 8 experts and top-2 kept.
+    model_dir = write_config(tmp_path / "qwen2-moe", QWEN2_MOE)
+    record = timing_record(tmp_path, model_dir, monkeypatch, tensor_parallel_size=2)
+    geometry = record["geometry"]
+    assert geometry["tensor_parallel_size"] == 2
+    attention = 64 * (32 + 2 * 16) + 32 * 64  # 2 query heads, 1 KV head of 16
+    dense_mlp = 64 * 96 + 48 * 64
+    router, shared_gate, shared = 64 * 8, 64 * 1, 64 * 48 + 24 * 64
+    assert geometry["layers"] == [
+        {"first": 0, "last": 0, "dense_params": attention + dense_mlp, "experts": []},
+        {
+            "first": 1,
+            "last": 3,
+            "dense_params": attention + router + shared_gate + shared,
+            "experts": [
+                {
+                    "local_experts": 8,
+                    "global_experts": 8,
+                    "top_k": 2,
+                    "params_per_expert": 3 * 64 * 16,
+                }
+            ],
+        },
+    ]
+    assert record["communication"]["interconnect"] == "NVLink 4"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"interconnect_gbs": 0.0},
+        {"interconnect_gbs": -450.0},
+        {"interconnect_gbs": float("inf")},
+        {"interconnect_gbs": float("nan")},
+        {"interconnect_efficiency": 0.0},
+        {"interconnect_efficiency": -0.8},
+        {"interconnect_efficiency": float("nan")},
+        {"collective_latency_us": -1.0},
+        {"collective_latency_us": float("inf")},
+    ],
+)
+def test_invalid_communication_overrides_are_rejected(override):
+    (name,) = override
+    with pytest.raises(ValueError, match=name):
+        h100(**override)
+
+
+def test_zero_collective_latency_is_allowed():
+    geometry = dataclasses.replace(QWEN_7B, tensor_parallel_size=2)
+    provider = RooflineTimingProvider(
+        None, gpu="h100", geometry=geometry, collective_latency_us=0.0
+    )
+    assert provider.communication_s(0) == 0
+
+
+def moe_parallel_config(**parallel):
+    sizes = {
+        "tensor_parallel_size": 4,
+        "world_size_across_dp": 4,
+        "enable_expert_parallel": False,
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        **parallel,
+    }
+    return SimpleNamespace(
+        model_config=SimpleNamespace(quantization=None, dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(**sizes),
+    )
+
+
+def test_moe_timing_allows_pure_tensor_parallelism_only():
+    ModelGeometry._check_moe(moe_parallel_config())
+    for parallel in (
+        {"decode_context_parallel_size": 2},  # reuses the TP ranks
+        {"prefill_context_parallel_size": 2},
+        {"enable_expert_parallel": True},
+        {"world_size_across_dp": 8},  # PP or DP
+    ):
+        with pytest.raises(ValueError, match="tensor parallelism only"):
+            ModelGeometry._check_moe(moe_parallel_config(**parallel))
