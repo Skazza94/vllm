@@ -12,7 +12,7 @@ from vllm.benchmarks.sweep.simulate import (
     run_main,
     simulated_serve_cmd,
 )
-from vllm.entrypoints.launchers.cli_args import make_arg_parser
+from vllm.entrypoints.common.cli_args import make_arg_parser
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.argparse_utils import FlexibleArgumentParser

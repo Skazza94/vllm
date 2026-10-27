@@ -209,7 +209,7 @@ def _select_devices(index: int, num_ranks: int) -> None:
 
 def _engine_args(cmd: list[str]) -> "EngineArgs":
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.entrypoints.launchers.cli_args import make_arg_parser
+    from vllm.entrypoints.common.cli_args import make_arg_parser
 
     serve_args = make_arg_parser(FlexibleArgumentParser()).parse_args(
         _subcommand_args(cmd, ("vllm", "serve"))

@@ -19,7 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
-    _group_kv_bytes_per_block,
+    group_kv_bytes_per_block,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
@@ -324,7 +324,7 @@ class SchedulerOffloadConfig(NamedTuple):
                 spec.extra_config.get("sync_load_budget_bytes", 0)
             ),
             kv_bytes_per_token=sum(
-                _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[g.group_id])
+                group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[g.group_id])
                 // g.tokens_per_block
                 for g in spec.config.groups
             ),

@@ -21,7 +21,11 @@ import numpy as np
 
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1182,6 +1186,9 @@ class SimulatedAsyncOutput(AsyncModelRunnerOutput):
         self.clock.sleep_until(self.deadline)
         self.resolved = True
         return self.output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.output.kv_connector_output
 
 
 def is_output_rank() -> bool:

@@ -21,7 +21,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
 )
 from vllm.logger import init_logger
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector, KVConnector
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
@@ -71,6 +75,9 @@ class _RecordedOutput(AsyncModelRunnerOutput):
         output = self.inner.get_output()
         self.worker._resolve(self.record, output)
         return output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.inner.get_kv_connector_output()
 
 
 def _write_transfers(
