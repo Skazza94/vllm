@@ -1196,10 +1196,23 @@ def step_log_path(vllm_config: VllmConfig) -> str | None:
     """This rank's step log, if it writes one: the output rank's, of DP rank 0
     under MoE DP (which logs joint steps), else `<log_path>.dp<i>` for an
     independent DP rank i > 0. Under pipeline parallelism a recorded step is
-    timed on the last stage, so its device time spans the whole pipeline."""
+    timed on the last stage, so its device time spans the whole pipeline.
+    With real KV transfers every tensor-parallel rank moves and checks its
+    own KV heads: rank r > 0 logs into `<log_path>.tp<r>`."""
+    from vllm.distributed.parallel_state import get_tp_group
+
     path = vllm_config.simulation_config.log_path
-    if path is None or not is_output_rank():
+    if path is None:
         return None
+    if not is_output_rank():
+        if vllm_config.simulation_config.kv_transfer_mode != "real":
+            return None
+        from vllm.distributed.parallel_state import get_pp_group
+
+        if not get_pp_group().is_last_rank:
+            return None
+        root, ext = os.path.splitext(path)
+        return f"{root}.tp{get_tp_group().rank_in_group}{ext}"
     parallel_config = vllm_config.parallel_config
     dp_index = parallel_config.data_parallel_index
     if parallel_config.data_parallel_size > 1:

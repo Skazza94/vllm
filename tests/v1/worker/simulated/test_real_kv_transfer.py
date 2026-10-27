@@ -3,6 +3,9 @@
 """Configuration of real NIXL KV transfers under simulated compute."""
 
 import json
+import os
+import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -211,6 +214,46 @@ def test_real_mode_accepts_moe_models_but_not_mla(moe_model_dir, tmp_path):
         engine_config(str(tmp_path))
 
 
+def test_real_mode_allows_tensor_parallelism_only_over_mooncake(model_dir):
+    mooncake = {"kv_connector": "MooncakeConnector"}
+    config = engine_config(model_dir, kv_transfer=mooncake, tensor_parallel_size=2)
+    assert config.parallel_config.tensor_parallel_size == 2
+    with pytest.raises(ValueError, match="tensor parallelism at most"):
+        engine_config(model_dir, kv_transfer=mooncake, pipeline_parallel_size=2)
+    # NIXL does not check the peer's TP size.
+    with pytest.raises(ValueError, match="MooncakeConnector for tensor parallelism"):
+        engine_config(model_dir, tensor_parallel_size=2)
+
+
+@pytest.mark.parametrize(
+    "mode, rank, name",
+    [
+        ("real", 0, "steps.jsonl"),
+        ("real", 1, "steps.tp1.jsonl"),
+        ("simulated", 1, None),  # the output rank's log only
+    ],
+)
+def test_each_tensor_parallel_rank_logs_its_own_transfers(
+    monkeypatch, tmp_path, mode, rank, name
+):
+    from vllm.distributed import parallel_state
+    from vllm.v1.worker.simulated.timing import step_log_path
+
+    group = SimpleNamespace(rank_in_group=rank, is_last_rank=True)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
+    config = SimpleNamespace(
+        simulation_config=SimpleNamespace(
+            log_path=str(tmp_path / "steps.jsonl"), kv_transfer_mode=mode
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0, data_parallel_size=1, data_parallel_rank=0
+        ),
+    )
+    path = step_log_path(config)
+    assert path == (str(tmp_path / name) if name else None)
+
+
 def test_real_mode_needs_a_connector(model_dir):
     with pytest.raises(ValueError, match="needs a kv_transfer_config"):
         engine_config(model_dir, kv_transfer_config=None)
@@ -239,6 +282,23 @@ def test_real_mode_rejects_offloading_that_would_replace_nixl(model_dir):
         engine_config(model_dir, kv_offloading_size=1)
 
 
+def stand_in_metadata(loads=()):
+    """Metadata of the stand-in connectors, sent to (spawned) workers: a
+    module-level class, so it pickles."""
+    return StandInMetadata(list(loads))
+
+
+def _metadata_base():
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
+    return KVConnectorMetadata
+
+
+class StandInMetadata(_metadata_base()):  # type: ignore[misc]
+    def __init__(self, loads):
+        self.loads = loads
+
+
 class RecordingConnector:
     """Stands in for the NIXL connector: keeps the KV tensors registered with it."""
 
@@ -248,11 +308,7 @@ class RecordingConnector:
     def make(cls):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorBase_V1,
-            KVConnectorMetadata,
         )
-
-        class Metadata(KVConnectorMetadata):
-            pass
 
         class Connector(KVConnectorBase_V1):
             def register_kv_caches(self, kv_caches):
@@ -277,7 +333,7 @@ class RecordingConnector:
                 pass
 
             def build_connector_meta(self, scheduler_output):
-                return Metadata()
+                return stand_in_metadata()
 
         return Connector
 
@@ -447,3 +503,291 @@ def test_runner_uses_native_kv_tensors_only_in_real_mode(monkeypatch, real):
         ]
     else:
         assert calls == [] and runner.kv_caches == []
+
+
+# The CPU platform spawns its workers: a test's monkeypatch never reaches them.
+# This sitecustomize, on their PYTHONPATH, makes the connector factory build
+# the stand-in that VLLM_SIM_TEST_CONNECTOR names (a function and its
+# arguments), imported once a worker first asks for its connector.
+SITECUSTOMIZE = """
+import json, os
+
+_spec = os.environ.get("VLLM_SIM_TEST_CONNECTOR")
+if _spec:
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    _made = {}
+
+    def _get_connector_class(cls, config):
+        if "class" not in _made:
+            import importlib
+
+            target, *args = json.loads(_spec)
+            module, _, name = target.rpartition(".")
+            _made["class"] = getattr(importlib.import_module(module), name)(*args)
+        return _made["class"]
+
+    KVConnectorFactory.get_connector_class = classmethod(_get_connector_class)
+"""
+
+
+@pytest.fixture
+def stand_in_connector(monkeypatch, tmp_path):
+    """Make this process and the spawned workers build a stand-in connector:
+    a module-level function of this file and its arguments."""
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    def install(function, *args):
+        site = tmp_path / "site"
+        site.mkdir()
+        (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
+            [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
+        ))
+        monkeypatch.setenv(
+            "VLLM_SIM_TEST_CONNECTOR",
+            json.dumps([f"{__name__}.{function.__name__}", *args]),
+        )
+        connector = function(*args)
+        monkeypatch.setattr(
+            KVConnectorFactory,
+            "get_connector_class",
+            classmethod(lambda cls, c: connector),
+        )
+
+    return install
+
+
+def recording_connector():
+    return RecordingConnector.make()
+
+
+def slow_rank_connector(directory):
+    return SlowRankConnector.make(directory)
+
+
+def log_records(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_tensor_parallel_ranks_register_and_log_their_own_kv(
+    model_dir, monkeypatch, tmp_path, stand_in_connector
+):
+    """On 2 ranks each worker registers its own KV heads (1 of the model's 2),
+    logs them in its own step log and serves TENT's metrics on its own port."""
+    from vllm import LLM, SamplingParams
+
+    stand_in_connector(recording_connector)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("TENT_METRICS_HTTP_PORT", "9100")
+    monkeypatch.delenv("VLLM_SIM_TENT_METRICS_BASE_PORT", raising=False)
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        max_model_len=256,
+        block_size=32,
+        kv_cache_memory_bytes=8 * 1024**2,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        tensor_parallel_size=2,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        llm.generate(
+            [{"prompt_token_ids": [5] * 70}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+    finally:
+        del llm
+    for rank, path in ((0, log), (1, tmp_path / "steps.tp1.jsonl")):
+        records = log_records(path)
+        (layout,) = [r["kv_layout"] for r in records if "kv_layout" in r]
+        assert (layout["tp_rank"], layout["tp_size"]) == (rank, 2)
+        assert layout["tent_metrics_port"] == str(9100 + rank)
+        # [blocks, KV heads, block size, K and V]: 1 of the model's 2 heads.
+        assert layout["shape"][1] == 1, layout
+        assert any("step" in r for r in records)
+
+
+class SlowRankConnector:
+    """Stands in for a consumer's connector: every request's KV but its last
+    token loads asynchronously, and TP rank r reports a load finished at its
+    (1 + 5 r)-th poll, writing when into `<directory>/rank<r>`."""
+
+    @classmethod
+    def make(cls, directory):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+
+        class Connector(KVConnectorBase_V1):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.to_load, self.matched, self.polls = [], set(), {}
+
+            def get_num_new_matched_tokens(self, request, num_computed_tokens):
+                if request.request_id in self.matched:
+                    return 0, False
+                self.matched.add(request.request_id)
+                return request.num_prompt_tokens - 1 - num_computed_tokens, True
+
+            def update_state_after_alloc(self, request, blocks, num_external_tokens):
+                if num_external_tokens:
+                    self.to_load.append(request.request_id)
+
+            def build_connector_meta(self, scheduler_output):
+                loads, self.to_load = self.to_load, []
+                return stand_in_metadata(loads)
+
+            def register_kv_caches(self, kv_caches):
+                pass
+
+            def start_load_kv(self, forward_context, **kwargs):
+                for req_id in self._get_connector_metadata().loads:
+                    self.polls.setdefault(req_id, 0)
+
+            def get_finished(self, finished_req_ids):
+                from vllm.distributed.parallel_state import get_tp_group
+
+                rank = get_tp_group().rank_in_group
+                done = set()
+                for req_id in list(self.polls):
+                    self.polls[req_id] += 1
+                    if self.polls[req_id] >= 1 + 5 * rank:
+                        del self.polls[req_id]
+                        done.add(req_id)
+                        with open(f"{directory}/rank{rank}", "a") as f:
+                            f.write(json.dumps({"req_id": req_id, "t": time.monotonic()}) + "\n")
+                return None, done or None
+
+            def wait_for_layer_load(self, layer_name):
+                pass
+
+            def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+                pass
+
+            def wait_for_save(self):
+                pass
+
+        return Connector
+
+
+def test_a_slower_rank_holds_the_request_until_its_load_finishes(
+    model_dir, monkeypatch, tmp_path, stand_in_connector
+):
+    """Decode resumes a request only once every rank's load finished: the
+    executor aggregates the ranks' reports (rank 1 reports 5 polls later)."""
+    from vllm import LLM, SamplingParams
+
+    stand_in_connector(slow_rank_connector, str(tmp_path))
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=model_dir,
+        skip_tokenizer_init=True,
+        dtype="float32",
+        max_model_len=256,
+        block_size=32,
+        kv_cache_memory_bytes=8 * 1024**2,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        tensor_parallel_size=2,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "timing": "linear",
+            "timing_args": {"fixed_us": 2000},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_consumer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        (output,) = llm.generate(
+            [{"prompt_token_ids": [5] * 64}],
+            SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(output.outputs[0].token_ids) == 2
+    finally:
+        del llm
+    (rank0,) = log_records(tmp_path / "rank0")
+    (rank1,) = log_records(tmp_path / "rank1")
+    assert rank0["t"] < rank1["t"]
+    # The request's first step on decode: only its last prompt token.
+    first = next(
+        r
+        for r in log_records(log)
+        if "step" in r
+        and any(q["num_computed_tokens"] == 63 for q in r["step"]["requests"])
+    )
+    assert first["t_start"] >= rank1["t"]
+
+
+@pytest.mark.parametrize(
+    "env, conf, rank, port, conf_port",
+    [
+        ({}, None, 1, 9101, None),  # TENT's default port
+        ({"TENT_METRICS_HTTP_PORT": "9200"}, None, 1, 9201, None),
+        ({}, "inline", 1, 9301, 9301),  # MC_TENT_CONF's metrics/http_port wins
+        ({"TENT_METRICS_HTTP_PORT": "9200"}, "file", 1, 9301, 9301),
+        ({}, "flat", 1, 9401, 9401),  # TENT's flat-key fallback
+        ({}, "both", 1, 9301, 9301),  # the nested path before the flat key
+        ({}, None, 0, 9100, None),
+    ],
+)
+def test_each_rank_serves_tent_metrics_on_its_own_port(
+    monkeypatch, tmp_path, env, conf, rank, port, conf_port
+):
+    from vllm.distributed import parallel_state
+    from vllm.v1.worker.simulated import worker
+
+    for name in ("TENT_METRICS_HTTP_PORT", "VLLM_SIM_TENT_METRICS_BASE_PORT", "MC_TENT_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    tent = {"transports": {"hp_tcp": {"enable": True}}, "metrics": {"http_port": 9300}}
+    flat = {"transports": tent["transports"], "metrics/http_port": 9400}
+    if conf == "inline":
+        monkeypatch.setenv("MC_TENT_CONF", json.dumps(tent))
+    elif conf == "flat":
+        monkeypatch.setenv("MC_TENT_CONF", json.dumps(flat))
+    elif conf == "both":
+        monkeypatch.setenv("MC_TENT_CONF", json.dumps({**tent, **flat}))
+    elif conf == "file":
+        (tmp_path / "tent.json").write_text(json.dumps(tent))
+        monkeypatch.setenv("MC_TENT_CONF", str(tmp_path / "tent.json"))
+    group = SimpleNamespace(rank_in_group=rank)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+
+    # A second initialization (a restarted connector) keeps the port.
+    for _ in range(2):
+        worker._rank_tent_metrics_port()
+        assert os.environ["TENT_METRICS_HTTP_PORT"] == str(port)
+        if conf_port is not None:
+            resolved = json.loads(os.environ["MC_TENT_CONF"])
+            if conf == "flat":
+                assert resolved["metrics/http_port"] == conf_port
+            else:
+                assert resolved["metrics"]["http_port"] == conf_port
+            if conf == "both":
+                assert resolved["metrics/http_port"] == 9400  # TENT ignores it
+            assert resolved["transports"] == tent["transports"]

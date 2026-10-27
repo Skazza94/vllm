@@ -454,3 +454,22 @@ def test_invalid_blocks_reported_a_poll_before_the_load_finished(sides):
     # The next read into the same blocks is checked afresh.
     reads.blocks[DECODE_ID] = [1, 2]
     assert reads.events(finished)["reads_done"] == [DECODE_ID]
+
+
+def test_a_block_of_another_tensor_parallel_rank_fails():
+    """Each rank holds its own KV heads: decode's rank r must receive prefill's
+    rank r blocks, not another rank's."""
+    assert not torch.equal(
+        pattern(PREFILL_ID, LAYERS[0], 0, 64, tp_rank=0),
+        pattern(PREFILL_ID, LAYERS[0], 0, 64, tp_rank=1),
+    )
+    prefill = {rank: block_views(caches(), 8) for rank in (0, 1)}
+    for rank, views in prefill.items():
+        PatternFiller(views, rank).after_update(new_request_step(PREFILL_ID, [3, 5, 6]))
+    for decode_rank, sender_rank, ok in ((1, 1, True), (1, 0, False), (0, 1, False)):
+        decode = block_views(caches(), 8)
+        checker = PatternChecker(decode, decode_rank)
+        checker.before_step(recv_step([1, 2], [3, 5]))
+        transfer(prefill[sender_rank], decode, [(1, 3), (2, 5)])
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"] is ok, (decode_rank, sender_rank)

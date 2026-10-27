@@ -228,26 +228,35 @@ class SimulatedModelRunner(GPUModelRunner):
     def _make_kv_connector(self, kv_caches_dict):  # type: ignore[override]
         """Real KV transfers: the native connector; with pattern checks, also
         the views of the tensors it registers."""
+        from vllm.distributed.parallel_state import get_tp_group
+
         sim = self.vllm_config.simulation_config
+        tp = get_tp_group()
         if sim.kv_pattern_fill or sim.kv_pattern_check:
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks)
             if sim.kv_pattern_fill:
-                self._kv_filler = PatternFiller(views)
+                self._kv_filler = PatternFiller(views, tp.rank_in_group)
             if sim.kv_pattern_check:
-                self._kv_checker = PatternChecker(views)
+                self._kv_checker = PatternChecker(views, tp.rank_in_group)
             logger.info(
                 "KV pattern %s over %d layers.",
                 "fill" if sim.kv_pattern_fill else "check",
                 len(views),
             )
         if self.step_log is not None:
+            # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
-                kv_layout(
-                    kv_caches_dict,
-                    self.kv_cache_config.num_blocks,
-                    self.cache_config.block_size,
-                    self.cache_config.get_resolved_kv_cache_layout().name,
-                ),
+                {
+                    **kv_layout(
+                        kv_caches_dict,
+                        self.kv_cache_config.num_blocks,
+                        self.cache_config.block_size,
+                        self.cache_config.get_resolved_kv_cache_layout().name,
+                    ),
+                    "tp_rank": tp.rank_in_group,
+                    "tp_size": tp.world_size,
+                    "tent_metrics_port": os.environ.get("TENT_METRICS_HTTP_PORT"),
+                },
                 self.clock.now(),
             )
         return super()._make_kv_connector(kv_caches_dict)

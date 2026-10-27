@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
+    simulated_tp_mismatch,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
@@ -2993,3 +2994,61 @@ def test_sleep_unregisters_and_restores_kv_caches():
         worker.restore_kv_caches()
         worker.restore_kv_caches()
         reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])
+
+
+def _simulation_config(simulate_forward=True, kv_transfer_mode="real"):
+    return SimpleNamespace(
+        simulation_config=SimpleNamespace(
+            simulate_forward=simulate_forward, kv_transfer_mode=kv_transfer_mode
+        )
+    )
+
+
+def test_simulated_real_transfers_pair_equal_tensor_parallel_sizes():
+    assert simulated_tp_mismatch(_simulation_config(), 2, 2) is None
+    assert "local TP 2 and remote TP 1" in simulated_tp_mismatch(
+        _simulation_config(), 2, 1
+    )
+    # Simulated transfers move no KV; real deployments keep Mooncake's
+    # heterogeneous TP.
+    assert simulated_tp_mismatch(_simulation_config(kv_transfer_mode="simulated"), 2, 1) is None
+    assert (
+        simulated_tp_mismatch(_simulation_config(False, "simulated"), 2, 1) is None
+    )
+
+
+def test_simulated_decode_fails_reads_from_a_prefill_of_another_tp_size():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = worker.is_kv_producer = True
+    worker.vllm_config = _simulation_config()
+    worker.tp_size = 2
+    worker._tp_size = {"prefill-engine": 1}
+    worker._handle_failed_recv = MagicMock()
+    pull_metas = {"d-req-1": MagicMock()}
+
+    assert worker.receive_kv("prefill-engine", pull_metas) is False
+
+    worker._handle_failed_recv.assert_called_once()
+    metas, req_ids, reason = worker._handle_failed_recv.call_args.args
+    assert metas is pull_metas and req_ids == ["d-req-1"]
+    assert "local TP 2 and remote TP 1" in reason
+
+
+@pytest.mark.asyncio
+async def test_simulated_prefill_refuses_a_decode_of_another_tp_size():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = worker.is_kv_producer = True
+    worker.vllm_config = _simulation_config()
+    worker.tp_size = 1
+    worker._encoder = msgspec.msgpack.Encoder()
+    sock = SimpleNamespace(send_multipart=AsyncMock())
+
+    await worker.send_kv_to_decode(b"decode", sock, SimpleNamespace(remote_tp_size=2))
+
+    identity, payload = sock.send_multipart.await_args.args[0]
+    response = msgspec.msgpack.decode(payload, type=MooncakeXferResponse)
+    assert identity == b"decode"
+    assert response.status == MooncakeXferResponseStatus.ERROR
+    assert "local TP 1 and remote TP 2" in response.err_msg

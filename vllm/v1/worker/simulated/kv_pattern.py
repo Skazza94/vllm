@@ -60,12 +60,17 @@ def block_views(
     return views
 
 
-def pattern(request_id: str, layer: str, logical_block: int, size: int) -> torch.Tensor:
-    """The expected bytes of a request's logical block in one layer: never zero.
+def pattern(
+    request_id: str, layer: str, logical_block: int, size: int, tp_rank: int = 0
+) -> torch.Tensor:
+    """The expected bytes of a request's logical block in one layer of a
+    tensor-parallel rank (its KV heads): never zero, and another rank's
+    differ, so a block delivered to the wrong rank fails.
 
     PCG64 (numpy's portable generator) seeded by the identity's 128-bit
     BLAKE2b hash; both instances run the same numpy, so they agree."""
-    identity = f"{get_base_request_id(request_id)}|{layer}|{logical_block}".encode()
+    base = get_base_request_id(request_id)
+    identity = f"{base}|tp{tp_rank}|{layer}|{logical_block}".encode()
     seed = int.from_bytes(hashlib.blake2b(identity, digest_size=16).digest(), "little")
     stream = np.random.Generator(np.random.PCG64(seed)).integers(
         1, 256, size, dtype=np.uint8
@@ -79,6 +84,7 @@ class PatternFiller:
     scheduler allocates them (after the runner zeroed new blocks)."""
 
     views: dict[str, torch.Tensor]
+    tp_rank: int = 0
     blocks: dict[str, list[int]] = field(default_factory=dict)
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
@@ -99,7 +105,7 @@ class PatternFiller:
         for offset, block_id in enumerate(block_ids):
             for layer, view in self.views.items():
                 view[block_id].copy_(
-                    pattern(req_id, layer, start + offset, view.shape[1])
+                    pattern(req_id, layer, start + offset, view.shape[1], self.tp_rank)
                 )
 
 
@@ -115,6 +121,7 @@ class PatternChecker:
     """Decode side: sentinel before each remote read, comparison after it."""
 
     views: dict[str, torch.Tensor]
+    tp_rank: int = 0
     pending: dict[str, _Expected] = field(default_factory=dict)
     # Pending reads whose blocks the connector reported invalid.
     lost: set[str] = field(default_factory=set)
@@ -174,7 +181,9 @@ class PatternChecker:
         for layer, view in self.views.items():
             for offset, block_id in enumerate(expected.block_ids):
                 logical = expected.first_logical_block + offset
-                want = pattern(expected.remote_request_id, layer, logical, view.shape[1])
+                want = pattern(
+                    expected.remote_request_id, layer, logical, view.shape[1], self.tp_rank
+                )
                 wrong = int((view[block_id] != want).sum())
                 total += view.shape[1]
                 if wrong:

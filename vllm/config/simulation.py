@@ -230,8 +230,9 @@ class SimulationConfig:
     def _verify_real_kv_transfer(self, vllm_config: "VllmConfig") -> None:
         """Check what real transfers under simulated compute support so far:
         CPU KV buffers moved by a native connector (NIXL or Mooncake) between
-        single-rank instances of a full-attention model, dense or MoE (its
-        experts hold no KV). The native connector stays in place."""
+        instances of a full-attention model, dense or MoE (its experts hold
+        no KV), on one rank or tensor-parallel ones. The native connector
+        stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -284,9 +285,18 @@ class SimulationConfig:
             "PCP": parallel.prefill_context_parallel_size,
             "DCP": parallel.decode_context_parallel_size,
         }
-        if any(size != 1 for size in sizes.values()):
+        # Tensor parallelism: each rank moves its own KV heads, to the
+        # matching rank of an instance of the same TP size (the connector
+        # checks the peer's).
+        if any(size != 1 for name, size in sizes.items() if name != "TP"):
             parallel_sizes = ", ".join(f"{k}={v}" for k, v in sizes.items())
-            problems.append(f"one rank, not {parallel_sizes}")
+            problems.append(f"tensor parallelism at most, not {parallel_sizes}")
+        elif sizes["TP"] > 1 and kv_transfer.kv_connector != "MooncakeConnector":
+            # Only Mooncake checks the peer's TP size (simulated_tp_mismatch):
+            # NIXL would pair unequal ranks, whose patterns differ.
+            problems.append(
+                f"MooncakeConnector for tensor parallelism, not {kv_transfer.kv_connector}"
+            )
         model = vllm_config.model_config
         if (
             model.use_mla

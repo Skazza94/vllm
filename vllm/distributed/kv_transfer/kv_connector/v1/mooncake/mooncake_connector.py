@@ -150,6 +150,24 @@ def _block_ids_for_region(
     return list(block_ids_by_group[group_index])
 
 
+def simulated_tp_mismatch(
+    vllm_config: VllmConfig, local_tp_size: int, remote_tp_size: int
+) -> str | None:
+    """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
+    real KV transfers under simulated compute pair ranks of equal sizes only."""
+    sim = vllm_config.simulation_config
+    if (
+        sim.simulate_forward
+        and sim.kv_transfer_mode == "real"
+        and local_tp_size != remote_tp_size
+    ):
+        return (
+            "Simulated real KV transfers pair equal tensor-parallel sizes, not "
+            f"local TP {local_tp_size} and remote TP {remote_tp_size}."
+        )
+    return None
+
+
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
     """Return the TP ratio used by heterogeneous TP transfer planning.
 
@@ -1572,6 +1590,17 @@ class MooncakeConnectorWorker:
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        mismatch = simulated_tp_mismatch(
+            self.vllm_config, self.tp_size, meta.remote_tp_size
+        )
+        if mismatch is not None:
+            logger.error(mismatch)
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=mismatch,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
             # This D worker does not pair with the P worker.
@@ -2660,6 +2689,13 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        mismatch = simulated_tp_mismatch(
+            self.vllm_config, self.tp_size, self._tp_size[remote_engine_id]
+        )
+        if mismatch is not None:
+            logger.error(mismatch)
+            self._handle_failed_recv(pull_metas, list(pull_metas), mismatch)
+            return False
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
