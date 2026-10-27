@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Roofline step timing of dense and MoE models on a GPU preset."""
+"""Roofline step timing of dense, MoE and MLA models on a GPU preset."""
 
 import dataclasses
 import json
@@ -11,7 +11,9 @@ import torch
 
 from tests.v1.worker.simulated.utils import sim_req, sim_step
 from vllm.v1.worker.simulated.timing import (
+    LATENT_ATTENTION_BACKENDS,
     ExpertGeometry,
+    LatentAttentionGeometry,
     LayerGeometry,
     ROUTING_MODEL,
     ModelGeometry,
@@ -77,9 +79,10 @@ def test_kv_bytes_follow_the_cache_dtype(cache_dtype, kv_bytes):
     assert geometry.kv_bytes_per_token == KV_BYTES_PER_TOKEN // 2 * kv_bytes
 
 
-def test_packed_kv_dtypes_are_rejected():
-    with pytest.raises(ValueError, match="int4_per_token_head"):
-        ModelGeometry.from_config(qwen_7b_config("int4_per_token_head"))
+@pytest.mark.parametrize("cache_dtype", ["int4_per_token_head", "fp8_ds_mla"])
+def test_packed_kv_dtypes_are_rejected(cache_dtype):
+    with pytest.raises(ValueError, match=cache_dtype):
+        ModelGeometry.from_config(qwen_7b_config(cache_dtype))
 
 
 def test_decode_reads_the_weights_and_the_context():
@@ -253,9 +256,11 @@ def write_config(directory, config):
     return str(directory)
 
 
-def timing_record(tmp_path, model_dir, monkeypatch, tensor_parallel_size=1):
+def timing_record(
+    tmp_path, model_dir, monkeypatch, tensor_parallel_size=1, steps=None, block_size=16
+):
     """The timing record an in-process simulated engine writes, after one
-    request's steps (the output rank's)."""
+    request's steps (the output rank's), which `steps` receives."""
     from vllm import LLM, SamplingParams
 
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -265,7 +270,7 @@ def timing_record(tmp_path, model_dir, monkeypatch, tensor_parallel_size=1):
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=256,
-        block_size=16,
+        block_size=block_size,
         kv_cache_memory_bytes=8 * 1024**2,
         enforce_eager=True,
         tensor_parallel_size=tensor_parallel_size,
@@ -286,6 +291,8 @@ def timing_record(tmp_path, model_dir, monkeypatch, tensor_parallel_size=1):
     finally:
         del llm
     records = [json.loads(line) for line in log.read_text().splitlines()]
+    if steps is not None:
+        steps.extend(r for r in records if "step" in r)
     timings = [r["timing"] for r in records if "timing" in r]
     assert len(timings) == 1
     # Recorded before any step.
@@ -580,3 +587,425 @@ def test_moe_timing_allows_pure_tensor_parallelism_only():
     ):
         with pytest.raises(ValueError, match="tensor parallelism only"):
             ModelGeometry._check_moe(moe_parallel_config(**parallel))
+
+
+# MLA, from the built model. DeepSeek-V2-Lite projects queries directly
+# (q_lora_rank None), DeepSeek-V3 through a compressed query; both cache a
+# latent of 512 plus a 64-wide rope key per token and layer.
+DEEPSEEK_V2_LITE = dict(
+    hidden=2048, heads=16, q_lora=None, layers=27, dense_layers=1,
+    intermediate=10944, moe_intermediate=1408, experts=64, top_k=6, shared=2,
+    vocab=102400,
+)  # fmt: skip
+DEEPSEEK_V3 = dict(
+    hidden=7168, heads=128, q_lora=1536, layers=61, dense_layers=3,
+    intermediate=18432, moe_intermediate=2048, experts=256, top_k=8, shared=1,
+    vocab=129280,
+)  # fmt: skip
+
+
+def deepseek(spec, tp=1):
+    """A DeepSeek model's geometry on one of `tp` ranks: heads, MLPs and
+    experts split; the latent's down-projection and the router replicated."""
+    hidden, heads = spec["hidden"], spec["heads"] // tp
+    if spec["q_lora"]:
+        query = hidden * spec["q_lora"] + spec["q_lora"] * heads * 192
+    else:
+        query = hidden * heads * 192  # nope 128 + rope 64 per head
+    attention = query + hidden * (512 + 64) + heads * 128 * hidden
+    latent = LatentAttentionGeometry(
+        num_heads=heads,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        kv_b_params=512 * heads * (128 + 128),
+    )
+    moe = spec["moe_intermediate"]
+    expert = ExpertGeometry(
+        spec["experts"], spec["experts"], spec["top_k"], 3 * hidden * moe // tp
+    )
+    dense = LayerGeometry(attention + 3 * hidden * spec["intermediate"] // tp, (), latent)
+    sparse = LayerGeometry(
+        attention + hidden * spec["experts"] + 3 * hidden * moe * spec["shared"] // tp,
+        (expert,),
+        latent,
+    )
+    return ModelGeometry(
+        num_layers=spec["layers"],
+        hidden_size=hidden,
+        num_heads=heads,
+        num_kv_heads=1,
+        head_size=576,
+        intermediate_size=spec["intermediate"] // tp,
+        vocab_size=spec["vocab"] // tp,
+        weight_bytes=2,
+        kv_bytes=2,
+        tensor_parallel_size=tp,
+        layers=(dense,) * spec["dense_layers"]
+        + (sparse,) * (spec["layers"] - spec["dense_layers"]),
+    )
+
+
+VARIANTS = pytest.mark.parametrize(
+    "spec,tp",
+    [(DEEPSEEK_V2_LITE, 1), (DEEPSEEK_V2_LITE, 2), (DEEPSEEK_V3, 1), (DEEPSEEK_V3, 2)],
+    ids=["v2-lite-tp1", "v2-lite-tp2", "v3-tp1", "v3-tp2"],
+)
+
+
+def mla(geometry, **kwargs):
+    return RooflineTimingProvider(None, gpu="h100", geometry=geometry, **kwargs)
+
+
+def compute_flops(cost, gpu_tflops=989.0):
+    return cost.breakdown["compute_us"] * 1e-6 * gpu_tflops * 1e12 * 0.6
+
+
+def pairs(scheduled, computed):
+    return scheduled * computed + scheduled * (scheduled + 1) // 2
+
+
+@VARIANTS
+def test_every_rank_caches_the_whole_latent(spec, tp):
+    geometry = deepseek(spec, tp)
+    assert geometry.kv_bytes_per_token == spec["layers"] * 576 * 2
+    # A 64-token block of one layer, on each rank.
+    assert geometry.kv_bytes_per_token // spec["layers"] * 64 == 73_728
+
+
+@VARIANTS
+def test_decode_absorbs_kv_b_proj_once_per_query_token(spec, tp):
+    geometry = deepseek(spec, tp)
+    heads, layers = spec["heads"] // tp, spec["layers"]
+    kv_b = 512 * heads * 256
+    cost = mla(geometry).estimate(sim_step(0, sim_req("r", 1, 1000, 1000)))
+    flops = (
+        2 * geometry.token_params
+        + 2 * spec["hidden"] * spec["vocab"] // tp
+        # MQA over the latent: keys 576 wide, values 512.
+        + layers * 2 * heads * pairs(1, 1000) * (576 + 512)
+        + layers * 2 * kv_b
+    )
+    assert compute_flops(cost) == pytest.approx(flops)
+    assert cost.breakdown["mla_decode_path_reqs"] == 1
+    # One kv_b_proj read; the whole latent context read and the token's written.
+    weights = geometry.weights_read(1) + spec["hidden"] * spec["vocab"] // tp
+    memory = weights * 2 + (1001 + 1) * geometry.kv_bytes_per_token
+    assert cost.breakdown["memory_us"] == pytest.approx(memory / (3.35e12 * 0.8) * 1e6)
+    assert geometry.weights_read(1) == geometry.weights_read(1, latent_paths=1)
+
+
+@VARIANTS
+def test_a_prefill_chunk_up_projects_its_cached_context(spec, tp):
+    # FLASH_ATTN_MLA (h100) sends chunks over 512 tokens to the prefill path.
+    geometry = deepseek(spec, tp)
+    heads, layers = spec["heads"] // tp, spec["layers"]
+    kv_b = 512 * heads * 256
+    cost = mla(geometry).estimate(sim_step(1, sim_req("r", 1000, 1000, 3000)))
+    flops = (
+        2 * geometry.token_params * 1000
+        # MHA: keys 192 wide (nope 128 + rope 64), values 128.
+        + layers * 2 * heads * pairs(1000, 1000) * (192 + 128)
+        # The chunk's tokens and the 1000 cached ones, up-projected.
+        + layers * 2 * kv_b * 2000
+    )
+    assert compute_flops(cost) == pytest.approx(flops)
+    assert cost.breakdown["mla_decode_path_reqs"] == 0
+
+
+@VARIANTS
+def test_a_mixed_batch_takes_both_paths(spec, tp):
+    geometry = deepseek(spec, tp)
+    heads, layers = spec["heads"] // tp, spec["layers"]
+    kv_b = 512 * heads * 256
+    step = sim_step(0, sim_req("d", 1, 1000, 1000), sim_req("p", 1000, 0, 1000))
+    cost = mla(geometry).estimate(step)
+    flops = (
+        2 * geometry.token_params * 1001
+        + 2 * 2 * spec["hidden"] * spec["vocab"] // tp
+        + layers * (2 * heads * pairs(1, 1000) * (576 + 512) + 2 * kv_b)
+        + layers * (2 * heads * pairs(1000, 0) * (192 + 128) + 2 * kv_b * 1000)
+    )
+    assert compute_flops(cost) == pytest.approx(flops)
+    assert cost.breakdown["mla_decode_path_reqs"] == 1
+    # kv_b_proj read twice: its absorbed copies and itself.
+    weights = geometry.weights_read(1001, latent_paths=2) + spec["hidden"] * spec["vocab"] // tp
+    assert geometry.weights_read(1001, latent_paths=2) - geometry.weights_read(1001) == (
+        layers * kv_b
+    )
+    memory = weights * 2 + (2001 + 1001) * geometry.kv_bytes_per_token
+    assert cost.breakdown["memory_us"] == pytest.approx(memory / (3.35e12 * 0.8) * 1e6)
+
+
+def absorbed(backend, *requests):
+    return LATENT_ATTENTION_BACKENDS[backend].absorbed(requests)
+
+
+@pytest.mark.parametrize("backend", sorted(LATENT_ATTENTION_BACKENDS))
+def test_the_token_recomputed_after_a_kv_handoff_takes_the_decode_path(backend):
+    # Decode loads all of a prompt but its last token, which it computes.
+    handoff = sim_req("new", 1, 999, 1000)
+    assert absorbed(backend, handoff) == (True,)
+    assert absorbed(backend, sim_req("old", 1, 1500, 1000), handoff) == (True, True)
+
+
+@pytest.mark.parametrize(
+    "backend,expected",
+    [
+        ("TRITON_MLA", False),
+        ("FLASHINFER_MLA", False),
+        ("CUTLASS_MLA", False),
+        ("FLASHMLA", True),  # at most 128 tokens
+        ("FLASH_ATTN_MLA", True),  # at most 512 tokens
+    ],
+)
+def test_short_prefills_take_the_decode_path_below_the_threshold(backend, expected):
+    assert absorbed(backend, sim_req("p", 50, 0, 50)) == (expected,)
+    assert absorbed(backend, sim_req("p", 600, 0, 600)) == (False,)
+
+
+def test_uniform_decode_backends_split_after_the_first_query_length():
+    batch = (sim_req("d", 1, 1500, 1000), sim_req("p", 50, 0, 50))
+    # FlashMLA's decode queries must share the first one's length.
+    assert absorbed("FLASHMLA", *batch) == (True, False)
+    assert absorbed("FLASH_ATTN_MLA", *batch) == (True, True)
+    # The short extend (a chunk of 100 continuing a prompt) follows decodes.
+    batch = (sim_req("c", 100, 100, 1000), sim_req("d", 1, 1500, 1000))
+    assert absorbed("FLASHMLA", *batch) == (False, True)
+    assert absorbed("FLASHMLA", sim_req("a", 100, 100, 1000), sim_req("b", 100, 0, 100)) == (
+        True,
+        True,
+    )
+
+
+def test_the_batch_splits_after_its_first_long_query():
+    # Ordered decode, long extend, first chunk: the 50-token prompt follows
+    # the 600-token chunk onto the prefill path.
+    batch = (
+        sim_req("p", 50, 0, 50),
+        sim_req("l", 600, 600, 2000),
+        sim_req("d", 1, 1500, 1000),
+    )
+    assert absorbed("FLASH_ATTN_MLA", *batch) == (False, False, True)
+    assert absorbed("FLASH_ATTN_MLA", batch[0], batch[2]) == (True, True)
+
+
+@pytest.mark.parametrize(
+    "gpu,backend,rejected",
+    [
+        ("a100", "TRITON_MLA", ["FLASH_ATTN_MLA", "FLASHMLA", "FLASHINFER_MLA"]),
+        ("h100", "FLASH_ATTN_MLA", []),
+        ("h200", "FLASH_ATTN_MLA", []),
+        ("b200", "FLASHINFER_MLA", []),
+    ],
+)
+def test_the_mla_backend_is_vllms_choice_on_the_gpu(gpu, backend, rejected):
+    geometry = deepseek(DEEPSEEK_V2_LITE)
+    provider = RooflineTimingProvider(None, gpu=gpu, geometry=geometry)
+    recorded = provider.assumptions()["latent_attention"]
+    assert recorded["backend"] == backend
+    assert recorded["selected_by"].startswith(f"vLLM's CUDA priorities on {gpu}")
+    assert list(recorded["rejected"]) == rejected
+    assert recorded["decode_threshold"] == LATENT_ATTENTION_BACKENDS[backend].decode_threshold
+    # The geometry records each layer's latent attention.
+    assert provider.assumptions()["geometry"]["layers"][0]["latent"]["kv_b_params"] == (
+        512 * 16 * 256
+    )
+
+
+def narrow(geometry, latent_size):
+    """`geometry` with a latent of `latent_size` (rope 8, the rest compressed)."""
+    layers = tuple(
+        dataclasses.replace(
+            layer,
+            latent=dataclasses.replace(
+                layer.latent, kv_lora_rank=latent_size - 8, qk_rope_head_dim=8
+            ),
+        )
+        for layer in geometry.layers
+    )
+    return dataclasses.replace(geometry, layers=layers)
+
+
+def test_a_latent_no_native_kernel_serves_falls_back_to_triton():
+    # Native MLA kernels serve latents 320, 512 or 576 wide.
+    recorded = mla(narrow(deepseek(DEEPSEEK_V2_LITE), 40)).assumptions()["latent_attention"]
+    assert recorded["backend"] == "TRITON_MLA"
+    assert recorded["rejected"]["FLASH_ATTN_MLA"] == ["latent width 40 not in (320, 512, 576)"]
+    assert "latent width 40 not in (320, 512, 576)" in recorded["rejected"]["FLASHMLA"]
+    with pytest.raises(ValueError, match="FLASH_ATTN_MLA here: latent width 40"):
+        mla(narrow(deepseek(DEEPSEEK_V2_LITE), 40), mla_backend="FLASH_ATTN_MLA")
+
+
+@pytest.mark.parametrize(
+    "gpu,backend", [("h100", "FLASHMLA"), ("b200", "FLASHINFER_MLA")]
+)
+def test_an_fp8_kv_cache_selects_a_backend_serving_it(gpu, backend):
+    fp8 = dataclasses.replace(deepseek(DEEPSEEK_V2_LITE), kv_bytes=1, kv_cache_dtype="fp8")
+    provider = RooflineTimingProvider(None, gpu=gpu, geometry=fp8)
+    assert provider.assumptions()["latent_attention"]["backend"] == backend
+    # FlashAttention MLA serves 16-bit caches only.
+    with pytest.raises(ValueError, match="KV cache dtype fp8 not in"):
+        mla(fp8, mla_backend="FLASH_ATTN_MLA")
+    # Triton's fp8 needs SM89: no backend on an A100.
+    with pytest.raises(ValueError, match="No MLA backend vLLM would run on a100"):
+        RooflineTimingProvider(None, gpu="a100", geometry=fp8)
+
+
+def test_the_block_size_takes_part_in_the_choice():
+    geometry = deepseek(DEEPSEEK_V2_LITE)
+    blocks_of_16 = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+
+    def backend(**kwargs):
+        provider = RooflineTimingProvider(blocks_of_16, geometry=geometry, **kwargs)
+        return provider.assumptions()["latent_attention"]
+
+    assert backend(gpu="h100")["backend"] == "FLASH_ATTN_MLA"
+    # FlashInfer's 32 or 64 and CUTLASS's 128 do not divide 16.
+    b200 = backend(gpu="b200")
+    assert b200["backend"] == "TRITON_MLA"
+    assert b200["checked"] == {
+        "kv_cache_dtype": "auto",
+        "block_size": 16,
+        "compute_capability": (10, 0),
+    }
+    with pytest.raises(ValueError, match="block size 16 not a multiple of one of"):
+        backend(gpu="h100", mla_backend="FLASHMLA")
+
+
+def test_the_mla_backend_can_be_chosen():
+    geometry = deepseek(DEEPSEEK_V2_LITE)
+    provider = mla(geometry, mla_backend="FLASHMLA")
+    assert provider.assumptions()["latent_attention"]["backend"] == "FLASHMLA"
+    assert provider.assumptions()["latent_attention"]["selected_by"] == "mla_backend"
+    with pytest.raises(ValueError, match="Unknown MLA backend"):
+        mla(geometry, mla_backend="FLASHMLA_SPARSE")
+    # FlashMLA's dense kernels run on Hopper only.
+    with pytest.raises(ValueError, match=r"compute capability \(10, 0\) not supported"):
+        RooflineTimingProvider(None, gpu="b200", geometry=geometry, mla_backend="FLASHMLA")
+    # Without a preset, the backend must be named; the GPU goes unchecked.
+    with pytest.raises(ValueError, match="mla_backend"):
+        RooflineTimingProvider(None, peak_tflops=989.0, hbm_tbps=3.35, geometry=geometry)
+    custom = RooflineTimingProvider(
+        None, peak_tflops=989.0, hbm_tbps=3.35, geometry=geometry, mla_backend="FLASHMLA"
+    )
+    assert custom.assumptions()["latent_attention"]["checked"]["compute_capability"] is None
+
+
+def test_dense_and_moe_steps_record_no_mla():
+    step = sim_step(0, sim_req("d", 1, 1000, 1000), sim_req("p", 1000, 0, 1000))
+    for provider in (h100(), moe()):
+        assert set(provider.estimate(step).breakdown) == {
+            "compute_us",
+            "memory_us",
+            "communication_us",
+        }
+        assert "latent_attention" not in provider.assumptions()
+        layers = provider.assumptions()["geometry"].get("layers") or []
+        assert all("latent" not in group for group in layers)
+
+
+def test_an_mla_model_is_timed_from_its_built_layers():
+    config = qwen_7b_config("auto")
+    config.model_config.use_mla = True
+    with pytest.raises(ValueError, match="from_model"):
+        ModelGeometry.from_config(config)
+    provider = RooflineTimingProvider(config, gpu="h100")
+    with pytest.raises(RuntimeError, match="bind_model"):
+        provider.estimate(sim_step(0, sim_req("r", 1, 999, 1000)))
+    # Not the config's geometry when its layers cannot be found.
+    with pytest.raises(UnsupportedModelLayout):
+        provider.bind_model(torch.nn.Module())
+
+
+# Tiny DeepSeek models: V2 projects queries directly, V3 compresses them.
+DEEPSEEK_V2 = {
+    "architectures": ["DeepseekV2ForCausalLM"],
+    "model_type": "deepseek_v2",
+    "hidden_size": 64,
+    "intermediate_size": 96,
+    "moe_intermediate_size": 32,
+    "num_hidden_layers": 3,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "q_lora_rank": None,
+    "kv_lora_rank": 32,
+    "qk_nope_head_dim": 16,
+    "qk_rope_head_dim": 8,
+    "v_head_dim": 16,
+    "n_routed_experts": 8,
+    "num_experts_per_tok": 2,
+    "n_shared_experts": 1,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "topk_method": "greedy",
+    "scoring_func": "softmax",
+    "norm_topk_prob": False,
+    "routed_scaling_factor": 1.0,
+    "tie_word_embeddings": False,
+}
+DEEPSEEK_V3_TINY = {
+    **DEEPSEEK_V2,
+    "architectures": ["DeepseekV3ForCausalLM"],
+    "model_type": "deepseek_v3",
+    "q_lora_rank": 24,
+    "topk_method": "noaux_tc",
+    "scoring_func": "sigmoid",
+    "norm_topk_prob": True,
+}
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("config", [DEEPSEEK_V2, DEEPSEEK_V3_TINY], ids=["v2", "v3"])
+def test_a_built_mla_model_keeps_kv_b_proj_apart(tmp_path, monkeypatch, config, tp):
+    model_dir = write_config(tmp_path / config["model_type"], config)
+    steps = []
+    # 64-token blocks suit either CPU MLA kernel (AMX: multiples of 32; the
+    # reference one, without AMX, is given 16 by the platform).
+    record = timing_record(tmp_path, model_dir, monkeypatch, tp, steps, block_size=64)
+    heads = 4 // tp
+    if config["q_lora_rank"]:
+        query = 64 * 24 + 24 * heads * 24  # compressed, then 16 + 8 per head
+    else:
+        query = 64 * heads * 24
+    attention = query + 64 * (32 + 8) + heads * 16 * 64  # latent + rope key; O
+    latent = {
+        "num_heads": heads,
+        "kv_lora_rank": 32,
+        "qk_nope_head_dim": 16,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 16,
+        "kv_b_params": 32 * heads * (16 + 16),
+    }
+    router, shared = 64 * 8, 3 * 64 * 32 // tp
+    assert record["geometry"]["layers"] == [
+        {
+            "first": 0,
+            "last": 0,
+            "dense_params": attention + 3 * 64 * 96 // tp,
+            "experts": [],
+            "latent": latent,
+        },
+        {
+            "first": 1,
+            "last": 2,
+            "dense_params": attention + router + shared,
+            "experts": [
+                {
+                    "local_experts": 8,
+                    "global_experts": 8,
+                    "top_k": 2,
+                    "params_per_expert": 3 * 64 * 32 // tp,
+                }
+            ],
+            "latent": latent,
+        },
+    ]
+    # No native kernel serves a 40-wide latent: vLLM would run Triton, whose
+    # decode path takes single tokens only.
+    assert record["latent_attention"]["backend"] == "TRITON_MLA"
+    assert record["latent_attention"]["checked"]["block_size"] == 64
+    assert [s["cost"]["breakdown"]["mla_decode_path_reqs"] for s in steps] == [0, 1]

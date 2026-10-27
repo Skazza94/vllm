@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
+import functools
 import itertools
 import json
 import math
@@ -385,9 +387,26 @@ INTERCONNECT_PRESETS: dict[str, dict[str, Any]] = {
     "h200": {"interconnect": "NVLink 4", "interconnect_gbs": 450.0},
     "b200": {"interconnect": "NVLink 5", "interconnect_gbs": 900.0},
 }
+# Each preset's CUDA compute capability, which vLLM's backend choice follows.
+COMPUTE_CAPABILITIES: dict[str, tuple[int, int]] = {
+    "a100": (8, 0),
+    "h100": (9, 0),
+    "h200": (9, 0),
+    "b200": (10, 0),
+}
 # KV cache dtypes packing elements below a byte, or with per-token scales:
-# their size is not their storage dtype's.
-PACKED_KV_DTYPES = ("int4", "nvfp4", "turboquant", "int8_per_token_head", "fp8_per_token_head")
+# their size is not their storage dtype's (fp8_ds_mla: 656 bytes per token).
+PACKED_KV_DTYPES = (
+    "int4",
+    "nvfp4",
+    "turboquant",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "fp8_ds_mla",
+)
+_MLA_KV_DTYPES_16_BIT = ("auto", "float16", "bfloat16")
+_MLA_KV_DTYPES = (*_MLA_KV_DTYPES_16_BIT, "fp8", "fp8_e4m3")
+_MLA_LATENT_SIZES = (320, 512, 576)
 
 
 @dataclass(frozen=True)
@@ -410,13 +429,185 @@ class ExpertGeometry:
 
 
 @dataclass(frozen=True)
+class LatentAttentionGeometry:
+    """One layer's multi-head latent attention (MLA) on this rank: a cached
+    latent of `kv_lora_rank` plus a shared rope key per token, which
+    `kv_b_proj` up-projects into the heads' non-rope keys and values."""
+
+    num_heads: int
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    kv_b_params: int
+    """Weights of `kv_b_proj` on this rank, logical (unpadded)."""
+
+    @property
+    def latent_size(self) -> int:
+        """Elements one token caches in this layer, on every rank."""
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    def attention_flops(self, pairs: int, absorbed: bool) -> int:
+        """QK^T and AV over `pairs` query-key pairs: on the decode path MQA
+        over the latent (keys `latent_size`, values `kv_lora_rank` wide),
+        on the prefill path MHA over the up-projected keys and values."""
+        if absorbed:
+            return 2 * self.num_heads * pairs * (self.latent_size + self.kv_lora_rank)
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        return 2 * self.num_heads * pairs * (qk_head_dim + self.v_head_dim)
+
+    def kv_b_flops(self, request: SimRequestStep, absorbed: bool) -> int:
+        """`kv_b_proj`'s share of a request's step. The decode path absorbs it
+        into each query token (keys before QK^T, values after AV: one
+        application per token); the prefill path up-projects the latent of
+        every scheduled and cached context token."""
+        tokens = request.num_scheduled_tokens
+        if not absorbed:
+            tokens += request.num_computed_tokens
+        return 2 * self.kv_b_params * tokens
+
+
+@dataclass(frozen=True)
+class LatentAttentionBackend:
+    """One of vLLM's CUDA MLA backends: what it serves (as its
+    `validate_configuration`), and how it splits a batch between the decode
+    path and the prefill path (its metadata builder's reorder threshold, and
+    whether its decode queries must be of one length)."""
+
+    name: str
+    decode_threshold: int
+    uniform_decode: bool
+    compute_capabilities: tuple[int, ...] | None
+    """Majors it runs on; None: any."""
+    kv_cache_dtypes: tuple[str, ...]
+    kernel_block_sizes: tuple[int, ...]
+    """A block size must be a multiple of one."""
+    latent_sizes: tuple[int, ...] | None = _MLA_LATENT_SIZES
+    """Head sizes (`latent_size`) it serves; None: any."""
+    qk_nope_head_dims: tuple[int, ...] | None = None
+    fp8_min_capability: tuple[int, int] | None = None
+
+    def unsupported(
+        self,
+        latent: LatentAttentionGeometry,
+        kv_cache_dtype: str,
+        capability: tuple[int, int] | None,
+        block_size: int | None,
+    ) -> list[str]:
+        """Why vLLM would not run this backend for the layer, cache and GPU
+        (`capability` None: not checked); empty if it would."""
+        reasons = []
+        if self.latent_sizes is not None and latent.latent_size not in self.latent_sizes:
+            reasons.append(f"latent width {latent.latent_size} not in {self.latent_sizes}")
+        if (
+            self.qk_nope_head_dims is not None
+            and latent.qk_nope_head_dim not in self.qk_nope_head_dims
+        ):
+            reasons.append(
+                f"qk_nope_head_dim {latent.qk_nope_head_dim} not in {self.qk_nope_head_dims}"
+            )
+        if kv_cache_dtype not in self.kv_cache_dtypes:
+            reasons.append(f"KV cache dtype {kv_cache_dtype} not in {self.kv_cache_dtypes}")
+        if block_size is not None and not any(
+            block_size % size == 0 for size in self.kernel_block_sizes
+        ):
+            reasons.append(
+                f"block size {block_size} not a multiple of one of {self.kernel_block_sizes}"
+            )
+        if capability is not None:
+            if (
+                self.compute_capabilities is not None
+                and capability[0] not in self.compute_capabilities
+            ):
+                reasons.append(f"compute capability {capability} not supported")
+            elif (
+                self.fp8_min_capability is not None
+                and kv_cache_dtype.startswith("fp8")
+                and capability < self.fp8_min_capability
+            ):
+                reasons.append(
+                    f"an fp8 KV cache needs compute capability {self.fp8_min_capability}"
+                )
+        return reasons
+
+    def absorbed(self, requests: tuple[SimRequestStep, ...]) -> tuple[bool, ...]:
+        """Which requests take the decode path. The runner orders the batch
+        as decodes, short extends, long extends, then first chunks
+        (`reorder_batch_to_split_decodes_and_prefills`; within each region
+        the step's order is kept here), and the builder splits it after
+        its leading decodes (`split_decodes_and_prefills`)."""
+        threshold = self.decode_threshold
+
+        def region(r: SimRequestStep) -> int:
+            if r.num_computed_tokens == 0:
+                return 3
+            if r.num_scheduled_tokens > threshold:
+                return 2
+            return 1 if r.num_computed_tokens < r.num_prompt_tokens else 0
+
+        order = sorted(range(len(requests)), key=lambda i: region(requests[i]))
+        lens = [requests[i].num_scheduled_tokens for i in order]
+        num_decodes = len(lens)
+        all_short = max(lens, default=0) <= threshold
+        if all_short and (not self.uniform_decode or threshold <= 1):
+            pass  # every request a decode, without looking at lengths
+        elif lens[0] > threshold:
+            num_decodes = 0
+        elif self.uniform_decode:
+            num_decodes = next((i for i, n in enumerate(lens) if n != lens[0]), len(lens))
+        else:
+            num_decodes = next((i for i, n in enumerate(lens) if n > threshold), len(lens))
+        decodes = set(order[:num_decodes])
+        return tuple(i in decodes for i in range(len(requests)))
+
+
+# vLLM's CUDA MLA backends that serve dense latent attention: their metadata
+# builders' reorder_batch_threshold and query_len_support (UNIFORM and
+# SINGLE_ONLY require one decode query length), without speculative
+# decoding; what each serves (FlashMLA's dense kernels: Hopper only).
+LATENT_ATTENTION_BACKENDS = {
+    backend.name: backend
+    for backend in (
+        LatentAttentionBackend(
+            "TRITON_MLA", 1, True, None, _MLA_KV_DTYPES, (16,),
+            latent_sizes=None, fp8_min_capability=(8, 9),
+        ),
+        LatentAttentionBackend("FLASHMLA", 128, True, (9,), _MLA_KV_DTYPES, (64,)),
+        LatentAttentionBackend(
+            "FLASH_ATTN_MLA", 512, False, (9,), _MLA_KV_DTYPES_16_BIT, (16,)
+        ),
+        LatentAttentionBackend(
+            "FLASHINFER_MLA", 1, False, (10,), _MLA_KV_DTYPES, (32, 64),
+            qk_nope_head_dims=(64, 128, 192),
+        ),
+        LatentAttentionBackend("CUTLASS_MLA", 1, True, (10,), _MLA_KV_DTYPES, (128,)),
+    )
+}  # fmt: skip
+# vLLM's CUDA MLA priorities by compute capability major
+# (`_get_backend_priorities`), the first that supports the model, cache and
+# GPU chosen. TOKENSPEED_MLA, behind FLASHINFER_MLA on SM100, serves a
+# subset of its cases (fp8 KV, DeepSeek-R1's dimensions, 32/64 blocks), so
+# never wins here.
+LATENT_ATTENTION_PRIORITIES: dict[int, tuple[str, ...]] = {
+    10: ("FLASHINFER_MLA", "CUTLASS_MLA", "FLASH_ATTN_MLA", "FLASHMLA", "TRITON_MLA"),
+}
+_DEFAULT_LATENT_ATTENTION_PRIORITY = (
+    "FLASH_ATTN_MLA",
+    "FLASHMLA",
+    "FLASHINFER_MLA",
+    "TRITON_MLA",
+)
+
+
+@dataclass(frozen=True)
 class LayerGeometry:
     """One decoder layer's matrix multiplications on this rank."""
 
     dense_params: int
     """Weights every token goes through: attention projections, dense MLP,
-    shared experts, router."""
+    shared experts, router; not an MLA layer's `kv_b_proj` (`latent`)."""
     experts: tuple[ExpertGeometry, ...] = ()
+    latent: LatentAttentionGeometry | None = None
 
 
 # How an MoE step's expert reads are estimated, as recorded with the geometry.
@@ -441,14 +632,15 @@ def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
         if groups and layers[groups[-1]["last"]] == layer:
             groups[-1]["last"] = index
         else:
-            groups.append(
-                {
-                    "first": index,
-                    "last": index,
-                    "dense_params": layer.dense_params,
-                    "experts": [asdict(e) for e in layer.experts],
-                }
-            )
+            group = {
+                "first": index,
+                "last": index,
+                "dense_params": layer.dense_params,
+                "experts": [asdict(e) for e in layer.experts],
+            }
+            if layer.latent is not None:
+                group["latent"] = asdict(layer.latent)
+            groups.append(group)
     return groups
 
 
@@ -470,6 +662,7 @@ class ModelGeometry:
     activation_bytes: float = 2
     """Bytes per activation element (the model's dtype, whatever its weights'
     or KV's)."""
+    kv_cache_dtype: str = "auto"
     tensor_parallel_size: int = 1
     layers: tuple[LayerGeometry, ...] | None = None
     """Each decoder layer's matrix multiplications, from the built model;
@@ -478,10 +671,10 @@ class ModelGeometry:
     @classmethod
     def from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
         """A dense model's geometry from its config."""
-        if vllm_config.model_config.is_moe:
+        if vllm_config.model_config.is_moe or vllm_config.model_config.use_mla:
             raise ValueError(
-                "The roofline timing provider needs an MoE model's built "
-                "layers: ModelGeometry.from_model."
+                "The roofline timing provider needs an MoE or MLA model's "
+                "built layers: ModelGeometry.from_model."
             )
         return cls._from_config(vllm_config)
 
@@ -489,15 +682,27 @@ class ModelGeometry:
     def from_model(cls, vllm_config: VllmConfig, model: Any) -> ModelGeometry:
         """The geometry of the built model (simulation builds it on the meta
         device, with this rank's shapes): each decoder layer's matrix
-        multiplications at their logical sizes, the routed experts' apart.
-        Embeddings are lookups and norms no matrix multiplications; the LM
-        head stays `vocab_size`, run for the sampled tokens only."""
+        multiplications at their logical sizes, the routed experts' and an
+        MLA layer's `kv_b_proj` apart. Embeddings are lookups and norms no
+        matrix multiplications; the LM head stays `vocab_size`, run for the
+        sampled tokens only."""
         import torch
 
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
         from vllm.model_executor.layers.fused_moe.routed_experts import (
             RoutedExperts,
         )
         from vllm.model_executor.layers.linear import LinearBase
+
+        def linear_params(module: torch.nn.Module) -> int:
+            if isinstance(module, LinearBase):
+                inputs = getattr(module, "input_size_per_partition", module.input_size)
+                outputs = getattr(module, "output_partition_sizes", None) or [
+                    getattr(module, "output_size_per_partition", module.output_size)
+                ]
+                return inputs * sum(outputs)
+            assert isinstance(module, torch.nn.Linear)
+            return module.in_features * module.out_features
 
         geometry = cls._from_config(vllm_config)
         num_layers = vllm_config.model_config.get_total_num_hidden_layers()
@@ -518,10 +723,36 @@ class ModelGeometry:
             )
         layers = []
         for layer in candidates[0]:
-            dense, experts = 0, []
+            dense, experts, latent = 0, [], None
+            attentions = [m for m in layer.modules() if isinstance(m, MLAAttention)]
+            if len(attentions) > 1:
+                raise UnsupportedModelLayout(
+                    f"The roofline timing provider models one MLA attention "
+                    f"per decoder layer, not {len(attentions)}."
+                )
+            for attention in attentions:
+                if (
+                    attention.indexer is not None
+                    or getattr(attention, "use_sparse", False)
+                    or attention.sliding_window is not None
+                ):
+                    raise ValueError(
+                        "The roofline timing provider models dense MLA (no "
+                        "sparse or sliding-window MLA)."
+                    )
+                latent = LatentAttentionGeometry(
+                    num_heads=attention.num_heads,
+                    kv_lora_rank=attention.kv_lora_rank,
+                    qk_nope_head_dim=attention.qk_nope_head_dim,
+                    qk_rope_head_dim=attention.qk_rope_head_dim,
+                    v_head_dim=attention.v_head_dim,
+                    kv_b_params=linear_params(attention.kv_b_proj),
+                )
             # modules() yields a module referenced twice (a shared expert's
-            # gate, say) once.
+            # gate, MLA's kv_b_proj, say) once.
             for module in layer.modules():
+                if attentions and module is attentions[0].kv_b_proj:
+                    continue
                 if isinstance(module, RoutedExperts):
                     moe = module.moe_config
                     hidden = moe.hidden_dim_unpadded or moe.hidden_dim
@@ -538,26 +769,51 @@ class ModelGeometry:
                             params_per_expert=projections * hidden * intermediate,
                         )
                     )
-                elif isinstance(module, LinearBase):
-                    inputs = getattr(
-                        module, "input_size_per_partition", module.input_size
-                    )
-                    outputs = getattr(module, "output_partition_sizes", None) or [
-                        getattr(module, "output_size_per_partition", module.output_size)
-                    ]
-                    dense += inputs * sum(outputs)
-                elif isinstance(module, torch.nn.Linear):
-                    dense += module.in_features * module.out_features
-            layers.append(LayerGeometry(dense, tuple(experts)))
+                elif isinstance(module, (LinearBase, torch.nn.Linear)):
+                    dense += linear_params(module)
+            layers.append(LayerGeometry(dense, tuple(experts), latent))
         if any(layer.experts for layer in layers):
             cls._check_moe(vllm_config)
+        if any(layer.latent for layer in layers):
+            cls._check_latent(vllm_config)
+        elif vllm_config.model_config.use_mla:
+            raise UnsupportedModelLayout(
+                "The roofline timing provider found no MLA attention in the "
+                "MLA model's decoder layers."
+            )
         return dataclasses.replace(geometry, layers=tuple(layers))
 
     @staticmethod
-    def _check_moe(vllm_config: VllmConfig) -> None:
+    def _check_latent(vllm_config: VllmConfig) -> None:
+        parallel = vllm_config.parallel_config
+        # Speculative decoding raises the backends' decode thresholds.
+        if (
+            parallel.decode_context_parallel_size > 1
+            or parallel.prefill_context_parallel_size > 1
+            or vllm_config.speculative_config is not None
+        ):
+            raise ValueError(
+                "The roofline timing provider models MLA models without "
+                "context parallelism (DCP, PCP) or speculative decoding."
+            )
+        ModelGeometry._check_unquantized(vllm_config, "MLA")
+
+    @staticmethod
+    def _check_unquantized(vllm_config: VllmConfig, kind: str) -> None:
         import torch
 
         model = vllm_config.model_config
+        if model.quantization is not None or model.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError(
+                f"The roofline timing provider models {kind} models with "
+                f"unquantized bf16 or fp16 weights, not {model.quantization or model.dtype}."
+            )
+
+    @staticmethod
+    def _check_moe(vllm_config: VllmConfig) -> None:
         parallel = vllm_config.parallel_config
         # Pure TP keeps every expert on each rank, its matrices split. DCP
         # reuses the TP ranks, so the world size does not show it.
@@ -571,14 +827,7 @@ class ModelGeometry:
                 "The roofline timing provider models MoE models under tensor "
                 "parallelism only (no PP, DP, EP, PCP or DCP) so far."
             )
-        if model.quantization is not None or model.dtype not in (
-            torch.bfloat16,
-            torch.float16,
-        ):
-            raise ValueError(
-                "The roofline timing provider models MoE models with "
-                f"unquantized bf16 or fp16 weights, not {model.quantization or model.dtype}."
-            )
+        ModelGeometry._check_unquantized(vllm_config, "MoE")
 
     @classmethod
     def _from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
@@ -586,10 +835,10 @@ class ModelGeometry:
 
         model = vllm_config.model_config
         parallel = vllm_config.parallel_config
-        if model.use_mla or model.is_hybrid or model.is_attention_free:
+        if model.is_hybrid or model.is_attention_free:
             raise ValueError(
-                "The roofline timing provider models dense and MoE attention "
-                "models (no MLA, hybrid or attention-free ones)."
+                "The roofline timing provider models dense, MoE and MLA "
+                "attention models (no hybrid or attention-free ones)."
             )
         tp = parallel.tensor_parallel_size
         text = model.hf_text_config
@@ -608,6 +857,7 @@ class ModelGeometry:
             weight_bytes=weight_bytes,
             kv_bytes=kv_cache_dtype_str_to_dtype(cache_dtype, model).itemsize,
             activation_bytes=model.dtype.itemsize,
+            kv_cache_dtype=cache_dtype,
             tensor_parallel_size=tp,
         )
 
@@ -622,7 +872,7 @@ class ModelGeometry:
     @property
     def token_params(self) -> int:
         """Decoder weights a token goes through: every layer's dense ones and
-        `top_k` of its experts."""
+        `top_k` of its experts (not `kv_b_proj`: `attention_flops`)."""
         if self.layers is None:
             return self.num_layers * self.layer_params
         return sum(
@@ -631,16 +881,57 @@ class ModelGeometry:
             for layer in self.layers
         )
 
-    def weights_read(self, num_tokens: int) -> float:
+    def weights_read(self, num_tokens: int, latent_paths: int = 1) -> float:
         """Decoder weights a step of `num_tokens` tokens reads: every layer's
-        dense ones and the experts its tokens are expected to route to."""
+        dense ones, the experts its tokens are expected to route to, and an
+        MLA layer's `kv_b_proj` once per path the step takes (the decode
+        path reads the absorbed copies vLLM makes of it at load)."""
         if self.layers is None:
             return self.num_layers * self.layer_params
         return sum(
             layer.dense_params
             + sum(e.expected_read(num_tokens) * e.params_per_expert for e in layer.experts)
+            + (layer.latent.kv_b_params * latent_paths if layer.latent else 0)
             for layer in self.layers
         )
+
+    @functools.cached_property
+    def _attention_layers(
+        self,
+    ) -> tuple[int, tuple[tuple[LatentAttentionGeometry, int], ...]]:
+        """Layers of multi-head attention, and of each MLA geometry."""
+        if self.layers is None:
+            return self.num_layers, ()
+        latent = collections.Counter(layer.latent for layer in self.layers)
+        plain = latent.pop(None, 0)
+        return plain, tuple(latent.items())  # type: ignore[arg-type]
+
+    @property
+    def has_latent_attention(self) -> bool:
+        return bool(self._attention_layers[1])
+
+    def attention_flops(
+        self, requests: tuple[SimRequestStep, ...], absorbed: tuple[bool, ...]
+    ) -> int:
+        """A step's QK^T and AV in every layer, each new token attending to
+        its request's context and to the new tokens before it, plus each
+        MLA layer's `kv_b_proj`; `absorbed[i]`: whether request i takes the
+        MLA decode path."""
+        plain, latent = self._attention_layers
+        flops = 0
+        for request, decode_path in zip(requests, absorbed):
+            scheduled = request.num_scheduled_tokens
+            pairs = (
+                scheduled * request.num_computed_tokens
+                + scheduled * (scheduled + 1) // 2
+            )
+            flops += 4 * plain * self.num_heads * self.head_size * pairs
+            for geometry, count in latent:
+                flops += count * (
+                    geometry.attention_flops(pairs, decode_path)
+                    + geometry.kv_b_flops(request, decode_path)
+                )
+        return flops
 
     def describe(self) -> dict[str, Any]:
         """The geometry as recorded: consecutive layers of one geometry
@@ -655,8 +946,13 @@ class ModelGeometry:
 
     @property
     def kv_bytes_per_token(self) -> float:
-        """K and V of one token across all layers on this rank."""
-        return self.num_layers * 2 * self.num_kv_heads * self.head_size * self.kv_bytes
+        """K and V of one token across all layers on this rank; an MLA
+        layer's latent, which every rank holds whole."""
+        plain, latent = self._attention_layers
+        return (
+            plain * 2 * self.num_kv_heads * self.head_size
+            + sum(geometry.latent_size * count for geometry, count in latent)
+        ) * self.kv_bytes
 
 
 class RooflineTimingProvider:
@@ -679,7 +975,14 @@ class RooflineTimingProvider:
     efficiency varying with batch shape, routing skew (fewer experts read,
     but uneven work: the error's direction is unknown). ``gpu`` picks a
     preset of `GPU_PRESETS`; ``peak_tflops`` and ``hbm_tbps`` override it.
-    An MoE model's geometry comes from its built layers (`bind_model`)."""
+    An MoE or MLA model's geometry comes from its built layers
+    (`bind_model`).
+
+    MLA: a request takes the decode path (MQA over the latent) or the
+    prefill path (MHA over its up-projected context) as the modeled
+    backend splits the batch (`LatentAttentionBackend`): ``mla_backend``
+    (a `LATENT_ATTENTION_BACKENDS` name), else vLLM's default on ``gpu``.
+    Every rank reads and writes the whole latent."""
 
     def __init__(
         self,
@@ -696,6 +999,7 @@ class RooflineTimingProvider:
         interconnect_gbs: float | None = None,
         interconnect_efficiency: float = 0.8,
         collective_latency_us: float = 10.0,
+        mla_backend: str | None = None,
     ) -> None:
         if gpu is not None and gpu not in GPU_PRESETS:
             raise ValueError(f"Unknown GPU {gpu!r}; presets: {sorted(GPU_PRESETS)}.")
@@ -748,13 +1052,26 @@ class RooflineTimingProvider:
             "collective_latency_us": collective_latency_us,
             "latency_rank_dependence": "none: one latency per collective",
         }
+        if mla_backend is not None and mla_backend not in LATENT_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"Unknown MLA backend {mla_backend!r}; modeled: "
+                f"{sorted(LATENT_ATTENTION_BACKENDS)}."
+            )
+        self._gpu = gpu
+        self._mla_backend = mla_backend
+        # Resolved with an MLA model's layers (_check_geometry).
+        self.latent_backend: LatentAttentionBackend | None = None
+        self._latent_attention: dict[str, Any] | None = None
         self._vllm_config = vllm_config
-        # An MoE model's geometry comes from its built layers (bind_model).
+        # An MoE or MLA model's geometry comes from its built layers
+        # (bind_model).
         self.geometry: ModelGeometry | None = geometry
-        if geometry is None and not vllm_config.model_config.is_moe:
+        if geometry is None and not (
+            vllm_config.model_config.is_moe or vllm_config.model_config.use_mla
+        ):
             self.geometry = ModelGeometry.from_config(vllm_config)
         if self.geometry is not None:
-            self._check_interconnect(self.geometry)
+            self._check_geometry(self.geometry)
         self._assumptions = {
             "gpu": gpu,
             "peak_tflops": peak,
@@ -768,22 +1085,111 @@ class RooflineTimingProvider:
     def bind_model(self, model: Any) -> None:
         """Take each layer's geometry from the built model, before any step
         is timed. A dense model whose decoder layers cannot be told apart
-        keeps its config's; an MoE model needs its layers."""
+        keeps its config's; an MoE or MLA model needs its layers."""
         try:
             self.geometry = ModelGeometry.from_model(self._vllm_config, model)
         except UnsupportedModelLayout as error:
-            if self._vllm_config.model_config.is_moe:
+            config = self._vllm_config.model_config
+            if config.is_moe or config.use_mla:
                 raise
             logger.warning("%s Timing the dense model from its config.", error)
             self.geometry = ModelGeometry.from_config(self._vllm_config)
-        self._check_interconnect(self.geometry)
+        self._check_geometry(self.geometry)
 
-    def _check_interconnect(self, geometry: ModelGeometry) -> None:
+    def _check_geometry(self, geometry: ModelGeometry) -> None:
         if geometry.tensor_parallel_size > 1 and self.collective_bytes_per_s is None:
             raise ValueError(
                 "The roofline timing provider needs an interconnect for tensor "
                 "parallelism: a gpu preset, or interconnect_gbs."
             )
+        if geometry.has_latent_attention:
+            self._select_latent_backend(geometry)
+
+    def _select_latent_backend(self, geometry: ModelGeometry) -> None:
+        """The MLA backend vLLM would run for the model's layers, KV cache,
+        block size and GPU: ``mla_backend`` if it supports them, else the
+        first of vLLM's priorities on ``gpu`` that does."""
+        capability = COMPUTE_CAPABILITIES[self._gpu] if self._gpu else None
+        block_size = (
+            self._vllm_config.cache_config.block_size
+            if self._vllm_config is not None
+            else None
+        )
+        latents = [latent for latent, _ in geometry._attention_layers[1]]
+
+        def unsupported(name: str) -> list[str]:
+            backend = LATENT_ATTENTION_BACKENDS[name]
+            return sorted(
+                {
+                    reason
+                    for latent in latents
+                    for reason in backend.unsupported(
+                        latent, geometry.kv_cache_dtype, capability, block_size
+                    )
+                }
+            )
+
+        rejected: dict[str, list[str]] = {}
+        if self._mla_backend is not None:
+            name = self._mla_backend
+            if reasons := unsupported(name):
+                raise ValueError(
+                    f"vLLM would not run the MLA backend {name} here: "
+                    + "; ".join(reasons)
+                    + "."
+                )
+            selected_by = "mla_backend"
+        elif capability is None:
+            raise ValueError(
+                "The roofline timing provider needs an MLA backend for an MLA "
+                "model: a gpu preset, or mla_backend."
+            )
+        else:
+            priorities = LATENT_ATTENTION_PRIORITIES.get(
+                capability[0], _DEFAULT_LATENT_ATTENTION_PRIORITY
+            )
+            for name in priorities:
+                if not (reasons := unsupported(name)):
+                    break
+                rejected[name] = reasons
+            else:
+                raise ValueError(
+                    f"No MLA backend vLLM would run on {self._gpu}: {rejected}."
+                )
+            major, minor = capability
+            selected_by = (
+                f"vLLM's CUDA priorities on {self._gpu} (SM{major}{minor}): the "
+                "first serving the layers, KV cache and block size"
+            )
+        backend = LATENT_ATTENTION_BACKENDS[name]
+        self.latent_backend = backend
+        self._latent_attention = {
+            "backend": backend.name,
+            "selected_by": selected_by,
+            "rejected": rejected,
+            "checked": {
+                "kv_cache_dtype": geometry.kv_cache_dtype,
+                "block_size": block_size,
+                "compute_capability": capability,
+            },
+            "decode_threshold": backend.decode_threshold,
+            "uniform_decode": backend.uniform_decode,
+            "split": (
+                "batch ordered as decodes, short extends, long extends, first "
+                "chunks (each region in the step's order); the leading requests "
+                "of at most decode_threshold tokens (with uniform_decode, of the "
+                "first one's length) take the decode path"
+            ),
+            "decode_path": (
+                "MQA over the latent: QK^T kv_lora_rank + rope wide, AV "
+                "kv_lora_rank wide; kv_b_proj absorbed, once per query token"
+            ),
+            "prefill_path": (
+                "MHA: QK^T qk_nope + rope wide, AV v_head wide; kv_b_proj "
+                "up-projects every scheduled and cached context token"
+            ),
+            "kv_b_proj_read": "once per path a step takes",
+        }
 
     def communication_s(self, num_tokens: int) -> float:
         """A step's tensor-parallel all-reduces, under the no-overlap
@@ -811,11 +1217,15 @@ class RooflineTimingProvider:
     def assumptions(self) -> dict[str, Any]:
         """What the step times rest on, resolved: the GPU's figures (preset or
         overridden), efficiencies, fixed costs and the model's geometry."""
-        return {
+        geometry = self._bound()
+        assumptions = {
             **self._assumptions,
             "communication": self._communication,
-            "geometry": self._bound().describe(),
+            "geometry": geometry.describe(),
         }
+        if geometry.has_latent_attention:
+            assumptions["latent_attention"] = self._latent_attention
+        return assumptions
 
     def estimate(self, step: StepDescriptor) -> StepCost:
         g = self._bound()
@@ -824,33 +1234,34 @@ class RooflineTimingProvider:
             for r in step.requests
             if r.num_computed_tokens + r.num_scheduled_tokens >= r.num_prompt_tokens
         )
-        # Query-key pairs: each new token attends to the context and to the
-        # new tokens before it.
-        pairs = sum(
-            r.num_scheduled_tokens * r.num_computed_tokens
-            + r.num_scheduled_tokens * (r.num_scheduled_tokens + 1) // 2
-            for r in step.requests
-        )
+        absorbed = (False,) * len(step.requests)
+        if g.has_latent_attention:
+            assert self.latent_backend is not None
+            absorbed = self.latent_backend.absorbed(step.requests)
+        latent_paths = any(absorbed) + (not all(absorbed))
         context = sum(r.num_computed_tokens + r.num_scheduled_tokens for r in step.requests)
         lm_head = g.hidden_size * g.vocab_size
         flops = (
             2 * g.token_params * step.num_tokens
             + 2 * lm_head * sampled
-            + 4 * g.num_layers * g.num_heads * g.head_size * pairs
+            + g.attention_flops(step.requests, absorbed)
         )
-        memory = (g.weights_read(step.num_tokens) + lm_head) * g.weight_bytes
+        memory = (g.weights_read(step.num_tokens, latent_paths) + lm_head) * g.weight_bytes
         memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
         compute_us = flops / self.flops_per_s * 1e6
         memory_us = memory / self.bytes_per_s * 1e6
         communication_us = self.communication_s(step.num_tokens) * 1e6
+        breakdown = {
+            "compute_us": compute_us,
+            "memory_us": memory_us,
+            "communication_us": communication_us,
+        }
+        if g.has_latent_attention:
+            breakdown["mla_decode_path_reqs"] = float(sum(absorbed))
         return StepCost(
             device_s=(self.fixed_us + max(compute_us, memory_us) + communication_us) * 1e-6,
             host_s=self.host.host_s(step),
-            breakdown={
-                "compute_us": compute_us,
-                "memory_us": memory_us,
-                "communication_us": communication_us,
-            },
+            breakdown=breakdown,
         )
 
 
