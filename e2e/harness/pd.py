@@ -13,9 +13,14 @@ each serves TENT's metrics on its own port.
 
 The run is then checked from what the servers and routers recorded: every
 request completed, decode compared every byte it received with prefill's
-pattern (``kv_check``) on every rank, the connector failed no transfer, each
-rank's TENT saw the bytes its connector moved, and the KV crossed its
-rank's network's router, not another's or the control one's.
+pattern (``kv_check``) on every rank, the connector failed no transfer and
+moved the bytes decode checked, each rank's TENT saw the bytes its connector
+moved, and the KV crossed its rank's network's router, not another's or the
+control one's. A model of several KV cache groups (full and sliding-window
+attention) is checked group by group against the rank's layout, a window's
+pulls holding its last blocks only; the verdict keeps each group's evidence
+(blocks and bytes checked, pulls clipped to the window, null places and
+reused blocks in its allocations).
 """
 
 from __future__ import annotations
@@ -289,6 +294,27 @@ def execute(run: Run, output: Path | None = None) -> dict:
     return verdict
 
 
+def recheck(output: str | Path) -> dict:
+    """A saved run's checks again, from its results directory, with this
+    harness: written to ``verdict-recheck.json``, the run's own
+    ``verdict.json`` left as it was."""
+    output = Path(output)
+    raw = json.loads((output / "run.json").read_text())
+    raw.pop("addresses", None)
+    run = Run(**{**raw, "model": Path(raw["model"]), "proxy": Path(raw["proxy"]),
+                 "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
+                 "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
+    ranks = run.server.tensor_parallel_size
+    verdict = check(
+        json.loads((output / "bench.json").read_text()),
+        *[[(output / _step_log_name(role, dp, tp)).read_text() for dp, tp in getattr(run, role).ranks(ranks)]
+          for role in ("prefill", "decode")],
+        json.loads((output / "routers.json").read_text()), run,
+        json.loads((output / "tent.json").read_text()))
+    (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
+    return verdict
+
+
 def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], routers: dict[str, int],
           run: Run, tent: dict[str, list[dict]] | None = None) -> dict:
     """The run's checks, from the client's results, every rank's step logs
@@ -343,10 +369,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 bad = [c for c in checks if not c.get("ok") or c.get("mismatched_bytes")]
                 if bad:
                     problems.append(f"{at}{len(bad)} request(s) received KV bytes unlike prefill's: {bad[0]}")
-                if layout and any(c.get("bytes") != c["blocks"] * c["layers"] * layout["block_bytes"]
-                                  for c in checks if "blocks" in c):
-                    problems.append(f"{at}byte checks disagree with the rank's KV layout ({layout['block_bytes']} "
-                                    "bytes a block and layer)")
+                if layout:
+                    # Failed receives are reported above; every other check is validated.
+                    problems.extend(f"{at}{problem}" for problem in _byte_check_problems(
+                        layout, [c for c in checks if "error" not in c], w.input_len, _pull_plans(records)))
             # The requests the rank owns: prefill's allocations; decode's
             # byte checks, else its allocations.
             owned = {_base_request_id(c["req_id"]) for c in checks if "req_id" in c} if (
@@ -371,6 +397,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                                     "moved")
             ranks[role][(dp, tp)] = {
                 "transfers": sent, "kv_checks": len(checks),
+                "groups": layout and layout.get("groups") and _group_evidence(layout, checks, records),
                 "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
                 "requests": owned, "tent": counters,
                 "kv_layout": layout and {key: layout.get(key) for key in (
@@ -386,8 +413,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         of = {role: {dp: summary for (dp, rank), summary in ranks[role].items() if rank == tp} for role in sides}
         checked = sum(summary["kv_bytes_checked"] for summary in of["decode"].values())
         moved = sum(summary["transfers"]["bytes"] for role in sides for summary in of[role].values())
-        if moved < checked:
-            problems.append(f"{at}the connector moved {moved} bytes, fewer than the {checked} decode checked")
+        # Decode checks every block the connector pulls: the transfer plan.
+        if moved < checked or (run.kv_check and moved != checked):
+            problems.append(f"{at}the connector moved {moved} bytes, not the {checked} decode checked")
         owners: dict[str, dict[str, set[int]]] = {}
         for role in sides:
             owners[role] = {}
@@ -416,6 +444,8 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked,
             "transfers_bytes": moved,
             "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
+            "groups": {role: {dp: summary["groups"] for dp, summary in of[role].items()}
+                       for role in sides} if any(s["groups"] for r in sides for s in of[r].values()) else None,
         })
     # Every TP rank of a request's owner is the same DP rank.
     for role, kind in (("prefill", "producers"), ("decode", "consumers")):
@@ -442,7 +472,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                             "its ranks moved")
         elif carried > carried_by_ranks * 1.05 + (1 << 20):
             problems.append(f"the KV network {network} carried {carried} bytes, more than its ranks' "
-                            f"{carried_by_ranks}: another rank's KV")
+                            f"{carried_by_ranks} (another rank's KV, or traffic the connectors did not count)")
     moved = sum(summary["transfers"]["bytes"] for role in sides for summary in ranks[role].values())
     control = routers.get(run.control_network, 0)
     if moved and control > moved / 10:
@@ -465,6 +495,132 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
     }
+
+
+def _pull_plans(records: list[dict]) -> dict[str, dict[int, tuple[int, int]]]:
+    """Decode's pulls as the connector posted them: for each request in a
+    step's ``reads_posted``, that step's ``allocated_groups`` entries (the
+    blocks it pulls, not the request's later scheduled table), as each
+    group's first place and blocks holding KV."""
+    plans: dict[str, dict[int, tuple[int, int]]] = {}
+    for record in records:
+        events = record.get("kv_events") or {}
+        by_group = events.get("allocated_groups") or {}
+        for request in events.get("reads_posted") or []:
+            plans[request] = {entry["group"]: (entry["first"], sum(1 for block in entry["blocks"] if block))
+                              for entry in by_group.get(request, [])}
+    return plans
+
+
+def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
+                         plans: dict[str, dict[int, tuple[int, int]]]) -> list[str]:
+    """How a rank's successful byte checks disagree with its KV layout.
+
+    An older simulator's layout (no ``groups``): each check's bytes are its
+    blocks times its layers times the layout's block bytes. Otherwise each
+    check has blocks, bytes and nested results covering each KV cache group
+    once, its blocks and bytes their sums; each group holds blocks (with
+    prefix caching off a pull has some of every group), its bytes being
+    its blocks times its layers' block bytes; a window pulls its last
+    blocks only (Mooncake's cdiv(window, block) + 1), full attention from
+    the first. For several groups or a window, each group must also be the
+    request's pull as posted (``_pull_plans``), and prompts longer than a
+    window must have had some pull clipped. Missing fields are problems."""
+    groups = layout.get("groups")
+    problems = []
+    if groups is None:
+        for check in checks:
+            if any(key not in check for key in ("blocks", "layers", "bytes")) or (
+                    check["bytes"] != check["blocks"] * check["layers"] * layout["block_bytes"]):
+                problems.append(f"{check.get('req_id')}'s byte check disagrees with the rank's KV layout "
+                                f"({layout['block_bytes']} bytes a block and layer)")
+        return _capped(problems)
+    grouped = len(groups) > 1 or any(spec.get("sliding_window") is not None for spec in groups)
+    clipped = [0] * len(groups)
+    for check in checks:
+        request = check.get("req_id")
+        if missing := [key for key in ("blocks", "bytes", "groups") if key not in check]:
+            problems.append(f"{request}'s byte check lacks {', '.join(missing)}")
+            continue
+        nested = check["groups"]
+        ids = sorted(g["group"] for g in nested)
+        if ids != list(range(len(groups))):
+            problems.append(f"{request}'s byte check covers groups {ids}, not each of the layout's "
+                            f"{len(groups)} once")
+        if (check["blocks"], check["bytes"]) != (sum(g["blocks"] for g in nested), sum(g["bytes"] for g in nested)):
+            problems.append(f"{request}'s byte check is not its groups' sum")
+        plan = plans.get(request) if grouped else None
+        if grouped and plan is None:
+            problems.append(f"{request}'s pull plan was not logged (reads_posted with allocated_groups)")
+        for g in nested:
+            spec = groups[g["group"]] if 0 <= g["group"] < len(groups) else None
+            if spec is None:
+                continue
+            if g["blocks"] < 1:
+                problems.append(f"{request}'s group {g['group']} checked no blocks")
+            if (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["layers"] * spec["block_bytes"]):
+                problems.append(f"{request}'s group {g['group']} check disagrees with the layout "
+                                f"({spec['layers']} layers of {spec['block_bytes']} bytes a block)")
+            window = spec.get("sliding_window")
+            if window is None and g["first_logical_block"] != 0:
+                problems.append(f"{request}'s full-attention group {g['group']} was pulled from block "
+                                f"{g['first_logical_block']}, not 0")
+            if window is not None:
+                bound = -(-window // spec["block_size"]) + 1
+                if g["blocks"] > bound:
+                    problems.append(f"{request}'s window group {g['group']} pulled {g['blocks']} blocks, "
+                                    f"more than its window's {bound}")
+                clipped[g["group"]] += g["first_logical_block"] > 0
+            if plan is not None and plan.get(g["group"]) != (g["first_logical_block"], g["blocks"]):
+                first, blocks = plan.get(g["group"]) or (None, 0)
+                problems.append(f"{request}'s group {g['group']} checked {g['blocks']} block(s) from "
+                                f"{g['first_logical_block']}, not the pull's {blocks} from {first}")
+    for index, spec in enumerate(groups):
+        window = spec.get("sliding_window")
+        if checks and window is not None and input_len > window + 2 * spec["block_size"] and not clipped[index]:
+            problems.append(f"no pull of window group {index} was clipped, with prompts of {input_len} tokens "
+                            f"beyond its {window}")
+    return _capped(problems)
+
+
+def _capped(problems: list[str], keep: int = 3) -> list[str]:
+    """At most `keep` problems of one kind, then their count."""
+    return problems if len(problems) <= keep else problems[:keep] + [
+        f"and {len(problems) - keep} more such problems"]
+
+
+def _group_evidence(layout: dict, checks: list[dict], records: list[dict]) -> list[dict]:
+    """Each KV cache group of a rank: its layout, what decode checked of it
+    (blocks, bytes, pulls clipped to a window and the furthest first block)
+    and its allocations by place (`allocated_groups`): places held by the
+    null block (a window's head), blocks a request got at more than one
+    place (reused), and blocks given at more than one place of any requests
+    (reallocated)."""
+    given: list[set[tuple[str, int, int]]] = [set() for _ in layout["groups"]]
+    for record in records:
+        for request, entries in ((record.get("kv_events") or {}).get("allocated_groups") or {}).items():
+            for entry in entries:
+                given[entry["group"]].update(
+                    (request, entry["first"] + offset, block) for offset, block in enumerate(entry["blocks"]))
+    evidence = []
+    for index, spec in enumerate(layout["groups"]):
+        nested = [g for check in checks for g in check.get("groups", []) if g["group"] == index]
+        firsts = [g["first_logical_block"] for g in nested]
+        places: dict[int, set[tuple[str, int]]] = {}
+        for request, place, block in given[index]:
+            if block:
+                places.setdefault(block, set()).add((request, place))
+        evidence.append({
+            **spec,
+            "checked_blocks": sum(g["blocks"] for g in nested),
+            "checked_bytes": sum(g["bytes"] for g in nested),
+            "clipped_pulls": sum(first > 0 for first in firsts),
+            "first_logical_block_max": max(firsts, default=None),
+            "null_places": len({(request, place) for request, place, block in given[index] if not block}),
+            "reused_blocks": sum(len(held) > len({request for request, _ in held}) for held in places.values()),
+            "reallocated_blocks": sum(len(held) > 1 for held in places.values()),
+        })
+    return evidence
 
 
 def _base_request_id(request_id: str) -> str:

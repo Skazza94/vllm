@@ -3,9 +3,13 @@ E2E_VLLM=1 (several minutes, most of the machine's cores)."""
 
 from __future__ import annotations
 
+import contextlib
+from dataclasses import asdict
+import io
 import json
 import os
 from pathlib import Path
+import tempfile
 import unittest
 
 from harness import pd, spec, topology
@@ -30,8 +34,10 @@ def allocated(*requests: str) -> str:
 
 
 def checked(request: str, ok: bool = True, **more) -> dict:
-    """Decode's byte check of a request, under its own request id."""
-    return {"req_id": f"cmpl-{request}-0-d", "ok": ok, "bytes": 1000, "mismatched_bytes": 0 if ok else 9, **more}
+    """Decode's byte check of a request, under its own request id: 5 blocks
+    of 50 layers, 4 bytes a block and layer."""
+    return {"req_id": f"cmpl-{request}-0-d", "ok": ok, "blocks": 5, "layers": 50, "bytes": 1000,
+            "mismatched_bytes": 0 if ok else 9, **more}
 
 
 GOOD = {
@@ -62,9 +68,13 @@ class CheckTests(unittest.TestCase):
             "failed 1 transfer": {
                 "prefill": ONE_RANK + allocated("a", "b")
                 + line(kv_transfers={"send": {"count": 2, "bytes": 2000, "failed": 1}})},
-            "fewer than the 2000 decode checked": {
+            "moved 1000 bytes, not the 2000 decode checked": {
                 "prefill": ONE_RANK + allocated("a", "b") + line(kv_transfers={"send": {"count": 1, "bytes": 1000}}),
                 "routers": {"control": 50, "data0": 5000}},
+            # Decode checks every block pulled: more is not the plan either.
+            "moved 3000 bytes, not the 2000 decode checked": {
+                "prefill": ONE_RANK + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": 3000}}),
+                "routers": {"control": 50, "data0": 3100}},
             "not both produced and consumed": {"prefill": ONE_RANK + allocated("a", "b", "c")
                                                + line(kv_transfers={"send": {"count": 2, "bytes": 2000}})},
             "KV network": {"routers": {"control": 50, "data0": 100}},
@@ -89,6 +99,169 @@ class CheckTests(unittest.TestCase):
         self.assertEqual((run.prefill.node, run.decode.kv_network), ("prefill0", "data0"))
         self.assertTrue((run.model / "config.json").is_file(), run.model)
         self.assertTrue(run.proxy.is_file(), run.proxy)
+
+
+# gpt-oss-like: a 32-token window group and a full one, 2 layers each, 4
+# bytes a block and layer; 1024-token prompts (64 blocks).
+GROUPS_LAYOUT = line(kv_layout={
+    "tp_rank": 0, "tp_size": 1, "block_bytes": 4, "bytes": 1600,
+    "groups": [{"kind": "SlidingWindowSpec", "sliding_window": 32, "block_size": 16, "layers": 2, "block_bytes": 4},
+               {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
+                "block_bytes": 4}]})
+
+
+def group_check(group: int, first: int, blocks: int, **more) -> dict:
+    return {"group": group, "first_logical_block": first, "blocks": blocks, "layers": 2, "block_bytes": 8,
+            "bytes": blocks * 8, "mismatched_bytes": 0, **more}
+
+
+def grouped(request: str, window=(61, 3), full=(0, 64)) -> dict:
+    """Decode's check of a request: the window's last blocks, every full one."""
+    groups = [group_check(0, *window), group_check(1, *full)]
+    return checked(request, blocks=window[1] + full[1], layers=4, bytes=sum(g["bytes"] for g in groups),
+                   groups=groups)
+
+
+def pulled(request: str, window=(61, 3), full=(0, 64), offset: int = 100) -> str:
+    """Decode's pull of a request as posted: its blocks by group."""
+    return line(kv_events={"reads_posted": [f"cmpl-{request}-0-d"], "allocated_groups": {f"cmpl-{request}-0-d": [
+        {"group": 0, "first": window[0], "blocks": list(range(offset, offset + window[1]))},
+        {"group": 1, "first": full[0], "blocks": list(range(offset + 10, offset + 10 + full[1]))}]}})
+
+
+PULLS = pulled("a") + pulled("b", offset=300)
+
+
+def allocated_groups(request: str, *entries: tuple[int, int, list[int]], side: str = "p") -> str:
+    return line(kv_events={"allocated_groups": {f"cmpl-{request}-0-{side}": [
+        {"group": group, "first": first, "blocks": blocks} for group, first, blocks in entries]}})
+
+
+class GroupCheckTests(unittest.TestCase):
+    MOVED = 2 * (3 + 64) * 8
+
+    def verdict(self, checks=None, moved=MOVED, prefill_events="", decode_events="", pulls=PULLS) -> dict:
+        checks = checks or [grouped("a"), grouped("b")]
+        prefill = (GROUPS_LAYOUT + allocated("a", "b") + prefill_events
+                   + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
+        decode = GROUPS_LAYOUT + pulls + decode_events + "".join(line(kv_check=c) for c in checks)
+        return pd.check({"completed": 2, "errors": []}, [prefill], [decode],
+                        {"control": 50, "data0": moved + 100}, RUN)
+
+    def test_groups_are_checked_and_their_evidence_kept(self) -> None:
+        # Prefill gave the window block 1 again at its fourth place; decode's
+        # table pads the window's head with the null block.
+        verdict = self.verdict(
+            prefill_events=allocated_groups("a", (0, 0, [1, 2, 3]), (1, 0, [4, 5, 6]))
+            + allocated_groups("a", (0, 3, [1])),
+            decode_events=allocated_groups("a", (0, 61, [7, 8, 9]), side="d")
+            + allocated_groups("a", (0, 0, [0] * 61 + [7, 8, 9]), side="d"))
+        self.assertEqual(verdict["problems"], [])
+        window, full = verdict["ranks"][0]["groups"]["decode"][0]
+        self.assertEqual((window["kind"], window["checked_blocks"], window["clipped_pulls"],
+                          window["first_logical_block_max"], window["null_places"]),
+                         ("SlidingWindowSpec", 6, 2, 61, 61))
+        self.assertEqual((full["checked_blocks"], full["checked_bytes"], full["clipped_pulls"]), (128, 1024, 0))
+        window = verdict["ranks"][0]["groups"]["prefill"][0][0]
+        self.assertEqual((window["reused_blocks"], window["reallocated_blocks"]), (1, 1))
+        # Listed twice at one place (a pull, then the scheduled table) is not
+        # a reallocation; a block given to another request is.
+        verdict = self.verdict(
+            prefill_events=allocated_groups("a", (0, 0, [1, 2])) + allocated_groups("b", (0, 0, [2])),
+            decode_events=allocated_groups("a", (0, 61, [7, 8, 9]), side="d")
+            + allocated_groups("a", (0, 0, [0] * 61 + [7, 8, 9]), side="d"))
+        decode_window = verdict["ranks"][0]["groups"]["decode"][0][0]
+        self.assertEqual((decode_window["reused_blocks"], decode_window["reallocated_blocks"]), (0, 0))
+        prefill_window = verdict["ranks"][0]["groups"]["prefill"][0][0]
+        self.assertEqual((prefill_window["reused_blocks"], prefill_window["reallocated_blocks"]), (0, 1))
+
+    def test_group_failures_are_reported(self) -> None:
+        wrong_bytes = grouped("a")
+        wrong_bytes["groups"][1] = group_check(1, 0, 64, bytes=1000)
+        wrong_bytes["bytes"] = 24 + 1000
+        unsummed = grouped("a")
+        unsummed["bytes"] += 8
+        omitted = grouped("a")
+        omitted["groups"] = omitted["groups"][:1]
+        omitted["bytes"] = 24
+        duplicated = grouped("a")
+        duplicated["groups"] = [duplicated["groups"][0], *duplicated["groups"]]
+        duplicated["bytes"] += 24
+        ungrouped = grouped("a")
+        del ungrouped["groups"]
+        cases = {
+            "covers groups [0], not each of the layout's 2 once": [omitted, grouped("b")],
+            "covers groups [0, 0, 1], not each of the layout's 2 once": [duplicated, grouped("b")],
+            "cmpl-a-0-d's byte check lacks groups": [ungrouped, grouped("b")],
+            # Within every bound, but not what was pulled.
+            "group 1 checked 32 block(s) from 0, not the pull's 64 from 0": [grouped("a", full=(0, 32)),
+                                                                             grouped("b")],
+            "group 0 checked 3 block(s) from 1, not the pull's 3 from 61": [grouped("a", window=(1, 3)),
+                                                                            grouped("b")],
+            "group 1 check disagrees with the layout": [wrong_bytes, grouped("b")],
+            "is not its groups' sum": [unsummed, grouped("b")],
+            "pulled 4 blocks, more than its window's 3": [grouped("a", window=(60, 4)), grouped("b")],
+            "full-attention group 1 was pulled from block 2": [grouped("a", full=(2, 62)), grouped("b")],
+            "no pull of window group 0 was clipped": [grouped("a", window=(0, 3)), grouped("b", window=(0, 3))],
+        }
+        for message, checks in cases.items():
+            with self.subTest(message=message):
+                moved = sum(c["bytes"] for c in checks)
+                problems = self.verdict(checks, moved=moved)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+        problems = self.verdict(pulls=pulled("a"))["problems"]
+        self.assertTrue(any("cmpl-b-0-d's pull plan was not logged" in p for p in problems), problems)
+
+    def test_checks_missing_fields_are_not_skipped(self) -> None:
+        # A truncated full group whose aggregate blocks were dropped, or
+        # both aggregates and groups: validated, not let through.
+        truncated = grouped("a", full=(0, 32))
+        del truncated["blocks"]
+        bare = grouped("a")
+        del bare["blocks"], bare["groups"]
+        for message, check in (("lacks blocks", truncated), ("lacks blocks, groups", bare)):
+            with self.subTest(message=message):
+                problems = self.verdict([check, grouped("b")], moved=check["bytes"] + grouped("b")["bytes"])[
+                    "problems"]
+                self.assertTrue(any(f"cmpl-a-0-d's byte check {message}" in p for p in problems), problems)
+
+    def test_every_group_of_a_pull_holds_blocks(self) -> None:
+        # Full attention left out of the posted pull and checked empty.
+        empty = grouped("a", full=(0, 0))
+        pulls = line(kv_events={"reads_posted": ["cmpl-a-0-d"], "allocated_groups": {"cmpl-a-0-d": [
+            {"group": 0, "first": 61, "blocks": [100, 101, 102]}]}}) + pulled("b", offset=300)
+        problems = self.verdict([empty, grouped("b")], moved=empty["bytes"] + grouped("b")["bytes"],
+                                pulls=pulls)["problems"]
+        self.assertTrue(any("cmpl-a-0-d's group 1 checked no blocks" in p for p in problems), problems)
+        self.assertTrue(any("not the pull's 0 from None" in p for p in problems), problems)
+
+
+class RecheckTests(unittest.TestCase):
+    """`python -m harness recheck` on a saved results directory."""
+
+    def save(self, directory: Path, checks: list[dict]) -> None:
+        moved = sum(c["bytes"] for c in checks)
+        (directory / "run.json").write_text(json.dumps(
+            {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}}, default=str))
+        (directory / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
+        (directory / "routers.json").write_text(json.dumps({"control": 50, "data0": moved + 100}))
+        (directory / "tent.json").write_text("{}")
+        (directory / "prefill-steps.jsonl").write_text(
+            GROUPS_LAYOUT + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": moved}}))
+        (directory / "decode-steps.jsonl").write_text(
+            GROUPS_LAYOUT + PULLS + "".join(line(kv_check=c) for c in checks))
+
+    def test_recheck_exits_with_the_verdict(self) -> None:
+        from harness.__main__ import main
+
+        for checks, status in (([grouped("a"), grouped("b")], 0), ([grouped("a", full=(0, 32)), grouped("b")], 1)):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                self.save(Path(directory), checks)
+                with contextlib.redirect_stdout(io.StringIO()) as printed:
+                    self.assertEqual(main(["recheck", directory]), status)
+                verdict = json.loads((Path(directory) / "verdict-recheck.json").read_text())
+                self.assertEqual(json.loads(printed.getvalue())["problems"], verdict["problems"])
+                self.assertEqual(bool(verdict["problems"]), bool(status))
 
 
 TP2 = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", ["data0", "data1"]),
@@ -176,7 +349,10 @@ class TensorParallelCheckTests(unittest.TestCase):
         prefill, decode = rank_logs(1)
         problems = self.verdict(logs=[rank_logs(0), (prefill, decode.replace('"blocks": 5', '"blocks": 4'))])[
             "problems"]
-        self.assertTrue(any("disagree with the rank's KV layout" in p for p in problems), problems)
+        self.assertTrue(any("disagrees with the rank's KV layout" in p for p in problems), problems)
+        # An older layout's check without its blocks is not let through.
+        problems = self.verdict(logs=[rank_logs(0), (prefill, decode.replace('"blocks": 5, ', ''))])["problems"]
+        self.assertTrue(any("disagrees with the rank's KV layout" in p for p in problems), problems)
 
     def test_rank_networks_must_pair(self) -> None:
         self.assertEqual(TP2.prefill.rank_networks(2), ["data0", "data1"])
