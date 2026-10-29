@@ -65,12 +65,41 @@ its startup log reports it: prefix-cache hit rates and preemption depend on it.
 | `linear` | `fixed_us + prefill_us_per_token * P + decode_us_per_req * D + decode_us_per_kv_token * K` | those four, plus `host_us` or `host_fit_log` |
 | `table` | nearest-neighbor interpolation over a step log | `path`, `k` |
 | `replay` | exact match on the step's batch composition, else `fallback` | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
+| `roofline` | a GPU's FLOPs and HBM bandwidth over the model's layers (below) | `gpu` or `peak_tflops`/`hbm_tbps`, efficiencies, `fixed_us`, `host_us`, interconnect, `mla_backend`, `ep_all2all`, `ep_moe_interface` |
 | `module.Class` | a `vllm.v1.worker.simulated.timing.TimingProvider` | its keyword arguments |
 
 A provider receives a `StepDescriptor`: per request, the tokens scheduled in
 the step, the KV length before it, the prompt length, prefix-cache hits at
-admission, draft tokens and whether it is prefilling; plus batch totals,
-common-prefix blocks and the parallel configuration. It returns a `StepCost`.
+admission, draft tokens, whether it is prefilling and, in an MoE-DP joint
+step, its DP rank; plus batch totals, common-prefix blocks and the parallel
+configuration. It returns a `StepCost`.
+
+`roofline` prices a step as `fixed_us` plus the longer of its FLOPs at
+`peak_tflops * compute_efficiency` and its bytes at `hbm_tbps *
+bandwidth_efficiency` (presets: `gpu` = `a100`, `h100`, `h200`, `b200`), from
+the built model's layers: dense, MoE (each token through its top-k experts,
+the experts a step's tokens are expected to route to read) and dense MLA. It
+records what it rests on in the step log's `timing` record. Other parallel
+layouts are rejected rather than mispriced:
+
+* Tensor parallelism adds two all-reduces per layer at the GPU's NVLink
+  bandwidth (`interconnect_gbs`, `interconnect_efficiency`,
+  `collective_latency_us`).
+* MLA requests take the decode or prefill path as vLLM's MLA backend on the
+  GPU splits the batch (`mla_backend` overrides it).
+* MoE models with data-parallel attention and expert parallelism
+  (`--data-parallel-size N --enable-expert-parallel`, one rank per DP rank,
+  N up to 8, experts split evenly) are priced per joint step: between the
+  synchronizations at each MoE layer, the slowest rank's own requests set the
+  pace; every rank then runs its share of the experts, and the all-to-all is
+  added without overlap. `ep_all2all` models `allgather_reducescatter`
+  (vLLM's default) or `deepep_high_throughput`, independently of the backend
+  the CPU build constructs; `ep_moe_interface` (`modular` or `monolithic`)
+  sets whether `allgather_reducescatter` gathers top-k ids and weights or
+  every router logit: `modular` by default, and required on `b200`, where
+  vLLM's default MoE kernel may be either. Routing is taken as uniform and
+  balanced: routing skew, grouped routing, EPLB and DeepEP low-latency are
+  not modeled.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also
 be written by hand, as JSONL records of
@@ -213,7 +242,8 @@ same scheduler output.
   `i > 0` logs to `<log_path>.dp<i>`. MoE models run their DP ranks in
   lockstep: wherever the real runner synchronizes them, the ranks gather
   their step descriptors into one joint step, priced once and logged by DP
-  rank 0. Joint steps do not record accepted drafts.
+  rank 0, busy or idle; each request keeps its DP rank. Joint steps do not
+  record accepted drafts.
 
 Only the output rank (last pipeline stage, first tensor-parallel rank) writes
 the step log. On CUDA hosts each rank binds its own device, using a few MB of

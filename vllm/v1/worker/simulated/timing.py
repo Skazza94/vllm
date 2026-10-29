@@ -56,6 +56,9 @@ class SimRequestStep:
     """Prefix-cache hits credited at admission (0 for already-running reqs)."""
     num_spec_tokens: int
     is_prefill: bool
+    dp_rank: int = 0
+    """The data-parallel rank serving it: in an MoE-DP joint step, which
+    rank's batch it belongs to."""
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,13 @@ def gather_dp_step(descriptor: StepDescriptor) -> StepDescriptor:
     from vllm.distributed.parallel_state import get_dp_group
 
     group = get_dp_group()
+    descriptor = dataclasses.replace(
+        descriptor,
+        requests=tuple(
+            dataclasses.replace(r, dp_rank=group.rank_in_group)
+            for r in descriptor.requests
+        ),
+    )
     gathered: list[StepDescriptor | None] = [None] * group.world_size
     dist.all_gather_object(gathered, descriptor, group=group.cpu_group)
     others = [d for i, d in enumerate(gathered) if i != group.rank_in_group]
@@ -387,6 +397,21 @@ INTERCONNECT_PRESETS: dict[str, dict[str, Any]] = {
     "h200": {"interconnect": "NVLink 4", "interconnect_gbs": 450.0},
     "b200": {"interconnect": "NVLink 5", "interconnect_gbs": 900.0},
 }
+# GPUs one NVLink domain joins in each preset's usual (HGX) node: the widest
+# expert-parallel group modeled so far.
+NVLINK_DOMAIN_GPUS = 8
+# Expert-parallel all-to-all backends modeled, by vLLM's all2all_backend name:
+# a dispatched token copy is its hidden state plus routing metadata, through
+# the modular interface its top_k weights (float32) and ids (int32 gathered,
+# int64 for DeepEP).
+EXPERT_PARALLEL_BACKENDS = {
+    "allgather_reducescatter": {"id_bytes": 4, "weight_bytes": 4},
+    "deepep_high_throughput": {"id_bytes": 8, "weight_bytes": 4},
+}
+# How the allgather_reducescatter backend dispatches: through a modular MoE
+# kernel, a token's top-k ids and weights; through a monolithic one (FlashInfer
+# TRTLLM's, Blackwell only), every expert's router logit.
+MOE_INTERFACES = ("modular", "monolithic")
 # Each preset's CUDA compute capability, which vLLM's backend choice follows.
 COMPUTE_CAPABILITIES: dict[str, tuple[int, int]] = {
     "a100": (8, 0),
@@ -536,6 +561,8 @@ class LatentAttentionBackend:
         (`reorder_batch_to_split_decodes_and_prefills`; within each region
         the step's order is kept here), and the builder splits it after
         its leading decodes (`split_decodes_and_prefills`)."""
+        if not requests:
+            return ()
         threshold = self.decode_threshold
 
         def region(r: SimRequestStep) -> int:
@@ -617,8 +644,20 @@ ROUTING_MODEL = {
         "local_experts * (1 - (1 - top_k / global_experts) ** step_tokens)"
     ),
     "flops_per_token_per_layer": "2 * (dense_params + top_k * params_per_expert)",
-    "not_modeled": ["routing skew (error direction unknown)", "expert parallelism"],
+    "not_modeled": [
+        "routing skew (error direction unknown)",
+        "grouped (node-limited) routing",
+    ],
 }
+
+
+def rank_reach_probability(global_experts: int, local_experts: int, top_k: int) -> float:
+    """The probability that a token's top_k distinct experts, chosen
+    uniformly, include one of a rank's local_experts:
+    1 - C(E - m, k) / C(E, k)."""
+    return 1.0 - math.comb(global_experts - local_experts, top_k) / math.comb(
+        global_experts, top_k
+    )
 
 
 class UnsupportedModelLayout(ValueError):
@@ -664,6 +703,14 @@ class ModelGeometry:
     or KV's)."""
     kv_cache_dtype: str = "auto"
     tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
+    expert_parallel: bool = False
+    """Routed experts split across the data-parallel ranks (EP), each rank
+    running attention on its own requests (TP=1 per rank)."""
+    routing_method: str | None = None
+    """The MoE layers' routing (vLLM's RoutingMethodType name)."""
+    router_logits_bytes: int | None = None
+    """Bytes per router logit (the gate's output dtype)."""
     layers: tuple[LayerGeometry, ...] | None = None
     """Each decoder layer's matrix multiplications, from the built model;
     None: `layer_params` for every layer (a dense model's config)."""
@@ -772,8 +819,32 @@ class ModelGeometry:
                 elif isinstance(module, (LinearBase, torch.nn.Linear)):
                     dense += linear_params(module)
             layers.append(LayerGeometry(dense, tuple(experts), latent))
+        routers = [
+            module.moe_config
+            for layer in candidates[0]
+            for module in layer.modules()
+            if isinstance(module, RoutedExperts)
+        ]
+        if routers:
+            method = getattr(routers[0], "routing_method", None)
+            dtype = getattr(routers[0], "router_logits_dtype", None)
+            geometry = dataclasses.replace(
+                geometry,
+                routing_method=method.name if method is not None else None,
+                router_logits_bytes=dtype.itemsize if dtype is not None else None,
+            )
         if any(layer.experts for layer in layers):
             cls._check_moe(vllm_config)
+            if geometry.expert_parallel:
+                ranks = geometry.data_parallel_size
+                for layer in layers:
+                    for experts in layer.experts:
+                        if experts.local_experts * ranks != experts.global_experts:
+                            raise ValueError(
+                                "The roofline timing provider models experts "
+                                f"placed evenly: {experts.local_experts} of "
+                                f"{experts.global_experts} on one of {ranks} ranks."
+                            )
         if any(layer.latent for layer in layers):
             cls._check_latent(vllm_config)
         elif vllm_config.model_config.use_mla:
@@ -815,17 +886,35 @@ class ModelGeometry:
     @staticmethod
     def _check_moe(vllm_config: VllmConfig) -> None:
         parallel = vllm_config.parallel_config
-        # Pure TP keeps every expert on each rank, its matrices split. DCP
-        # reuses the TP ranks, so the world size does not show it.
+        tp = parallel.tensor_parallel_size
+        # Pure TP keeps every expert on each rank, its matrices split. Data
+        # parallelism with EP splits the experts across the DP ranks, each
+        # running attention for its own requests. DCP reuses the TP ranks, so
+        # the world size does not show it.
+        pure_tp = (
+            parallel.world_size_across_dp == tp and not parallel.enable_expert_parallel
+        )
+        dp_attention_ep = (
+            parallel.enable_expert_parallel
+            and tp == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size > 1
+        )
         if (
-            parallel.world_size_across_dp > parallel.tensor_parallel_size
-            or parallel.enable_expert_parallel
+            not (pure_tp or dp_attention_ep)
             or parallel.decode_context_parallel_size > 1
             or parallel.prefill_context_parallel_size > 1
         ):
             raise ValueError(
                 "The roofline timing provider models MoE models under tensor "
-                "parallelism only (no PP, DP, EP, PCP or DCP) so far."
+                "parallelism, or data-parallel attention with expert "
+                "parallelism (one rank per DP rank), without PP, PCP or DCP "
+                "so far."
+            )
+        if parallel.enable_eplb:
+            raise ValueError(
+                "The roofline timing provider does not model EPLB's redundant "
+                "experts."
             )
         ModelGeometry._check_unquantized(vllm_config, "MoE")
 
@@ -859,6 +948,8 @@ class ModelGeometry:
             activation_bytes=model.dtype.itemsize,
             kv_cache_dtype=cache_dtype,
             tensor_parallel_size=tp,
+            data_parallel_size=parallel.data_parallel_size,
+            expert_parallel=parallel.enable_expert_parallel,
         )
 
     @property
@@ -907,8 +998,36 @@ class ModelGeometry:
         return plain, tuple(latent.items())  # type: ignore[arg-type]
 
     @property
+    def ep_size(self) -> int:
+        """Ranks the routed experts are split across, synchronizing at every
+        MoE layer: the DP ranks under EP, else 1."""
+        if self.expert_parallel and any(
+            layer.experts for layer in self.layers or ()
+        ):
+            return self.data_parallel_size
+        return 1
+
+    @property
     def has_latent_attention(self) -> bool:
         return bool(self._attention_layers[1])
+
+    def layer_attention_flops(
+        self, layer: LayerGeometry, request: SimRequestStep, absorbed: bool
+    ) -> int:
+        """One request's QK^T and AV in one layer, and its MLA `kv_b_proj`."""
+        scheduled = request.num_scheduled_tokens
+        pairs = scheduled * request.num_computed_tokens + scheduled * (scheduled + 1) // 2
+        if layer.latent is None:
+            return 4 * self.num_heads * self.head_size * pairs
+        return layer.latent.attention_flops(pairs, absorbed) + layer.latent.kv_b_flops(
+            request, absorbed
+        )
+
+    def layer_kv_bytes_per_token(self, layer: LayerGeometry) -> float:
+        """K and V, or the MLA latent, of one token in one layer."""
+        if layer.latent is None:
+            return 2 * self.num_kv_heads * self.head_size * self.kv_bytes
+        return layer.latent.latent_size * self.kv_bytes
 
     def attention_flops(
         self, requests: tuple[SimRequestStep, ...], absorbed: tuple[bool, ...]
@@ -982,7 +1101,15 @@ class RooflineTimingProvider:
     prefill path (MHA over its up-projected context) as the modeled
     backend splits the batch (`LatentAttentionBackend`): ``mla_backend``
     (a `LATENT_ATTENTION_BACKENDS` name), else vLLM's default on ``gpu``.
-    Every rank reads and writes the whole latent."""
+    Every rank reads and writes the whole latent.
+
+    Data-parallel attention with expert parallelism (TP=1 per DP rank, up to
+    `NVLINK_DOMAIN_GPUS` ranks): a joint step's segments between the MoE
+    layers' synchronizations each take the slowest rank's own work; every
+    rank's share of the experts and the all-to-all (``ep_all2all``, an
+    `EXPERT_PARALLEL_BACKENDS` name, else ``all2all_backend``; its dispatch
+    through ``ep_moe_interface``, else vLLM's default MoE kernel on ``gpu``)
+    follow without overlap."""
 
     def __init__(
         self,
@@ -1000,6 +1127,8 @@ class RooflineTimingProvider:
         interconnect_efficiency: float = 0.8,
         collective_latency_us: float = 10.0,
         mla_backend: str | None = None,
+        ep_all2all: str | None = None,
+        ep_moe_interface: str | None = None,
     ) -> None:
         if gpu is not None and gpu not in GPU_PRESETS:
             raise ValueError(f"Unknown GPU {gpu!r}; presets: {sorted(GPU_PRESETS)}.")
@@ -1057,8 +1186,24 @@ class RooflineTimingProvider:
                 f"Unknown MLA backend {mla_backend!r}; modeled: "
                 f"{sorted(LATENT_ATTENTION_BACKENDS)}."
             )
+        if ep_all2all is not None and ep_all2all not in EXPERT_PARALLEL_BACKENDS:
+            raise ValueError(
+                f"The roofline timing provider models the expert-parallel "
+                f"all-to-all as {sorted(EXPERT_PARALLEL_BACKENDS)}, not "
+                f"{ep_all2all!r}."
+            )
         self._gpu = gpu
         self._mla_backend = mla_backend
+        if ep_moe_interface is not None and ep_moe_interface not in MOE_INTERFACES:
+            raise ValueError(
+                f"ep_moe_interface is one of {MOE_INTERFACES}, not {ep_moe_interface!r}."
+            )
+        self._ep_all2all = ep_all2all
+        self._ep_moe_interface = ep_moe_interface
+        # Resolved with an expert-parallel model's layers (_check_geometry).
+        self.expert_all2all: str | None = None
+        self.moe_interface: str | None = None
+        self._expert_parallel: dict[str, Any] | None = None
         # Resolved with an MLA model's layers (_check_geometry).
         self.latent_backend: LatentAttentionBackend | None = None
         self._latent_attention: dict[str, Any] | None = None
@@ -1104,6 +1249,156 @@ class RooflineTimingProvider:
             )
         if geometry.has_latent_attention:
             self._select_latent_backend(geometry)
+        if geometry.ep_size > 1:
+            self._select_expert_all2all(geometry)
+
+    def _select_expert_all2all(self, geometry: ModelGeometry) -> None:
+        """The modeled expert-parallel all-to-all: ``ep_all2all``, else the
+        backend vLLM constructs (``all2all_backend``), which on the CPU
+        platform need not be the one modeled."""
+        ranks = geometry.ep_size
+        if ranks > NVLINK_DOMAIN_GPUS:
+            raise ValueError(
+                f"The roofline timing provider models expert parallelism within "
+                f"one NVLink domain ({NVLINK_DOMAIN_GPUS} GPUs), not {ranks} ranks."
+            )
+        if self.collective_bytes_per_s is None:
+            raise ValueError(
+                "The roofline timing provider needs an interconnect for expert "
+                "parallelism: a gpu preset, or interconnect_gbs."
+            )
+        configured = (
+            self._vllm_config.parallel_config.all2all_backend
+            if self._vllm_config is not None
+            else None
+        )
+        modeled = self._ep_all2all or configured or "allgather_reducescatter"
+        if modeled not in EXPERT_PARALLEL_BACKENDS:
+            raise ValueError(
+                f"The roofline timing provider models the expert-parallel "
+                f"all-to-all as {sorted(EXPERT_PARALLEL_BACKENDS)}, not "
+                f"{modeled!r}: pass ep_all2all."
+            )
+        self.expert_all2all = modeled
+        metadata = EXPERT_PARALLEL_BACKENDS[modeled]
+        interface, interface_selected_by = self._ep_moe_interface, "ep_moe_interface"
+        if modeled != "allgather_reducescatter":
+            # DeepEP dispatches top-k routed tokens only.
+            if interface == "monolithic":
+                raise ValueError(
+                    f"{modeled} dispatches through the modular MoE interface, "
+                    "not the monolithic one."
+                )
+            interface, interface_selected_by = "modular", modeled
+        elif interface is None:
+            if self._gpu is None:
+                raise ValueError(
+                    "The roofline timing provider needs the MoE interface the "
+                    "allgather_reducescatter backend dispatches through: a gpu "
+                    "preset, or ep_moe_interface."
+                )
+            if COMPUTE_CAPABILITIES[self._gpu][0] == 10:
+                # TRTLLM's monolithic kernel comes first on Blackwell where its
+                # routing, activation and expert-count limits allow: not
+                # modeled, so the interface must be named.
+                raise ValueError(
+                    f"The roofline timing provider needs ep_moe_interface on "
+                    f"{self._gpu}: vLLM's default MoE kernel there may be "
+                    "monolithic or modular."
+                )
+            interface = "modular"
+            interface_selected_by = (
+                f"vLLM's default unquantized MoE kernel on {self._gpu}: a "
+                "modular one (Triton first, no monolithic candidate)"
+            )
+        if interface == "monolithic" and geometry.router_logits_bytes is None:
+            raise ValueError(
+                "The roofline timing provider needs the router logits' dtype "
+                "for the monolithic MoE interface."
+            )
+        self.moe_interface = interface
+        if interface == "monolithic":
+            routing = (
+                f"global_experts * {geometry.router_logits_bytes} (every "
+                "expert's router logit)"
+            )
+        else:
+            routing = (
+                f"top_k * ({metadata['id_bytes']} + {metadata['weight_bytes']}) "
+                "(top-k ids and weights)"
+            )
+        if modeled == "allgather_reducescatter":
+            communication = (
+                "per MoE layer, a variable-size all-gather of the hidden states "
+                "and routing metadata, then a variable-size reduce-scatter of "
+                "the outputs (vLLM: one grouped NCCL broadcast or reduce per "
+                "rank): each phase moves the other ranks' tokens, T - T_r, "
+                "each way, priced at the busiest rank"
+            )
+        else:
+            communication = (
+                "per MoE layer, dispatch sends each token once to every other "
+                "rank holding one of its top_k experts, combine returns one "
+                "reduced output per such rank: rank r sends T_r (N - 1) p "
+                "copies and receives (T - T_r) p, p = 1 - C(E - m, k) / C(E, k) "
+                "for m local experts; each phase priced at the busiest rank's "
+                "send or receive demand"
+            )
+        self._expert_parallel = {
+            "model": (
+                "data-parallel attention with expert parallelism: each rank runs "
+                "its own requests' attention, dense weights and LM head; the "
+                "routed experts are split evenly; the ranks synchronize at each "
+                "MoE layer's dispatch and combine"
+            ),
+            "step_time": (
+                "fixed + the sum, over the segments between synchronizations, "
+                "of the slowest rank's max(compute, memory), + all-to-all time "
+                "(no overlap)"
+            ),
+            "experts": (
+                "every rank: 2 * T * top_k * local / global experts' FLOPs, and "
+                "the local experts the joint step's T tokens are expected to "
+                "route to read"
+            ),
+            "ranks": ranks,
+            "all2all_modeled": modeled,
+            "all2all_configured": configured,
+            "all2all_configured_note": (
+                "vLLM's all2all_backend setting; the CPU build may construct "
+                "another (it cannot build DeepEP)"
+            ),
+            "moe_interface": interface,
+            "moe_interface_selected_by": interface_selected_by,
+            "routing_method": geometry.routing_method,
+            "communication": communication,
+            "bytes_per_token_copy": (
+                f"dispatch: hidden_size * activation_bytes + {routing}; "
+                "combine: hidden_size * activation_bytes"
+            ),
+            "dispatch_dtype_bytes": geometry.activation_bytes,
+            "bandwidth": (
+                "each GPU's interconnect bandwidth per direction times "
+                "interconnect_efficiency, sending and receiving concurrently, "
+                "plus collective_latency_us per phase (uncalibrated, shared "
+                "with tensor parallelism)"
+            ),
+            "baseline": (
+                "idealized: balanced uniform routing, no overlap; skew may "
+                "lengthen steps (imbalance) or shorten them (fewer experts "
+                "read), overlap shortens them"
+            ),
+            "not_modeled": [
+                "routing skew",
+                "grouped (node-limited) routing, which changes which ranks a "
+                "token reaches",
+                "EPLB's redundant experts",
+                "overlap of the all-to-all with compute",
+                "idle ranks' dummy batches and padding",
+                "expert parallelism across NVLink domains",
+                "DeepEP low-latency",
+            ],
+        }
 
     def _select_latent_backend(self, geometry: ModelGeometry) -> None:
         """The MLA backend vLLM would run for the model's layers, KV cache,
@@ -1225,10 +1520,14 @@ class RooflineTimingProvider:
         }
         if geometry.has_latent_attention:
             assumptions["latent_attention"] = self._latent_attention
+        if geometry.ep_size > 1:
+            assumptions["expert_parallel"] = self._expert_parallel
         return assumptions
 
     def estimate(self, step: StepDescriptor) -> StepCost:
         g = self._bound()
+        if g.ep_size > 1:
+            return self._estimate_expert_parallel(step, g)
         sampled = sum(
             1
             for r in step.requests
@@ -1263,6 +1562,113 @@ class RooflineTimingProvider:
             host_s=self.host.host_s(step),
             breakdown=breakdown,
         )
+
+    def _estimate_expert_parallel(self, step: StepDescriptor, g: ModelGeometry) -> StepCost:
+        """A joint step of data-parallel ranks with expert-parallel MoE
+        layers: each rank's own work between synchronizations, the slowest
+        rank's setting the pace, then the experts' and the all-to-all's."""
+        ranks = g.ep_size
+        batches: list[list[SimRequestStep]] = [[] for _ in range(ranks)]
+        for request in step.requests:
+            batches[request.dp_rank].append(request)
+        tokens = [sum(r.num_scheduled_tokens for r in batch) for batch in batches]
+        total = sum(tokens)
+        # Each rank splits its own batch between the MLA paths.
+        absorbed = [
+            self.latent_backend.absorbed(tuple(batch))
+            if self.latent_backend is not None
+            else (False,) * len(batch)
+            for batch in batches
+        ]
+        flops = [0.0] * ranks
+        memory = [0.0] * ranks
+        local_s = experts_s = communication_s = 0.0
+
+        def segment() -> float:
+            slowest = max(
+                max(f / self.flops_per_s, m / self.bytes_per_s)
+                for f, m in zip(flops, memory)
+            )
+            flops[:] = [0.0] * ranks
+            memory[:] = [0.0] * ranks
+            return slowest
+
+        for layer in g.layers or ():
+            for rank, batch in enumerate(batches):
+                if not batch:
+                    continue  # an idle rank's dummy batch is not modeled
+                paths = any(absorbed[rank]) + (not all(absorbed[rank]))
+                weights = layer.dense_params
+                if layer.latent is not None:
+                    weights += layer.latent.kv_b_params * paths
+                context = sum(r.num_computed_tokens + r.num_scheduled_tokens for r in batch)
+                flops[rank] += 2 * layer.dense_params * tokens[rank] + sum(
+                    g.layer_attention_flops(layer, r, a)
+                    for r, a in zip(batch, absorbed[rank])
+                )
+                memory[rank] += weights * g.weight_bytes + (
+                    context + tokens[rank]
+                ) * g.layer_kv_bytes_per_token(layer)
+            for experts in layer.experts:
+                local_s += segment()  # dispatch
+                share = experts.local_experts / experts.global_experts
+                expert_flops = 2 * total * experts.top_k * share * experts.params_per_expert
+                expert_bytes = (
+                    experts.expected_read(total) * experts.params_per_expert * g.weight_bytes
+                )
+                experts_s += max(
+                    expert_flops / self.flops_per_s, expert_bytes / self.bytes_per_s
+                )
+                communication_s += self.expert_all2all_s(tokens, experts, g)
+        lm_head = g.hidden_size * g.vocab_size
+        for rank, batch in enumerate(batches):
+            if batch:
+                sampled = sum(
+                    1
+                    for r in batch
+                    if r.num_computed_tokens + r.num_scheduled_tokens >= r.num_prompt_tokens
+                )
+                flops[rank] += 2 * lm_head * sampled
+                memory[rank] += lm_head * g.weight_bytes
+        local_s += segment()
+        breakdown = {
+            "local_us": local_s * 1e6,
+            "experts_us": experts_s * 1e6,
+            "communication_us": communication_s * 1e6,
+            "idle_dp_ranks": float(tokens.count(0)),
+        }
+        if g.has_latent_attention:
+            breakdown["mla_decode_path_reqs"] = float(sum(map(sum, absorbed)))
+        return StepCost(
+            device_s=self.fixed_us * 1e-6 + local_s + experts_s + communication_s,
+            host_s=self.host.host_s(step),
+            breakdown=breakdown,
+        )
+
+    def expert_all2all_s(
+        self, tokens: list[int], experts: ExpertGeometry, g: ModelGeometry
+    ) -> float:
+        """One MoE layer's dispatch and combine, for the ranks' token counts."""
+        assert self.expert_all2all is not None and self.collective_bytes_per_s
+        total = sum(tokens)
+        metadata = EXPERT_PARALLEL_BACKENDS[self.expert_all2all]
+        hidden = g.hidden_size * g.activation_bytes
+        if self.moe_interface == "monolithic":
+            assert g.router_logits_bytes is not None
+            routing = experts.global_experts * g.router_logits_bytes
+        else:
+            routing = experts.top_k * (metadata["id_bytes"] + metadata["weight_bytes"])
+        if self.expert_all2all == "allgather_reducescatter":
+            copies = max(total - t for t in tokens)
+        else:
+            p = rank_reach_probability(
+                experts.global_experts, experts.local_experts, experts.top_k
+            )
+            ranks = len(tokens)
+            copies = max(max(t * (ranks - 1) * p, (total - t) * p) for t in tokens)
+        dispatch = copies * (hidden + routing) / self.collective_bytes_per_s
+        combine = copies * hidden / self.collective_bytes_per_s
+        return 2 * self.collective_latency_s + dispatch + combine
 
 
 def _step_features(step: StepDescriptor) -> tuple[float, float, float]:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Roofline step timing of dense, MoE and MLA models on a GPU preset."""
+"""Roofline step timing of dense, MoE and MLA models on a GPU preset, and of
+data-parallel attention with expert parallelism."""
 
 import dataclasses
 import json
@@ -11,6 +12,7 @@ import torch
 
 from tests.v1.worker.simulated.utils import sim_req, sim_step
 from vllm.v1.worker.simulated.timing import (
+    EXPERT_PARALLEL_BACKENDS,
     LATENT_ATTENTION_BACKENDS,
     ExpertGeometry,
     LatentAttentionGeometry,
@@ -19,6 +21,8 @@ from vllm.v1.worker.simulated.timing import (
     ModelGeometry,
     RooflineTimingProvider,
     UnsupportedModelLayout,
+    merge_dp_descriptors,
+    rank_reach_probability,
 )
 
 # Qwen2.5-7B in bf16, one rank.
@@ -64,7 +68,9 @@ def qwen_7b_config(cache_dtype, dtype=torch.bfloat16):
     )
     return SimpleNamespace(
         model_config=model,
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, data_parallel_size=1, enable_expert_parallel=False
+        ),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
     )
 
@@ -565,8 +571,11 @@ def test_zero_collective_latency_is_allowed():
 def moe_parallel_config(**parallel):
     sizes = {
         "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
         "world_size_across_dp": 4,
         "enable_expert_parallel": False,
+        "enable_eplb": False,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         **parallel,
@@ -577,16 +586,30 @@ def moe_parallel_config(**parallel):
     )
 
 
-def test_moe_timing_allows_pure_tensor_parallelism_only():
+DP_ATTENTION_EP = {
+    "tensor_parallel_size": 1,
+    "data_parallel_size": 4,
+    "world_size_across_dp": 4,
+    "enable_expert_parallel": True,
+}
+
+
+def test_moe_timing_allows_tensor_or_dp_attention_with_expert_parallelism():
     ModelGeometry._check_moe(moe_parallel_config())
+    ModelGeometry._check_moe(moe_parallel_config(**DP_ATTENTION_EP))
     for parallel in (
         {"decode_context_parallel_size": 2},  # reuses the TP ranks
         {"prefill_context_parallel_size": 2},
-        {"enable_expert_parallel": True},
+        {"enable_expert_parallel": True},  # EP across TP ranks
         {"world_size_across_dp": 8},  # PP or DP
+        {**DP_ATTENTION_EP, "enable_expert_parallel": False},  # DP without EP
+        {**DP_ATTENTION_EP, "tensor_parallel_size": 2, "world_size_across_dp": 8},
+        {**DP_ATTENTION_EP, "pipeline_parallel_size": 2, "world_size_across_dp": 8},
     ):
-        with pytest.raises(ValueError, match="tensor parallelism only"):
+        with pytest.raises(ValueError, match="data-parallel attention with expert"):
             ModelGeometry._check_moe(moe_parallel_config(**parallel))
+    with pytest.raises(ValueError, match="EPLB"):
+        ModelGeometry._check_moe(moe_parallel_config(**DP_ATTENTION_EP, enable_eplb=True))
 
 
 # MLA, from the built model. DeepSeek-V2-Lite projects queries directly
@@ -1009,3 +1032,400 @@ def test_a_built_mla_model_keeps_kv_b_proj_apart(tmp_path, monkeypatch, config, 
     assert record["latent_attention"]["backend"] == "TRITON_MLA"
     assert record["latent_attention"]["checked"]["block_size"] == 64
     assert [s["cost"]["breakdown"]["mla_decode_path_reqs"] for s in steps] == [0, 1]
+
+
+# Data-parallel attention with expert parallelism: one rank per DP rank, the
+# routed experts split evenly across them.
+def expert_parallel(geometry, ranks):
+    layers = tuple(
+        dataclasses.replace(
+            layer,
+            experts=tuple(
+                dataclasses.replace(e, local_experts=e.global_experts // ranks)
+                for e in layer.experts
+            ),
+        )
+        for layer in geometry.layers
+    )
+    return dataclasses.replace(
+        geometry, layers=layers, data_parallel_size=ranks, expert_parallel=True
+    )
+
+
+def on_rank(rank, request):
+    return dataclasses.replace(request, dp_rank=rank)
+
+
+# Two ranks of a model whose dense layer outweighs everything else, then an
+# MoE layer of 4 experts (2 a rank), top-2; a vocabulary large enough that
+# sampling many tokens takes long. Unit rates: 1 TFLOP/s, 1 TB/s, 1 GB/s.
+SEGMENT_EXPERTS = ExpertGeometry(
+    local_experts=2, global_experts=4, top_k=2, params_per_expert=1000
+)
+TWO_RANKS = ModelGeometry(
+    num_layers=2,
+    hidden_size=64,
+    num_heads=2,
+    num_kv_heads=1,
+    head_size=32,
+    intermediate_size=0,
+    vocab_size=1_000_000,
+    weight_bytes=2,
+    kv_bytes=2,
+    data_parallel_size=2,
+    expert_parallel=True,
+    layers=(LayerGeometry(10_000_000), LayerGeometry(1000, (SEGMENT_EXPERTS,))),
+)
+
+
+def unit_rates(geometry=TWO_RANKS, **kwargs):
+    kwargs.setdefault("ep_moe_interface", "modular")
+    return RooflineTimingProvider(
+        None,
+        peak_tflops=1.0,
+        hbm_tbps=1.0,
+        compute_efficiency=1.0,
+        bandwidth_efficiency=1.0,
+        fixed_us=0.0,
+        interconnect_gbs=1.0,
+        interconnect_efficiency=1.0,
+        collective_latency_us=0.0,
+        geometry=geometry,
+        **kwargs,
+    )
+
+
+def test_routing_reaches_a_rank_with_the_probability_of_hitting_its_experts():
+    # One expert of 256, 32 a rank: a token reaches 1 rank of 8; remote with
+    # probability 7/8, never 0.
+    p = rank_reach_probability(256, 32, 1)
+    assert p == pytest.approx(1 / 8)
+    assert (8 - 1) * p == pytest.approx(7 / 8)
+    # top_k >= ranks does not reach every rank.
+    assert rank_reach_probability(256, 32, 8) == pytest.approx(
+        1 - (224 * 223 * 222 * 221 * 220 * 219 * 218 * 217)
+        / (256 * 255 * 254 * 253 * 252 * 251 * 250 * 249)
+    )
+    assert rank_reach_probability(256, 32, 8) < 1
+    # More experts than the other ranks hold: certainly this rank.
+    assert rank_reach_probability(8, 4, 5) == 1
+    assert rank_reach_probability(4, 2, 2) == pytest.approx(5 / 6)
+
+
+def test_ranks_pace_each_segment_between_synchronizations():
+    """Rank 0's prefill dominates before the MoE layer's dispatch, rank 1's
+    50 sampled tokens after its combine: the step takes both, not the larger
+    of the ranks' totals."""
+    prefill = on_rank(0, sim_req("a", 1000, 0, 2000))
+    decodes = [on_rank(1, sim_req(f"d{i}", 1, 10, 10)) for i in range(50)]
+    cost = unit_rates().estimate(sim_step(0, prefill, *decodes))
+
+    def seconds(flops, nbytes):
+        return max(flops / 1e12, nbytes / 1e12)
+
+    dense = 10_000_000 + 1000
+    kv = 2 * 1 * 32 * 2  # K and V, one head of 32, bf16
+    lm_head = 64 * 1_000_000
+    before = [
+        seconds(
+            2 * dense * 1000 + 2 * 4 * 2 * 32 * (1000 * 1001 // 2),
+            dense * 2 + 2 * (1000 + 1000) * kv,
+        ),
+        seconds(
+            2 * dense * 50 + 2 * 4 * 2 * 32 * 50 * 11,
+            dense * 2 + 2 * 50 * (11 + 1) * kv,
+        ),
+    ]
+    after = [seconds(0, lm_head * 2), seconds(2 * lm_head * 50, lm_head * 2)]
+    assert before[0] > before[1] and after[1] > after[0]
+    assert cost.breakdown["local_us"] == pytest.approx((before[0] + after[1]) * 1e6)
+    assert cost.breakdown["local_us"] > max(b + a for b, a in zip(before, after)) * 1e6
+    # Every rank runs its share of the 1050 tokens' experts.
+    experts = seconds(
+        2 * 1050 * 2 * (2 / 4) * 1000,
+        SEGMENT_EXPERTS.expected_read(1050) * 1000 * 2,
+    )
+    assert cost.breakdown["experts_us"] == pytest.approx(experts * 1e6)
+    assert cost.device_s == pytest.approx(
+        (cost.breakdown["local_us"] + cost.breakdown["experts_us"]
+         + cost.breakdown["communication_us"]) * 1e-6
+    )
+
+
+@pytest.mark.parametrize("backend", sorted(EXPERT_PARALLEL_BACKENDS))
+def test_the_all_to_all_moves_the_busiest_ranks_tokens(backend):
+    # 1000 tokens on rank 0, 50 on rank 1.
+    step = sim_step(
+        0,
+        on_rank(0, sim_req("a", 1000, 0, 2000)),
+        *[on_rank(1, sim_req(f"d{i}", 1, 10, 10)) for i in range(50)],
+    )
+    cost = unit_rates(ep_all2all=backend).estimate(step)
+    if backend == "allgather_reducescatter":
+        # Each rank gathers the other's tokens: rank 1 receives 1000.
+        copies, routing = 1000, 2 * (4 + 4)
+    else:
+        # Rank 0 sends 1000 p copies to rank 1 and receives 50 p.
+        copies, routing = 1000 * 5 / 6, 2 * (8 + 4)
+    seconds = copies * (64 * 2 + routing) / 1e9 + copies * 64 * 2 / 1e9
+    assert cost.breakdown["communication_us"] == pytest.approx(seconds * 1e6)
+
+
+def test_a_monolithic_moe_kernel_gathers_every_router_logit():
+    """Through FlashInfer TRTLLM's monolithic kernel, allgather_reducescatter
+    gathers all E router logits per token: 4 here, BF16."""
+    geometry = dataclasses.replace(TWO_RANKS, router_logits_bytes=2)
+    request = sim_req("r", 300, 0, 300)
+    cost = unit_rates(geometry, ep_moe_interface="monolithic").estimate(
+        sim_step(0, on_rank(1, request))
+    )
+    assert cost.breakdown["communication_us"] == pytest.approx(
+        300 * (64 * 2 + 4 * 2 + 64 * 2) / 1e9 * 1e6
+    )
+    with pytest.raises(ValueError, match="router logits' dtype"):
+        unit_rates(ep_moe_interface="monolithic")
+    with pytest.raises(ValueError, match="modular MoE interface"):
+        unit_rates(geometry, ep_all2all="deepep_high_throughput", ep_moe_interface="monolithic")
+    with pytest.raises(ValueError, match="pass ep_moe_interface|a gpu preset, or ep_moe_interface"):
+        unit_rates(geometry, ep_moe_interface=None)
+
+
+def bf16_deepseek_v3_on_8_ranks():
+    return dataclasses.replace(
+        expert_parallel(deepseek(DEEPSEEK_V3), 8),
+        routing_method="DeepSeekV3",
+        router_logits_bytes=2,
+    )
+
+
+def per_layer_all2all_us(provider, metadata, tokens=100):
+    hidden = 7168 * 2
+    return (2 * 10e-6 + tokens * (2 * hidden + metadata) / provider.collective_bytes_per_s) * 1e6
+
+
+@pytest.mark.parametrize("gpu", ["a100", "h100", "h200"])
+def test_the_moe_interface_is_modular_where_vllm_has_no_monolithic_kernel(gpu):
+    provider = RooflineTimingProvider(None, gpu=gpu, geometry=bf16_deepseek_v3_on_8_ranks())
+    recorded = provider.assumptions()["expert_parallel"]
+    assert recorded["moe_interface"] == "modular"
+    assert recorded["moe_interface_selected_by"].startswith(
+        f"vLLM's default unquantized MoE kernel on {gpu}"
+    )
+    # Top-k ids and weights: 64 bytes per token for BF16 DeepSeek-V3.
+    step = sim_step(0, on_rank(0, sim_req("r", 100, 0, 100)))
+    assert provider.estimate(step).breakdown["communication_us"] == pytest.approx(
+        58 * per_layer_all2all_us(provider, 8 * (4 + 4))
+    )
+
+
+def test_b200_needs_the_moe_interface_named():
+    """TRTLLM's monolithic kernel leads on Blackwell where its routing,
+    activation and expert-count limits allow, which is not modeled."""
+    geometry = bf16_deepseek_v3_on_8_ranks()
+    with pytest.raises(ValueError, match="needs ep_moe_interface on b200"):
+        RooflineTimingProvider(None, gpu="b200", geometry=geometry)
+    step = sim_step(0, on_rank(0, sim_req("r", 100, 0, 100)))
+    for interface, metadata in (("monolithic", 256 * 2), ("modular", 8 * (4 + 4))):
+        provider = RooflineTimingProvider(
+            None, gpu="b200", geometry=geometry, ep_moe_interface=interface
+        )
+        recorded = provider.assumptions()["expert_parallel"]
+        assert (recorded["moe_interface"], recorded["moe_interface_selected_by"]) == (
+            interface,
+            "ep_moe_interface",
+        )
+        # 512 bytes of router logits per token, or 64 of top-k.
+        assert provider.estimate(step).breakdown["communication_us"] == pytest.approx(
+            58 * per_layer_all2all_us(provider, metadata)
+        )
+    # DeepEP dispatches top-k tokens whatever the GPU.
+    deepep = RooflineTimingProvider(
+        None, gpu="b200", geometry=geometry, ep_all2all="deepep_high_throughput"
+    )
+    assert deepep.assumptions()["expert_parallel"]["moe_interface"] == "modular"
+
+
+def test_an_idle_rank_runs_its_share_of_the_experts_only():
+    """DP rank 0 idle: no local work of its own (its dummy batch is not
+    modeled), but its experts serve rank 1's tokens and it takes part in
+    the all-to-all; the step is the same as with the roles swapped."""
+    request = sim_req("r", 300, 0, 300)
+    idle0 = unit_rates().estimate(sim_step(0, on_rank(1, request)))
+    idle1 = unit_rates().estimate(sim_step(0, on_rank(0, request)))
+    assert idle0.breakdown["idle_dp_ranks"] == 1
+    assert idle0.device_s == pytest.approx(idle1.device_s)
+    assert idle0.breakdown["experts_us"] > 0
+    # The busy rank's whole share of the gather: all 300 tokens.
+    assert idle0.breakdown["communication_us"] == pytest.approx(
+        300 * (64 * 2 + 2 * 8 + 64 * 2) / 1e9 * 1e6
+    )
+
+
+def test_each_rank_splits_its_own_batch_between_the_mla_paths():
+    """FLASH_ATTN_MLA (h100) takes a lone 50-token prompt on the decode path:
+    another rank's 600-token prompt does not change that."""
+    geometry = expert_parallel(deepseek(DEEPSEEK_V2_LITE), 2)
+    long, short = sim_req("a", 600, 0, 600), sim_req("b", 50, 0, 50)
+    cost = mla(geometry).estimate(sim_step(0, on_rank(0, long), on_rank(1, short)))
+    assert cost.breakdown["mla_decode_path_reqs"] == 1
+    # One merged batch would split after the long prompt.
+    assert absorbed("FLASH_ATTN_MLA", long, short) == (False, False)
+
+
+@pytest.mark.parametrize("backend", sorted(LATENT_ATTENTION_BACKENDS))
+def test_an_empty_batch_takes_no_mla_path(backend):
+    assert absorbed(backend) == ()
+
+
+def test_expert_parallel_assumptions_are_recorded():
+    geometry = expert_parallel(deepseek(DEEPSEEK_V3), 8)
+    recorded = mla(geometry).assumptions()["expert_parallel"]
+    assert recorded["ranks"] == 8
+    assert recorded["all2all_modeled"] == "allgather_reducescatter"
+    assert recorded["all2all_configured"] is None
+    assert recorded["moe_interface"] == "modular"
+    assert recorded["dispatch_dtype_bytes"] == 2
+    assert "grouped (node-limited) routing, which changes which ranks a token reaches" in (
+        recorded["not_modeled"]
+    )
+    assert "expert_parallel" not in moe().assumptions()
+    # vLLM constructs one backend, the roofline models another.
+    constructed = SimpleNamespace(
+        parallel_config=SimpleNamespace(all2all_backend="deepep_low_latency"),
+        cache_config=SimpleNamespace(block_size=64),
+    )
+    with pytest.raises(ValueError, match="pass ep_all2all"):
+        RooflineTimingProvider(constructed, gpu="h100", geometry=geometry)
+    provider = RooflineTimingProvider(
+        constructed, gpu="h100", geometry=geometry, ep_all2all="deepep_high_throughput"
+    )
+    recorded = provider.assumptions()["expert_parallel"]
+    assert (recorded["all2all_modeled"], recorded["all2all_configured"]) == (
+        "deepep_high_throughput",
+        "deepep_low_latency",
+    )
+    assert (recorded["moe_interface"], recorded["moe_interface_selected_by"]) == (
+        "modular",
+        "deepep_high_throughput",
+    )
+
+
+def test_unmodeled_expert_parallel_layouts_are_rejected():
+    with pytest.raises(ValueError, match="not 'deepep_low_latency'"):
+        mla(expert_parallel(deepseek(DEEPSEEK_V3), 8), ep_all2all="deepep_low_latency")
+    with pytest.raises(ValueError, match="one NVLink domain"):
+        mla(expert_parallel(deepseek(DEEPSEEK_V3), 16))
+    with pytest.raises(ValueError, match="interconnect for expert parallelism"):
+        RooflineTimingProvider(
+            None,
+            peak_tflops=989.0,
+            hbm_tbps=3.35,
+            geometry=expert_parallel(deepseek(DEEPSEEK_V3), 8),
+            mla_backend="FLASHMLA",
+        )
+
+
+def test_dense_data_parallel_ranks_time_as_one_rank():
+    # Independent engines: no joint steps, each rank times its own.
+    geometry = dataclasses.replace(QWEN_7B, data_parallel_size=4)
+    step = sim_step(0, sim_req("r", 1000, 0, 1000), sim_req("s", 1, 999, 1000))
+    one = h100().estimate(step)
+    four = RooflineTimingProvider(None, gpu="h100", geometry=geometry).estimate(step)
+    assert four.device_s == one.device_s and four.breakdown == one.breakdown
+
+
+def test_joint_steps_keep_each_requests_dp_rank():
+    first = sim_step(3, on_rank(0, sim_req("b", 1, 9, 10)))
+    second = sim_step(7, on_rank(1, sim_req("a", 5, 0, 5)))
+    joint = merge_dp_descriptors([first, second])
+    assert [(r.req_id, r.dp_rank) for r in joint.requests] == [("a", 1), ("b", 0)]
+    assert joint.step_index == 3
+
+
+class StubExperts(torch.nn.Module):
+    """A rank's routed experts as a built model holds them: `local` of
+    `total`, top-2, 3 * 8 * 4 weights each."""
+
+    def __init__(self, local, total):
+        super().__init__()
+        self.moe_config = SimpleNamespace(
+            hidden_dim=8,
+            hidden_dim_unpadded=None,
+            intermediate_size_per_partition=4,
+            intermediate_size_per_partition_unpadded=None,
+            is_act_and_mul=True,
+            num_local_experts=local,
+            num_experts=total,
+            experts_per_token=2,
+        )
+
+
+@pytest.mark.parametrize("local,total,even", [(3, 9, True), (3, 8, False)])
+def test_expert_parallel_experts_must_be_placed_evenly(monkeypatch, local, total, even):
+    from vllm.model_executor.layers.fused_moe import routed_experts
+
+    monkeypatch.setattr(routed_experts, "RoutedExperts", StubExperts)
+    config = qwen_7b_config("auto")
+    config.model_config.is_moe = True
+    config.model_config.quantization = None
+    config.parallel_config = moe_parallel_config(
+        **{**DP_ATTENTION_EP, "data_parallel_size": 3, "world_size_across_dp": 3}
+    ).parallel_config
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(StubExperts(local, total) for _ in range(28))
+    if even:
+        geometry = ModelGeometry.from_model(config, model)
+        assert (geometry.ep_size, geometry.layers[0].experts[0].local_experts) == (3, 3)
+    else:
+        with pytest.raises(ValueError, match="placed evenly: 3 of 8 on one of 3"):
+            ModelGeometry.from_model(config, model)
+
+
+def test_dp_attention_ranks_build_their_experts_and_log_every_joint_step(tmp_path):
+    """Served with DP=2 and EP, each rank builds 4 of the 8 experts. With
+    the only request on DP rank 1, the idle DP rank 0 still logs each
+    lockstep step, in order."""
+    import requests
+
+    from tests.utils import RemoteOpenAIServer
+
+    model_dir = write_config(tmp_path / "qwen2-moe", QWEN2_MOE)
+    log = tmp_path / "steps.jsonl"
+    simulation = {"timing": "roofline", "timing_args": {"gpu": "h100"}, "log_path": str(log)}
+    args = [
+        "--skip-tokenizer-init",
+        "--dtype", "bfloat16",
+        "--max-model-len", "256",
+        "--block-size", "16",
+        "--kv-cache-memory-bytes", str(8 * 1024**2),
+        "--enforce-eager",
+        "--data-parallel-size", "2",
+        "--enable-expert-parallel",
+        "--simulate-forward",
+        "--simulation-config", json.dumps(simulation),
+    ]  # fmt: skip
+    with RemoteOpenAIServer(model_dir, args, max_wait_seconds=600) as server:
+        response = requests.post(
+            server.url_for("v1/completions"),
+            json={"model": model_dir, "prompt": [5] * 40, "max_tokens": 3, "ignore_eos": True},
+            headers={"X-data-parallel-rank": "1"},
+            timeout=120,
+        )
+        response.raise_for_status()
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    (timing,) = [r["timing"] for r in records if "timing" in r]
+    geometry = timing["geometry"]
+    assert (geometry["data_parallel_size"], geometry["expert_parallel"]) == (2, True)
+    experts = geometry["layers"][-1]["experts"][0]
+    assert (experts["local_experts"], experts["global_experts"]) == (4, 8)
+    assert timing["expert_parallel"]["all2all_modeled"] == "allgather_reducescatter"
+    # Hopper: a modular MoE kernel, so top-k metadata is gathered.
+    assert timing["expert_parallel"]["moe_interface"] == "modular"
+    assert geometry["routing_method"] is not None
+    assert geometry["router_logits_bytes"] in (2, 4)
+    steps = [r for r in records if "step" in r]
+    assert len(steps) >= 3  # prefill and decodes
+    assert all(r["dp_rank"] == 1 for s in steps for r in s["step"]["requests"])
+    assert all(s["cost"]["breakdown"]["idle_dp_ranks"] == 1 for s in steps)
+    indexes = [s["step"]["step_index"] for s in steps]
+    assert indexes == sorted(set(indexes))

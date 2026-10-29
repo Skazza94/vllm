@@ -620,7 +620,13 @@ class SimulatedModelRunner(GPUModelRunner):
         )
         cost = self._estimate(descriptor)
         t_start = self._agree_start(max(now, self._stage_free_at[0]), now)
-        self._run_pipeline(t_start, cost.device_s)
+        device_end = self._run_pipeline(t_start, cost.device_s)
+        if self._syncs_dp():
+            # Every rank counts the lockstep steps; DP rank 0 logs them, busy
+            # or idle.
+            if self.step_log is not None and descriptor.requests:
+                self.step_log.write(descriptor, cost, t_start, device_end, [])
+            self._step_index += 1
         return None, None
 
     def _num_accepted(
