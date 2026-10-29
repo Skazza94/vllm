@@ -236,9 +236,9 @@ class SimulationConfig:
         ones, or an MoE model's data-parallel ranks with expert parallelism.
         Sliding-window layers, alone or beside full-attention ones, over
         Mooncake, which moves each window's blocks only; Qwen gated
-        delta-net layers (a hybrid model's) over Mooncake, without prefix
-        caching, each request's state one block. The native connector stays
-        in place."""
+        delta-net or Mamba2 layers (a hybrid model's) over Mooncake, without
+        prefix caching, each request's state one block. The native connector
+        stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -326,15 +326,15 @@ class SimulationConfig:
         if sparse_mla or model.is_attention_free:
             problems.append(
                 "an attention model, dense, MoE or dense MLA, its layers full "
-                "or sliding-window attention or Qwen gated delta-nets (no "
-                "sparse MLA or attention-free models)"
+                "or sliding-window attention, Qwen gated delta-nets or Mamba2 "
+                "mixers (no sparse MLA or attention-free models)"
             )
         elif (
             model.get_sliding_window() is not None or model.is_hybrid
         ) and kv_transfer.kv_connector != "MooncakeConnector":
             # Only Mooncake's plan is followed group by group: a sliding
             # window's blocks are clipped to the window on both sides, a
-            # delta-net's state is one block.
+            # recurrent layer's state is one block.
             problems.append(
                 "MooncakeConnector for a sliding-window or hybrid model, not "
                 f"{kv_transfer.kv_connector}"

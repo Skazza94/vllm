@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -186,6 +187,93 @@ def qwen3_next_model_dir(tmp_path_factory):
     return str(directory)
 
 
+# A tiny Nemotron-H: Mamba2, MLP-only, attention, Mamba2 layers.
+NEMOTRON_H = {
+    "architectures": ["NemotronHForCausalLM"],
+    "model_type": "nemotron_h",
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "hybrid_override_pattern": "M-*M",
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "mamba_num_heads": 8,
+    "mamba_head_dim": 8,
+    "n_groups": 2,
+    "ssm_state_size": 16,
+    "conv_kernel": 4,
+    "chunk_size": 16,
+    "mamba_hidden_act": "silu",
+    "use_conv_bias": True,
+    "mamba_proj_bias": False,
+    "mlp_hidden_act": "relu2",
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 256,
+}
+# A tiny Falcon-H1: each layer runs a Mamba2 mixer beside attention.
+FALCON_H1 = {
+    "architectures": ["FalconH1ForCausalLM"],
+    "model_type": "falcon_h1",
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "mamba_d_ssm": 64,
+    "mamba_n_heads": 8,
+    "mamba_d_head": 8,
+    "mamba_n_groups": 1,
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 1,
+    "mamba_chunk_size": 16,
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 256,
+}
+# A tiny Zamba2: Mamba2 layers, two of them hybrid (a shared transformer
+# block, attention, beside the mixer).
+ZAMBA2 = {
+    "architectures": ["Zamba2ForCausalLM"],
+    "model_type": "zamba2",
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 4,
+    "layers_block_type": ["mamba", "hybrid", "mamba", "hybrid"],
+    "hybrid_layer_ids": [1, 3],
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "attention_head_dim": 32,
+    "num_mem_blocks": 1,
+    "use_shared_attention_adapter": False,
+    "use_mem_rope": False,
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 2,
+    "mamba_ngroups": 1,
+    "n_mamba_heads": 8,
+    "mamba_headdim": 16,
+    "chunk_size": 16,
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 256,
+}
+
+
+def write_model_dir(tmp_path_factory, name, config):
+    directory = tmp_path_factory.mktemp(name)
+    (directory / "config.json").write_text(json.dumps(config))
+    return str(directory)
+
+
+@pytest.fixture(scope="module")
+def nemotron_h_model_dir(tmp_path_factory):
+    return write_model_dir(tmp_path_factory, "tiny-nemotron-h", NEMOTRON_H)
+
+
 @pytest.fixture(params=["model_dir", "moe_model_dir", "mla_model_dir"])
 def any_model_dir(request):
     """The dense model, the MoE one, then the MLA one: blocks of each layer's
@@ -330,6 +418,21 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
         engine_config(qwen3_next_model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
     with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window or hybrid"):
         engine_config(qwen3_next_model_dir)
+
+
+def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
+    nemotron_h_model_dir,
+):
+    mooncake = {"kv_connector": "MooncakeConnector"}
+    config = engine_config(nemotron_h_model_dir, kv_transfer=mooncake)
+    assert config.model_config.is_hybrid
+    assert config.cache_config.mamba_cache_mode == "none"
+    with pytest.raises(ValueError, match="hybrid model without prefix caching"):
+        engine_config(
+            nemotron_h_model_dir, kv_transfer=mooncake, enable_prefix_caching=True
+        )
+    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window"):
+        engine_config(nemotron_h_model_dir)
 
 
 def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
@@ -654,14 +757,21 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
         del llm
 
 
-def test_a_gdn_producer_fills_each_groups_pages_padding_included(
-    qwen3_next_model_dir, monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "model, mamba_type",
+    [("qwen3_next_model_dir", "GDN_ATTN"), ("nemotron_h_model_dir", "MAMBA2")],
+    ids=["qwen3-next", "nemotron-h"],
+)
+def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
+    model, mamba_type, request, monkeypatch, tmp_path
 ):
-    """Tiny Qwen3-Next: three delta-net groups and an attention group in one
-    allocation, the platform's attention block covering a state's page. A
-    chunked prompt: each attention block holds its place's pattern, each
-    delta-net's single state block (place 0) its pattern over the whole
-    page, padding included; the layout record describes the padding."""
+    """Tiny Qwen3-Next (three delta-net groups) and Nemotron-H (Mamba2
+    groups, an MLP-only layer without KV): recurrent groups and an attention
+    group in one allocation, the platform's attention block covering a
+    state's page. A chunked prompt: each attention block holds its place's
+    pattern, each recurrent layer's single state block (place 0) its
+    pattern over the whole page, padding included; the layout record
+    describes the padding."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
@@ -675,7 +785,7 @@ def test_a_gdn_producer_fills_each_groups_pages_padding_included(
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     log = tmp_path / "steps.jsonl"
     llm = LLM(
-        model=qwen3_next_model_dir,
+        model=request.getfixturevalue(model),
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=256,
@@ -706,7 +816,7 @@ def test_a_gdn_producer_fills_each_groups_pages_padding_included(
         config = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_config
         groups = config.kv_cache_groups
         kinds = [type(g.kv_cache_spec).__name__ for g in groups]
-        assert sorted(kinds) == ["FullAttentionSpec"] + ["MambaSpec"] * 3
+        assert sorted(set(kinds)) == ["FullAttentionSpec", "MambaSpec"]
         pages = {
             name: g.kv_cache_spec.page_size_bytes for g in groups for name in g.layer_names
         }
@@ -727,11 +837,59 @@ def test_a_gdn_producer_fills_each_groups_pages_padding_included(
             for t in RecordingConnector.registered[0].values()
         }
         assert layout["bytes"] == sum(storages.values())
-        gdn = [g for g in layout["groups"] if g["kind"] == "MambaSpec"]
-        assert {g["mamba_type"] for g in gdn} == {"GDN_ATTN"}
-        assert all(g["real_page_bytes"] < g["block_bytes"] == g["block_stride"] for g in gdn)
+        states = [g for g in layout["groups"] if g["kind"] == "MambaSpec"]
+        assert {g["mamba_type"] for g in states} == {mamba_type}
+        assert all(
+            g["real_page_bytes"] < g["block_bytes"] == g["block_stride"] for g in states
+        )
     finally:
         del llm
+
+
+@pytest.mark.parametrize(
+    "config, layer",
+    [(FALCON_H1, "0 (FalconH1ParallelHybrid)"), (ZAMBA2, "1 (Zamba2HybridLayer)")],
+    ids=["falcon-h1", "zamba2"],
+)
+def test_real_mode_refuses_a_mixer_beside_attention_whatever_the_timing(
+    config, layer, monkeypatch, tmp_path
+):
+    """Falcon-H1 runs attention and a Mamba2 mixer in each layer, Zamba2's
+    hybrid layers a shared transformer block beside theirs: refused as built,
+    under linear timing too (no roofline)."""
+    from vllm import LLM
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    connector = RecordingConnector.make(hma=True)
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    model_dir = tmp_path / config["model_type"]
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(config))
+    message = rf"decoder layer {re.escape(layer)} has 1 mixers and attention"
+    with pytest.raises(Exception, match=message):
+        LLM(
+            model=str(model_dir),
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            max_model_len=256,
+            kv_cache_memory_bytes=8 * 1024**2,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+            simulation_config={
+                "simulate_forward": True,
+                "kv_transfer_mode": "real",
+                "timing": "linear",
+                "timing_args": {"fixed_us": 100},
+            },
+            kv_transfer_config={
+                "kv_connector": "MooncakeConnector",
+                "kv_role": "kv_producer",
+                "kv_buffer_device": "cpu",
+            },
+        )
 
 
 @pytest.mark.parametrize("block_size", [32, 16])

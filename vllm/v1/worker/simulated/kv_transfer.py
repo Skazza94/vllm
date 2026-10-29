@@ -315,25 +315,26 @@ def completed_transfers(
 
 # The KV cache groups real transfers move and check: full attention (MLA's
 # included) and sliding-window attention, whose blocks are the tokens' in
-# order, a window's head left null; and a gated delta-net's state, one block
-# a request (mamba_cache_mode none).
+# order, a window's head left null; and a gated delta-net's or a Mamba2
+# mixer's state, one block a request (mamba_cache_mode none).
 REAL_KV_SPECS = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, MambaSpec)
 
 
 def check_real_kv_groups(kv_cache_config: KVCacheConfig) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
     RSWA attention, attention sinks), and of Mamba states other than a
-    gated delta-net's in mamba_cache_mode none without speculative blocks,
-    whose blocks follow other rules."""
+    gated delta-net's or a Mamba2 mixer's in mamba_cache_mode none without
+    speculative blocks, whose blocks follow other rules."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+    states = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.MAMBA2)
     other = set()
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         if type(spec) not in REAL_KV_SPECS:
             other.add(type(spec).__name__)
         elif isinstance(spec, MambaSpec) and (
-            spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN
+            spec.mamba_type not in states
             or spec.mamba_cache_mode != "none"
             or spec.num_speculative_blocks
         ):
@@ -344,34 +345,81 @@ def check_real_kv_groups(kv_cache_config: KVCacheConfig) -> None:
             )
     if other:
         raise ValueError(
-            "kv_transfer_mode real moves full and sliding-window attention KV "
-            "and gated delta-net states (mamba_cache_mode none) only, not "
+            "kv_transfer_mode real moves full and sliding-window attention KV, "
+            "gated delta-net and Mamba2 states (mamba_cache_mode none) only, not "
             f"{'; '.join(sorted(other))}."
         )
 
 
 def check_real_kv_layers(model: torch.nn.Module) -> None:
     """Refuse real KV transfers of a model whose recurrent layers are not
-    Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself): Kimi's and
-    OLMo's share its KV cache groups but not its states' rules."""
+    Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself) or Mamba2
+    (`MambaMixer2` itself, without ReplaySSM or speculative state): Kimi's
+    and OLMo's delta-nets share their KV cache groups but not their states'
+    rules. Each recurrent mixer must be the only one of its decoder layer
+    (an element of the one module list holding them all), without attention
+    beside it (Falcon-H1's parallel hybrid, Zamba2's shared transformer)."""
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
     )
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 
+    mixers = [m for m in model.modules() if isinstance(m, MambaBase)]
+    if not mixers:
+        return
     other = sorted(
         {
-            type(module).__name__
-            for module in model.modules()
-            if isinstance(module, MambaBase)
-            and type(module) is not QwenGatedDeltaNetAttention
+            type(m).__name__
+            for m in mixers
+            if type(m) not in (QwenGatedDeltaNetAttention, MambaMixer2)
         }
     )
     if other:
         raise ValueError(
-            "kv_transfer_mode real moves Qwen's gated delta-net states "
-            f"(QwenGatedDeltaNetAttention) only, not {', '.join(other)}."
+            "kv_transfer_mode real moves Qwen's gated delta-net "
+            "(QwenGatedDeltaNetAttention) and Mamba2 (MambaMixer2) states only, "
+            f"not {', '.join(other)}'s."
         )
+    if any(
+        type(m) is MambaMixer2 and (m.use_replayssm or m.num_spec) for m in mixers
+    ):
+        raise ValueError(
+            "kv_transfer_mode real moves Mamba2 states without ReplaySSM or "
+            "speculative state only."
+        )
+    # The decoder layers: the elements of the one module list whose
+    # elements hold every recurrent mixer (a layer's modules taken whole,
+    # shared ones included).
+    lists = [
+        layers
+        for layers in model.modules()
+        if isinstance(layers, torch.nn.ModuleList)
+        and any(
+            isinstance(m, MambaBase) for layer in layers for m in layer.modules()
+        )
+    ]
+    held = {id(m) for layers in lists[:1] for layer in layers for m in layer.modules()}
+    if len(lists) != 1 or any(id(m) not in held for m in mixers):
+        raise ValueError(
+            "kv_transfer_mode real needs a recurrent model's mixers in one list "
+            "of decoder layers, not this layout."
+        )
+    for index, layer in enumerate(lists[0]):
+        modules = list(layer.modules())
+        recurrent = sum(isinstance(m, MambaBase) for m in modules)
+        attends = any(
+            isinstance(m, AttentionLayerBase) and not isinstance(m, MambaBase)
+            for m in modules
+        )
+        if recurrent > 1 or (recurrent and attends):
+            raise ValueError(
+                "kv_transfer_mode real moves one recurrent mixer's state a "
+                "decoder layer, without attention beside it; decoder layer "
+                f"{index} ({type(layer).__name__}) has {recurrent} mixers"
+                f"{' and attention' if attends else ''}."
+            )
 
 
 def kv_layout(

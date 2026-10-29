@@ -918,7 +918,9 @@ def test_kv_layout_describes_a_padded_state_and_counts_storage_once():
     }
 
 
-def test_real_transfers_take_a_gated_delta_nets_single_state_only():
+def test_real_transfers_take_a_recurrent_layers_single_state_only():
+    """A gated delta-net's or a Mamba2 mixer's state, one block a request
+    (mamba_cache_mode none), without speculative blocks."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -946,10 +948,15 @@ def test_real_transfers_take_a_gated_delta_nets_single_state_only():
         )
 
     check_real_kv_groups(config())
+    check_real_kv_groups(config(mamba_type=MambaAttentionBackendEnum.MAMBA2))
+    mamba2 = {"mamba_type": MambaAttentionBackendEnum.MAMBA2}
     for mamba, message in (
-        ({"mamba_type": MambaAttentionBackendEnum.MAMBA2}, "MAMBA2"),
-        ({"mamba_cache_mode": "align"}, "mamba_cache_mode align"),
+        ({"mamba_type": MambaAttentionBackendEnum.MAMBA1}, "MAMBA1"),
+        ({"mamba_type": MambaAttentionBackendEnum.SHORT_CONV}, "SHORT_CONV"),
+        ({"mamba_cache_mode": "align"}, "GDN_ATTN, mamba_cache_mode align"),
+        ({**mamba2, "mamba_cache_mode": "align"}, "MAMBA2, mamba_cache_mode align"),
         ({"num_speculative_blocks": 1}, "1 speculative blocks"),
+        ({**mamba2, "num_speculative_blocks": 1}, "1 speculative blocks"),
     ):
         with pytest.raises(ValueError, match=message):
             check_real_kv_groups(config(**mamba))
@@ -974,3 +981,117 @@ def test_real_transfers_take_qwens_gated_delta_net_layers_only():
     check_real_kv_layers(model(QwenGatedDeltaNetAttention))
     with pytest.raises(ValueError, match="not KimiDeltaAttention"):
         check_real_kv_layers(model(KimiDeltaAttention))
+
+
+def mamba2_mixer(kind=None, use_replayssm=False, num_spec=0):
+    """A built Mamba2 mixer (`kind`, default `MambaMixer2`), its fields the
+    guard reads."""
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+
+    kind = kind or MambaMixer2
+    mixer = kind.__new__(kind)
+    torch.nn.Module.__init__(mixer)
+    mixer.use_replayssm, mixer.num_spec = use_replayssm, num_spec
+    return mixer
+
+
+def attention_layer():
+    from vllm.model_executor.layers.attention import Attention
+
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    return attention
+
+
+def decoder(**children):
+    layer = torch.nn.Module()
+    for name, module in children.items():
+        setattr(layer, name, module)
+    return layer
+
+
+def recurrent_model(layers, **extra):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(layers)
+    for name, module in extra.items():
+        setattr(model, name, module)
+    return model
+
+
+def test_real_transfers_take_one_mamba2_mixer_a_decoder_layer_without_attention():
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_layers
+
+    # Nemotron-H's sublayers: a mixer, an MLP or attention a layer.
+    mlp = decoder(mixer=torch.nn.Linear(4, 4, device="meta"))
+    check_real_kv_layers(
+        recurrent_model([
+            decoder(mixer=mamba2_mixer()), mlp, decoder(mixer=attention_layer()),
+            decoder(mixer=mamba2_mixer()),
+        ])
+    )
+    # Granite-4.0-H's: a mixer's layer holds its MoE beside it, its
+    # attention layers attention.
+    moe = torch.nn.ModuleList([torch.nn.Linear(4, 4, device="meta")] * 2)
+    check_real_kv_layers(
+        recurrent_model([
+            decoder(mamba=mamba2_mixer(), block_sparse_moe=moe),
+            decoder(self_attn=attention_layer(), block_sparse_moe=moe),
+        ])
+    )
+
+    class SubMixer(MambaMixer2):
+        pass
+
+    shared = decoder(self_attn=attention_layer())
+    for model, message in (
+        (recurrent_model([decoder(mixer=mamba2_mixer(SubMixer))]), "not SubMixer's"),
+        (
+            recurrent_model([decoder(mixer=mamba2_mixer(use_replayssm=True))]),
+            "ReplaySSM",
+        ),
+        (recurrent_model([decoder(mixer=mamba2_mixer(num_spec=1))]), "speculative"),
+        # Falcon-H1: attention and a mixer in each layer.
+        (
+            recurrent_model([
+                decoder(
+                    mamba=decoder(mamba=mamba2_mixer()), self_attn=attention_layer()
+                )
+            ]),
+            r"decoder layer 0 \(Module\) has 1 mixers and attention",
+        ),
+        # Zamba2: one transformer block shared by the hybrid layers, each
+        # beside its own mixer; the second layer's is no less attention.
+        (
+            recurrent_model([
+                decoder(mamba_decoder=decoder(mamba=mamba2_mixer())),
+                *(
+                    decoder(
+                        shared_transformer=shared,
+                        mamba_decoder=decoder(mamba=mamba2_mixer()),
+                    )
+                    for _ in range(2)
+                ),
+            ]),
+            "decoder layer 1 .* has 1 mixers and attention",
+        ),
+        (
+            recurrent_model([decoder(a=mamba2_mixer(), b=mamba2_mixer())]),
+            "has 2 mixers",
+        ),
+        # A mixer outside the decoder layers, or mixers in two lists: no
+        # unambiguous decoder layers.
+        (
+            recurrent_model([decoder(mixer=mamba2_mixer())], head=mamba2_mixer()),
+            "one list of decoder layers",
+        ),
+        (
+            recurrent_model(
+                [decoder(mixer=mamba2_mixer())],
+                blocks=torch.nn.ModuleList([decoder(mixer=mamba2_mixer())]),
+            ),
+            "one list of decoder layers",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            check_real_kv_layers(model)

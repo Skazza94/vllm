@@ -229,10 +229,13 @@ def test_pulls_carry_where_each_groups_blocks_start(
         assert blocks[first:] == pulled
 
 
-def gdn_kv_cache_config(block_size: int = 16) -> KVCacheConfig:
+def gdn_kv_cache_config(
+    block_size: int = 16, mamba_type: str = "GDN_ATTN"
+) -> KVCacheConfig:
     """Qwen3-Next's groups, small: full attention, and a gated delta-net's
     state, one block a request (mamba_cache_mode none, its block the model
-    length)."""
+    length); or, `mamba_type` MAMBA2, a Mamba2 mixer's (Nemotron-H,
+    Granite-4.0-H)."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -255,7 +258,7 @@ def gdn_kv_cache_config(block_size: int = 16) -> KVCacheConfig:
                     block_size=1024,
                     shapes=((16,), (16,)),
                     dtypes=(torch.float16, torch.float16),
-                    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+                    mamba_type=MambaAttentionBackendEnum[mamba_type],
                 ),
             ),
         ],
@@ -263,8 +266,9 @@ def gdn_kv_cache_config(block_size: int = 16) -> KVCacheConfig:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("mamba_type", ["GDN_ATTN", "MAMBA2"])
 @pytest.mark.parametrize("num_tokens", [16, 17, 33])
-def test_a_gdn_pull_holds_the_prompt_but_its_last_token(num_tokens):
+def test_a_hybrid_pull_holds_the_prompt_but_its_last_token(num_tokens, mamba_type):
     """The decoder pulls N - 1 tokens' attention blocks and the state after
     them (one block, at place 0), then computes the last token itself."""
     vllm_config = create_vllm_config(
@@ -276,7 +280,9 @@ def test_a_gdn_pull_holds_the_prompt_but_its_last_token(num_tokens):
     vllm_config.cache_config.enable_prefix_caching = False
     # Scheduled in multiples of every group's block: the state's, 1024.
     vllm_config.cache_config.block_size = 1024
-    scheduler = create_scheduler(vllm_config, kv_cache_config=gdn_kv_cache_config())
+    scheduler = create_scheduler(
+        vllm_config, kv_cache_config=gdn_kv_cache_config(mamba_type=mamba_type)
+    )
     request = create_request(
         request_id=1, block_size=16, num_tokens=num_tokens, do_remote_prefill=True
     )
@@ -293,14 +299,15 @@ def test_a_gdn_pull_holds_the_prompt_but_its_last_token(num_tokens):
 
 
 @pytest.mark.cpu_test
-def test_a_gdn_producer_prefills_all_but_the_last_token():
+@pytest.mark.parametrize("mamba_type", ["GDN_ATTN", "MAMBA2"])
+def test_a_hybrid_producer_prefills_all_but_the_last_token(mamba_type):
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=16
     )
     connector = MooncakeConnectorScheduler(
         vllm_config=vllm_config,
         engine_id="test-engine",
-        kv_cache_config=gdn_kv_cache_config(),
+        kv_cache_config=gdn_kv_cache_config(mamba_type=mamba_type),
     )
     request = create_request(
         request_id=1, block_size=16, num_tokens=17, do_remote_decode=True
