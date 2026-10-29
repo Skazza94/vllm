@@ -48,7 +48,9 @@ kv_check: true
 
 server:  # both servers; defaults shown where set
   gpu: h100                   # roofline GPU preset: a100, h100, h200, b200
-  block_size: 16              # tokens per KV block (a multiple of 16)
+  block_size: 16              # tokens per KV block (a multiple of 16); null: the platform's (a hybrid model's)
+  # enable_prefix_caching: null  # null: off with kv_check, else vLLM's default (on);
+  #                               a hybrid model's real transfers need false
   kv_cache_memory_bytes: 2147483648  # KV cache per rank (default 2 GiB)
   max_model_len: 4096
   max_num_batched_tokens: 2048

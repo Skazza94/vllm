@@ -77,7 +77,11 @@ class Side:
 @dataclass
 class Server:
     gpu: str = "h100"
-    block_size: int = 16
+    block_size: int | None = 16
+    """Tokens per KV block; None: the platform's (a hybrid model's)."""
+    enable_prefix_caching: bool | None = None
+    """None: off with kv_check, else vLLM's default (on; a hybrid model's
+    real transfers need it off)."""
     kv_cache_memory_bytes: int = 2 * 1024 ** 3
     max_model_len: int = 4096
     max_num_batched_tokens: int = 2048
@@ -140,6 +144,8 @@ def load(path: str | Path) -> Run:
         raise ValueError(f"run config needs {missing}") from None
     except TypeError as error:
         raise ValueError(f"run config: {error}") from None
+    if run.kv_check and run.server.enable_prefix_caching:
+        raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
     ranks = run.server.tensor_parallel_size
     for side in (run.prefill, run.decode):
         if not isinstance(side.kv_network, str) and len(side.kv_network) != ranks:
@@ -197,7 +203,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     return [
         "env", *(f"{name}={value}" for name, value in env.items()),
         VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(SERVER_PORT),
-        "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--block-size", str(s.block_size),
+        "--served-model-name", MODEL_NAME, "--dtype", s.dtype,
+        *(["--block-size", str(s.block_size)] if s.block_size is not None else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(s.tensor_parallel_size),
@@ -206,7 +213,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         "--generation-config", "vllm", "--enforce-eager",
         # The byte check's pattern is the request's: a block cached for
         # another request would not match it.
-        *(["--no-enable-prefix-caching"] if run.kv_check else []),
+        *_prefix_caching_flags(run),
         "--simulation-config", json.dumps(simulation),
         "--kv-transfer-config", json.dumps(kv_transfer),
         "--simulate-forward",
@@ -344,6 +351,13 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             for role, side, steps in (("prefill", run.prefill, prefill_steps),
                                       ("decode", run.decode, decode_steps))}
     tents = {role: dict(zip(sides[role].ranks(tp_size), tent[role])) for role in tent} if tent else {}
+    # Each TP rank's steps, every DP rank's requests: under MoE DP only DP
+    # rank 0 logs the joint steps, the others their own KV.
+    joint_steps: dict[tuple[str, int], dict[str, list[tuple[int, int, int]]]] = {
+        (role, tp): {} for role in sides for tp in range(tp_size)}
+    for role in sides:
+        for (dp, tp), records in logs[role].items():
+            joint_steps[(role, tp)].update(_request_steps(records))
     ranks: dict[str, dict[tuple[int, int], dict]] = {role: {} for role in sides}
     for role, side in sides.items():
         for (dp, tp), records in logs[role].items():
@@ -372,7 +386,8 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 if layout:
                     # Failed receives are reported above; every other check is validated.
                     problems.extend(f"{at}{problem}" for problem in _byte_check_problems(
-                        layout, [c for c in checks if "error" not in c], w.input_len, _pull_plans(records)))
+                        layout, [c for c in checks if "error" not in c], w.input_len, _pull_plans(records),
+                        {req_id: steps[0][2] for req_id, steps in joint_steps[("decode", tp)].items()}))
             # The requests the rank owns: prefill's allocations; decode's
             # byte checks, else its allocations.
             owned = {_base_request_id(c["req_id"]) for c in checks if "req_id" in c} if (
@@ -397,6 +412,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                                     "moved")
             ranks[role][(dp, tp)] = {
                 "transfers": sent, "kv_checks": len(checks),
+                "checked_ids": {c["req_id"] for c in checks if "req_id" in c and "error" not in c},
+                "allocated_ids": {req_id for r in records
+                                  for req_id in ((r.get("kv_events") or {}).get("allocated") or {})},
+                "hybrid": bool(layout and any(g.get("kind") == "MambaSpec" for g in layout.get("groups") or [])),
                 "groups": layout and layout.get("groups") and _group_evidence(layout, checks, records),
                 "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
                 "requests": owned, "tent": counters,
@@ -440,12 +459,22 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         if unpaired:
             problems.append(f"{at}{len(unpaired)} request(s) not both produced and consumed: {unpaired[0]}")
         owners_by_tp.append(owners)
+        handoff = None
+        if any(summary["hybrid"] for summary in of["decode"].values()):
+            # The requests decode consumed: its byte checks, else its
+            # allocations (never its steps alone).
+            consumed_ids = "checked_ids" if run.kv_check else "allocated_ids"
+            handoff = _handoff_problems(
+                joint_steps[("prefill", tp)], joint_steps[("decode", tp)],
+                set().union(*(summary[consumed_ids] for summary in of["decode"].values())))
+            problems.extend(f"{at}{problem}" for problem in handoff["problems"])
         per_tp.append({
             "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked,
             "transfers_bytes": moved,
             "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
             "groups": {role: {dp: summary["groups"] for dp, summary in of[role].items()}
                        for role in sides} if any(s["groups"] for r in sides for s in of[r].values()) else None,
+            "handoff": handoff and handoff["evidence"],
         })
     # Every TP rank of a request's owner is the same DP rank.
     for role, kind in (("prefill", "producers"), ("decode", "consumers")):
@@ -489,7 +518,8 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "ranks": per_tp,
         "ownership": ownership,
         "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
-                             **{key: value for key, value in summary.items() if key != "requests"},
+                             **{key: value for key, value in summary.items()
+                                if key not in ("requests", "checked_ids", "allocated_ids")},
                              "requests": len(summary["requests"])}
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
@@ -513,7 +543,8 @@ def _pull_plans(records: list[dict]) -> dict[str, dict[int, tuple[int, int]]]:
 
 
 def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
-                         plans: dict[str, dict[int, tuple[int, int]]]) -> list[str]:
+                         plans: dict[str, dict[int, tuple[int, int]]],
+                         prompts: dict[str, int] | None = None) -> list[str]:
     """How a rank's successful byte checks disagree with its KV layout.
 
     An older simulator's layout (no ``groups``): each check's bytes are its
@@ -522,10 +553,14 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
     once, its blocks and bytes their sums; each group holds blocks (with
     prefix caching off a pull has some of every group), its bytes being
     its blocks times its layers' block bytes; a window pulls its last
-    blocks only (Mooncake's cdiv(window, block) + 1), full attention from
-    the first. For several groups or a window, each group must also be the
-    request's pull as posted (``_pull_plans``), and prompts longer than a
-    window must have had some pull clipped. Missing fields are problems."""
+    blocks only (Mooncake's cdiv(window, block) + 1), other attention from
+    the first, all of the request's prompt (`prompts`, by decode's request
+    id): cdiv(tokens, block) blocks of its N tokens, N - 1 for a hybrid
+    model, whose decoder computes the last token; a gated delta-net's state
+    is one block, at place 0. For several groups or a window, each group
+    must also be the request's pull as posted (``_pull_plans``), and prompts
+    longer than a window must have had some pull clipped. Missing fields are
+    problems."""
     groups = layout.get("groups")
     problems = []
     if groups is None:
@@ -536,6 +571,7 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                                 f"({layout['block_bytes']} bytes a block and layer)")
         return _capped(problems)
     grouped = len(groups) > 1 or any(spec.get("sliding_window") is not None for spec in groups)
+    hybrid = any(spec.get("kind") == "MambaSpec" for spec in groups)
     clipped = [0] * len(groups)
     for check in checks:
         request = check.get("req_id")
@@ -563,8 +599,22 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                                 f"({spec['layers']} layers of {spec['block_bytes']} bytes a block)")
             window = spec.get("sliding_window")
             if window is None and g["first_logical_block"] != 0:
-                problems.append(f"{request}'s full-attention group {g['group']} was pulled from block "
+                problems.append(f"{request}'s group {g['group']} ({spec.get('kind')}) was pulled from block "
                                 f"{g['first_logical_block']}, not 0")
+            prompt = (prompts or {}).get(request)
+            if spec.get("kind") == "MambaSpec":
+                if g["blocks"] != 1:
+                    problems.append(f"{request}'s state group {g['group']} checked {g['blocks']} blocks, not 1")
+            elif window is None and prompt is None:
+                problems.append(f"{request}'s group {g['group']} pages cannot be checked: decode logged no "
+                                "steps of it")
+            elif window is None:
+                # A hybrid's decoder computes the last of N > 1 tokens; one
+                # token's pages are pulled whole, the token computed again.
+                tokens = prompt - 1 if hybrid and prompt > 1 else prompt
+                if g["blocks"] != -(-tokens // spec["block_size"]):
+                    problems.append(f"{request}'s group {g['group']} checked {g['blocks']} blocks, not the "
+                                    f"cdiv({tokens}, {spec['block_size']}) of its prompt")
             if window is not None:
                 bound = -(-window // spec["block_size"]) + 1
                 if g["blocks"] > bound:
@@ -581,6 +631,53 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             problems.append(f"no pull of window group {index} was clipped, with prompts of {input_len} tokens "
                             f"beyond its {window}")
     return _capped(problems)
+
+
+def _request_steps(records: list[dict]) -> dict[str, list[tuple[int, int, int]]]:
+    """Each request's steps in a step log: (computed, scheduled, prompt)
+    tokens, in order."""
+    steps: dict[str, list[tuple[int, int, int]]] = {}
+    for record in records:
+        for request in (record.get("step") or {}).get("requests", []):
+            steps.setdefault(request["req_id"], []).append(
+                (request["num_computed_tokens"], request["num_scheduled_tokens"], request["num_prompt_tokens"]))
+    return steps
+
+
+def _handoff_problems(prefill: dict[str, list[tuple[int, int, int]]],
+                      decode: dict[str, list[tuple[int, int, int]]],
+                      consumed: set[str]) -> dict:
+    """A hybrid model's handoff, from both sides' steps: prefill computes
+    the prompt but its last token (Mooncake truncates its N tokens to
+    N - 1), decode resumes at N - 1 and computes the last one. Every
+    request decode consumed (`consumed`, by its own request ids: its byte
+    checks, or its allocations) needs its steps. Requests whose steps show
+    one prompt token, which no side truncates, are not checked."""
+    produced = {_base_request_id(request): steps for request, steps in prefill.items()}
+    problems, prompts = [], []
+    for request in sorted(consumed):
+        steps = decode.get(request)
+        if steps is None:
+            problems.append(f"{request} has no decode steps")
+            continue
+        computed, scheduled, prompt = steps[0]
+        if prompt <= 1:
+            continue
+        prompts.append(prompt)
+        if (computed, scheduled) != (prompt - 1, 1):
+            problems.append(f"{request} resumed at {computed} tokens with {scheduled} scheduled, not at "
+                            f"{prompt - 1} with 1")
+        steps = produced.get(_base_request_id(request))
+        if steps is None:
+            problems.append(f"{request} has no prefill steps")
+            continue
+        computed, scheduled, prefilled = steps[-1]
+        if prefilled != prompt - 1 or computed + scheduled != prompt - 1:
+            problems.append(f"{request}'s prefill took a {prefilled}-token prompt to {computed + scheduled} "
+                            f"tokens, not its {prompt} tokens but the last")
+    return {"problems": _capped(problems), "evidence": {
+        "requests": len(prompts), "prompt_tokens": [min(prompts), max(prompts)] if prompts else None,
+        "prefilled": "N - 1", "decode_resumes_at": "N - 1"}}
 
 
 def _capped(problems: list[str], keep: int = 3) -> list[str]:
@@ -621,6 +718,17 @@ def _group_evidence(layout: dict, checks: list[dict], records: list[dict]) -> li
             "reallocated_blocks": sum(len(held) > 1 for held in places.values()),
         })
     return evidence
+
+
+def _prefix_caching_flags(run: Run) -> list[str]:
+    """The server's prefix caching: as set, else off for the byte checks
+    (the pattern is the request's), else vLLM's default."""
+    enabled = run.server.enable_prefix_caching
+    if enabled is None:
+        enabled = False if run.kv_check else None
+    if enabled is None:
+        return []
+    return ["--enable-prefix-caching" if enabled else "--no-enable-prefix-caching"]
 
 
 def _base_request_id(request_id: str) -> str:

@@ -94,6 +94,31 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(hp_tcp["max_outstanding_tasks"], 8192)
         self.assertTrue(all(not t["enable"] for name, t in tent["transports"].items() if name != "hp_tcp"))
 
+    def test_the_platform_may_choose_the_block_size(self) -> None:
+        default = pd.server_command(RUN, "prefill", ["10.100.0.1"])
+        self.assertEqual(default[default.index("--block-size") + 1], "16")
+        unset = pd.Run(**{**RUN.__dict__, "server": pd.Server(block_size=None)})
+        self.assertNotIn("--block-size", pd.server_command(unset, "prefill", ["10.100.0.1"]))
+
+    def test_prefix_caching_is_off_for_byte_checks_and_settable(self) -> None:
+        def flags(kv_check: bool, enabled: bool | None) -> list[str]:
+            run = pd.Run(**{**RUN.__dict__, "kv_check": kv_check,
+                            "server": pd.Server(enable_prefix_caching=enabled)})
+            return [flag for flag in pd.server_command(run, "prefill", ["10.100.0.1"]) if "prefix-caching" in flag]
+
+        self.assertEqual(flags(True, None), ["--no-enable-prefix-caching"])
+        self.assertEqual(flags(False, None), [])  # vLLM's default
+        # A hybrid model's run without byte checks keeps it off.
+        self.assertEqual(flags(False, False), ["--no-enable-prefix-caching"])
+        self.assertEqual(flags(False, True), ["--enable-prefix-caching"])
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "run.yaml"
+            spec.write_text((E2E / "runs" / "pd-smoke.yaml").read_text().replace(
+                "server:  # both servers", "server:  # both servers\n  enable_prefix_caching: true"))
+            with self.assertRaises(ValueError) as raised:
+                pd.load(spec)
+            self.assertIn("kv_check needs prefix caching off", str(raised.exception))
+
     def test_the_example_run_loads(self) -> None:
         run = pd.load(E2E / "runs" / "pd-smoke.yaml")
         self.assertEqual((run.prefill.node, run.decode.kv_network), ("prefill0", "data0"))
@@ -130,6 +155,11 @@ def pulled(request: str, window=(61, 3), full=(0, 64), offset: int = 100) -> str
 
 
 PULLS = pulled("a") + pulled("b", offset=300)
+# Decode's first steps of the two 1024-token requests.
+FIRST_STEPS = "".join(
+    line(step={"requests": [{"req_id": f"cmpl-{r}-0-d", "num_computed_tokens": 1023,
+                             "num_scheduled_tokens": 1, "num_prompt_tokens": 1024}]})
+    for r in ("a", "b"))
 
 
 def allocated_groups(request: str, *entries: tuple[int, int, list[int]], side: str = "p") -> str:
@@ -144,7 +174,7 @@ class GroupCheckTests(unittest.TestCase):
         checks = checks or [grouped("a"), grouped("b")]
         prefill = (GROUPS_LAYOUT + allocated("a", "b") + prefill_events
                    + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
-        decode = GROUPS_LAYOUT + pulls + decode_events + "".join(line(kv_check=c) for c in checks)
+        decode = GROUPS_LAYOUT + pulls + FIRST_STEPS + decode_events + "".join(line(kv_check=c) for c in checks)
         return pd.check({"completed": 2, "errors": []}, [prefill], [decode],
                         {"control": 50, "data0": moved + 100}, RUN)
 
@@ -201,7 +231,7 @@ class GroupCheckTests(unittest.TestCase):
             "group 1 check disagrees with the layout": [wrong_bytes, grouped("b")],
             "is not its groups' sum": [unsummed, grouped("b")],
             "pulled 4 blocks, more than its window's 3": [grouped("a", window=(60, 4)), grouped("b")],
-            "full-attention group 1 was pulled from block 2": [grouped("a", full=(2, 62)), grouped("b")],
+            "group 1 (FullAttentionSpec) was pulled from block 2": [grouped("a", full=(2, 62)), grouped("b")],
             "no pull of window group 0 was clipped": [grouped("a", window=(0, 3)), grouped("b", window=(0, 3))],
         }
         for message, checks in cases.items():
@@ -236,6 +266,184 @@ class GroupCheckTests(unittest.TestCase):
         self.assertTrue(any("not the pull's 0 from None" in p for p in problems), problems)
 
 
+# Qwen3-Next-like: a gated delta-net's state group (one 8-byte padded page a
+# layer, 6 real) and a full-attention group of 16-token blocks, 2 layers
+# each; 33-token prompts, of which decode pulls 32 tokens' pages.
+HYBRID_LAYOUT = line(kv_layout={
+    "tp_rank": 0, "tp_size": 1, "block_bytes": 8, "bytes": 1600,
+    "groups": [{"kind": "MambaSpec", "sliding_window": None, "block_size": 4096, "layers": 2, "block_bytes": 8,
+                "real_page_bytes": 6, "block_stride": 8, "mamba_type": "GDN_ATTN"},
+               {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
+                "block_bytes": 8, "real_page_bytes": 8, "block_stride": 8}]})
+
+
+def hybrid_check(request: str, state=(0, 1), attention=(0, 2)) -> dict:
+    groups = [{"group": 0, "first_logical_block": state[0], "blocks": state[1], "layers": 2, "block_bytes": 16,
+               "bytes": state[1] * 16, "mismatched_bytes": 0},
+              {"group": 1, "first_logical_block": attention[0], "blocks": attention[1], "layers": 2,
+               "block_bytes": 16, "bytes": attention[1] * 16, "mismatched_bytes": 0}]
+    return checked(request, blocks=state[1] + attention[1], layers=4, bytes=sum(g["bytes"] for g in groups),
+                   groups=groups)
+
+
+def hybrid_pull(request: str, state=(0, 1), attention=(0, 2), offset: int = 100) -> str:
+    return line(kv_events={"reads_posted": [f"cmpl-{request}-0-d"], "allocated_groups": {f"cmpl-{request}-0-d": [
+        {"group": 0, "first": state[0], "blocks": list(range(offset, offset + state[1]))},
+        {"group": 1, "first": attention[0], "blocks": list(range(offset + 10, offset + 10 + attention[1]))}]}})
+
+
+def stepped(request: str, side: str, computed: int, scheduled: int, prompt: int) -> str:
+    return line(step={"requests": [{"req_id": f"cmpl-{request}-0-{side}", "num_computed_tokens": computed,
+                                    "num_scheduled_tokens": scheduled, "num_prompt_tokens": prompt}]})
+
+
+class HybridCheckTests(unittest.TestCase):
+    def verdict(self, checks=None, prefill_steps=None, decode_steps=None, pulls=None) -> dict:
+        checks = checks or [hybrid_check("a"), hybrid_check("b")]
+        moved = sum(c["bytes"] for c in checks)
+        prefill_steps = prefill_steps if prefill_steps is not None else "".join(
+            stepped(r, "p", 0, 32, 32) for r in ("a", "b"))
+        decode_steps = decode_steps if decode_steps is not None else "".join(
+            stepped(r, "d", 32, 1, 33) for r in ("a", "b"))
+        pulls = pulls if pulls is not None else hybrid_pull("a") + hybrid_pull("b", offset=300)
+        prefill = (HYBRID_LAYOUT + allocated("a", "b") + prefill_steps
+                   + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
+        decode = HYBRID_LAYOUT + pulls + decode_steps + "".join(line(kv_check=c) for c in checks)
+        return pd.check({"completed": 2, "errors": []}, [prefill], [decode],
+                        {"control": 1, "data0": moved + 100}, RUN)
+
+    def test_a_hybrid_handoff_passes_with_its_evidence(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["ranks"][0]["handoff"]["requests"], 2)
+        self.assertEqual(verdict["ranks"][0]["handoff"]["prompt_tokens"], [33, 33])
+
+    def test_hybrid_failures_are_reported(self) -> None:
+        cases = {
+            "state group 0 checked 2 blocks, not 1": {
+                "checks": [hybrid_check("a", state=(0, 2)), hybrid_check("b")],
+                "pulls": hybrid_pull("a", state=(0, 2)) + hybrid_pull("b", offset=300)},
+            # The whole prompt's pages: not truncated.
+            "group 1 checked 3 blocks, not the cdiv(32, 16) of its prompt": {
+                "checks": [hybrid_check("a", attention=(0, 3)), hybrid_check("b")],
+                "pulls": hybrid_pull("a", attention=(0, 3)) + hybrid_pull("b", offset=300)},
+            "resumed at 33 tokens with 1 scheduled, not at 32 with 1": {
+                "decode_steps": stepped("a", "d", 33, 1, 33) + stepped("b", "d", 32, 1, 33)},
+            "prefill took a 33-token prompt to 33 tokens, not its 33 tokens but the last": {
+                "prefill_steps": stepped("a", "p", 0, 33, 33) + stepped("b", "p", 0, 32, 32)},
+            "cmpl-b-0-d has no prefill steps": {"prefill_steps": stepped("a", "p", 0, 32, 32)},
+        }
+        for message, changes in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**changes)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+
+    def test_every_consumed_request_needs_its_decode_steps(self) -> None:
+        only_b = stepped("b", "d", 32, 1, 33)
+        cases = {
+            "complete absence": ({"decode_steps": ""}, ["cmpl-a-0-d has no decode steps",
+                                                        "cmpl-b-0-d has no decode steps"]),
+            "partial absence": ({"decode_steps": only_b}, ["cmpl-a-0-d has no decode steps"]),
+            # One page where two are needed, behind the missing steps.
+            "wrong pages": ({"decode_steps": only_b,
+                             "checks": [hybrid_check("a", attention=(0, 1)), hybrid_check("b")],
+                             "pulls": hybrid_pull("a", attention=(0, 1)) + hybrid_pull("b", offset=300)},
+                            ["cmpl-a-0-d has no decode steps",
+                             "cmpl-a-0-d's group 1 pages cannot be checked"]),
+        }
+        for case, (changes, messages) in cases.items():
+            with self.subTest(case=case):
+                verdict = self.verdict(**changes)
+                for message in messages:
+                    self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
+                self.assertLess(verdict["ranks"][0]["handoff"]["requests"], 2)
+
+    def test_a_one_token_prompt_pulls_its_token(self) -> None:
+        # Neither side truncates it: its one token's page is pulled, the token
+        # computed again.
+        checks = [hybrid_check(r, attention=(0, 1)) for r in ("a", "b")]
+        verdict = self.verdict(
+            checks=checks,
+            prefill_steps="".join(stepped(r, "p", 0, 1, 1) for r in ("a", "b")),
+            decode_steps="".join(stepped(r, "d", 0, 1, 1) for r in ("a", "b")),
+            pulls=hybrid_pull("a", attention=(0, 1)) + hybrid_pull("b", attention=(0, 1), offset=300))
+        self.assertEqual(verdict["problems"], [])
+
+    def test_dp_ranks_take_prompts_from_the_joint_steps(self) -> None:
+        """Decode DP=2: DP rank 0 logs both requests' joint steps, DP rank 1
+        only its own KV (request a); a's pages are still checked."""
+
+        def layout(dp: int) -> str:
+            raw = json.loads(HYBRID_LAYOUT)
+            raw["kv_layout"]["dp_rank"] = dp
+            return line(**raw)
+
+        def verdict(a_pages: int) -> dict:
+            a = hybrid_check("a", attention=(0, a_pages))
+            moved = a["bytes"] + hybrid_check("b")["bytes"]
+            prefill = (layout(0) + allocated("a", "b") + stepped("a", "p", 0, 32, 32)
+                       + stepped("b", "p", 0, 32, 32) + sent(moved))
+            decode = [layout(0) + stepped("a", "d", 32, 1, 33) + stepped("b", "d", 32, 1, 33)
+                      + hybrid_pull("b", offset=300) + line(kv_check=hybrid_check("b")),
+                      layout(1) + hybrid_pull("a", attention=(0, a_pages)) + line(kv_check=a)]
+            return pd.check({"completed": 2, "errors": []}, [prefill], decode,
+                            {"control": 1, "data0": moved + 100}, dp_run(1, 2))
+
+        right = verdict(2)
+        self.assertEqual(right["problems"], [])
+        self.assertEqual(right["ranks"][0]["handoff"]["requests"], 2)
+        problems = verdict(3)["problems"]
+        self.assertTrue(any("DP rank 1: cmpl-a-0-d's group 1 checked 3 blocks, not the cdiv(32, 16)" in p
+                            for p in problems), problems)
+
+
+    def test_without_byte_checks_decodes_allocations_require_their_steps(self) -> None:
+        """Byte checks off (prefix caching off): the requests decode
+        allocated, not those its steps name, need their handoff steps; on
+        one DP rank or across two, the joint steps in DP rank 0's log."""
+
+        def decode_allocated(*requests: str) -> str:
+            return line(kv_events={"allocated": {f"cmpl-{r}-0-d": [1] for r in requests}})
+
+        def layout(dp: int) -> str:
+            raw = json.loads(HYBRID_LAYOUT)
+            raw["kv_layout"]["dp_rank"] = dp
+            return line(**raw)
+
+        prefill = (HYBRID_LAYOUT + allocated("a", "b") + stepped("a", "p", 0, 32, 32)
+                   + stepped("b", "p", 0, 32, 32) + sent(2000))
+        steps = {r: stepped(r, "d", 32, 1, 33) for r in ("a", "b")}
+        one = pd.Run(**{**RUN.__dict__, "kv_check": False})
+        two = pd.Run(**{**dp_run(1, 2).__dict__, "kv_check": False})
+        cases = {
+            # (decode logs, run): the problems, the requests the handoff checked.
+            "complete": ([HYBRID_LAYOUT + decode_allocated("a", "b") + steps["a"] + steps["b"]], one, [], 2),
+            "partial": ([HYBRID_LAYOUT + decode_allocated("a", "b") + steps["a"]], one,
+                        ["cmpl-b-0-d has no decode steps"], 1),
+            "absent": ([HYBRID_LAYOUT + decode_allocated("a", "b")], one,
+                       ["cmpl-a-0-d has no decode steps", "cmpl-b-0-d has no decode steps"], 0),
+            "DP complete": ([layout(0) + decode_allocated("b") + steps["a"] + steps["b"],
+                             layout(1) + decode_allocated("a")], two, [], 2),
+            "DP partial": ([layout(0) + decode_allocated("b") + steps["b"],
+                            layout(1) + decode_allocated("a")], two, ["cmpl-a-0-d has no decode steps"], 1),
+            "DP absent": ([layout(0) + decode_allocated("b"), layout(1) + decode_allocated("a")], two,
+                          ["cmpl-a-0-d has no decode steps", "cmpl-b-0-d has no decode steps"], 0),
+        }
+        for case, (decode, run, messages, checked) in cases.items():
+            with self.subTest(case=case):
+                prefills = [prefill if not run.decode.data_parallel_size > 1 else
+                            prefill.replace(HYBRID_LAYOUT, layout(0))]
+                verdict = pd.check({"completed": 2, "errors": []}, prefills, decode,
+                                   {"control": 1, "data0": 2100}, run)
+                self.assertEqual(verdict["kv_checks"], 0)
+                if not messages:
+                    self.assertEqual(verdict["problems"], [])
+                for message in messages:
+                    self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
+                self.assertEqual(verdict["ranks"][0]["handoff"]["requests"], checked)
+
+
 class RecheckTests(unittest.TestCase):
     """`python -m harness recheck` on a saved results directory."""
 
@@ -249,7 +457,7 @@ class RecheckTests(unittest.TestCase):
         (directory / "prefill-steps.jsonl").write_text(
             GROUPS_LAYOUT + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": moved}}))
         (directory / "decode-steps.jsonl").write_text(
-            GROUPS_LAYOUT + PULLS + "".join(line(kv_check=c) for c in checks))
+            GROUPS_LAYOUT + PULLS + FIRST_STEPS + "".join(line(kv_check=c) for c in checks))
 
     def test_recheck_exits_with_the_verdict(self) -> None:
         from harness.__main__ import main
