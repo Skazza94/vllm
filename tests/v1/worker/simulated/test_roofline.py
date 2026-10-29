@@ -21,6 +21,8 @@ from vllm.v1.worker.simulated.timing import (
     ModelGeometry,
     RooflineTimingProvider,
     UnsupportedModelLayout,
+    attention_pairs,
+    kv_tokens,
     merge_dp_descriptors,
     rank_reach_probability,
 )
@@ -65,6 +67,7 @@ def qwen_7b_config(cache_dtype, dtype=torch.bfloat16):
         get_num_kv_heads=lambda parallel: 4,
         get_head_size=lambda: 128,
         get_vocab_size=lambda: 152064,
+        get_sliding_window=lambda: None,
     )
     return SimpleNamespace(
         model_config=model,
@@ -1429,3 +1432,245 @@ def test_dp_attention_ranks_build_their_experts_and_log_every_joint_step(tmp_pat
     assert all(s["cost"]["breakdown"]["idle_dp_ranks"] == 1 for s in steps)
     indexes = [s["step"]["step_index"] for s in steps]
     assert indexes == sorted(set(indexes))
+
+
+# Sliding windows: a layer whose tokens attend to at most `window` tokens,
+# themselves included.
+def test_a_window_bounds_the_pairs_and_the_kv_read():
+    # Full attention: every cached token and the new ones before each.
+    assert attention_pairs(500, 1000, None) == 1000 * 500 + 1000 * 1001 // 2
+    assert kv_tokens(500, 1000, None) == 1000 + 500 + 1000
+    # A first chunk of 1000 under a 128-token window: min(128, i) pairs.
+    assert attention_pairs(0, 1000, 128) == sum(min(128, i) for i in range(1, 1001))
+    # A window not yet full: 50 cached, 10 new.
+    assert attention_pairs(50, 10, 128) == sum(range(51, 61))
+    # Decode stays within the window.
+    assert attention_pairs(5000, 1, 128) == 128
+    assert kv_tokens(5000, 1, 128) == 1 + 127 + 1
+    # A 1000-token chunk after an established window reads 1127 tokens of KV.
+    assert kv_tokens(5000, 1000, 128) - 1000 == 1127
+    assert attention_pairs(5000, 1000, 128) == 1000 * 128
+
+
+# Qwen-7B's shapes, its layers alternating a 128-token window and full
+# attention, as gpt-oss's do.
+ALTERNATING = dataclasses.replace(
+    QWEN_7B,
+    layers=tuple(
+        LayerGeometry(QWEN_7B.layer_params, sliding_window=128 if i % 2 == 0 else None)
+        for i in range(28)
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        sim_req("prefill", 1000, 0, 1000),
+        sim_req("chunk", 1000, 5000, 8000),
+        sim_req("decode", 1, 5000, 5000),
+    ],
+    ids=["prefill", "chunk", "decode"],
+)
+def test_windowed_layers_attend_and_read_within_their_window(request_):
+    cost = RooflineTimingProvider(None, gpu="h100", geometry=ALTERNATING).estimate(
+        sim_step(0, request_)
+    )
+    c, t = request_.num_computed_tokens, request_.num_scheduled_tokens
+    sampled = c + t >= request_.num_prompt_tokens
+    flops = (
+        2 * 28 * QWEN_7B.layer_params * t
+        + 2 * 3584 * 152064 * sampled
+        + 14 * 4 * 28 * 128 * attention_pairs(c, t, None)
+        + 14 * 4 * 28 * 128 * attention_pairs(c, t, 128)
+    )
+    assert cost.breakdown["compute_us"] == pytest.approx(flops / (989e12 * 0.6) * 1e6)
+    per_layer = KV_BYTES_PER_TOKEN // 28
+    memory = (
+        WEIGHT_BYTES
+        + 14 * per_layer * kv_tokens(c, t, None)
+        + 14 * per_layer * kv_tokens(c, t, 128)
+    )
+    assert cost.breakdown["memory_us"] == pytest.approx(memory / (3.35e12 * 0.8) * 1e6)
+    # Full layers everywhere would read and compute as much or more (a first
+    # chunk reads no cached KV either way).
+    full = dataclasses.replace(
+        ALTERNATING, layers=(LayerGeometry(QWEN_7B.layer_params),) * 28
+    )
+    full_cost = RooflineTimingProvider(None, gpu="h100", geometry=full).estimate(
+        sim_step(0, request_)
+    )
+    assert full_cost.breakdown["compute_us"] >= cost.breakdown["compute_us"]
+    assert full_cost.breakdown["memory_us"] >= cost.breakdown["memory_us"]
+
+
+def test_windows_are_recorded_with_the_layers():
+    layers = RooflineTimingProvider(None, gpu="h100", geometry=ALTERNATING).assumptions()[
+        "geometry"
+    ]["layers"]
+    assert [group.get("sliding_window") for group in layers[:3]] == [128, None, 128]
+    assert len(layers) == 28  # consecutive layers differ
+    # The same total KV per token: a window bounds the reads, not the cache.
+    assert ALTERNATING.kv_bytes_per_token == KV_BYTES_PER_TOKEN
+
+
+def test_expert_parallel_ranks_attend_within_the_window():
+    """The DP+EP path prices a windowed layer's attention and KV like the
+    single-rank path: the two-rank model, its dense layer under a window."""
+    windowed = dataclasses.replace(
+        TWO_RANKS,
+        layers=(
+            dataclasses.replace(TWO_RANKS.layers[0], sliding_window=128),
+            TWO_RANKS.layers[1],
+        ),
+    )
+    step = sim_step(0, on_rank(0, sim_req("a", 1000, 5000, 8000)))
+    full, window = (unit_rates(g).estimate(step) for g in (TWO_RANKS, windowed))
+    kv_layer = 2 * 1 * 32 * 2
+    flops_saved = 4 * 2 * 32 * (attention_pairs(5000, 1000, None) - attention_pairs(5000, 1000, 128))
+    bytes_saved = kv_layer * (kv_tokens(5000, 1000, None) - kv_tokens(5000, 1000, 128))
+    seconds = max(f / 1e12 for f in (flops_saved,))  # compute-bound prefill chunk
+    assert full.breakdown["local_us"] - window.breakdown["local_us"] == pytest.approx(
+        seconds * 1e6
+    )
+    assert bytes_saved > 0
+
+
+def test_a_sliding_window_model_is_timed_from_its_built_layers():
+    config = qwen_7b_config("auto")
+    config.model_config.get_sliding_window = lambda: 4096
+    with pytest.raises(ValueError, match="from_model"):
+        ModelGeometry.from_config(config)
+    provider = RooflineTimingProvider(config, gpu="h100")
+    with pytest.raises(UnsupportedModelLayout):
+        provider.bind_model(torch.nn.Module())
+
+
+def attention_layer(kind=None, heads=28, kv_heads=4, head_size=128, head_size_v=None):
+    """A built attention layer of `kind` (default plain `Attention`) with
+    the fields its constructor sets, `sliding_window` the inherited None
+    (chunked local and RSWA attention keep their windows apart), without the
+    backend the constructor selects."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    kind = kind or Attention
+    layer = kind.__new__(kind)
+    torch.nn.Module.__init__(layer)
+    layer.num_heads, layer.num_kv_heads, layer.head_size = heads, kv_heads, head_size
+    layer.head_size_v = head_size if head_size_v is None else head_size_v
+    layer.sliding_window = None
+    layer.attention_chunk_size = layer._rswa_window = 64
+    return layer
+
+
+def attention_decoder(layer):
+    """A model of Qwen2.5-7B's 28 decoder layers, layer `i`'s attention
+    `layer(i)`."""
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList()
+    for index in range(28):
+        block = torch.nn.Module()
+        block.attn = layer(index)
+        model.layers.append(block)
+    return model
+
+
+def test_plain_attention_of_the_models_heads_is_bound():
+    provider = RooflineTimingProvider(qwen_7b_config("auto"), gpu="h100")
+    provider.bind_model(attention_decoder(lambda _: attention_layer()))
+    assert provider.assumptions()["geometry"]["source"] == "built model"
+
+
+@pytest.mark.parametrize("kind", ["ChunkedLocalAttention", "RSWAAttention"])
+def test_other_attention_kinds_are_rejected_whatever_their_window(kind):
+    # Llama4's chunked local attention leaves `sliding_window` None: neither
+    # priced as full attention nor timed from the dense config.
+    from vllm.model_executor.layers.attention import (
+        chunked_local_attention,
+        rswa_attention,
+    )
+
+    module = {
+        "ChunkedLocalAttention": chunked_local_attention,
+        "RSWAAttention": rswa_attention,
+    }[kind]
+    provider = RooflineTimingProvider(qwen_7b_config("auto"), gpu="h100")
+    model = attention_decoder(lambda _: attention_layer(getattr(module, kind)))
+    with pytest.raises(ValueError, match=f"plain attention layers only, not \\['{kind}'\\]"):
+        provider.bind_model(model)
+
+
+@pytest.mark.parametrize(
+    "dimensions",
+    [
+        {"heads": 32},
+        {"kv_heads": 8},
+        {"head_size": 64},
+        {"head_size_v": 64},  # a narrower value
+    ],
+)
+def test_attention_layers_of_other_heads_are_rejected(dimensions):
+    # MiMoV2's sliding layers have their own heads and head sizes.
+    provider = RooflineTimingProvider(qwen_7b_config("auto"), gpu="h100")
+    model = attention_decoder(
+        lambda index: attention_layer(**(dimensions if index % 2 else {}))
+    )
+    with pytest.raises(ValueError, match=r"\(28, 4, 128, 128\), not"):
+        provider.bind_model(model)
+
+
+GPT_OSS = {
+    "architectures": ["GptOssForCausalLM"],
+    "model_type": "gpt_oss",
+    "hidden_size": 64,
+    "intermediate_size": 32,
+    "head_dim": 16,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_local_experts": 4,
+    "num_experts_per_tok": 2,
+    "experts_per_token": 2,
+    "sliding_window": 32,
+    "layer_types": ["sliding_attention", "full_attention"] * 2,
+    "attention_bias": True,
+    "hidden_act": "silu",
+    "swiglu_limit": 7.0,
+    "rope_theta": 150000,
+    "rope_scaling": {
+        "rope_type": "yarn",
+        "factor": 32.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "truncate": False,
+        "original_max_position_embeddings": 4096,
+    },
+    "tie_word_embeddings": False,
+}
+MISTRAL = {
+    "architectures": ["MistralForCausalLM"],
+    "model_type": "mistral",
+    "hidden_size": 64,
+    "intermediate_size": 96,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "sliding_window": 48,
+    "tie_word_embeddings": False,
+}
+
+
+@pytest.mark.parametrize(
+    "config,windows",
+    [(GPT_OSS, [32, None, 32, None]), (MISTRAL, [48, 48])],
+    ids=["gpt-oss", "mistral"],
+)
+def test_a_built_model_records_each_layers_window(tmp_path, monkeypatch, config, windows):
+    model_dir = write_config(tmp_path / config["model_type"], config)
+    record = timing_record(tmp_path, model_dir, monkeypatch)
+    expanded = [
+        group.get("sliding_window")
+        for group in record["geometry"]["layers"]
+        for _ in range(group["last"] - group["first"] + 1)
+    ]
+    assert expanded == windows

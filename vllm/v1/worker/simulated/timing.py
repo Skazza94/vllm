@@ -434,6 +434,25 @@ _MLA_KV_DTYPES = (*_MLA_KV_DTYPES_16_BIT, "fp8", "fp8_e4m3")
 _MLA_LATENT_SIZES = (320, 512, 576)
 
 
+def attention_pairs(computed: int, scheduled: int, window: int | None) -> int:
+    """Query-key pairs of a request's `scheduled` new tokens after its
+    `computed` cached ones, each attending to the tokens before it and
+    itself; under a sliding window of `window` tokens (itself included), to
+    at most that many: sum(min(window, computed + i) for i in 1..scheduled)."""
+    if window is None:
+        return scheduled * computed + scheduled * (scheduled + 1) // 2
+    within = max(0, min(scheduled, window - computed))
+    return within * computed + within * (within + 1) // 2 + (scheduled - within) * window
+
+
+def kv_tokens(computed: int, scheduled: int, window: int | None) -> int:
+    """Tokens of KV a request's step reads (each once: the new tokens and
+    the cached ones they attend to, under a window at most `window` - 1)
+    and writes (the new ones)."""
+    cached = computed if window is None else min(computed, window - 1)
+    return scheduled + cached + scheduled
+
+
 @dataclass(frozen=True)
 class ExpertGeometry:
     """One layer's routed experts on this rank."""
@@ -635,6 +654,9 @@ class LayerGeometry:
     shared experts, router; not an MLA layer's `kv_b_proj` (`latent`)."""
     experts: tuple[ExpertGeometry, ...] = ()
     latent: LatentAttentionGeometry | None = None
+    sliding_window: int | None = None
+    """Its attention's window, in tokens (each attends to at most this many,
+    itself included); None: full attention."""
 
 
 # How an MoE step's expert reads are estimated, as recorded with the geometry.
@@ -660,6 +682,17 @@ def rank_reach_probability(global_experts: int, local_experts: int, top_k: int) 
     )
 
 
+def needs_built_layers(model_config: Any) -> bool:
+    """Whether the roofline needs the built model's layers: an MoE, MLA or
+    sliding-window model, whose layers differ in ways the config alone does
+    not settle."""
+    return (
+        model_config.is_moe
+        or model_config.use_mla
+        or model_config.get_sliding_window() is not None
+    )
+
+
 class UnsupportedModelLayout(ValueError):
     """The built model's decoder layers cannot be told apart."""
 
@@ -679,6 +712,8 @@ def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
             }
             if layer.latent is not None:
                 group["latent"] = asdict(layer.latent)
+            if layer.sliding_window is not None:
+                group["sliding_window"] = layer.sliding_window
             groups.append(group)
     return groups
 
@@ -718,10 +753,10 @@ class ModelGeometry:
     @classmethod
     def from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
         """A dense model's geometry from its config."""
-        if vllm_config.model_config.is_moe or vllm_config.model_config.use_mla:
+        if needs_built_layers(vllm_config.model_config):
             raise ValueError(
-                "The roofline timing provider needs an MoE or MLA model's "
-                "built layers: ModelGeometry.from_model."
+                "The roofline timing provider needs an MoE, MLA or "
+                "sliding-window model's built layers: ModelGeometry.from_model."
             )
         return cls._from_config(vllm_config)
 
@@ -735,6 +770,7 @@ class ModelGeometry:
         sampled tokens only."""
         import torch
 
+        from vllm.model_executor.layers.attention.attention import Attention
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
         from vllm.model_executor.layers.fused_moe.routed_experts import (
             RoutedExperts,
@@ -768,9 +804,47 @@ class ModelGeometry:
                 f"apart: {len(lists)} module lists of {num_layers} modules, "
                 f"{len(named)} named 'layers'."
             )
+        # This rank's heads, K and V head sizes, as every attention layer is
+        # priced.
+        heads = (
+            geometry.num_heads,
+            geometry.num_kv_heads,
+            geometry.head_size,
+            geometry.head_size,
+        )
         layers = []
         for layer in candidates[0]:
             dense, experts, latent = 0, [], None
+            plain = [m for m in layer.modules() if isinstance(m, Attention)]
+            others = sorted({type(m).__name__ for m in plain if type(m) is not Attention})
+            if others:
+                # Chunked local or RSWA attention keeps its window apart from
+                # `sliding_window`; sinks, cross or encoder-only attention
+                # attend otherwise.
+                raise ValueError(
+                    "The roofline timing provider models plain attention "
+                    f"layers only, not {others}."
+                )
+            for attention in plain:
+                built = (
+                    attention.num_heads,
+                    attention.num_kv_heads,
+                    attention.head_size,
+                    attention.head_size_v,
+                )
+                if built != heads:
+                    raise ValueError(
+                        "The roofline timing provider models attention "
+                        "layers of the model's heads, KV heads, K and V head "
+                        f"sizes per rank {heads}, not {built}."
+                    )
+            windows = {m.sliding_window for m in plain}
+            if len(windows) > 1:
+                raise UnsupportedModelLayout(
+                    "The roofline timing provider models one attention window "
+                    f"per decoder layer, not {sorted(windows, key=str)}."
+                )
+            window = next(iter(windows), None)
             attentions = [m for m in layer.modules() if isinstance(m, MLAAttention)]
             if len(attentions) > 1:
                 raise UnsupportedModelLayout(
@@ -818,7 +892,7 @@ class ModelGeometry:
                     )
                 elif isinstance(module, (LinearBase, torch.nn.Linear)):
                     dense += linear_params(module)
-            layers.append(LayerGeometry(dense, tuple(experts), latent))
+            layers.append(LayerGeometry(dense, tuple(experts), latent, window))
         routers = [
             module.moe_config
             for layer in candidates[0]
@@ -990,12 +1064,24 @@ class ModelGeometry:
     def _attention_layers(
         self,
     ) -> tuple[int, tuple[tuple[LatentAttentionGeometry, int], ...]]:
-        """Layers of multi-head attention, and of each MLA geometry."""
+        """Layers of full multi-head attention, and of each MLA geometry."""
         if self.layers is None:
             return self.num_layers, ()
-        latent = collections.Counter(layer.latent for layer in self.layers)
+        latent = collections.Counter(
+            layer.latent for layer in self.layers if layer.sliding_window is None
+        )
         plain = latent.pop(None, 0)
         return plain, tuple(latent.items())  # type: ignore[arg-type]
+
+    @functools.cached_property
+    def _windowed_layers(self) -> tuple[tuple[int, int], ...]:
+        """Layers of sliding-window multi-head attention, by window."""
+        windows = collections.Counter(
+            layer.sliding_window
+            for layer in self.layers or ()
+            if layer.sliding_window is not None
+        )
+        return tuple(sorted(windows.items()))
 
     @property
     def ep_size(self) -> int:
@@ -1015,13 +1101,20 @@ class ModelGeometry:
         self, layer: LayerGeometry, request: SimRequestStep, absorbed: bool
     ) -> int:
         """One request's QK^T and AV in one layer, and its MLA `kv_b_proj`."""
-        scheduled = request.num_scheduled_tokens
-        pairs = scheduled * request.num_computed_tokens + scheduled * (scheduled + 1) // 2
+        pairs = attention_pairs(
+            request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
+        )
         if layer.latent is None:
             return 4 * self.num_heads * self.head_size * pairs
         return layer.latent.attention_flops(pairs, absorbed) + layer.latent.kv_b_flops(
             request, absorbed
         )
+
+    def layer_kv_bytes(self, layer: LayerGeometry, request: SimRequestStep) -> float:
+        """The KV one request's step reads and writes in one layer."""
+        return kv_tokens(
+            request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
+        ) * self.layer_kv_bytes_per_token(layer)
 
     def layer_kv_bytes_per_token(self, layer: LayerGeometry) -> float:
         """K and V, or the MLA latent, of one token in one layer."""
@@ -1033,9 +1126,10 @@ class ModelGeometry:
         self, requests: tuple[SimRequestStep, ...], absorbed: tuple[bool, ...]
     ) -> int:
         """A step's QK^T and AV in every layer, each new token attending to
-        its request's context and to the new tokens before it, plus each
-        MLA layer's `kv_b_proj`; `absorbed[i]`: whether request i takes the
-        MLA decode path."""
+        its request's context and to the new tokens before it (under a
+        sliding window, the last ones of them), plus each MLA layer's
+        `kv_b_proj`; `absorbed[i]`: whether request i takes the MLA decode
+        path."""
         plain, latent = self._attention_layers
         flops = 0
         for request, decode_path in zip(requests, absorbed):
@@ -1045,6 +1139,14 @@ class ModelGeometry:
                 + scheduled * (scheduled + 1) // 2
             )
             flops += 4 * plain * self.num_heads * self.head_size * pairs
+            for window, count in self._windowed_layers:
+                flops += (
+                    4
+                    * count
+                    * self.num_heads
+                    * self.head_size
+                    * attention_pairs(request.num_computed_tokens, scheduled, window)
+                )
             for geometry, count in latent:
                 flops += count * (
                     geometry.attention_flops(pairs, decode_path)
@@ -1068,10 +1170,29 @@ class ModelGeometry:
         """K and V of one token across all layers on this rank; an MLA
         layer's latent, which every rank holds whole."""
         plain, latent = self._attention_layers
+        windowed = sum(count for _, count in self._windowed_layers)
         return (
-            plain * 2 * self.num_kv_heads * self.head_size
+            (plain + windowed) * 2 * self.num_kv_heads * self.head_size
             + sum(geometry.latent_size * count for geometry, count in latent)
         ) * self.kv_bytes
+
+    def step_kv_bytes(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """The KV a step reads and writes in every layer (`kv_tokens`)."""
+        plain, latent = self._attention_layers
+        full = (plain * 2 * self.num_kv_heads * self.head_size + sum(
+            geometry.latent_size * count for geometry, count in latent
+        )) * self.kv_bytes
+        per_token = 2 * self.num_kv_heads * self.head_size * self.kv_bytes
+        total = 0.0
+        for r in requests:
+            total += full * kv_tokens(r.num_computed_tokens, r.num_scheduled_tokens, None)
+            for window, count in self._windowed_layers:
+                total += (
+                    count
+                    * per_token
+                    * kv_tokens(r.num_computed_tokens, r.num_scheduled_tokens, window)
+                )
+        return total
 
 
 class RooflineTimingProvider:
@@ -1102,6 +1223,10 @@ class RooflineTimingProvider:
     backend splits the batch (`LatentAttentionBackend`): ``mla_backend``
     (a `LATENT_ATTENTION_BACKENDS` name), else vLLM's default on ``gpu``.
     Every rank reads and writes the whole latent.
+
+    A sliding-window layer's new tokens attend to at most its window
+    (`attention_pairs`), and its step reads each KV it needs once
+    (`kv_tokens`): its new tokens and up to ``window - 1`` cached ones.
 
     Data-parallel attention with expert parallelism (TP=1 per DP rank, up to
     `NVLINK_DOMAIN_GPUS` ranks): a joint step's segments between the MoE
@@ -1211,9 +1336,7 @@ class RooflineTimingProvider:
         # An MoE or MLA model's geometry comes from its built layers
         # (bind_model).
         self.geometry: ModelGeometry | None = geometry
-        if geometry is None and not (
-            vllm_config.model_config.is_moe or vllm_config.model_config.use_mla
-        ):
+        if geometry is None and not needs_built_layers(vllm_config.model_config):
             self.geometry = ModelGeometry.from_config(vllm_config)
         if self.geometry is not None:
             self._check_geometry(self.geometry)
@@ -1234,8 +1357,7 @@ class RooflineTimingProvider:
         try:
             self.geometry = ModelGeometry.from_model(self._vllm_config, model)
         except UnsupportedModelLayout as error:
-            config = self._vllm_config.model_config
-            if config.is_moe or config.use_mla:
+            if needs_built_layers(self._vllm_config.model_config):
                 raise
             logger.warning("%s Timing the dense model from its config.", error)
             self.geometry = ModelGeometry.from_config(self._vllm_config)
@@ -1546,7 +1668,10 @@ class RooflineTimingProvider:
             + g.attention_flops(step.requests, absorbed)
         )
         memory = (g.weights_read(step.num_tokens, latent_paths) + lm_head) * g.weight_bytes
-        memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
+        if g._windowed_layers:
+            memory += g.step_kv_bytes(step.requests)
+        else:
+            memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
         compute_us = flops / self.flops_per_s * 1e6
         memory_us = memory / self.bytes_per_s * 1e6
         communication_us = self.communication_s(step.num_tokens) * 1e6
@@ -1601,14 +1726,13 @@ class RooflineTimingProvider:
                 weights = layer.dense_params
                 if layer.latent is not None:
                     weights += layer.latent.kv_b_params * paths
-                context = sum(r.num_computed_tokens + r.num_scheduled_tokens for r in batch)
                 flops[rank] += 2 * layer.dense_params * tokens[rank] + sum(
                     g.layer_attention_flops(layer, r, a)
                     for r, a in zip(batch, absorbed[rank])
                 )
-                memory[rank] += weights * g.weight_bytes + (
-                    context + tokens[rank]
-                ) * g.layer_kv_bytes_per_token(layer)
+                memory[rank] += weights * g.weight_bytes + sum(
+                    g.layer_kv_bytes(layer, r) for r in batch
+                )
             for experts in layer.experts:
                 local_s += segment()  # dispatch
                 share = experts.local_experts / experts.global_experts

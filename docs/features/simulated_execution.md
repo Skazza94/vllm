@@ -78,7 +78,12 @@ configuration. It returns a `StepCost`.
 `peak_tflops * compute_efficiency` and its bytes at `hbm_tbps *
 bandwidth_efficiency` (presets: `gpu` = `a100`, `h100`, `h200`, `b200`), from
 the built model's layers: dense, MoE (each token through its top-k experts,
-the experts a step's tokens are expected to route to read) and dense MLA. It
+the experts a step's tokens are expected to route to read), dense MLA, and
+sliding-window attention (each new token attends to at most the window's
+tokens, itself included; a step reads each token's KV it needs once: its new
+tokens and up to `window - 1` cached ones). Other attention layers (chunked
+local or RSWA attention, say) and attention layers whose heads or head sizes
+differ from the model's are rejected. It
 records what it rests on in the step log's `timing` record. Other parallel
 layouts are rejected rather than mispriced:
 
