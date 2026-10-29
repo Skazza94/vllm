@@ -19,6 +19,7 @@ from vllm.v1.worker.simulated.timing import (
     LayerGeometry,
     ROUTING_MODEL,
     ModelGeometry,
+    RecurrentGeometry,
     RooflineTimingProvider,
     UnsupportedModelLayout,
     attention_pairs,
@@ -266,7 +267,13 @@ def write_config(directory, config):
 
 
 def timing_record(
-    tmp_path, model_dir, monkeypatch, tensor_parallel_size=1, steps=None, block_size=16
+    tmp_path,
+    model_dir,
+    monkeypatch,
+    tensor_parallel_size=1,
+    steps=None,
+    block_size=16,
+    **options,
 ):
     """The timing record an in-process simulated engine writes, after one
     request's steps (the output rank's), which `steps` receives."""
@@ -289,6 +296,7 @@ def timing_record(
             "timing_args": {"gpu": "h100"},
             "log_path": str(log),
         },
+        **options,
     )
     try:
         output = llm.generate(
@@ -1674,3 +1682,377 @@ def test_a_built_model_records_each_layers_window(tmp_path, monkeypatch, config,
         for _ in range(group["last"] - group["first"] + 1)
     ]
     assert expanded == windows
+
+
+# Qwen3-Next-80B-A3B's gated delta-net on one rank: 16 key and 32 value
+# heads of 128, a convolution of 8192 channels over 4 tokens, BF16 states.
+NEXT_GDN = RecurrentGeometry(
+    num_k_heads=16,
+    num_v_heads=32,
+    head_k_dim=128,
+    head_v_dim=128,
+    conv_dim=8192,
+    conv_kernel=4,
+    conv_state_bytes=3 * 8192 * 2,
+    ssm_state_bytes=32 * 128 * 128 * 2,
+    ssm_dtype_bytes=2,
+    activation_bytes=2,
+)
+STATE = 32 * 128 * 128 * 2
+FINAL = 32 * 128 * 128 * 4
+CONV = 3 * 8192 * 2
+# Per value head and 64-token chunk.
+CHUNK_FLOPS = 6 * 64 * 128 * 128 + 6 * 64 * 64 * 128 + 4 * 64 * 64 * 128 + 2 * 64**3 / 3
+
+
+def test_a_gdn_decode_reads_and_writes_its_states():
+    assert NEXT_GDN.decode_flops() == 7 * 32 * 128 * 128 == 3_670_016
+    assert NEXT_GDN.decode_bytes() == 2 * STATE + 2 * CONV == 2_195_456
+
+
+def test_a_gdn_chunk_path_counts_whole_chunks_and_its_temporaries():
+    # Full chunks: about 5.85 MFLOP and 163,840 bytes a token (106,496 of
+    # temporaries, 57,344 of inputs and output) beside the fixed states.
+    assert NEXT_GDN.chunk_flops(4096) / 4096 == pytest.approx(5.85455e6, rel=1e-5)
+    fixed = 6 * STATE + 2 * FINAL + 2 * CONV
+    assert fixed == 10_584_064
+    assert NEXT_GDN.chunk_bytes(4096) == fixed + 4096 * 163_840
+    # 100 tokens: two chunks' tiles and state snapshots, 100 tokens' buffers.
+    assert NEXT_GDN.chunk_flops(100) == 32 * 2 * CHUNK_FLOPS
+    per_token = 32 * (64 * 4 + 64 * 2 + 128 * 2 + 2 * 128 * 2)
+    snapshots = 2 * 32 * 128 * 128 * 2
+    inputs = 32 * (5 * 128 + 2 * 128) * 2
+    assert NEXT_GDN.chunk_bytes(100) == fixed + 2 * (100 * per_token + snapshots) + 100 * inputs
+
+
+@pytest.mark.parametrize(
+    "ssm_bytes, fixed",
+    [
+        (2, 6 * STATE + 2 * FINAL),  # converted to BF16 through a temporary
+        (4, 4 * (2 * STATE) + 2 * FINAL),  # an FP32 cache takes the state as is
+    ],
+)
+def test_the_final_state_conversion_follows_the_cache_dtype(ssm_bytes, fixed):
+    # A BF16 convolution state beside the SSM state's own dtype.
+    gdn = dataclasses.replace(
+        NEXT_GDN, ssm_state_bytes=STATE // 2 * ssm_bytes, ssm_dtype_bytes=ssm_bytes
+    )
+    assert gdn.chunk_bytes(64) - gdn.chunk_bytes(0) == NEXT_GDN.chunk_bytes(64) - (
+        NEXT_GDN.chunk_bytes(0)
+    )
+    assert gdn.chunk_bytes(0) == fixed + 2 * CONV
+    assert gdn.decode_bytes() == 2 * STATE // 2 * ssm_bytes + 2 * CONV
+
+
+@pytest.mark.parametrize(
+    "request_, decode",
+    [
+        (sim_req("decode", 1, 300, 300), True),
+        # A resumed one-token chunk still marked as prefill: it has state.
+        (sim_req("resumed", 1, 299, 300), True),
+        # A first chunk of one token has none: the chunk path.
+        (sim_req("first", 1, 0, 1), False),
+        (sim_req("later", 200, 100, 300), False),
+    ],
+)
+def test_gdn_dispatch_follows_scheduled_and_computed_tokens(request_, decode):
+    assert NEXT_GDN.takes_decode(request_) is decode
+    chunk = NEXT_GDN.chunk_flops(request_.num_scheduled_tokens)
+    assert NEXT_GDN.step_flops(request_) == (NEXT_GDN.decode_flops() if decode else chunk)
+
+
+def test_gdn_speculative_steps_are_rejected():
+    request = dataclasses.replace(sim_req("r", 3, 10, 10), num_spec_tokens=2)
+    with pytest.raises(ValueError, match="speculative"):
+        NEXT_GDN.step_flops(request)
+
+
+# Qwen3-Next's pattern on a small dense model: three GDN layers, then one
+# of full attention.
+HYBRID = dataclasses.replace(
+    QWEN_7B,
+    num_layers=4,
+    layers=(LayerGeometry(1000, recurrent=NEXT_GDN),) * 3 + (LayerGeometry(1000),),
+)
+
+
+def unit(geometry, **kwargs):
+    return RooflineTimingProvider(
+        None,
+        peak_tflops=1.0,
+        hbm_tbps=1.0,
+        compute_efficiency=1.0,
+        bandwidth_efficiency=1.0,
+        fixed_us=0.0,
+        geometry=geometry,
+        **kwargs,
+    )
+
+
+def test_gdn_layers_take_no_attention():
+    assert HYBRID._attention_layers == (1, ())
+    assert HYBRID.kv_bytes_per_token == 2 * 4 * 128 * 2
+    request = sim_req("r", 100, 0, 100)
+    assert HYBRID.attention_flops((request,), (False,)) == 4 * 28 * 128 * 5050
+    assert HYBRID.layer_attention_flops(HYBRID.layers[0], request, False) == (
+        NEXT_GDN.chunk_flops(100)
+    )
+    assert HYBRID.layer_kv_bytes(HYBRID.layers[0], request) == NEXT_GDN.chunk_bytes(100)
+
+
+def test_a_mixed_batch_prices_each_requests_gdn_path():
+    prefill, decode = sim_req("p", 300, 0, 300), sim_req("d", 1, 500, 400)
+    cost = unit(HYBRID).estimate(sim_step(0, prefill, decode))
+    lm_head = 3584 * 152064
+    flops = (
+        2 * 4000 * 301
+        + 2 * lm_head * 2
+        + 4 * 28 * 128 * (300 * 301 // 2 + 501)
+        + 3 * (NEXT_GDN.chunk_flops(300) + NEXT_GDN.decode_flops())
+    )
+    memory = (
+        (4000 + lm_head) * 2
+        + (300 + 501 + 301) * 2 * 4 * 128 * 2
+        + 3 * (NEXT_GDN.chunk_bytes(300) + NEXT_GDN.decode_bytes())
+    )
+    assert cost.breakdown["compute_us"] == pytest.approx(flops / 1e12 * 1e6)
+    assert cost.breakdown["memory_us"] == pytest.approx(memory / 1e12 * 1e6)
+    assert cost.breakdown["gdn_decode_reqs"] == 1
+
+
+def test_gdn_dual_rank_ep_paces_each_ranks_own_requests():
+    """DP=2 with EP: rank 0's prefill and rank 1's decodes each price their own
+    GDN layers before the MoE layer; an idle rank pays none of it."""
+    gdn = LayerGeometry(10_000, recurrent=NEXT_GDN)
+    geometry = dataclasses.replace(TWO_RANKS, layers=(gdn, TWO_RANKS.layers[1]))
+    prefill = on_rank(0, sim_req("a", 1000, 0, 2000))
+    decodes = [on_rank(1, sim_req(f"d{i}", 1, 10, 10)) for i in range(50)]
+    cost = unit_rates(geometry).estimate(sim_step(0, prefill, *decodes))
+
+    def seconds(flops, nbytes):
+        return max(flops / 1e12, nbytes / 1e12)
+
+    # Before the MoE layer's dispatch: the GDN layer, then the MoE layer's
+    # own attention (one head of 32 for K and V, bf16).
+    dense = 10_000 + 1000
+    kv = 2 * 1 * 32 * 2
+    before = [
+        seconds(
+            2 * dense * 1000 + NEXT_GDN.chunk_flops(1000) + 4 * 2 * 32 * (1000 * 1001 // 2),
+            dense * 2 + NEXT_GDN.chunk_bytes(1000) + (1000 + 1000) * kv,
+        ),
+        seconds(
+            2 * dense * 50 + 50 * NEXT_GDN.decode_flops() + 4 * 2 * 32 * 50 * 11,
+            dense * 2 + 50 * NEXT_GDN.decode_bytes() + 50 * (11 + 1) * kv,
+        ),
+    ]
+    lm_head = 64 * 1_000_000
+    after = [seconds(0, lm_head * 2), seconds(2 * lm_head * 50, lm_head * 2)]
+    assert cost.breakdown["local_us"] == pytest.approx(
+        (max(before) + max(after)) * 1e6
+    )
+    idle = unit_rates(geometry).estimate(sim_step(0, *decodes))
+    assert idle.breakdown["idle_dp_ranks"] == 1
+    assert idle.breakdown["local_us"] == pytest.approx((before[1] + after[1]) * 1e6)
+
+
+class StubGDN:
+    """A built `QwenGatedDeltaNetAttention`'s fields: global heads and
+    convolution width, its rank's state shapes and dtypes."""
+
+    def __init__(self, tp, conv_dtype=torch.bfloat16, ssm_dtype=torch.bfloat16, shape=None):
+        self.tp_size = tp
+        self.num_k_heads, self.num_v_heads = 16, 32
+        self.head_k_dim = self.head_v_dim = 128
+        self.conv_dim, self.conv_kernel_size = 8192, 4
+        self.num_spec = 0
+        self.gdn_prefill_backend = "triton"
+        self._shape = shape or (32 // tp, 128, 128)
+        self._dtypes = (conv_dtype, ssm_dtype)
+
+    def get_state_shape(self):
+        return (3, 8192 // self.tp_size), self._shape
+
+    def get_state_dtype(self):
+        return self._dtypes
+
+
+def test_gdn_geometry_is_this_ranks_once():
+    one, two = (RecurrentGeometry.from_module(StubGDN(tp), 2) for tp in (1, 2))
+    assert one == dataclasses.replace(NEXT_GDN, constructed_prefill="triton")
+    assert (two.num_k_heads, two.num_v_heads, two.conv_dim) == (8, 16, 4096)
+    # The rank's state shapes are not divided again.
+    assert (two.ssm_state_bytes, two.conv_state_bytes) == (STATE // 2, CONV // 2)
+    assert two.decode_flops() * 2 == one.decode_flops()
+    assert two.chunk_bytes(640) * 2 == pytest.approx(one.chunk_bytes(640))
+    mixed = RecurrentGeometry.from_module(StubGDN(1, ssm_dtype=torch.float32), 2)
+    assert (mixed.conv_state_bytes, mixed.ssm_state_bytes, mixed.ssm_dtype_bytes) == (
+        CONV,
+        2 * STATE,
+        4,
+    )
+    with pytest.raises(ValueError, match="state on this rank of"):
+        RecurrentGeometry.from_module(StubGDN(2, shape=(32, 128, 128)), 2)
+    with pytest.raises(ValueError, match="divisible by the tensor-parallel size 3"):
+        RecurrentGeometry.from_module(StubGDN(3), 2)
+
+
+def test_gdn_assumptions_are_recorded():
+    recorded = unit(HYBRID).assumptions()["recurrent"]
+    assert recorded["modeled_prefill"] == "triton_fla"
+    assert recorded["chunk_size"] == 64
+    assert "FlashInfer" in recorded["not_modeled"][0]
+    groups = unit(HYBRID).assumptions()["geometry"]["layers"]
+    assert [g.get("recurrent", {}).get("num_v_heads") for g in groups] == [32, None]
+    with pytest.raises(ValueError, match="GDN prefill"):
+        unit(HYBRID, gdn_prefill_backend="flashinfer")
+
+
+def gdn_layer(kind=None, **fields):
+    """A built gated delta-net of `kind` (default Qwen's) with
+    `StubGDN`'s fields, without the kernels its constructor selects."""
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    kind = kind or QwenGatedDeltaNetAttention
+    layer = kind.__new__(kind)
+    torch.nn.Module.__init__(layer)
+    stub = StubGDN(1)
+    for name in ("tp_size", "num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim",
+                 "conv_dim", "conv_kernel_size", "num_spec", "gdn_prefill_backend"):
+        setattr(layer, name, getattr(stub, name))
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.cache_config = SimpleNamespace(mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto")
+    for name, value in fields.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def hybrid_config(**cache):
+    config = qwen_7b_config("auto")
+    config.model_config.is_hybrid = True
+    config.model_config.quantization = None
+    config.cache_config.mamba_cache_mode = cache.get("mamba_cache_mode", "none")
+    config.cache_config.enable_prefix_caching = cache.get("enable_prefix_caching", False)
+    config.speculative_config = cache.get("speculative_config")
+    config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    return config
+
+
+def hybrid_model(layer):
+    """28 decoder layers, layer `i`'s mixer `layer(i)`."""
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList()
+    for index in range(28):
+        block = torch.nn.Module()
+        block.mixer = layer(index)
+        model.layers.append(block)
+    return model
+
+
+def test_a_built_gdn_model_records_its_layers():
+    model = hybrid_model(lambda i: gdn_layer() if i % 4 < 3 else attention_layer())
+    geometry = ModelGeometry.from_model(hybrid_config(), model)
+    assert [layer.recurrent is not None for layer in geometry.layers[:4]] == [
+        True, True, True, False
+    ]
+    assert geometry.layers[0].recurrent == dataclasses.replace(
+        NEXT_GDN, constructed_prefill="triton"
+    )
+    assert geometry._attention_layers == (7, ())
+    with pytest.raises(ValueError, match="hybrid model's built layers"):
+        ModelGeometry.from_config(hybrid_config())
+
+
+def test_other_recurrent_layers_and_layouts_are_rejected():
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    class OtherGDN(QwenGatedDeltaNetAttention):  # e.g. Kimi's or OLMo's
+        pass
+
+    def beside(index):
+        block = torch.nn.Module()
+        block.gdn, block.attn = gdn_layer(), attention_layer()
+        return block
+
+    for model, message in (
+        (hybrid_model(lambda _: gdn_layer(OtherGDN)), r"only, not \['OtherGDN'\]"),
+        (hybrid_model(beside), "without attention beside it"),
+        (hybrid_model(lambda _: gdn_layer(num_spec=2)), "speculative state"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ModelGeometry.from_model(hybrid_config(), model)
+    model = hybrid_model(lambda _: gdn_layer())
+    for cache in (
+        {"mamba_cache_mode": "align"},
+        {"enable_prefix_caching": True},
+        {"speculative_config": object()},
+    ):
+        with pytest.raises(ValueError, match="mamba_cache_mode none"):
+            ModelGeometry.from_model(hybrid_config(**cache), model)
+
+
+QWEN3_NEXT = {
+    "architectures": ["Qwen3NextForCausalLM"],
+    "model_type": "qwen3_next",
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "full_attention_interval": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "norm_topk_prob": True,
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10000,
+    "tie_word_embeddings": False,
+}
+
+
+def test_a_built_qwen3_next_is_timed_from_its_gdn_layers(tmp_path, monkeypatch):
+    model_dir = write_config(tmp_path / "qwen3-next", QWEN3_NEXT)
+    steps = []
+    record = timing_record(
+        tmp_path, model_dir, monkeypatch, steps=steps, block_size=None,
+        enable_prefix_caching=False,
+    )
+    groups = record["geometry"]["layers"]
+    recurrent = [g.get("recurrent") for g in groups for _ in range(g["last"] - g["first"] + 1)]
+    assert [r is not None for r in recurrent] == [True, True, True, False]
+    assert recurrent[0] == {
+        "num_k_heads": 2,
+        "num_v_heads": 4,
+        "head_k_dim": 16,
+        "head_v_dim": 16,
+        "conv_dim": 2 * 2 * 16 + 4 * 16,
+        "conv_kernel": 4,
+        "conv_state_bytes": 3 * 128 * 2,
+        "ssm_state_bytes": 4 * 16 * 16 * 2,
+        "ssm_dtype_bytes": 2,
+        "activation_bytes": 2,
+        "constructed_prefill": "triton",
+    }
+    assert record["recurrent"]["constructed_prefill"] == ["triton"]
+    # 40 prompt tokens, then a decode step.
+    assert [s["cost"]["breakdown"]["gdn_decode_reqs"] for s in steps] == [0, 1]

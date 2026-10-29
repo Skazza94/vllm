@@ -81,9 +81,15 @@ the built model's layers: dense, MoE (each token through its top-k experts,
 the experts a step's tokens are expected to route to read), dense MLA, and
 sliding-window attention (each new token attends to at most the window's
 tokens, itself included; a step reads each token's KV it needs once: its new
-tokens and up to `window - 1` cached ones). Other attention layers (chunked
-local or RSWA attention, say) and attention layers whose heads or head sizes
-differ from the model's are rejected. It
+tokens and up to `window - 1` cached ones), and hybrid models' Qwen gated
+delta-net layers (Qwen3-Next, Qwen3.5; `mamba_cache_mode` none, prefix
+caching off): a request's step takes the recurrent decode when it schedules
+one token after others, else FLA's Triton chunk path (64-token chunks),
+whichever kernel the GPU would select (FlashInfer on Hopper), with its
+states, temporaries and inputs counted as logical bytes. Other attention
+layers (chunked local or RSWA attention, say), other recurrent layers
+(Mamba, Kimi's or OLMo's delta-nets) and attention layers whose heads or
+head sizes differ from the model's are rejected. It
 records what it rests on in the step log's `timing` record. Other parallel
 layouts are rejected rather than mispriced:
 

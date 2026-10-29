@@ -511,6 +511,159 @@ class LatentAttentionGeometry:
         return 2 * self.kv_b_params * tokens
 
 
+# Qwen's gated delta-net (GDN) as modeled: FLA's Triton chunk path for a
+# sequence's chunk of tokens (FLA_CHUNK_SIZE), the recurrent delta rule for
+# a one-token decode; FlashInfer, which vLLM selects on Hopper and on
+# Blackwell, CuteDSL and AITER are not modeled.
+GDN_CHUNK_SIZE = 64
+GDN_PREFILL_BACKENDS = ("triton_fla",)
+
+
+@dataclass(frozen=True)
+class RecurrentGeometry:
+    """One layer's Qwen gated delta-net (`QwenGatedDeltaNetAttention`) on this
+    rank: its key and value heads, their dims, the convolution's width and
+    its cached states' bytes, as resolved (the layer's state shapes are
+    already this rank's). Its projections and convolution weights are dense
+    weights (`LayerGeometry.dense_params`).
+
+    A request's step takes the recurrent decode when it schedules one token
+    after others (GDN's metadata split), else FLA's chunk path over its
+    scheduled tokens, a chunk of `GDN_CHUNK_SIZE` tokens costing a whole
+    chunk's tiles. FLOPs and logical global bytes (one tensor read per
+    consuming kernel, buffers written once; not measured HBM traffic):
+    `decode_flops`, `chunk_flops`, `decode_bytes`, `chunk_bytes`."""
+
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    conv_dim: int
+    conv_kernel: int
+    conv_state_bytes: int
+    """The cached convolution state, (conv_kernel - 1) x conv_dim."""
+    ssm_state_bytes: int
+    """The cached recurrent state, num_v_heads x head_v_dim x head_k_dim."""
+    ssm_dtype_bytes: int
+    activation_bytes: int
+    """The kernels' inputs, outputs and temporaries (the model's dtype)."""
+    constructed_prefill: str | None = None
+    """The prefill backend the built rank selected (not the one modeled)."""
+
+    @property
+    def _state_elements(self) -> int:
+        return self.num_v_heads * self.head_k_dim * self.head_v_dim
+
+    def decode_flops(self) -> int:
+        """One token's recurrent delta rule, per value head: decay (dk dv),
+        k^T S (2 dk dv), the rank-1 update (2 dk dv), S^T q (2 dk dv)."""
+        return 7 * self._state_elements
+
+    def chunk_flops(self, tokens: int) -> float:
+        """FLA's chunk path over `tokens`, per value head and chunk: K K^T
+        (2 C^2 dk), w and u (2 C^2 dk, 2 C^2 dv), the new values and the
+        state update (2 C dk dv each), the output's q S, q K^T and its
+        product with the new values (2 C dk dv, 2 C^2 dk, 2 C^2 dv), and
+        the C x C triangular inverse (about C^3 / 3 multiply-adds)."""
+        c, dk, dv = GDN_CHUNK_SIZE, self.head_k_dim, self.head_v_dim
+        chunks = math.ceil(tokens / c)
+        per_chunk = 6 * c * dk * dv + 6 * c * c * dk + 4 * c * c * dv + 2 * c**3 / 3
+        return self.num_v_heads * chunks * per_chunk
+
+    def decode_bytes(self) -> int:
+        """The recurrent state and the convolution state, read and written in
+        place."""
+        return 2 * self.ssm_state_bytes + 2 * self.conv_state_bytes
+
+    def chunk_bytes(self, tokens: int) -> float:
+        """A sequence's chunk path over `tokens`: its states, the chunk
+        kernels' temporaries (each written once and read once) and their
+        inputs and output.
+
+        States: the recurrent state gathered (read, write), read as the
+        initial state, the FP32 final state written and read, converted to
+        the cache's dtype (a temporary written, unless the cache is FP32)
+        and scattered (read, write); the convolution state read and
+        written. Temporaries: A in FP32 and in the activations' dtype, w, u,
+        the new values, and the state before each chunk. Inputs: k read by
+        four kernels, q and v by one each; the output written."""
+        a, h = self.activation_bytes, self.num_v_heads
+        dk, dv, c = self.head_k_dim, self.head_v_dim, GDN_CHUNK_SIZE
+        state, final = self.ssm_state_bytes, self._state_elements * 4
+        converted = 4 * state if self.ssm_dtype_bytes == 4 else 6 * state
+        states = converted + 2 * final + 2 * self.conv_state_bytes
+        per_token = h * (c * 4 + c * a + dk * a + 2 * dv * a)
+        snapshots = math.ceil(tokens / c) * h * dk * dv * a
+        temporaries = 2 * (tokens * per_token + snapshots)
+        inputs = tokens * h * (5 * dk + 2 * dv) * a
+        return states + temporaries + inputs
+
+    def takes_decode(self, request: SimRequestStep) -> bool:
+        """Whether a request's step takes the recurrent decode: one token,
+        after others (a first one-token chunk has no state: the chunk path)."""
+        return request.num_scheduled_tokens == 1 and request.num_computed_tokens > 0
+
+    def step_flops(self, request: SimRequestStep) -> float:
+        if request.num_spec_tokens:
+            raise ValueError(
+                "The roofline timing provider models GDN without speculative decoding."
+            )
+        if self.takes_decode(request):
+            return self.decode_flops()
+        return self.chunk_flops(request.num_scheduled_tokens)
+
+    def step_bytes(self, request: SimRequestStep) -> float:
+        if self.takes_decode(request):
+            return self.decode_bytes()
+        return self.chunk_bytes(request.num_scheduled_tokens)
+
+    @classmethod
+    def from_module(cls, module: Any, activation_bytes: int) -> RecurrentGeometry:
+        """A built `QwenGatedDeltaNetAttention`: its heads, dims and
+        convolution width are the model's, divided by its tensor-parallel
+        size here (exactly, once); its state shapes and dtypes are already
+        this rank's."""
+        tp = module.tp_size
+
+        def local(name: str) -> int:
+            value = getattr(module, name)
+            if value % tp:
+                raise ValueError(
+                    f"The roofline timing provider needs GDN's {name} ({value}) "
+                    f"divisible by the tensor-parallel size {tp}."
+                )
+            return value // tp
+
+        if getattr(module, "num_spec", 0):
+            raise ValueError(
+                "The roofline timing provider models GDN without speculative state."
+            )
+        (conv_shape, ssm_shape), (conv_dtype, ssm_dtype) = (
+            tuple(module.get_state_shape()),
+            tuple(module.get_state_dtype()),
+        )
+        geometry = cls(
+            num_k_heads=local("num_k_heads"),
+            num_v_heads=local("num_v_heads"),
+            head_k_dim=module.head_k_dim,
+            head_v_dim=module.head_v_dim,
+            conv_dim=local("conv_dim"),
+            conv_kernel=module.conv_kernel_size,
+            conv_state_bytes=math.prod(conv_shape) * conv_dtype.itemsize,
+            ssm_state_bytes=math.prod(ssm_shape) * ssm_dtype.itemsize,
+            ssm_dtype_bytes=ssm_dtype.itemsize,
+            activation_bytes=activation_bytes,
+            constructed_prefill=getattr(module, "gdn_prefill_backend", None),
+        )
+        expected = (geometry.num_v_heads, geometry.head_v_dim, geometry.head_k_dim)
+        if tuple(ssm_shape) != expected:
+            raise ValueError(
+                f"The roofline timing provider expects GDN's state on this rank "
+                f"of {expected}, not {tuple(ssm_shape)}."
+            )
+        return geometry
+
+
 @dataclass(frozen=True)
 class LatentAttentionBackend:
     """One of vLLM's CUDA MLA backends: what it serves (as its
@@ -657,6 +810,8 @@ class LayerGeometry:
     sliding_window: int | None = None
     """Its attention's window, in tokens (each attends to at most this many,
     itself included); None: full attention."""
+    recurrent: RecurrentGeometry | None = None
+    """Its gated delta-net, in place of attention."""
 
 
 # How an MoE step's expert reads are estimated, as recorded with the geometry.
@@ -683,13 +838,14 @@ def rank_reach_probability(global_experts: int, local_experts: int, top_k: int) 
 
 
 def needs_built_layers(model_config: Any) -> bool:
-    """Whether the roofline needs the built model's layers: an MoE, MLA or
-    sliding-window model, whose layers differ in ways the config alone does
-    not settle."""
+    """Whether the roofline needs the built model's layers: an MoE, MLA,
+    sliding-window or hybrid model, whose layers differ in ways the config
+    alone does not settle."""
     return (
         model_config.is_moe
         or model_config.use_mla
         or model_config.get_sliding_window() is not None
+        or model_config.is_hybrid
     )
 
 
@@ -714,6 +870,8 @@ def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
                 group["latent"] = asdict(layer.latent)
             if layer.sliding_window is not None:
                 group["sliding_window"] = layer.sliding_window
+            if layer.recurrent is not None:
+                group["recurrent"] = asdict(layer.recurrent)
             groups.append(group)
     return groups
 
@@ -755,8 +913,8 @@ class ModelGeometry:
         """A dense model's geometry from its config."""
         if needs_built_layers(vllm_config.model_config):
             raise ValueError(
-                "The roofline timing provider needs an MoE, MLA or "
-                "sliding-window model's built layers: ModelGeometry.from_model."
+                "The roofline timing provider needs an MoE, MLA, sliding-window "
+                "or hybrid model's built layers: ModelGeometry.from_model."
             )
         return cls._from_config(vllm_config)
 
@@ -776,6 +934,10 @@ class ModelGeometry:
             RoutedExperts,
         )
         from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
 
         def linear_params(module: torch.nn.Module) -> int:
             if isinstance(module, LinearBase):
@@ -787,7 +949,7 @@ class ModelGeometry:
             assert isinstance(module, torch.nn.Linear)
             return module.in_features * module.out_features
 
-        geometry = cls._from_config(vllm_config)
+        geometry = cls._from_config(vllm_config, built=True)
         num_layers = vllm_config.model_config.get_total_num_hidden_layers()
         # The decoder: the list of the model's layer count named "layers", or
         # the only such list under any name (EXAONE's transformer.h).
@@ -838,6 +1000,29 @@ class ModelGeometry:
                         "layers of the model's heads, KV heads, K and V head "
                         f"sizes per rank {heads}, not {built}."
                     )
+            recurrent = None
+            if mixers := [m for m in layer.modules() if isinstance(m, MambaBase)]:
+                if others := sorted(
+                    {
+                        type(m).__name__
+                        for m in mixers
+                        if type(m) is not QwenGatedDeltaNetAttention
+                    }
+                ):
+                    raise ValueError(
+                        "The roofline timing provider models Qwen's gated "
+                        f"delta-net (QwenGatedDeltaNetAttention) only, not {others}."
+                    )
+                if len(mixers) > 1 or plain or any(
+                    isinstance(m, MLAAttention) for m in layer.modules()
+                ):
+                    raise ValueError(
+                        "The roofline timing provider models one gated "
+                        "delta-net per decoder layer, without attention beside it."
+                    )
+                recurrent = RecurrentGeometry.from_module(
+                    mixers[0], int(geometry.activation_bytes)
+                )
             windows = {m.sliding_window for m in plain}
             if len(windows) > 1:
                 raise UnsupportedModelLayout(
@@ -892,7 +1077,9 @@ class ModelGeometry:
                     )
                 elif isinstance(module, (LinearBase, torch.nn.Linear)):
                     dense += linear_params(module)
-            layers.append(LayerGeometry(dense, tuple(experts), latent, window))
+            layers.append(
+                LayerGeometry(dense, tuple(experts), latent, window, recurrent)
+            )
         routers = [
             module.moe_config
             for layer in candidates[0]
@@ -919,6 +1106,13 @@ class ModelGeometry:
                                 f"placed evenly: {experts.local_experts} of "
                                 f"{experts.global_experts} on one of {ranks} ranks."
                             )
+        if any(layer.recurrent for layer in layers):
+            cls._check_recurrent(vllm_config)
+        elif vllm_config.model_config.is_hybrid:
+            raise UnsupportedModelLayout(
+                "The roofline timing provider found no gated delta-net in the "
+                "hybrid model's decoder layers."
+            )
         if any(layer.latent for layer in layers):
             cls._check_latent(vllm_config)
         elif vllm_config.model_config.use_mla:
@@ -942,6 +1136,28 @@ class ModelGeometry:
                 "context parallelism (DCP, PCP) or speculative decoding."
             )
         ModelGeometry._check_unquantized(vllm_config, "MLA")
+
+    @staticmethod
+    def _check_recurrent(vllm_config: VllmConfig) -> None:
+        """A gated delta-net model as modeled: one state per request
+        (mamba_cache_mode none, no prefix caching), no speculative state,
+        no pipeline or context parallelism, unquantized weights."""
+        cache = vllm_config.cache_config
+        parallel = vllm_config.parallel_config
+        if (
+            cache.mamba_cache_mode != "none"
+            or cache.enable_prefix_caching
+            or vllm_config.speculative_config is not None
+            or parallel.pipeline_parallel_size > 1
+            or parallel.decode_context_parallel_size > 1
+            or parallel.prefill_context_parallel_size > 1
+        ):
+            raise ValueError(
+                "The roofline timing provider models gated delta-net models "
+                "with mamba_cache_mode none and prefix caching off, without "
+                "speculative decoding, pipeline or context parallelism."
+            )
+        ModelGeometry._check_unquantized(vllm_config, "gated delta-net")
 
     @staticmethod
     def _check_unquantized(vllm_config: VllmConfig, kind: str) -> None:
@@ -993,15 +1209,19 @@ class ModelGeometry:
         ModelGeometry._check_unquantized(vllm_config, "MoE")
 
     @classmethod
-    def _from_config(cls, vllm_config: VllmConfig) -> ModelGeometry:
+    def _from_config(
+        cls, vllm_config: VllmConfig, built: bool = False
+    ) -> ModelGeometry:
+        """The config's figures; a hybrid model's only as the base of its
+        built layers' (`from_model`)."""
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
         model = vllm_config.model_config
         parallel = vllm_config.parallel_config
-        if model.is_hybrid or model.is_attention_free:
+        if (model.is_hybrid and not built) or model.is_attention_free:
             raise ValueError(
-                "The roofline timing provider models dense, MoE and MLA "
-                "attention models (no hybrid or attention-free ones)."
+                "The roofline timing provider models attention models, and "
+                "hybrid ones from their built layers (no attention-free ones)."
             )
         tp = parallel.tensor_parallel_size
         text = model.hf_text_config
@@ -1068,10 +1288,38 @@ class ModelGeometry:
         if self.layers is None:
             return self.num_layers, ()
         latent = collections.Counter(
-            layer.latent for layer in self.layers if layer.sliding_window is None
+            layer.latent
+            for layer in self.layers
+            if layer.sliding_window is None and layer.recurrent is None
         )
         plain = latent.pop(None, 0)
         return plain, tuple(latent.items())  # type: ignore[arg-type]
+
+    @functools.cached_property
+    def _recurrent_layers(self) -> tuple[tuple[RecurrentGeometry, int], ...]:
+        """Layers of gated delta-net, by geometry."""
+        recurrent = collections.Counter(
+            layer.recurrent
+            for layer in self.layers or ()
+            if layer.recurrent is not None
+        )
+        return tuple(recurrent.items())
+
+    def recurrent_flops(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """A step's gated delta-net work in every such layer."""
+        return sum(
+            count * geometry.step_flops(request)
+            for geometry, count in self._recurrent_layers
+            for request in requests
+        )
+
+    def recurrent_bytes(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """The states, temporaries and inputs a step's gated delta-nets move."""
+        return sum(
+            count * geometry.step_bytes(request)
+            for geometry, count in self._recurrent_layers
+            for request in requests
+        )
 
     @functools.cached_property
     def _windowed_layers(self) -> tuple[tuple[int, int], ...]:
@@ -1099,8 +1347,11 @@ class ModelGeometry:
 
     def layer_attention_flops(
         self, layer: LayerGeometry, request: SimRequestStep, absorbed: bool
-    ) -> int:
-        """One request's QK^T and AV in one layer, and its MLA `kv_b_proj`."""
+    ) -> float:
+        """One request's QK^T and AV in one layer, and its MLA `kv_b_proj`;
+        a gated delta-net layer's own work."""
+        if layer.recurrent is not None:
+            return layer.recurrent.step_flops(request)
         pairs = attention_pairs(
             request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
         )
@@ -1111,7 +1362,10 @@ class ModelGeometry:
         )
 
     def layer_kv_bytes(self, layer: LayerGeometry, request: SimRequestStep) -> float:
-        """The KV one request's step reads and writes in one layer."""
+        """The KV one request's step reads and writes in one layer; a gated
+        delta-net layer's states, temporaries and inputs."""
+        if layer.recurrent is not None:
+            return layer.recurrent.step_bytes(request)
         return kv_tokens(
             request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
         ) * self.layer_kv_bytes_per_token(layer)
@@ -1228,6 +1482,12 @@ class RooflineTimingProvider:
     (`attention_pairs`), and its step reads each KV it needs once
     (`kv_tokens`): its new tokens and up to ``window - 1`` cached ones.
 
+    A hybrid model's Qwen gated delta-net layers (`RecurrentGeometry`) take
+    no attention: a request's step takes the recurrent decode or FLA's
+    Triton chunk path (``gdn_prefill_backend``, `GDN_PREFILL_BACKENDS`),
+    whichever GPU's default prefill kernel is (FlashInfer on Hopper), with
+    its states, temporaries and inputs as logical bytes.
+
     Data-parallel attention with expert parallelism (TP=1 per DP rank, up to
     `NVLINK_DOMAIN_GPUS` ranks): a joint step's segments between the MoE
     layers' synchronizations each take the slowest rank's own work; every
@@ -1254,6 +1514,7 @@ class RooflineTimingProvider:
         mla_backend: str | None = None,
         ep_all2all: str | None = None,
         ep_moe_interface: str | None = None,
+        gdn_prefill_backend: str = "triton_fla",
     ) -> None:
         if gpu is not None and gpu not in GPU_PRESETS:
             raise ValueError(f"Unknown GPU {gpu!r}; presets: {sorted(GPU_PRESETS)}.")
@@ -1325,6 +1586,12 @@ class RooflineTimingProvider:
             )
         self._ep_all2all = ep_all2all
         self._ep_moe_interface = ep_moe_interface
+        if gdn_prefill_backend not in GDN_PREFILL_BACKENDS:
+            raise ValueError(
+                f"The roofline timing provider models GDN prefill as "
+                f"{GDN_PREFILL_BACKENDS}, not {gdn_prefill_backend!r}."
+            )
+        self._gdn_prefill_backend = gdn_prefill_backend
         # Resolved with an expert-parallel model's layers (_check_geometry).
         self.expert_all2all: str | None = None
         self.moe_interface: str | None = None
@@ -1644,7 +1911,60 @@ class RooflineTimingProvider:
             assumptions["latent_attention"] = self._latent_attention
         if geometry.ep_size > 1:
             assumptions["expert_parallel"] = self._expert_parallel
+        if geometry._recurrent_layers:
+            assumptions["recurrent"] = self._recurrent_assumptions(geometry)
         return assumptions
+
+    def _recurrent_assumptions(self, geometry: ModelGeometry) -> dict[str, Any]:
+        return {
+            "kind": "qwen_gated_delta_net",
+            "modeled_prefill": self._gdn_prefill_backend,
+            "modeled_decode": (
+                "recurrent delta rule, the arithmetic vLLM's Triton kernels share "
+                "(fused_sigmoid_gating_delta_rule_update in mixed batches, "
+                "fused_recurrent_gated_delta_rule_packed_decode in pure decode)"
+            ),
+            "constructed_prefill": sorted(
+                {str(g.constructed_prefill) for g, _ in geometry._recurrent_layers}
+            ),
+            "not_modeled": [
+                "FlashInfer (vLLM's default on SM90, and on SM100/SM120 with "
+                "head_k_dim 128 and CUDA 13)",
+                "CuteDSL",
+                "AITER FlyDSL",
+                "the fused speculative-decode kernel",
+                "FlashInfer checkpoint plans",
+            ],
+            "dispatch": (
+                "the recurrent decode for a request scheduling one token after "
+                "others, else the chunk path over its scheduled tokens"
+            ),
+            "chunk_size": GDN_CHUNK_SIZE,
+            "chunk_flops": (
+                "per value head and chunk 6 C dk dv + 6 C^2 dk + 4 C^2 dv "
+                "+ 2 C^3 / 3 (the triangular inverse approximated); a partial "
+                "chunk costs a whole one"
+            ),
+            "decode_flops": "per value head 7 dk dv",
+            "bytes": (
+                "logical global traffic, one tensor read per consuming kernel, "
+                "not measured HBM: decode 2 S + 2 S_conv; chunk path, per "
+                "sequence, 6 S + 2 F (4 S + 2 F for an FP32 state) + 2 S_conv, "
+                "plus temporaries (A FP32 and in the activations' dtype, w, u, new "
+                "values, a state per chunk; each written and read) and inputs (k "
+                "read by 4 kernels, q and v by 1, the output written)"
+            ),
+            "omitted": [
+                "elementwise work (gates, exponentials, l2norm, cumsum, masking)",
+                "buffer initialization (solve_tril zero-fills its output)",
+                "cumsum and gating buffers",
+                "loads repeated within a kernel (value tiling), cache reuse",
+            ],
+            "convolution": (
+                "its weights are dense weights (2 FLOPs a weight and token, read "
+                "once a step); its state is counted with the states"
+            ),
+        }
 
     def estimate(self, step: StepDescriptor) -> StepCost:
         g = self._bound()
@@ -1666,12 +1986,14 @@ class RooflineTimingProvider:
             2 * g.token_params * step.num_tokens
             + 2 * lm_head * sampled
             + g.attention_flops(step.requests, absorbed)
+            + g.recurrent_flops(step.requests)
         )
         memory = (g.weights_read(step.num_tokens, latent_paths) + lm_head) * g.weight_bytes
         if g._windowed_layers:
             memory += g.step_kv_bytes(step.requests)
         else:
             memory += (context + step.num_tokens) * g.kv_bytes_per_token  # read and write
+        memory += g.recurrent_bytes(step.requests)
         compute_us = flops / self.flops_per_s * 1e6
         memory_us = memory / self.bytes_per_s * 1e6
         communication_us = self.communication_s(step.num_tokens) * 1e6
@@ -1682,6 +2004,10 @@ class RooflineTimingProvider:
         }
         if g.has_latent_attention:
             breakdown["mla_decode_path_reqs"] = float(sum(absorbed))
+        if g._recurrent_layers:
+            gdn = g._recurrent_layers[0][0]
+            decodes = sum(map(gdn.takes_decode, step.requests))
+            breakdown["gdn_decode_reqs"] = float(decodes)
         return StepCost(
             device_s=(self.fixed_us + max(compute_us, memory_us) + communication_us) * 1e-6,
             host_s=self.host.host_s(step),
