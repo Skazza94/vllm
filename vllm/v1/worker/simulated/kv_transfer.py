@@ -39,7 +39,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LoadStoreSpec,
@@ -305,14 +312,48 @@ def completed_transfers(
     return transfers or None
 
 
+# The KV cache groups real transfers move and check: full attention (MLA's
+# included) and sliding-window attention, whose blocks are the tokens' in
+# order, a window's head left null.
+REAL_KV_SPECS = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec)
+
+
+def check_real_kv_groups(kv_cache_config: KVCacheConfig) -> None:
+    """Refuse real KV transfers of other KV cache groups (chunked local or
+    RSWA attention, attention sinks, Mamba states), whose blocks follow other
+    rules."""
+    other = sorted(
+        {
+            type(group.kv_cache_spec).__name__
+            for group in kv_cache_config.kv_cache_groups
+            if type(group.kv_cache_spec) not in REAL_KV_SPECS
+        }
+    )
+    if other:
+        raise ValueError(
+            "kv_transfer_mode real moves full and sliding-window attention KV "
+            f"only, not {', '.join(other)}."
+        )
+
+
 def kv_layout(
-    kv_caches: dict[str, torch.Tensor], num_blocks: int, block_size: int, layout: str
+    kv_caches: dict[str, torch.Tensor],
+    num_blocks: int,
+    block_size: int,
+    layout: str,
+    groups: Sequence[KVCacheGroupSpec] | None = None,
 ) -> dict[str, object]:
     """The KV cache a connector registers, for a step log's `kv_layout`
-    record: what each block of each layer is in bytes and tokens."""
+    record: what each block of each layer is in bytes and tokens, and, with
+    the KV cache groups, each group's. Layers of different groups may share
+    memory (a block is one group's at a time): it counts once."""
     first = next(iter(kv_caches.values()))
     layer_bytes = first.numel() * first.element_size()
-    return {
+    regions = {
+        (tensor.data_ptr(), tensor.numel() * tensor.element_size())
+        for tensor in kv_caches.values()
+    }
+    record: dict[str, object] = {
         "layers": len(kv_caches),
         "num_blocks": num_blocks,
         "block_size": block_size,
@@ -320,8 +361,28 @@ def kv_layout(
         "dtype": str(first.dtype).removeprefix("torch."),
         "shape": list(first.shape),
         "block_bytes": layer_bytes // num_blocks,
-        "bytes": layer_bytes * len(kv_caches),
+        "bytes": sum(size for _, size in regions),
     }
+    if groups is not None:
+        record["groups"] = [
+            {
+                "kind": type(group.kv_cache_spec).__name__,
+                "sliding_window": getattr(group.kv_cache_spec, "sliding_window", None),
+                "block_size": group.kv_cache_spec.block_size,
+                "layers": len(layers),
+                # Each layer's.
+                "block_bytes": (
+                    kv_caches[layers[0]].numel()
+                    * kv_caches[layers[0]].element_size()
+                    // num_blocks
+                    if layers
+                    else 0
+                ),
+            }
+            for group in groups
+            for layers in [[name for name in group.layer_names if name in kv_caches]]
+        ]
+    return record
 
 
 @dataclass(frozen=True)
@@ -330,14 +391,27 @@ class RequestedRead:
     consumer's connector metadata asks for it this step."""
 
     req_id: str
-    block_ids: list[int]
-    """Local blocks it fills; empty when it only frees the producer's."""
+    block_ids: list[list[int]]
+    """Local blocks it fills, by KV cache group that transfers KV; none when
+    it only frees the producer's."""
     remote_request_id: str
     """The producer's request id. Mooncake's metadata does not carry it: the
     consumer's own id stands in (both share the client's base request id), or,
     for a request with no blocks (one that only frees the producer's, under
     an id of its own), the transfer id the two share."""
-    first_logical_block: int
+    first_logical_blocks: list[int]
+    """Where each group's blocks start among the request's blocks (after a
+    prefix hit, or a sliding window's head the connector does not read)."""
+
+    @property
+    def blocks(self) -> list[int]:
+        """Its blocks that hold KV, every group's (not the null block)."""
+        return kv_blocks(self.block_ids)
+
+
+def kv_blocks(block_ids: Sequence[Sequence[int]]) -> list[int]:
+    """Every group's blocks but the null block (a sliding window's head)."""
+    return [b for group in block_ids for b in group if b != NULL_BLOCK_ID]
 
 
 def requested_reads(metadata: object) -> list[RequestedRead]:
@@ -348,50 +422,122 @@ def requested_reads(metadata: object) -> list[RequestedRead]:
     for key, value in getattr(metadata, "reqs_to_recv", {}).items():
         if isinstance(value, dict):  # Mooncake
             for req_id, meta in value.items():
-                blocks = list(meta.local_block_ids[0]) if meta.local_block_ids else []
-                remote = req_id if blocks else meta.transfer_id
-                reads.append(RequestedRead(req_id, blocks, remote, 0))
+                groups = [list(group) for group in meta.local_block_ids]
+                remote = req_id if any(groups) else meta.transfer_id
+                first = meta.first_block_indices or [0] * len(groups)
+                reads.append(RequestedRead(req_id, groups, remote, list(first)))
         elif value.remote is not None:  # NIXL
+            groups = [list(group) for group in value.local_block_ids]
             computed = value.local_num_computed_blocks
             reads.append(
                 RequestedRead(
                     key,
-                    list(value.local_block_ids[0]) if any(value.local_block_ids) else [],
+                    groups,
                     value.remote.request_id,
-                    computed[0] if computed else 0,
+                    list(computed) if computed else [0] * len(groups),
                 )
             )
     return reads
 
 
-def scheduled_kv_events(scheduler_output: "SchedulerOutput") -> dict[str, object]:
+@dataclass
+class GroupAllocations:
+    """The blocks given to each request by KV cache group, for a step log's
+    `kv_events` record (`allocated_groups`), where the flat `allocated` loses
+    which group a block is and where it sits: models of several groups or of
+    sliding windows. Each entry names the group, the place of its first block
+    among the request's blocks of that group, and the blocks, in order, the
+    null block (0, a window's head) holding its places. A new or resumed
+    request's blocks start at 0, a running one's continue its blocks, and a
+    pull lists the blocks the connector fills, where they start."""
+
+    transfer_group_ids: Sequence[int]
+    """The KV cache groups a pull lists its blocks by."""
+    lengths: dict[str, list[int]] = field(default_factory=dict)
+    """Each request's blocks so far, by group."""
+
+    def events(
+        self, scheduler_output: "SchedulerOutput", reads: list[RequestedRead]
+    ) -> dict[str, list[dict[str, object]]]:
+        allocated: dict[str, list[dict[str, object]]] = {}
+
+        def record(req_id: str, group: int, first: int, blocks: Sequence[int]):
+            if blocks:
+                allocated.setdefault(req_id, []).append(
+                    {"group": group, "first": first, "blocks": list(blocks)}
+                )
+
+        def extend(req_id: str, block_ids: Sequence[Sequence[int]], replace: bool):
+            known = None if replace else self.lengths.get(req_id)
+            lengths = known if known is not None else [0] * len(block_ids)
+            for group, blocks in enumerate(block_ids):
+                record(req_id, group, lengths[group], blocks)
+                lengths[group] += len(blocks)
+            self.lengths[req_id] = lengths
+
+        for new in scheduler_output.scheduled_new_reqs:
+            extend(new.req_id, new.block_ids, replace=True)
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_ids is not None:
+                extend(req_id, new_ids, replace=req_id in cached.resumed_req_ids)
+        for read in reads:
+            if read.blocks:
+                for index, (first, blocks) in enumerate(
+                    zip(read.first_logical_blocks, read.block_ids)
+                ):
+                    record(read.req_id, self.transfer_group_ids[index], first, blocks)
+        for req_id in scheduler_output.finished_req_ids:
+            self.lengths.pop(req_id, None)
+        return allocated
+
+
+def group_allocations(kv_cache_config: KVCacheConfig) -> GroupAllocations | None:
+    """A `GroupAllocations` for a model of several KV cache groups or of
+    sliding windows; None for one group of full attention."""
+    groups = kv_cache_config.kv_cache_groups
+    if len(groups) == 1 and not isinstance(groups[0].kv_cache_spec, SlidingWindowSpec):
+        return None
+    return GroupAllocations(kv_cache_config.transfer_group_ids)
+
+
+def scheduled_kv_events(
+    scheduler_output: "SchedulerOutput",
+    allocations: GroupAllocations | None = None,
+) -> dict[str, object]:
     """A step's request lifecycle as the scheduler sent it, for a step log's
-    `kv_events` record: blocks newly allocated to each request, the requests
+    `kv_events` record: blocks newly allocated to each request (every KV
+    cache group's, but the null block; by group with `allocations`), the
+    requests
     resumed after a preemption (their blocks replaced), the remote reads this
     step posts, the producer requests told to free their blocks without a
     read (by their remote id), and the requests finished (completed or
     aborted) since the previous step."""
     allocated: dict[str, list[int]] = {
-        new.req_id: list(new.block_ids[0])
+        new.req_id: blocks
         for new in scheduler_output.scheduled_new_reqs
-        if new.block_ids and new.block_ids[0]
+        if (blocks := kv_blocks(new.block_ids))
     }
     cached = scheduler_output.scheduled_cached_reqs
     for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
-        if new_ids is not None and new_ids[0]:
-            allocated.setdefault(req_id, []).extend(new_ids[0])
+        if new_ids is not None and (blocks := kv_blocks(new_ids)):
+            allocated.setdefault(req_id, []).extend(blocks)
+    requested = requested_reads(scheduler_output.kv_connector_metadata)
     reads, notified = [], []
-    for read in requested_reads(scheduler_output.kv_connector_metadata):
-        if read.block_ids:
+    for read in requested:
+        if read.blocks:
             reads.append(read.req_id)
             # Allocated when the request arrived; its first scheduled step,
             # after the transfer, lists them again.
-            allocated.setdefault(read.req_id, read.block_ids)
+            allocated.setdefault(read.req_id, read.blocks)
         else:
             # Aborted before decode allocated blocks: only frees prefill's.
             notified.append(read.remote_request_id)
+    events: dict[str, object] = {"allocated": allocated}
+    if allocations is not None:
+        events["allocated_groups"] = allocations.events(scheduler_output, requested)
     return {
-        "allocated": allocated,
+        **events,
         "resumed": sorted(cached.resumed_req_ids),
         "reads_posted": sorted(reads),
         "prefill_notified": sorted(notified),

@@ -107,6 +107,47 @@ def mla_model_dir(tmp_path_factory):
     return str(directory)
 
 
+# A tiny gpt-oss: sliding-window (32 tokens) and full attention alternating,
+# two KV cache groups sharing memory.
+GPT_OSS = {
+    "architectures": ["GptOssForCausalLM"],
+    "model_type": "gpt_oss",
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 32,
+    "head_dim": 16,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_local_experts": 4,
+    "num_experts_per_tok": 2,
+    "experts_per_token": 2,
+    "sliding_window": 32,
+    "layer_types": ["sliding_attention", "full_attention"] * 2,
+    "attention_bias": True,
+    "hidden_act": "silu",
+    "swiglu_limit": 7.0,
+    "rope_theta": 150000,
+    "rope_scaling": {
+        "rope_type": "yarn",
+        "factor": 32.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "truncate": False,
+        "original_max_position_embeddings": 4096,
+    },
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 256,
+}
+
+
+@pytest.fixture(scope="module")
+def gpt_oss_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("tiny-gpt-oss")
+    (directory / "config.json").write_text(json.dumps(GPT_OSS))
+    return str(directory)
+
+
 @pytest.fixture(params=["model_dir", "moe_model_dir", "mla_model_dir"])
 def any_model_dir(request):
     """The dense model, the MoE one, then the MLA one: blocks of each layer's
@@ -227,6 +268,16 @@ def test_real_mode_accepts_moe_and_dense_mla_models(moe_model_dir, mla_model_dir
     )
     with pytest.raises(ValueError, match="no sparse MLA"):
         engine_config(str(tmp_path))
+
+
+def test_real_mode_takes_sliding_window_models_over_mooncake_only(gpt_oss_model_dir):
+    config = engine_config(
+        gpt_oss_model_dir, kv_transfer={"kv_connector": "MooncakeConnector"}
+    )
+    assert config.model_config.get_sliding_window() == 32
+    # NIXL's plan is not followed group by group.
+    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window"):
+        engine_config(gpt_oss_model_dir)
 
 
 def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
@@ -358,17 +409,25 @@ class StandInMetadata(_metadata_base()):  # type: ignore[misc]
 
 
 class RecordingConnector:
-    """Stands in for the NIXL connector: keeps the KV tensors registered with it."""
+    """Stands in for the NIXL connector: keeps the KV tensors registered with
+    it and, with several KV cache groups (`hma`), each finished request's
+    blocks."""
 
     registered: list[dict] = []
+    finished: list[tuple[str, tuple[list[int], ...]]] = []
 
     @classmethod
-    def make(cls):
+    def make(cls, hma=False):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import (
             KVConnectorBase_V1,
+            SupportsHMA,
         )
 
-        class Connector(KVConnectorBase_V1):
+        class Connector(KVConnectorBase_V1, *((SupportsHMA,) if hma else ())):
+            def request_finished_all_groups(self, request, block_ids):
+                cls.finished.append((request.request_id, block_ids))
+                return False, None
+
             def register_kv_caches(self, kv_caches):
                 cls.registered.append(dict(kv_caches))
 
@@ -448,6 +507,97 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(any_model_dir, monkeypa
                     layer,
                     logical,
                 )
+    finally:
+        del llm
+
+
+def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
+    gpt_oss_model_dir, monkeypatch, tmp_path
+):
+    """gpt-oss's sliding-window and full groups share memory. A prompt
+    prefilled in chunks, in a pool of few blocks, leaves the window's head
+    null and the request reuses blocks it freed: at the end each block it
+    holds carries its group's pattern at its place, and the step log's
+    allocations by group rebuild its blocks, reuse included."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+
+    connector = RecordingConnector.make(hma=True)
+    RecordingConnector.registered.clear()
+    RecordingConnector.finished.clear()
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    log = tmp_path / "steps.jsonl"
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    llm = LLM(
+        model=gpt_oss_model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        block_size=16,
+        # 28 blocks of 2 x 2 KiB (a layer of each group).
+        kv_cache_memory_bytes=28 * 4096,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        llm.generate(
+            [{"prompt_token_ids": [5] * 200}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        config = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_config
+        kinds = [type(g.kv_cache_spec).__name__ for g in config.kv_cache_groups]
+        assert sorted(kinds) == ["FullAttentionSpec", "SlidingWindowSpec"]
+        ((req_id, block_ids),) = RecordingConnector.finished
+        caches = RecordingConnector.registered[0]
+        views = block_views(caches, config.num_blocks)
+        for group, held in zip(config.kv_cache_groups, block_ids):
+            # 200 tokens: 13 blocks, the window's first ones null.
+            assert len(held) == 13
+            nulls = held.count(0)
+            if kinds[config.kv_cache_groups.index(group)] == "SlidingWindowSpec":
+                assert nulls > 0 and set(held[:nulls]) == {0}
+                window = config.kv_cache_groups.index(group)
+            else:
+                assert nulls == 0
+            for logical, block in enumerate(held):
+                if block == 0:
+                    continue
+                for layer in group.layer_names:
+                    view = views[layer]
+                    want = pattern(req_id, layer, logical, view.shape[1])
+                    assert torch.equal(view[block], want), (layer, logical, block)
+        # Each group's blocks by place, as the step log gave them.
+        places: list[dict[int, int]] = [{} for _ in block_ids]
+        for record in log_records(log):
+            events = record.get("kv_events") or {}
+            for entry in events.get("allocated_groups", {}).get(req_id, []):
+                for offset, block in enumerate(entry["blocks"]):
+                    places[entry["group"]][entry["first"] + offset] = block
+        for group, held in enumerate(block_ids):
+            for logical, block in enumerate(held):
+                if block:
+                    assert places[group][logical] == block, (group, logical)
+        # The window's freed blocks were given to it again, at later places.
+        given = [block for block in places[window].values() if block]
+        assert len(given) > len(set(given))
     finally:
         del llm
 

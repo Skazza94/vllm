@@ -380,8 +380,12 @@ instances, so transfers take their actual time over the actual network. It
 needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 
 * Full-attention models, dense or MoE (experts hold no KV), and dense MLA
-  models (one latent per token and layer). Not hybrid, sliding-window,
-  attention-free or sparse-MLA models, nor speculative decoding.
+  models (one latent per token and layer); over `MooncakeConnector`,
+  sliding-window attention too, alone or beside full attention (each layer
+  kind a KV cache group, groups sharing memory, a block being one group's at
+  a time): Mooncake moves each window's last blocks only. Not hybrid
+  (Mamba), attention-free, sparse-MLA, chunked local or RSWA attention
+  models, nor speculative decoding.
 * One rank per instance, or, over `MooncakeConnector` only:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
@@ -397,10 +401,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   forced to the CPU MLA kernel's 16.
 
 `kv_pattern_fill` (prefill instance) writes a pattern into each request's KV
-blocks, derived from the request, the TP rank, the layer and the block, and
+blocks, derived from the request, the TP rank, the layer and the block's
+place among the request's blocks of its KV cache group, and
 `kv_pattern_check` (decode instance) checks every byte it receives, logging
-`kv_check` records (it needs `log_path`); the pattern needs prefix caching
-off.
+one `kv_check` record per request, each group's result nested in it (it
+needs `log_path`); the pattern needs prefix caching off. A group's blocks
+are its layers' only, and the null block that pads a window's head is
+neither filled nor checked. The `kv_layout` record describes each group and
+counts memory groups share once.
 
 `MooncakeConnector` takes one KV address per rank in its extra config,
 `"rank_addresses": [...]` (IPv4), so each rank can use a NIC of its own: its
@@ -415,7 +423,11 @@ Every rank of the last pipeline stage logs its own KV (`kv_layout`,
 `kv_transfers`, `kv_check`, `kv_events` and `threads` records) into
 `<log_path>[.dp<i>][.tp<r>]`, for its global DP rank `i` and TP rank `r`
 when not 0; its `kv_layout` record names both and its local DP rank. Under
-MoE DP the timing record and the joint steps stay in DP rank 0's logs.
+MoE DP the timing record and the joint steps stay in DP rank 0's logs. With
+several KV cache groups or a sliding window, `kv_events` also lists each
+request's new blocks by group (`allocated_groups`: the group, the place of
+the first block among the request's blocks of that group, and the blocks,
+null ones in place), the connector's pulls included.
 
 ### Running without a GPU
 

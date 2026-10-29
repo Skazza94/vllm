@@ -234,7 +234,9 @@ class SimulationConfig:
         no KV), or of a dense MLA one (one latent per token and layer, which
         every tensor-parallel rank holds whole), on one rank, tensor-parallel
         ones, or an MoE model's data-parallel ranks with expert parallelism.
-        The native connector stays in place."""
+        Sliding-window layers, alone or beside full-attention ones, over
+        Mooncake, which moves each window's blocks only. The native connector
+        stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -319,15 +321,21 @@ class SimulationConfig:
             getattr(model.hf_text_config, "index_topk", None) is not None
             or getattr(model.hf_config, "model_type", None) == "deepseek_v4"
         )
-        if (
-            sparse_mla
-            or model.is_hybrid
-            or model.is_attention_free
-            or model.get_sliding_window() is not None
-        ):
+        if sparse_mla or model.is_hybrid or model.is_attention_free:
             problems.append(
-                "a full-attention model, dense, MoE or dense MLA (no sparse "
-                "MLA, hybrid, attention-free or sliding-window models)"
+                "an attention model, dense, MoE or dense MLA, its layers full "
+                "or sliding-window attention (no sparse MLA, hybrid or "
+                "attention-free models)"
+            )
+        elif (
+            model.get_sliding_window() is not None
+            and kv_transfer.kv_connector != "MooncakeConnector"
+        ):
+            # Only Mooncake's plan is followed group by group: a sliding
+            # window's blocks are clipped to the window on both sides.
+            problems.append(
+                "MooncakeConnector for a sliding-window model, not "
+                f"{kv_transfer.kv_connector}"
             )
         if vllm_config.speculative_config is not None:
             problems.append("no speculative decoding")

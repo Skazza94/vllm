@@ -40,7 +40,10 @@ from vllm.v1.worker.simulated.kv_pattern import (
 from vllm.v1.worker.simulated.kv_transfer import (
     ReadsInFlight,
     SimulatedTransfers,
+    GroupAllocations,
+    check_real_kv_groups,
     completed_transfers,
+    group_allocations,
     kv_layout,
     scheduled_kv_events,
     simulated_kv_connector,
@@ -125,6 +128,9 @@ class SimulatedModelRunner(GPUModelRunner):
         # Real KV transfers: this step's lifecycle events, logged with the
         # connector's once it has posted the step's reads.
         self._kv_events: dict[str, object] | None = None
+        # Each request's blocks by KV cache group (several groups or a
+        # sliding window), for those events.
+        self._kv_allocations: GroupAllocations | None = None
         self._kv_events_scheduled_at = 0.0
         # Real KV transfers in flight on this consumer: request -> its blocks.
         self._reads_in_flight = ReadsInFlight()
@@ -176,6 +182,7 @@ class SimulatedModelRunner(GPUModelRunner):
         kv_cache_allocation_context: AbstractContextManager | None,
     ) -> None:
         if self._real_kv_transfer:
+            check_real_kv_groups(self.kv_cache_config)
             # The native path allocates the tensors, binds their layouts and
             # installs the connector that registers their memory for NIXL.
             super().initialize_kv_cache_tensors(
@@ -236,12 +243,20 @@ class SimulatedModelRunner(GPUModelRunner):
 
         sim = self.vllm_config.simulation_config
         tp = get_tp_group()
+        groups = self.kv_cache_config.kv_cache_groups
+        self._kv_allocations = group_allocations(self.kv_cache_config)
         if sim.kv_pattern_fill or sim.kv_pattern_check:
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks)
+            layers = [group.layer_names for group in groups]
             if sim.kv_pattern_fill:
-                self._kv_filler = PatternFiller(views, tp.rank_in_group)
+                self._kv_filler = PatternFiller(views, tp.rank_in_group, layers)
             if sim.kv_pattern_check:
-                self._kv_checker = PatternChecker(views, tp.rank_in_group)
+                self._kv_checker = PatternChecker(
+                    views,
+                    tp.rank_in_group,
+                    layers,
+                    self.kv_cache_config.transfer_group_ids,
+                )
             logger.info(
                 "KV pattern %s over %d layers.",
                 "fill" if sim.kv_pattern_fill else "check",
@@ -256,6 +271,7 @@ class SimulatedModelRunner(GPUModelRunner):
                         self.kv_cache_config.num_blocks,
                         self.cache_config.block_size,
                         self.cache_config.get_resolved_kv_cache_layout().name,
+                        groups,
                     ),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
@@ -365,7 +381,9 @@ class SimulatedModelRunner(GPUModelRunner):
             self._kv_filler.after_update(scheduler_output)
         if self._real_kv_transfer and self.step_log is not None:
             self._log_new_threads()
-            self._kv_events = scheduled_kv_events(scheduler_output)
+            self._kv_events = scheduled_kv_events(
+                scheduler_output, self._kv_allocations
+            )
             self._kv_events_scheduled_at = t_entry
 
         if not scheduler_output.total_num_scheduled_tokens:

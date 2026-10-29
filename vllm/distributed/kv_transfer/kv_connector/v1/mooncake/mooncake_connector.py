@@ -12,7 +12,7 @@ import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
 
@@ -783,6 +783,9 @@ class PullReqMeta:
     # A failure is sticky; still settle later peer results before releasing
     # destination blocks to prevent write-after-free from delayed peer writes.
     failed: bool = False
+    # Each group's first local block's index among the request's blocks (a
+    # sliding window's blocks before the window are not pulled).
+    first_block_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -813,6 +816,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        first_block_indices: list[int] | None = None,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -823,6 +827,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                first_block_indices=first_block_indices or [],
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -1069,7 +1074,10 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        # Request, its blocks to pull by group, and where they start.
+        self._reqs_need_recv: dict[
+            ReqId, tuple[Request, list[list[int]], list[int]]
+        ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -1089,6 +1097,15 @@ class MooncakeConnectorScheduler:
             for n_tokens, block_size in sw_sizes_tokens
         ]
 
+    def _transfer_block_ids(
+        self,
+        block_ids: tuple[list[int], ...] | list[list[int]],
+    ) -> list[list[int]]:
+        """The block IDs of the groups that transfer KV."""
+        if len(block_ids) == len(self.kv_cache_config.transfer_group_ids):
+            return list(block_ids)
+        return list(self.kv_cache_config.select_transfer_block_ids(block_ids))
+
     def get_sw_clipped_blocks(
         self,
         block_ids: tuple[list[int], ...] | list[list[int]],
@@ -1096,10 +1113,7 @@ class MooncakeConnectorScheduler:
         """Clip per-group block IDs to sliding window size."""
         if len(block_ids) == 0:
             return []
-        if len(block_ids) == len(self.kv_cache_config.transfer_group_ids):
-            selected = list(block_ids)
-        else:
-            selected = list(self.kv_cache_config.select_transfer_block_ids(block_ids))
+        selected = self._transfer_block_ids(block_ids)
         if len(selected) == 0 or not self._is_hma_required:
             return selected
         return [
@@ -1224,8 +1238,21 @@ class MooncakeConnectorScheduler:
                     else ()
                 )
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                # The blocks pulled end each group's blocks (null blocks pad a
+                # sliding window's head): where they start there.
+                first_block_indices = [
+                    len(group) - len(pulled)
+                    for group, pulled in zip(
+                        self._transfer_block_ids(blocks.get_block_ids()),
+                        local_block_ids,
+                    )
+                ]
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                    first_block_indices,
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -1251,12 +1278,17 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            for req_id, (
+                req,
+                block_ids,
+                first_block_indices,
+            ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    first_block_indices=first_block_indices,
                 )
             self._reqs_need_recv.clear()
 
@@ -1302,7 +1334,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], [])
             params["do_remote_prefill"] = False
             return False, None
 

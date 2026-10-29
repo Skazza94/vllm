@@ -17,9 +17,17 @@ of another request, layer or position, or a shifted range, does not match
 (by chance with negligible probability). Blocks are compared whole, so K
 and V (packed in each block) and every layer are covered. Pattern bytes are
 never zero and the sentinel is zero, so a block the read did not reach fails.
+
+A model of several KV cache groups (full and sliding-window attention, say)
+gives each group its own blocks; groups may share storage, a block being one
+group's at a time. A block's bytes are its group's layers', its logical
+block its place among the request's blocks of that group, where null blocks
+(a sliding window's head, no longer attended) hold their places. The null
+block itself holds no request's KV and is neither filled nor checked.
 """
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -30,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.simulated.kv_transfer import requested_reads
 
 if TYPE_CHECKING:
@@ -78,6 +87,16 @@ def pattern(
     return torch.from_numpy(stream)
 
 
+def group_views(
+    views: dict[str, torch.Tensor], groups: Sequence[Sequence[str]] | None
+) -> list[dict[str, torch.Tensor]]:
+    """Each KV cache group's layer views, `groups` naming each group's
+    layers; None: one group of every layer."""
+    if groups is None:
+        return [views]
+    return [{name: views[name] for name in names if name in views} for names in groups]
+
+
 @dataclass
 class PatternFiller:
     """Prefill side: fills each request's blocks with its pattern as the
@@ -85,35 +104,68 @@ class PatternFiller:
 
     views: dict[str, torch.Tensor]
     tp_rank: int = 0
-    blocks: dict[str, list[int]] = field(default_factory=dict)
+    groups: Sequence[Sequence[str]] | None = None
+    """Each KV cache group's layers; None: one group of every layer."""
+    blocks: dict[str, list[list[int]]] = field(default_factory=dict)
+    """Each request's blocks by group, null ones included."""
+
+    def __post_init__(self) -> None:
+        self._groups = group_views(self.views, self.groups)
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
         for new in scheduler_output.scheduled_new_reqs:
-            self._extend(new.req_id, list(new.block_ids[0]), replace=True)
+            self._extend(new.req_id, new.block_ids, replace=True)
         cached = scheduler_output.scheduled_cached_reqs
         for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
             if new_ids is not None:
                 resumed = req_id in cached.resumed_req_ids
-                self._extend(req_id, list(new_ids[0]), replace=resumed)
+                self._extend(req_id, new_ids, replace=resumed)
         for req_id in scheduler_output.finished_req_ids:
             self.blocks.pop(req_id, None)
 
-    def _extend(self, req_id: str, block_ids: list[int], replace: bool) -> None:
-        known = [] if replace else self.blocks.get(req_id, [])
-        start = len(known)
-        self.blocks[req_id] = known + block_ids
-        for offset, block_id in enumerate(block_ids):
-            for layer, view in self.views.items():
-                view[block_id].copy_(
-                    pattern(req_id, layer, start + offset, view.shape[1], self.tp_rank)
-                )
+    def _extend(
+        self, req_id: str, block_ids: Sequence[Sequence[int]], replace: bool
+    ) -> None:
+        known = None if replace else self.blocks.get(req_id)
+        if known is None:
+            known = [[] for _ in self._groups]
+        for views, held, new_ids in zip(self._groups, known, block_ids):
+            start = len(held)
+            held.extend(new_ids)
+            for offset, block_id in enumerate(new_ids):
+                if block_id == NULL_BLOCK_ID:
+                    continue
+                for layer, view in views.items():
+                    view[block_id].copy_(
+                        pattern(
+                            req_id, layer, start + offset, view.shape[1], self.tp_rank
+                        )
+                    )
+        self.blocks[req_id] = known
+
+
+@dataclass
+class _ExpectedGroup:
+    group: int
+    """Its KV cache group."""
+    first_logical_block: int
+    block_ids: list[int]
 
 
 @dataclass
 class _Expected:
     remote_request_id: str
-    first_logical_block: int
-    block_ids: list[int]
+    groups: list[_ExpectedGroup]
+
+    @property
+    def block_ids(self) -> list[int]:
+        """Its blocks that hold KV, every group's."""
+        return [
+            block_id
+            for group in self.groups
+            for block_id in group.block_ids
+            if block_id != NULL_BLOCK_ID
+        ]
 
 
 @dataclass
@@ -122,23 +174,38 @@ class PatternChecker:
 
     views: dict[str, torch.Tensor]
     tp_rank: int = 0
+    groups: Sequence[Sequence[str]] | None = None
+    """Each KV cache group's layers; None: one group of every layer."""
+    transfer_group_ids: Sequence[int] | None = None
+    """The KV cache groups a read's blocks are listed by (those that
+    transfer KV); None: every group, in order."""
     pending: dict[str, _Expected] = field(default_factory=dict)
     # Pending reads whose blocks the connector reported invalid.
     lost: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self._groups = group_views(self.views, self.groups)
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         """Fill the blocks of the reads this step will post (call before the
         connector sees the step's metadata)."""
         for read in requested_reads(scheduler_output.kv_connector_metadata):
-            if not read.block_ids:
+            if not read.blocks:
                 continue
-            for view in self.views.values():
-                view[read.block_ids] = SENTINEL
-            self.pending[read.req_id] = _Expected(
-                remote_request_id=read.remote_request_id,
-                first_logical_block=read.first_logical_block,
-                block_ids=read.block_ids,
-            )
+            groups = []
+            for index, (first, block_ids) in enumerate(
+                zip(read.first_logical_blocks, read.block_ids)
+            ):
+                group = (
+                    self.transfer_group_ids[index]
+                    if self.transfer_group_ids is not None
+                    else index
+                )
+                held = [b for b in block_ids if b != NULL_BLOCK_ID]
+                for view in self._groups[group].values():
+                    view[held] = SENTINEL
+                groups.append(_ExpectedGroup(group, first, list(block_ids)))
+            self.pending[read.req_id] = _Expected(read.remote_request_id, groups)
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
         """Compare the reads the connector reported finished or failed. A read
@@ -175,28 +242,52 @@ class PatternChecker:
         return results
 
     def _compare(self, req_id: str, expected: _Expected) -> dict:
-        mismatched_bytes = 0
+        """One request's result, its groups' nested: each group's blocks are
+        compared over the group's layers, each (layer, block) once."""
+        groups = []
         mismatched_blocks = []
-        total = 0
-        for layer, view in self.views.items():
-            for offset, block_id in enumerate(expected.block_ids):
-                logical = expected.first_logical_block + offset
-                want = pattern(
-                    expected.remote_request_id, layer, logical, view.shape[1], self.tp_rank
-                )
-                wrong = int((view[block_id] != want).sum())
-                total += view.shape[1]
-                if wrong:
-                    mismatched_bytes += wrong
-                    mismatched_blocks.append([layer, logical, block_id, wrong])
+        for group in expected.groups:
+            views = self._groups[group.group]
+            group_mismatched = 0
+            blocks = 0
+            for offset, block_id in enumerate(group.block_ids):
+                if block_id == NULL_BLOCK_ID:
+                    continue
+                blocks += 1
+                logical = group.first_logical_block + offset
+                for layer, view in views.items():
+                    want = pattern(
+                        expected.remote_request_id,
+                        layer,
+                        logical,
+                        view.shape[1],
+                        self.tp_rank,
+                    )
+                    wrong = int((view[block_id] != want).sum())
+                    if wrong:
+                        group_mismatched += wrong
+                        mismatched_blocks.append([layer, logical, block_id, wrong])
+            groups.append(
+                {
+                    "group": group.group,
+                    "first_logical_block": group.first_logical_block,
+                    "blocks": blocks,
+                    "layers": len(views),
+                    "block_bytes": sum(view.shape[1] for view in views.values()),
+                    "bytes": blocks * sum(view.shape[1] for view in views.values()),
+                    "mismatched_bytes": group_mismatched,
+                }
+            )
+        mismatched_bytes = sum(group["mismatched_bytes"] for group in groups)
         return {
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,
-            "blocks": len(expected.block_ids),
+            "blocks": sum(group["blocks"] for group in groups),
             # Decode's physical blocks: shows block reuse across requests.
             "block_ids": expected.block_ids,
-            "layers": len(self.views),
-            "bytes": total,
+            "layers": sum(group["layers"] for group in groups),
+            "bytes": sum(group["bytes"] for group in groups),
+            "groups": groups,
             "mismatched_bytes": mismatched_bytes,
             "mismatched_blocks": mismatched_blocks[:16],
             "ok": mismatched_bytes == 0,

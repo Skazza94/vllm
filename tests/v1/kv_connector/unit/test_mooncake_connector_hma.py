@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
 from .utils import (
     create_request,
+    create_scheduler,
     create_vllm_config,
     make_kv_cache_config,
     maybe_update_block_size,
@@ -169,6 +170,63 @@ def test_get_sw_clipped_blocks_noop_no_hma():
     block_ids = ([1, 2, 3],)
     clipped = scheduler.get_sw_clipped_blocks(block_ids)
     assert clipped == [[1, 2, 3]]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "num_tokens,window_first,window_blocks",
+    [
+        (40, 0, 3),  # within the window: every block
+        # 320 tokens, 20 blocks: the next token's 64-token window skips
+        # tokens 0..256, the first 16 blocks (null); 4 blocks are pulled.
+        (320, 16, 4),
+        # 325 tokens, 21 blocks: still 16 null; 5, the clip's cdiv(64, 16) + 1.
+        (325, 16, 5),
+    ],
+)
+def test_pulls_carry_where_each_groups_blocks_start(
+    num_tokens, window_first, window_blocks
+):
+    """A consumer pulls only a sliding window's last blocks, null blocks
+    padding the window's head: the pull says where each group's blocks start
+    among the request's blocks."""
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+        disable_hybrid_kv_cache_manager=False,
+    )
+    kv_cache_config = make_kv_cache_config(
+        block_size=block_size, swa_enabled=True, sw_size=64, num_blocks=1000
+    )
+    scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=num_tokens,
+        do_remote_prefill=True,
+    )
+    request.kv_transfer_params.update(
+        {"transfer_id": request.request_id, "remote_bootstrap_addr": 54321}
+    )
+    scheduler.add_request(request)
+
+    metadata = scheduler.schedule().kv_connector_metadata
+    pull = metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    held = [
+        [block.block_id for block in manager.req_to_blocks[request.request_id]]
+        for manager in managers
+    ]
+    total = -(-num_tokens // block_size)
+    assert [len(blocks) for blocks in held] == [total, total]
+    assert pull.first_block_indices == [0, window_first]
+    assert [len(pulled) for pulled in pull.local_block_ids] == [total, window_blocks]
+    for blocks, first, pulled in zip(
+        held, pull.first_block_indices, pull.local_block_ids
+    ):
+        assert blocks[first:] == pulled
 
 
 # ---------------------------------------------------------------------------

@@ -135,7 +135,7 @@ def test_chunked_prefill_blocks_continue_the_request_pattern():
     # A step that allocates the request nothing leaves its blocks as they are.
     chunk.scheduled_cached_reqs.new_block_ids = [None]
     filler.after_update(chunk)
-    assert filler.blocks[PREFILL_ID] == [3, 5, 1, 6]
+    assert filler.blocks[PREFILL_ID] == [[3, 5, 1, 6]]
 
 
 def test_block_views_need_block_major_tensors():
@@ -473,3 +473,327 @@ def test_a_block_of_another_tensor_parallel_rank_fails():
         transfer(prefill[sender_rank], decode, [(1, 3), (2, 5)])
         (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
         assert result["ok"] is ok, (decode_rank, sender_rank)
+
+
+# gpt-oss's KV cache: a sliding-window group (layers 0 and 2) and a full one
+# (1 and 3), layer i of each viewing the same memory; a block is one group's
+# at a time.
+SLIDING = ("model.layers.0.attn.attn", "model.layers.2.attn.attn")
+FULL = ("model.layers.1.attn.attn", "model.layers.3.attn.attn")
+GROUPS = [list(SLIDING), list(FULL)]
+
+
+def shared_caches(num_blocks=16):
+    memory = [torch.zeros(num_blocks, 2, 4, 8) for _ in SLIDING]
+    return {
+        SLIDING[0]: memory[0],
+        FULL[0]: memory[0],
+        SLIDING[1]: memory[1],
+        FULL[1]: memory[1],
+    }
+
+
+def groups_step(req_id, *block_ids, cached=False):
+    """A step allocating a request blocks of each group: a new request's, or
+    with `cached`, a running one's next blocks."""
+    step = new_request_step(req_id, [])
+    if cached:
+        step.scheduled_new_reqs = []
+        step.scheduled_cached_reqs = SimpleNamespace(
+            req_ids=[req_id], new_block_ids=[tuple(block_ids)], resumed_req_ids=set()
+        )
+    else:
+        step.scheduled_new_reqs[0].block_ids = tuple(block_ids)
+    return step
+
+
+def mooncake_pull(req_id, block_ids, first):
+    """A Mooncake pull of each group's blocks, `first` saying where each
+    group's start among the request's blocks."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+        MooncakeConnectorMetadata,
+    )
+
+    metadata = MooncakeConnectorMetadata()
+    metadata.add_new_req(
+        req_id,
+        [list(group) for group in block_ids],
+        {
+            "transfer_id": "xfer-abc",
+            "remote_engine_id": "prefill",
+            "remote_bootstrap_addr": "http://10.0.0.1:8998",
+        },
+        first_block_indices=first,
+    )
+    # Pulled before the request is scheduled (it waits for its KV).
+    return SimpleNamespace(
+        kv_connector_metadata=metadata,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        finished_req_ids=set(),
+    )
+
+
+def copy_blocks(prefill, decode, layers, pairs):
+    for layer in layers:
+        for d_block, p_block in pairs:
+            decode[layer][d_block].copy_(prefill[layer][p_block])
+
+
+def test_groups_sharing_memory_hold_their_own_layers_pattern():
+    prefill = block_views(shared_caches(), 16)
+    PatternFiller(prefill, groups=GROUPS).after_update(
+        groups_step(PREFILL_ID, [3, 5], [1, 2])
+    )
+    for layers, blocks in ((SLIDING, [3, 5]), (FULL, [1, 2])):
+        for layer in layers:
+            for logical, block in enumerate(blocks):
+                want = pattern(PREFILL_ID, layer, logical, 256)
+                assert torch.equal(prefill[layer][block], want), (layer, block)
+    # Filling every layer instead would leave the last writer's pattern.
+    unaware = block_views(shared_caches(), 16)
+    PatternFiller(unaware).after_update(new_request_step(PREFILL_ID, [3, 5]))
+    want = pattern(PREFILL_ID, SLIDING[0], 0, 256)
+    assert not torch.equal(unaware[SLIDING[0]][3], want)
+
+
+def test_a_pull_of_groups_sharing_memory_is_checked_group_by_group():
+    prefill = block_views(shared_caches(), 16)
+    PatternFiller(prefill, groups=GROUPS).after_update(
+        groups_step(PREFILL_ID, [3, 5], [1, 2])
+    )
+    decode = block_views(shared_caches(), 16)
+    checker = PatternChecker(decode, groups=GROUPS, transfer_group_ids=[0, 1])
+    checker.before_step(mooncake_pull(DECODE_ID, [[7, 8], [9, 10]], [0, 0]))
+    copy_blocks(prefill, decode, SLIDING, [(7, 3), (8, 5)])
+    copy_blocks(prefill, decode, FULL, [(9, 1), (10, 2)])
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert result["ok"], result
+    # Each group's blocks over its own layers: each (layer, block) once.
+    group = {"first_logical_block": 0, "blocks": 2, "layers": 2, "block_bytes": 512,
+             "bytes": 1024, "mismatched_bytes": 0}
+    assert result["groups"] == [{"group": 0, **group}, {"group": 1, **group}]
+    assert (result["blocks"], result["layers"], result["bytes"]) == (4, 4, 2048)
+    assert result["block_ids"] == [7, 8, 9, 10]
+    # Bytes of the other group's layer in the same memory fail.
+    checker.before_step(mooncake_pull(DECODE_ID, [[7, 8], [9, 10]], [0, 0]))
+    copy_blocks(prefill, decode, SLIDING, [(7, 3), (8, 5)])
+    copy_blocks(prefill, decode, FULL, [(9, 3), (10, 2)])
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+    assert [g["mismatched_bytes"] > 0 for g in result["groups"]] == [False, True]
+
+
+def test_a_window_is_checked_at_its_place_past_null_and_reused_blocks():
+    """A long prompt prefilled in chunks: the window's head turns null and its
+    blocks are freed and reused, by the request itself or another. Mooncake
+    pulls the window's last blocks into decode before the request is
+    scheduled, saying where they start."""
+    prefill = block_views(caches(), 8)
+    filler = PatternFiller(prefill)
+    filler.after_update(new_request_step(PREFILL_ID, [1, 2, 3]))
+    # Positions 0 and 1 left the window (null); block 1 returns to the request
+    # at position 4, block 2 goes to another request.
+    filler.after_update(groups_step(PREFILL_ID, [4, 1], cached=True))
+    other = "cmpl-other-0-81bb7a28"
+    filler.after_update(new_request_step(other, [2]))
+    assert filler.blocks[PREFILL_ID] == [[1, 2, 3, 4, 1]]
+    for logical, block in ((2, 3), (3, 4), (4, 1)):
+        for layer in LAYERS:
+            want = pattern(PREFILL_ID, layer, logical, 256)
+            assert torch.equal(prefill[layer][block], want)
+
+    decode = block_views(caches(), 8)
+    for first, ok in ((2, True), (0, False)):
+        checker = PatternChecker(decode)
+        checker.before_step(mooncake_pull(DECODE_ID, [[5, 6, 7]], [first]))
+        transfer(prefill, decode, [(5, 3), (6, 4), (7, 1)])
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"] is ok, first
+        assert result["groups"][0]["first_logical_block"] == first
+
+
+def test_null_blocks_keep_their_places_and_are_never_checked():
+    prefill = block_views(caches(), 8)
+    PatternFiller(prefill).after_update(new_request_step(PREFILL_ID, [0, 0, 3, 5]))
+    assert int(prefill[LAYERS[0]][0].sum()) == 0
+    decode = block_views(caches(), 8)
+    for view in decode.values():
+        view[0] = 7
+    checker = PatternChecker(decode)
+    checker.before_step(mooncake_pull(DECODE_ID, [[0, 0, 1, 2]], [0]))
+    # The null block is not the read's: left alone, not lost for another's.
+    assert all(int((view[0] == 7).sum()) == view.shape[1] for view in decode.values())
+    assert checker.after_step(KVConnectorOutput(invalid_block_ids={0})) == []
+    transfer(prefill, decode, [(1, 3), (2, 5)])
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert result["ok"], result
+    assert (result["blocks"], result["block_ids"]) == (2, [1, 2])
+
+
+def test_kv_events_leave_out_the_null_block():
+    pull = mooncake_pull(DECODE_ID, [[7, 8], [0, 9]], [0, 1])
+    events = scheduled_kv_events(pull)
+    assert (events["reads_posted"], events["allocated"]) == (
+        [DECODE_ID],
+        {DECODE_ID: [7, 8, 9]},
+    )
+    scheduled = groups_step(DECODE_ID, [7, 8], [0, 9])
+    scheduled.kv_connector_metadata = None
+    assert scheduled_kv_events(scheduled)["allocated"] == {DECODE_ID: [7, 8, 9]}
+
+
+def test_allocations_by_group_tell_groups_apart():
+    from vllm.v1.worker.simulated.kv_transfer import GroupAllocations
+
+    def events(*block_ids):
+        step = groups_step(DECODE_ID, *block_ids)
+        step.kv_connector_metadata = None
+        return scheduled_kv_events(step, GroupAllocations([0, 1]))
+
+    one, other = events([5], [8, 9]), events([5, 8], [9])
+    assert one["allocated"] == other["allocated"] == {DECODE_ID: [5, 8, 9]}
+    assert one["allocated_groups"] == {
+        DECODE_ID: [
+            {"group": 0, "first": 0, "blocks": [5]},
+            {"group": 1, "first": 0, "blocks": [8, 9]},
+        ]
+    }
+    assert other["allocated_groups"] == {
+        DECODE_ID: [
+            {"group": 0, "first": 0, "blocks": [5, 8]},
+            {"group": 1, "first": 0, "blocks": [9]},
+        ]
+    }
+
+
+def test_allocations_by_group_keep_places_through_chunks_resumption_and_pulls():
+    from vllm.v1.worker.simulated.kv_transfer import GroupAllocations
+
+    # KV cache group 1 transfers no KV: a pull lists groups 0 and 2.
+    allocations = GroupAllocations([0, 2])
+
+    def events(step):
+        step.kv_connector_metadata = getattr(step, "kv_connector_metadata", None)
+        return scheduled_kv_events(step, allocations)["allocated_groups"]
+
+    # A window's head null, then a chunk: the window gets block 1 again at
+    # its third place.
+    assert events(groups_step(PREFILL_ID, [0, 1], [3], [4])) == {
+        PREFILL_ID: [
+            {"group": 0, "first": 0, "blocks": [0, 1]},
+            {"group": 1, "first": 0, "blocks": [3]},
+            {"group": 2, "first": 0, "blocks": [4]},
+        ]
+    }
+    assert events(groups_step(PREFILL_ID, [1], [], [6], cached=True)) == {
+        PREFILL_ID: [
+            {"group": 0, "first": 2, "blocks": [1]},
+            {"group": 2, "first": 1, "blocks": [6]},
+        ]
+    }
+    # Resumed after a preemption: its blocks replaced, from the start.
+    resumed = groups_step(PREFILL_ID, [2], [5], [7], cached=True)
+    resumed.scheduled_cached_reqs.resumed_req_ids = {PREFILL_ID}
+    assert [e["first"] for e in events(resumed)[PREFILL_ID]] == [0, 0, 0]
+    # A pull clipped to the window, before the request is scheduled: by its
+    # KV cache groups, where the connector's blocks start.
+    pull = mooncake_pull(DECODE_ID, [[8, 9], [10, 11, 12]], [5, 0])
+    pull.finished_req_ids = {PREFILL_ID}
+    assert events(pull) == {
+        DECODE_ID: [
+            {"group": 0, "first": 5, "blocks": [8, 9]},
+            {"group": 2, "first": 0, "blocks": [10, 11, 12]},
+        ]
+    }
+    assert allocations.lengths == {}
+
+
+def test_allocations_by_group_are_kept_for_several_groups_or_a_window():
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import group_allocations
+
+    spec = {"block_size": 16, "num_kv_heads": 1, "head_size": 8, "dtype": torch.float32}
+    full = FullAttentionSpec(**spec)
+    window = SlidingWindowSpec(sliding_window=32, **spec)
+
+    def config(*specs):
+        return KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec([f"l{i}"], kind) for i, kind in enumerate(specs)
+            ],
+        )
+
+    assert group_allocations(config(full)) is None
+    assert group_allocations(config(window)) is not None
+    assert group_allocations(config(full, full)).transfer_group_ids == (0, 1)
+
+
+def test_kv_layout_counts_memory_shared_by_groups_once():
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+
+    spec = {"block_size": 4, "num_kv_heads": 2, "head_size": 8, "dtype": torch.float32}
+    groups = [
+        KVCacheGroupSpec(list(SLIDING), SlidingWindowSpec(sliding_window=8, **spec)),
+        KVCacheGroupSpec(list(FULL), FullAttentionSpec(**spec)),
+    ]
+    layout = kv_layout(shared_caches(), 16, 4, "LBHNC", groups)
+    assert (layout["layers"], layout["block_bytes"], layout["bytes"]) == (
+        4,
+        2 * 4 * 8 * 4,
+        2 * 16 * 2 * 4 * 8 * 4,
+    )
+    assert layout["groups"] == [
+        {"kind": "SlidingWindowSpec", "sliding_window": 8, "block_size": 4,
+         "layers": 2, "block_bytes": 256},
+        {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 4,
+         "layers": 2, "block_bytes": 256},
+    ]
+
+
+def test_real_transfers_take_full_and_sliding_window_groups_only():
+    from vllm.v1.kv_cache_interface import (
+        ChunkedLocalAttentionSpec,
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_groups
+
+    spec = {"block_size": 16, "num_kv_heads": 1, "head_size": 8, "dtype": torch.float32}
+
+    def config(*specs):
+        return KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec([f"l{i}"], kind) for i, kind in enumerate(specs)
+            ],
+        )
+
+    check_real_kv_groups(
+        config(FullAttentionSpec(**spec), SlidingWindowSpec(sliding_window=32, **spec))
+    )
+    check_real_kv_groups(config(MLAAttentionSpec(**spec)))
+    with pytest.raises(ValueError, match="not ChunkedLocalAttentionSpec"):
+        check_real_kv_groups(
+            config(
+                FullAttentionSpec(**spec),
+                ChunkedLocalAttentionSpec(attention_chunk_size=32, **spec),
+            )
+        )

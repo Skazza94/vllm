@@ -20,7 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.simulated.model_runner import SimulatedModelRunner
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -101,6 +101,12 @@ class SimulatedWorker(Worker):
             self.vllm_config.simulation_config.timing,
         )
         self._init_workspace_and_model_runner()
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        # A sliding window's blocks follow the attention backend's kernel
+        # block sizes, which depend on the simulation.
+        with set_current_vllm_config(self.vllm_config):
+            return super().get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         # Engines simulated in one process (disaggregated instances) each
