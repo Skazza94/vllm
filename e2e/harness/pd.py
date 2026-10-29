@@ -45,19 +45,28 @@ PROXY_PORT = 8080
 BOOTSTRAP_PORT = 8998
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
-TENT_METRICS_PORT = 9100  # rank r serves on TENT_METRICS_PORT + r
+TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
 DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 
 
 @dataclass
 class Side:
     node: str
-    kv_network: str | list[str]  # a list: one per tensor-parallel rank
+    # A list: one per tensor-parallel rank, which every DP rank's TP rank of
+    # that index uses (any prefill DP rank may pair with any decode DP rank).
+    kv_network: str | list[str]
+    # > 1: an MoE model's data-parallel attention with expert parallelism.
+    data_parallel_size: int = 1
 
     def rank_networks(self, ranks: int) -> list[str]:
         if isinstance(self.kv_network, str):
             return [self.kv_network] * ranks
         return list(self.kv_network)
+
+    def ranks(self, tp_size: int) -> list[tuple[int, int]]:
+        """(DP rank, TP rank) of each of the instance's ranks, in the host's
+        order (rank_addresses, TENT metrics ports, step logs)."""
+        return [(dp, tp) for dp in range(self.data_parallel_size) for tp in range(tp_size)]
 
 
 @dataclass
@@ -72,6 +81,9 @@ class Server:
     dtype: str = "auto"
     hp_tcp_args: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
+    # The simulator's timing provider; roofline's arguments default to {gpu}.
+    timing: str = "roofline"
+    timing_args: dict | None = None
 
 
 @dataclass
@@ -144,12 +156,17 @@ def tent_config(address: str, hp_tcp_args: dict) -> dict:
 
 
 def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
-    """``vllm serve`` for ``role`` (prefill or decode), rank r's KV on
-    ``kv_addresses[r]`` (their own: ``rank_addresses``)."""
+    """``vllm serve`` for ``role`` (prefill or decode), TP rank r's KV on
+    ``kv_addresses[r]`` in every DP rank (their own: ``rank_addresses``, DP
+    rank by TP rank)."""
 
     kv_address = kv_addresses[0]
+    side = getattr(run, role)
 
-    simulation = {"clock": "real", "timing": "roofline", "timing_args": {"gpu": run.server.gpu},
+    timing_args = run.server.timing_args
+    if timing_args is None:
+        timing_args = {"gpu": run.server.gpu} if run.server.timing == "roofline" else {}
+    simulation = {"clock": "real", "timing": run.server.timing, "timing_args": timing_args,
                   "log_path": STEP_LOG, "kv_transfer_mode": "real"}
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
@@ -157,7 +174,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
                    "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
                    "kv_buffer_device": "cpu", "kv_connector_extra_config": {"mooncake_protocol": "tcp"}}
     if len(set(kv_addresses)) > 1:
-        kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses
+        kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
     env = {
         "TRITON_CPU_BACKEND": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1", "OMP_NUM_THREADS": "1",
         # The address Mooncake's workers register (vLLM's get_ip).
@@ -179,6 +196,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(s.tensor_parallel_size),
+        *(["--data-parallel-size", str(side.data_parallel_size), "--enable-expert-parallel"]
+          if side.data_parallel_size > 1 else []),
         "--generation-config", "vllm", "--enforce-eager",
         # The byte check's pattern is the request's: a block cached for
         # another request would not match it.
@@ -261,8 +280,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
     (output / "tent.json").write_text(json.dumps(tent, indent=2) + "\n")
     verdict = check(
         json.loads((output / "bench.json").read_text()),
-        [(output / _step_log_name("prefill", r)).read_text() for r in range(ranks)],
-        [(output / _step_log_name("decode", r)).read_text() for r in range(ranks)],
+        *[[(output / _step_log_name(role, dp, tp)).read_text() for dp, tp in getattr(run, role).ranks(ranks)]
+          for role in ("prefill", "decode")],
         routers, run, tent)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
@@ -273,87 +292,149 @@ def execute(run: Run, output: Path | None = None) -> dict:
 def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], routers: dict[str, int],
           run: Run, tent: dict[str, list[dict]] | None = None) -> dict:
     """The run's checks, from the client's results, every rank's step logs
-    (``prefill_steps[r]``, ``decode_steps[r]``), the bytes each router
-    received during the workload and each rank's TENT counters over it
-    (``tent[role][r]``). Requests are counted once, from the client; bytes
-    per rank, then summed."""
+    (``prefill_steps[i]``, ``decode_steps[i]``, in each side's `Side.ranks`
+    order), the bytes each router received during the workload and each
+    rank's TENT counters over it (``tent[role][i]``). Requests are counted
+    once, from the client; bytes per rank, then summed. Each request is
+    produced by one prefill DP rank and consumed by one decode DP rank,
+    the same on every TP rank."""
 
     problems = []
     w = run.workload
-    ranks = run.server.tensor_parallel_size
+    tp_size = run.server.tensor_parallel_size
     errors = [error for error in bench.get("errors", []) if error]
     if bench.get("completed") != w.num_prompts or errors:
         problems.append(f"{bench.get('completed')} of {w.num_prompts} request(s) completed; errors: {errors[:3]}")
 
-    per_rank = []
-    for rank in range(ranks):
-        where = f"rank {rank}: " if ranks > 1 else ""
-        decode = _records(decode_steps[rank])
-        prefill = _records(prefill_steps[rank])
-        checks = [record["kv_check"] for record in decode if "kv_check" in record]
-        checked = sum(int(c.get("bytes") or 0) for c in checks)
-        layouts = {role: next((r["kv_layout"] for r in records if "kv_layout" in r), None)
-                   for role, records in (("prefill", prefill), ("decode", decode))}
-        # Each log must be this rank's (not another's supplied twice).
-        for role, layout in layouts.items():
-            if layout is None:
-                problems.append(f"{where}{role} logged no KV layout")
-            elif (layout.get("tp_rank"), layout.get("tp_size")) != (rank, ranks):
-                problems.append(f"{where}{role}'s log is TP rank {layout.get('tp_rank')} of "
-                                f"{layout.get('tp_size')}, not {rank} of {ranks}")
-        if run.kv_check:
-            if len(checks) != w.num_prompts:
-                problems.append(f"{where}decode byte-checked {len(checks)} request(s), not {w.num_prompts}")
-            bad = [c for c in checks if not c.get("ok") or c.get("mismatched_bytes")]
-            if bad:
-                problems.append(f"{where}{len(bad)} request(s) received KV bytes unlike prefill's: {bad[0]}")
-            layout = layouts["decode"]
-            if layout and any(c.get("bytes") != c["blocks"] * c["layers"] * layout["block_bytes"]
-                              for c in checks if "blocks" in c):
-                problems.append(f"{where}byte checks disagree with the rank's KV layout ({layout['block_bytes']} "
-                                "bytes a block and layer)")
-        sent = {"count": 0, "bytes": 0, "failed": 0}
-        for record in prefill + decode:
-            for transfers in (record.get("kv_transfers") or {}).values():
-                for key in sent:
-                    sent[key] += int(transfers.get(key) or 0)
-        if sent["failed"]:
-            problems.append(f"{where}the connector failed {sent['failed']} transfer(s)")
-        if sent["bytes"] < checked:
-            problems.append(f"{where}the connector moved {sent['bytes']} bytes, fewer than the {checked} decode "
-                            "checked")
-        rank_tent = {role: tent[role][rank] for role in tent} if tent else {}
-        required = {"prefill": ("tent_registered_buffer_bytes", "tent_write_bytes_total"),
-                    "decode": ("tent_registered_buffer_bytes",)}
-        for role, counters in rank_tent.items():
-            if counters is None:
-                problems.append(f"{where}{role}'s TENT metrics did not answer")
-            elif missing := [name for name in required[role] if name not in counters]:
-                problems.append(f"{where}{role}'s TENT metrics lack {', '.join(missing)}")
-        for role, counters in rank_tent.items():
-            registered = (counters or {}).get("tent_registered_buffer_bytes")
-            layout = layouts[role]
-            if registered is not None and layout and registered < layout["bytes"]:
-                problems.append(f"{where}{role}'s TENT registered {registered:.0f} bytes, less than its "
-                                f"{layout['bytes']} of KV")
-        written = (rank_tent.get("prefill") or {}).get("tent_write_bytes_total")
-        if tent and written is not None and written != sent["bytes"]:
-            problems.append(f"{where}TENT wrote {written:.0f} bytes, not the {sent['bytes']} its connector moved")
-        per_rank.append({
-            "kv_checks": len(checks), "kv_bytes_checked": checked, "transfers": sent,
-            "kv_layout": {role: layout and {key: layout.get(key) for key in
-                                            ("tp_rank", "tp_size", "shape", "block_bytes", "bytes",
-                                             "tent_metrics_port")}
-                          for role, layout in layouts.items()},
-            "tent": rank_tent,
-        })
+    sides = {"prefill": run.prefill, "decode": run.decode}
+    data_parallel = any(side.data_parallel_size > 1 for side in sides.values())
 
-    moved = sum(rank["transfers"]["bytes"] for rank in per_rank)
-    # Every KV byte crosses its rank's network's router once, and no other:
-    # each carries its ranks' bytes and little more (headers, acknowledgements).
+    def where(dp: int | None, tp: int) -> str:
+        parts = ([f"DP rank {dp}"] if data_parallel and dp is not None else []) + (
+            [f"rank {tp}"] if tp_size > 1 else [])
+        return " ".join(parts) + ": " if parts else ""
+
+    logs = {role: dict(zip(side.ranks(tp_size), map(_records, steps)))
+            for role, side, steps in (("prefill", run.prefill, prefill_steps),
+                                      ("decode", run.decode, decode_steps))}
+    tents = {role: dict(zip(sides[role].ranks(tp_size), tent[role])) for role in tent} if tent else {}
+    ranks: dict[str, dict[tuple[int, int], dict]] = {role: {} for role in sides}
+    for role, side in sides.items():
+        for (dp, tp), records in logs[role].items():
+            at = where(dp, tp)
+            layout = next((r["kv_layout"] for r in records if "kv_layout" in r), None)
+            # Each log must be this rank's (not another's supplied twice).
+            if layout is None:
+                problems.append(f"{at}{role} logged no KV layout")
+            elif (layout.get("tp_rank"), layout.get("tp_size")) != (tp, tp_size):
+                problems.append(f"{at}{role}'s log is TP rank {layout.get('tp_rank')} of "
+                                f"{layout.get('tp_size')}, not {tp} of {tp_size}")
+            elif data_parallel and layout.get("dp_rank") != dp:
+                problems.append(f"{at}{role}'s log is DP rank {layout.get('dp_rank')}, not {dp}")
+            sent = {"count": 0, "bytes": 0, "failed": 0}
+            for record in records:
+                for transfers in (record.get("kv_transfers") or {}).values():
+                    for key in sent:
+                        sent[key] += int(transfers.get(key) or 0)
+            if sent["failed"]:
+                problems.append(f"{at}{role}'s connector failed {sent['failed']} transfer(s)")
+            checks = [record["kv_check"] for record in records if "kv_check" in record]
+            if run.kv_check and role == "decode":
+                bad = [c for c in checks if not c.get("ok") or c.get("mismatched_bytes")]
+                if bad:
+                    problems.append(f"{at}{len(bad)} request(s) received KV bytes unlike prefill's: {bad[0]}")
+                if layout and any(c.get("bytes") != c["blocks"] * c["layers"] * layout["block_bytes"]
+                                  for c in checks if "blocks" in c):
+                    problems.append(f"{at}byte checks disagree with the rank's KV layout ({layout['block_bytes']} "
+                                    "bytes a block and layer)")
+            # The requests the rank owns: prefill's allocations; decode's
+            # byte checks, else its allocations.
+            owned = {_base_request_id(c["req_id"]) for c in checks if "req_id" in c} if (
+                role == "decode" and run.kv_check) else {
+                _base_request_id(req_id) for r in records
+                for req_id in ((r.get("kv_events") or {}).get("allocated") or {})}
+            counters = tents.get(role, {}).get((dp, tp)) if tents else None
+            if tents:
+                required = {"prefill": ("tent_registered_buffer_bytes", "tent_write_bytes_total"),
+                            "decode": ("tent_registered_buffer_bytes",)}[role]
+                if counters is None:
+                    problems.append(f"{at}{role}'s TENT metrics did not answer")
+                elif missing := [name for name in required if name not in counters]:
+                    problems.append(f"{at}{role}'s TENT metrics lack {', '.join(missing)}")
+                registered = (counters or {}).get("tent_registered_buffer_bytes")
+                if registered is not None and layout and registered < layout["bytes"]:
+                    problems.append(f"{at}{role}'s TENT registered {registered:.0f} bytes, less than its "
+                                    f"{layout['bytes']} of KV")
+                written = (counters or {}).get("tent_write_bytes_total")
+                if role == "prefill" and written is not None and written != sent["bytes"]:
+                    problems.append(f"{at}TENT wrote {written:.0f} bytes, not the {sent['bytes']} its connector "
+                                    "moved")
+            ranks[role][(dp, tp)] = {
+                "transfers": sent, "kv_checks": len(checks),
+                "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
+                "requests": owned, "tent": counters,
+                "kv_layout": layout and {key: layout.get(key) for key in (
+                    "dp_rank", "dp_local_rank", "tp_rank", "tp_size", "shape", "block_bytes", "bytes",
+                    "tent_metrics_port")},
+            }
+
+    per_tp = []
+    ownership: dict[str, dict[int, int]] = {"producers": {}, "consumers": {}}
+    owners_by_tp: list[dict[str, dict[str, set[int]]]] = []
+    for tp in range(tp_size):
+        at = where(None, tp)
+        of = {role: {dp: summary for (dp, rank), summary in ranks[role].items() if rank == tp} for role in sides}
+        checked = sum(summary["kv_bytes_checked"] for summary in of["decode"].values())
+        moved = sum(summary["transfers"]["bytes"] for role in sides for summary in of[role].values())
+        if moved < checked:
+            problems.append(f"{at}the connector moved {moved} bytes, fewer than the {checked} decode checked")
+        owners: dict[str, dict[str, set[int]]] = {}
+        for role in sides:
+            owners[role] = {}
+            for dp, summary in of[role].items():
+                for request in summary["requests"]:
+                    owners[role].setdefault(request, set()).add(dp)
+        # Requests the decode DP ranks own, and the byte checks they logged
+        # (none without kv_check).
+        consumed = len(set().union(*(summary["requests"] for summary in of["decode"].values())))
+        byte_checks = sum(summary["kv_checks"] for summary in of["decode"].values())
+        if run.kv_check:
+            if consumed != w.num_prompts:
+                problems.append(f"{at}decode byte-checked {consumed} distinct request(s), not {w.num_prompts}")
+            if byte_checks != consumed:
+                problems.append(f"{at}decode logged {byte_checks} byte check(s) for {consumed} distinct "
+                                "request(s)")
+        for role, label in (("prefill", "prefill DP ranks produced"), ("decode", "decode DP ranks consumed")):
+            shared = sorted(request for request, dps in owners[role].items() if len(dps) > 1)
+            if shared:
+                problems.append(f"{at}{len(shared)} request(s) more than one of the {label}: {shared[0]}")
+        unpaired = sorted(set(owners["prefill"]) ^ set(owners["decode"]))
+        if unpaired:
+            problems.append(f"{at}{len(unpaired)} request(s) not both produced and consumed: {unpaired[0]}")
+        owners_by_tp.append(owners)
+        per_tp.append({
+            "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked,
+            "transfers_bytes": moved,
+            "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
+        })
+    # Every TP rank of a request's owner is the same DP rank.
+    for role, kind in (("prefill", "producers"), ("decode", "consumers")):
+        first = owners_by_tp[0][role] if owners_by_tp else {}
+        for tp, owners in enumerate(owners_by_tp[1:], start=1):
+            differ = sorted(request for request in first if owners[role].get(request) != first[request])
+            if differ:
+                problems.append(f"rank {tp}: {len(differ)} request(s) with other {role} DP ranks than rank 0's")
+        for dps in first.values():
+            for dp in dps:
+                ownership[kind][dp] = ownership[kind].get(dp, 0) + 1
+
+    # Every KV byte crosses its TP rank's network's router once, and no
+    # other: each carries its ranks' bytes and little more (headers,
+    # acknowledgements).
     expected: dict[str, int] = {}
-    for rank, network in enumerate(run.prefill.rank_networks(ranks)):
-        expected[network] = expected.get(network, 0) + per_rank[rank]["transfers"]["bytes"]
+    for (dp, tp), summary in ranks["prefill"].items():
+        network = run.prefill.rank_networks(tp_size)[tp]
+        expected[network] = expected.get(network, 0) + summary["transfers"]["bytes"]
     for network, carried_by_ranks in expected.items():
         carried = routers.get(network, 0)
         if carried < carried_by_ranks:
@@ -362,21 +443,34 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         elif carried > carried_by_ranks * 1.05 + (1 << 20):
             problems.append(f"the KV network {network} carried {carried} bytes, more than its ranks' "
                             f"{carried_by_ranks}: another rank's KV")
+    moved = sum(summary["transfers"]["bytes"] for role in sides for summary in ranks[role].values())
     control = routers.get(run.control_network, 0)
     if moved and control > moved / 10:
         problems.append(f"the control network carried {control} bytes, too much beside {moved} of KV")
-    sums = {key: sum(rank["transfers"][key] for rank in per_rank) for key in ("count", "bytes", "failed")}
+    sums = {key: sum(summary["transfers"][key] for role in sides for summary in ranks[role].values())
+            for key in ("count", "bytes", "failed")}
     return {
         "problems": problems,
         "requests": bench.get("completed"),
-        "kv_checks": per_rank[0]["kv_checks"],
-        "kv_bytes_checked": sum(rank["kv_bytes_checked"] for rank in per_rank),
+        "kv_checks": per_tp[0]["kv_checks"] if per_tp else 0,
+        "kv_bytes_checked": sum(rank["kv_bytes_checked"] for rank in per_tp),
         "transfers": sums,
         "router_bytes": routers,
-        "ranks": per_rank,
+        "ranks": per_tp,
+        "ownership": ownership,
+        "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
+                             **{key: value for key, value in summary.items() if key != "requests"},
+                             "requests": len(summary["requests"])}
+                            for (dp, tp), summary in ranks[role].items()] for role in sides},
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
     }
+
+
+def _base_request_id(request_id: str) -> str:
+    """The id the proxy gives a request on both instances: vLLM appends its
+    own random suffix to each (``cmpl-<uuid>-0-<suffix>``)."""
+    return request_id.rsplit("-", 1)[0]
 
 
 def is_service(cmdline: bytes, comm: bytes) -> bool:
@@ -466,8 +560,13 @@ def _wait(client: str, url: str, timeout: float, owner: str, log: str) -> None:
     raise TimeoutError(f"{url} did not answer within {timeout:.0f} s; {owner}:{log} ends with:\n{tail}")
 
 
-def _step_log_name(role: str, rank: int) -> str:
-    return f"{role}-steps.jsonl" if rank == 0 else f"{role}-steps.tp{rank}.jsonl"
+def _rank_suffix(dp: int, tp: int) -> str:
+    """The simulator's step log suffix for a rank: `.dp<i>` and `.tp<r>`."""
+    return (f".dp{dp}" if dp else "") + (f".tp{tp}" if tp else "")
+
+
+def _step_log_name(role: str, dp: int, tp: int) -> str:
+    return f"{role}-steps{_rank_suffix(dp, tp)}.jsonl"
 
 
 def _tent_metrics(run: Run, container: dict[str, str]) -> dict[str, list[str | None]]:
@@ -479,7 +578,8 @@ def _tent_metrics(run: Run, container: dict[str, str]) -> dict[str, list[str | N
     metrics: dict[str, list[str | None]] = {}
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
         metrics[role] = []
-        for rank in range(run.server.tensor_parallel_size):
+        # The host's ranks, in order: local DP rank by TP rank.
+        for rank, _ in enumerate(side.ranks(run.server.tensor_parallel_size)):
             text = topology.exec_in(container[side.node], [
                 PYTHON, "-c", fetch, f"http://127.0.0.1:{TENT_METRICS_PORT + rank}/metrics"], check=False)
             metrics[role].append(None if text.strip() == "NO ANSWER" else text)
@@ -517,8 +617,9 @@ def _collect(run: Run, container: dict[str, str], output: Path) -> None:
         if role == "client":
             copies.append((f"{WORK}/results/bench.json", output / "bench.json"))
         else:
-            copies += [(STEP_LOG if rank == 0 else f"{WORK}/steps.tp{rank}.jsonl", output / _step_log_name(role, rank))
-                       for rank in range(run.server.tensor_parallel_size)]
+            side = run.prefill if role == "prefill" else run.decode
+            copies += [(f"{WORK}/steps{_rank_suffix(dp, tp)}.jsonl", output / _step_log_name(role, dp, tp))
+                       for dp, tp in side.ranks(run.server.tensor_parallel_size)]
         for remote, local in copies:
             local.parent.mkdir(parents=True, exist_ok=True)
             shell.run(["docker", "cp", f"{name}:{remote}", str(local)], check=False)

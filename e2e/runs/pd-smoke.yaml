@@ -16,7 +16,9 @@
 # mismatch; the connector failed no transfer and moved at least the checked
 # bytes; each KV network's router carried its ranks' bytes and the control
 # router less than 10% of them. Under tensor parallelism each rank is
-# checked on its own (its byte checks, layout, rail and TENT counters).
+# checked on its own (its byte checks, layout, rail and TENT counters); under
+# data parallelism each request must have one producer and one consumer DP
+# rank (the same on every TP rank), its bytes counted once.
 # Output: results/<name>-<timestamp>/ (bench.json, step logs, server and
 # proxy logs, routers.json, tent.json, verdict.json).
 
@@ -29,6 +31,9 @@ model: ../../models/Qwen--Qwen2.5-7B-Instruct/a09a35458c702b33eeacc393d103063234
 
 # Each side's node and KV network. Under tensor parallelism kv_network may be
 # a list, one network per rank (rank r of both sides on the same network).
+# data_parallel_size > 1 (per side, may differ): an MoE model's data-parallel
+# attention with expert parallelism; every DP rank's TP rank r uses the same
+# KV network, as any prefill DP rank may pair with any decode DP rank.
 prefill: {node: prefill0, kv_network: data0}
 decode: {node: decode0, kv_network: data0}
 client: client
@@ -50,6 +55,8 @@ server:  # both servers; defaults shown where set
   max_num_seqs: 32
   # tensor_parallel_size: 1   # > 1 needs a topology with --shm-size 4g
   # dtype: auto
+  # timing: roofline          # the simulator's timing provider
+  # timing_args: {gpu: h100}  # its arguments (roofline: {gpu} by default)
   # hp_tcp_args: {max_outstanding_tasks: 1048576}  # extra hp_tcp settings
   # env: {VLLM_LOGGING_LEVEL: DEBUG}               # extra server environment
 

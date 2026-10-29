@@ -22,11 +22,22 @@ def line(**record) -> str:
 
 
 ONE_RANK = line(kv_layout={"tp_rank": 0, "tp_size": 1, "block_bytes": 4, "bytes": 1600})
+
+
+def allocated(*requests: str) -> str:
+    """Prefill's allocations of requests, under its own request ids."""
+    return line(kv_events={"allocated": {f"cmpl-{r}-0-p": [1] for r in requests}})
+
+
+def checked(request: str, ok: bool = True, **more) -> dict:
+    """Decode's byte check of a request, under its own request id."""
+    return {"req_id": f"cmpl-{request}-0-d", "ok": ok, "bytes": 1000, "mismatched_bytes": 0 if ok else 9, **more}
+
+
 GOOD = {
     "bench": {"completed": 2, "errors": ["", ""], "mean_ttft_ms": 50.0},
-    "prefill": ONE_RANK + line(kv_transfers={"send": {"count": 2, "bytes": 2000, "failed": 0}}),
-    "decode": ONE_RANK + (line(kv_check={"ok": True, "bytes": 1000, "mismatched_bytes": 0})
-               + line(kv_check={"ok": True, "bytes": 1000, "mismatched_bytes": 0})),
+    "prefill": ONE_RANK + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": 2000, "failed": 0}}),
+    "decode": ONE_RANK + line(kv_check=checked("a")) + line(kv_check=checked("b")),
     "routers": {"control": 50, "data0": 2100},
 }
 
@@ -45,14 +56,17 @@ class CheckTests(unittest.TestCase):
     def test_each_failure_is_reported(self) -> None:
         cases = {
             "completed": {"bench": {"completed": 1, "errors": ["", "HTTP 500"]}},
-            "byte-checked 1": {"decode": ONE_RANK + line(kv_check={"ok": True, "bytes": 1000, "mismatched_bytes": 0})},
-            "unlike prefill": {"decode": GOOD["decode"].replace('"ok": true, "bytes": 1000, "mismatched_bytes": 0}',
-                                                                '"ok": false, "bytes": 1000, "mismatched_bytes": 9}', 1)},
+            "byte-checked 1": {"decode": ONE_RANK + line(kv_check=checked("a"))},
+            "unlike prefill": {"decode": ONE_RANK + line(kv_check=checked("a", ok=False))
+                               + line(kv_check=checked("b"))},
             "failed 1 transfer": {
-                "prefill": ONE_RANK + line(kv_transfers={"send": {"count": 2, "bytes": 2000, "failed": 1}})},
+                "prefill": ONE_RANK + allocated("a", "b")
+                + line(kv_transfers={"send": {"count": 2, "bytes": 2000, "failed": 1}})},
             "fewer than the 2000 decode checked": {
-                "prefill": ONE_RANK + line(kv_transfers={"send": {"count": 1, "bytes": 1000}}),
+                "prefill": ONE_RANK + allocated("a", "b") + line(kv_transfers={"send": {"count": 1, "bytes": 1000}}),
                 "routers": {"control": 50, "data0": 5000}},
+            "not both produced and consumed": {"prefill": ONE_RANK + allocated("a", "b", "c")
+                                               + line(kv_transfers={"send": {"count": 2, "bytes": 2000}})},
             "KV network": {"routers": {"control": 50, "data0": 100}},
             "control network carried": {"routers": {"control": 1000, "data0": 2100}},
         }
@@ -88,9 +102,8 @@ def rank_logs(rank: int, moved: int = 2000, ok: bool = True) -> tuple[str, str]:
 
     layout = line(kv_layout={"tp_rank": rank, "tp_size": 2, "shape": [8, 1, 16, 128],
                              "block_bytes": 4, "bytes": 1600})
-    check = {"ok": ok, "bytes": 1000, "mismatched_bytes": 0 if ok else 9, "blocks": 5, "layers": 50}
-    return (layout + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}),
-            layout + line(kv_check=check) + line(kv_check=check))
+    return (layout + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}),
+            layout + "".join(line(kv_check=checked(r, ok, blocks=5, layers=50)) for r in ("a", "b")))
 
 
 def tent(written: float = 2000, registered: float = 1600) -> dict:
@@ -173,6 +186,109 @@ class TensorParallelCheckTests(unittest.TestCase):
         shared = " ".join(pd.server_command(TP2, "prefill", ["10.100.0.1", "10.100.0.1"]))
         self.assertNotIn("rank_addresses", shared)
         self.assertIn("--tensor-parallel-size 2", shared)
+
+
+def dp_layout(dp: int, tp: int = 0, tp_size: int = 1) -> str:
+    return line(kv_layout={"dp_rank": dp, "tp_rank": tp, "tp_size": tp_size, "block_bytes": 4, "bytes": 1600})
+
+
+def sent(nbytes: int) -> str:
+    return line(kv_transfers={"send": {"count": nbytes // 1000, "bytes": nbytes, "failed": 0}})
+
+
+def dp_run(prefill_dp: int, decode_dp: int, tp: int = 1) -> pd.Run:
+    networks = "data0" if tp == 1 else ["data0", "data1"]
+    return pd.Run(name="t", topology="t", model=Path("/m"),
+                  prefill=pd.Side("p", networks, data_parallel_size=prefill_dp),
+                  decode=pd.Side("d", networks, data_parallel_size=decode_dp), client="c",
+                  control_network="control", server=pd.Server(tensor_parallel_size=tp),
+                  workload=pd.Workload(num_prompts=2))
+
+
+class DataParallelCheckTests(unittest.TestCase):
+    """Requests a and b; prefill DP=2, decode DP=1 unless a case says."""
+
+    def verdict(self, prefill=None, decode=None, run=None, routers=None) -> dict:
+        prefill = prefill or [dp_layout(0) + allocated("a") + sent(1000), dp_layout(1) + allocated("b") + sent(1000)]
+        decode = decode or [dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b"))]
+        run = run or dp_run(len(prefill), len(decode))
+        return pd.check({"completed": 2, "errors": []}, prefill, decode,
+                        routers or {"control": 50, "data0": 2100}, run)
+
+    def test_each_request_has_one_producer_and_one_consumer(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["ownership"], {"producers": {0: 1, 1: 1}, "consumers": {0: 2}})
+        # Bytes counted once: each request's KV crossed data0 once.
+        self.assertEqual((verdict["kv_checks"], verdict["kv_bytes_checked"], verdict["transfers"]["bytes"]),
+                         (2, 2000, 2000))
+        self.assertEqual([r["requests"] for r in verdict["dp_ranks"]["prefill"]], [1, 1])
+
+    def test_ownership_failures_are_reported(self) -> None:
+        cases = {
+            # Both decode DP ranks checked a.
+            "1 request(s) more than one of the decode DP ranks consumed": {"decode": [
+                dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b")),
+                dp_layout(1) + line(kv_check=checked("a"))]},
+            "decode logged 3 byte check(s) for 2 distinct request(s)": {"decode": [
+                dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b")),
+                dp_layout(1) + line(kv_check=checked("a"))]},
+            "1 request(s) more than one of the prefill DP ranks produced": {"prefill": [
+                dp_layout(0) + allocated("a", "b") + sent(1000), dp_layout(1) + allocated("b") + sent(1000)]},
+            "1 request(s) not both produced and consumed": {"decode": [dp_layout(0) + line(kv_check=checked("a"))]},
+            "DP rank 1: prefill's log is DP rank 0, not 1": {"prefill": [
+                dp_layout(0) + allocated("a") + sent(1000), dp_layout(0) + allocated("b") + sent(1000)]},
+        }
+        for message, given in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**given)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+    def test_every_request_is_byte_checked_once(self) -> None:
+        """Two requests completed, but the logs hold only a, checked twice:
+        as many checks as requests, yet b went unchecked."""
+        prefill = [dp_layout(0) + allocated("a") + sent(1000), dp_layout(1) + sent(1000)]
+        decode = [dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("a"))]
+        problems = self.verdict(prefill, decode)["problems"]
+        for message in ("decode byte-checked 1 distinct request(s), not 2",
+                        "decode logged 2 byte check(s) for 1 distinct request(s)"):
+            self.assertTrue(any(message in p for p in problems), problems)
+
+    def test_without_byte_checks_ownership_comes_from_allocations(self) -> None:
+        """kv_check off: decode's allocations name the consumers, and no
+        byte check is reported (regression: they were counted as checks)."""
+        run = dp_run(2, 1)
+        run.kv_check = False
+        decode = [dp_layout(0) + allocated("a", "b")]
+        verdict = self.verdict(decode=decode, run=run)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual((verdict["kv_checks"], verdict["kv_bytes_checked"]), (0, 0))
+        self.assertEqual(verdict["ranks"][0]["consumed"], 2)
+        self.assertEqual(verdict["ownership"], {"producers": {0: 1, 1: 1}, "consumers": {0: 2}})
+        # A request decode never took is still caught.
+        problems = self.verdict(decode=[dp_layout(0) + allocated("a")], run=run)["problems"]
+        self.assertTrue(any("1 request(s) not both produced and consumed" in p for p in problems), problems)
+
+    def test_every_tp_rank_of_a_request_has_the_same_owner(self) -> None:
+        # TP=2: rank 1 places a and b on the other prefill DP ranks.
+        prefill = [dp_layout(0, 0, 2) + allocated("a") + sent(1000), dp_layout(0, 1, 2) + allocated("b") + sent(1000),
+                   dp_layout(1, 0, 2) + allocated("b") + sent(1000), dp_layout(1, 1, 2) + allocated("a") + sent(1000)]
+        decode = [dp_layout(0, tp, 2) + line(kv_check=checked("a")) + line(kv_check=checked("b")) for tp in (0, 1)]
+        problems = self.verdict(prefill, decode, dp_run(2, 1, tp=2),
+                                {"control": 50, "data0": 2100, "data1": 2100})["problems"]
+        self.assertTrue(any("rank 1: 2 request(s) with other prefill DP ranks than rank 0's" in p
+                            for p in problems), problems)
+
+    def test_ranks_follow_the_hosts_order(self) -> None:
+        run = dp_run(2, 2, tp=2)
+        self.assertEqual(run.prefill.ranks(2), [(0, 0), (0, 1), (1, 0), (1, 1)])
+        self.assertEqual(pd._step_log_name("decode", 1, 1), "decode-steps.dp1.tp1.jsonl")
+        self.assertEqual(pd._step_log_name("decode", 0, 0), "decode-steps.jsonl")
+        command = " ".join(pd.server_command(run, "prefill", ["10.100.0.1", "10.101.0.1"]))
+        # Local DP rank by TP rank, each TP rank on its own rail.
+        self.assertIn('"rank_addresses": ["10.100.0.1", "10.101.0.1", "10.100.0.1", "10.101.0.1"]', command)
+        self.assertIn("--data-parallel-size 2 --enable-expert-parallel", command)
+        self.assertNotIn("--data-parallel-size", " ".join(pd.server_command(TP2, "prefill", ["a", "b"])))
 
 
 @unittest.skipUnless(os.environ.get("E2E_VLLM") == "1", "set E2E_VLLM=1 to run vLLM in docker")
