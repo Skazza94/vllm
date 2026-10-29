@@ -47,7 +47,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     bind_hp_tcp,
+    local_kv_rank,
     rank_kv_address,
+    this_rank_kv_address,
     should_launch_bootstrap_server,
     simulated_tp_mismatch,
 )
@@ -3099,12 +3101,68 @@ def test_each_tensor_parallel_rank_takes_its_own_address():
     config = _rank_addresses_config(addresses)
     assert [rank_kv_address(config, rank, 2) for rank in (0, 1)] == addresses
     assert rank_kv_address(KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_producer"), 0, 2) is None
-    with pytest.raises(ValueError, match="one address per tensor-parallel rank"):
+    with pytest.raises(ValueError, match="one address per rank on this host"):
         rank_kv_address(config, 0, 4)
     # An integer or bool would parse as IPv4; leading zeros are ambiguous.
     for bad in ("data1", "10.101.000.1", 174_391_297, True):
         with pytest.raises(ValueError, match="not an IPv4 address"):
             rank_kv_address(_rank_addresses_config(["10.100.0.1", bad]), 0, 2)
+
+
+def _dp_state(dp_size, dp_local_size, dp_local_rank, addresses=None):
+    """A worker's DP fields as native vLLM leaves them."""
+    from types import SimpleNamespace
+
+    extra = {} if addresses is None else {"rank_addresses": addresses}
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp_size,
+            data_parallel_size_local=dp_local_size,
+            data_parallel_rank_local=dp_local_rank,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_producer",
+            kv_connector_extra_config=extra,
+        ),
+    )
+
+
+def test_each_rank_takes_its_address_in_host_order():
+    """rank_addresses lists an engine's TP ranks; an MoE model's DP engines
+    on one host list theirs in turn."""
+    # No DP, and a dense model's independent DP engine (reconfigured as
+    # DP=1, local size 1, keeping its local rank 1): the TP ranks.
+    for state in (_dp_state(1, 1, None), _dp_state(1, 1, 1)):
+        assert [local_kv_rank(state, tp, 2) for tp in (0, 1)] == [(0, 2), (1, 2)]
+    # An MoE model's two DP engines of TP=2, served together on one host.
+    assert [
+        local_kv_rank(_dp_state(2, 2, dp), tp, 2) for dp in (0, 1) for tp in (0, 1)
+    ] == [(0, 4), (1, 4), (2, 4), (3, 4)]
+    addresses = ["10.100.0.1", "10.101.0.1", "10.102.0.1", "10.103.0.1"]
+    assert rank_kv_address(
+        _rank_addresses_config(addresses), *local_kv_rank(_dp_state(2, 2, 1), 0, 2)
+    ) == "10.102.0.1"
+
+
+def test_an_engine_launched_alone_needs_no_addresses(monkeypatch):
+    """Offline MoE DP: one engine per launch (local size 1) keeps its local
+    rank 1; rank_addresses cannot place it, so is refused, while without
+    them the engine runs on the host's address."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+        mooncake_connector,
+    )
+
+    monkeypatch.setattr(mooncake_connector, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mooncake_connector, "get_tensor_model_parallel_world_size", lambda: 2)
+    assert this_rank_kv_address(_dp_state(2, 1, 1)) is None
+    with pytest.raises(ValueError, match="local DP rank 1 is not one of its 1"):
+        this_rank_kv_address(_dp_state(2, 1, 1, ["10.100.0.1", "10.101.0.1"]))
+    # The independent dense engine keeps the TP-only mapping.
+    assert (
+        this_rank_kv_address(_dp_state(1, 1, 1, ["10.100.0.1", "10.101.0.1"]))
+        == "10.100.0.1"
+    )
 
 
 @pytest.mark.parametrize("existing", [None, "inline", "flat"])

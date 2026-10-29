@@ -14,7 +14,7 @@ if current_platform.is_cpu():
     # cpu_worker.py; must precede its import.
     import vllm.v1.worker.cpu.shm  # noqa: F401
 
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config.vllm import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.logger import init_logger
@@ -42,12 +42,13 @@ def _thread_ids() -> set[int]:
         return set()
 
 
-def _rank_tent_metrics_port() -> None:
+def _rank_tent_metrics_port(vllm_config: VllmConfig) -> None:
     """Every rank's transfer engine serves TENT's metrics on its own port:
-    the base port plus its tensor-parallel rank. TENT takes the port from
-    MC_TENT_CONF's metrics/http_port (nested, else the flat key), else
-    TENT_METRICS_HTTP_PORT, else its default; whichever it would use is
-    offset."""
+    the base port plus its host-local DP rank times the TP size plus its TP
+    rank, distinct for every engine on the host however launched. TENT takes
+    the port from MC_TENT_CONF's metrics/http_port (nested, else the flat
+    key), else TENT_METRICS_HTTP_PORT, else its default; whichever it would
+    use is offset."""
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
     from vllm.distributed.parallel_state import get_tp_group
 
@@ -62,7 +63,9 @@ def _rank_tent_metrics_port() -> None:
         or _TENT_DEFAULT_METRICS_PORT
     )
     os.environ[_TENT_METRICS_BASE_PORT] = base
-    port = int(base) + get_tp_group().rank_in_group
+    tp = get_tp_group()
+    dp_local_rank = vllm_config.parallel_config.data_parallel_rank_local or 0
+    port = int(base) + dp_local_rank * tp.world_size + tp.rank_in_group
     os.environ[_TENT_METRICS_PORT] = str(port)
     if found is not None and int(found[1]) != port:
         assert conf is not None
@@ -104,7 +107,7 @@ class SimulatedWorker(Worker):
         # build their own connector, which is a process global.
         kv_transfer_state.set_kv_transfer_group(None)
         if self.vllm_config.simulation_config.kv_transfer_mode == "real":
-            _rank_tent_metrics_port()
+            _rank_tent_metrics_port(self.vllm_config)
         before = _thread_ids()
         # The attention backend's kernel block sizes depend on the simulation.
         with set_current_vllm_config(self.vllm_config):

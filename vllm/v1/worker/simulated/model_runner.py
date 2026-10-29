@@ -60,6 +60,7 @@ from vllm.v1.worker.simulated.timing import (
     empty_step_descriptor,
     gather_dp_step,
     get_timing_provider,
+    logs_steps,
     new_clock,
     parallel_summary,
     step_log_path,
@@ -112,6 +113,9 @@ class SimulatedModelRunner(GPUModelRunner):
             self.clock = clock
         log_path = step_log_path(vllm_config)
         self.step_log = StepLogWriter(log_path) if log_path else None
+        # Under MoE DP only DP rank 0 logs the joint steps; the others log
+        # their own KV.
+        self._logs_steps = logs_steps(vllm_config)
         self.fallback_token_id = sim.fallback_token_id
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.
@@ -213,7 +217,7 @@ class SimulatedModelRunner(GPUModelRunner):
         bind = getattr(self.timing_provider, "bind_model", None)
         if bind is not None:
             bind(self.get_model())
-        if self.step_log is not None:
+        if self.step_log is not None and self._logs_steps:
             sim = self.vllm_config.simulation_config
             assumptions = getattr(self.timing_provider, "assumptions", None)
             self.step_log.write_timing(
@@ -255,6 +259,9 @@ class SimulatedModelRunner(GPUModelRunner):
                     ),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
+                    # Its identity, and its place on the host (NIC, port).
+                    "dp_rank": self.parallel_config.data_parallel_index,
+                    "dp_local_rank": self.parallel_config.data_parallel_rank_local or 0,
                     "tent_metrics_port": os.environ.get("TENT_METRICS_HTTP_PORT"),
                 },
                 self.clock.now(),
@@ -487,7 +494,7 @@ class SimulatedModelRunner(GPUModelRunner):
             ],
         )
 
-        if self.step_log is not None:
+        if self.step_log is not None and self._logs_steps:
             self.step_log.write(
                 pending.descriptor,
                 pending.cost,
@@ -624,7 +631,7 @@ class SimulatedModelRunner(GPUModelRunner):
         if self._syncs_dp():
             # Every rank counts the lockstep steps; DP rank 0 logs them, busy
             # or idle.
-            if self.step_log is not None and descriptor.requests:
+            if self.step_log is not None and self._logs_steps and descriptor.requests:
                 self.step_log.write(descriptor, cost, t_start, device_end, [])
             self._step_index += 1
         return None, None

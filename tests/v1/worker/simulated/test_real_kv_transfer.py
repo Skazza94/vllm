@@ -5,6 +5,7 @@
 import json
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -246,44 +247,69 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_real_mode_allows_tensor_parallelism_only_over_mooncake(model_dir):
+def test_real_mode_allows_tensor_and_dp_attention_only_over_mooncake(
+    model_dir, moe_model_dir
+):
     mooncake = {"kv_connector": "MooncakeConnector"}
     config = engine_config(model_dir, kv_transfer=mooncake, tensor_parallel_size=2)
     assert config.parallel_config.tensor_parallel_size == 2
-    with pytest.raises(ValueError, match="tensor parallelism at most"):
+    with pytest.raises(ValueError, match="data-parallel attention at most"):
         engine_config(model_dir, kv_transfer=mooncake, pipeline_parallel_size=2)
     # NIXL does not check the peer's TP size.
-    with pytest.raises(ValueError, match="MooncakeConnector for tensor parallelism"):
+    with pytest.raises(ValueError, match="MooncakeConnector for tensor or data"):
         engine_config(model_dir, tensor_parallel_size=2)
+    # An MoE model's DP ranks with EP: each holds its own requests' KV.
+    config = engine_config(
+        moe_model_dir, kv_transfer=mooncake, data_parallel_size=2, enable_expert_parallel=True
+    )
+    assert config.parallel_config.data_parallel_size == 2
+    for model, kwargs in (
+        (model_dir, {"enable_expert_parallel": True}),  # independent engines
+        (moe_model_dir, {}),  # experts not split
+    ):
+        with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
+            engine_config(model, kv_transfer=mooncake, data_parallel_size=2, **kwargs)
+    with pytest.raises(ValueError, match="MooncakeConnector for tensor or data"):
+        engine_config(moe_model_dir, data_parallel_size=2, enable_expert_parallel=True)
 
 
 @pytest.mark.parametrize(
-    "mode, rank, name",
+    "mode, dp_index, dp_size, tp_rank, name, steps",
     [
-        ("real", 0, "steps.jsonl"),
-        ("real", 1, "steps.tp1.jsonl"),
-        ("simulated", 1, None),  # the output rank's log only
+        ("real", 0, 1, 0, "steps.jsonl", True),
+        ("real", 0, 1, 1, "steps.tp1.jsonl", True),
+        ("simulated", 0, 1, 1, None, True),  # the output rank's log only
+        # MoE DP: DP rank 0 logs the joint steps, the others their own KV.
+        ("real", 0, 2, 0, "steps.jsonl", True),
+        ("real", 1, 2, 0, "steps.dp1.jsonl", False),
+        ("real", 1, 2, 1, "steps.dp1.tp1.jsonl", False),
+        ("simulated", 1, 2, 0, None, False),
+        # Dense DP: independent engines, each logging its own steps.
+        ("simulated", 2, 1, 0, "steps.dp2.jsonl", True),
     ],
 )
-def test_each_tensor_parallel_rank_logs_its_own_transfers(
-    monkeypatch, tmp_path, mode, rank, name
+def test_each_rank_logs_its_own_transfers(
+    monkeypatch, tmp_path, mode, dp_index, dp_size, tp_rank, name, steps
 ):
     from vllm.distributed import parallel_state
-    from vllm.v1.worker.simulated.timing import step_log_path
+    from vllm.v1.worker.simulated.timing import logs_steps, step_log_path
 
-    group = SimpleNamespace(rank_in_group=rank, is_last_rank=True)
+    group = SimpleNamespace(rank_in_group=tp_rank, is_last_rank=True)
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
     config = SimpleNamespace(
         simulation_config=SimpleNamespace(
             log_path=str(tmp_path / "steps.jsonl"), kv_transfer_mode=mode
         ),
+        # Dense DP engines run as DP=1, keeping their index.
         parallel_config=SimpleNamespace(
-            data_parallel_index=0, data_parallel_size=1, data_parallel_rank=0
+            data_parallel_index=dp_index,
+            data_parallel_size=dp_size,
+            data_parallel_rank=dp_index if dp_size > 1 else 0,
         ),
     )
-    path = step_log_path(config)
-    assert path == (str(tmp_path / name) if name else None)
+    assert step_log_path(config) == (str(tmp_path / name) if name else None)
+    assert logs_steps(config) is steps
 
 
 def test_real_mode_needs_a_connector(model_dir):
@@ -657,8 +683,11 @@ def stand_in_connector(monkeypatch, tmp_path):
         site = tmp_path / "site"
         site.mkdir()
         (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
+        # The repository root too: a served engine's processes do not start
+        # in it, yet import the stand-in from this module.
+        root = str(Path(__file__).resolve().parents[4])
         monkeypatch.setenv("PYTHONPATH", os.pathsep.join(
-            [str(site), *filter(None, [os.environ.get("PYTHONPATH")])]
+            [str(site), root, *filter(None, [os.environ.get("PYTHONPATH")])]
         ))
         monkeypatch.setenv(
             "VLLM_SIM_TEST_CONNECTOR",
@@ -747,6 +776,72 @@ def test_tensor_parallel_ranks_register_and_log_their_own_kv(
             # [blocks, KV heads, block size, K and V]: 1 of the model's 2 heads.
             assert layout["shape"][1] == 1, layout
         assert any("step" in r for r in records)
+
+
+def test_dp_attention_ranks_log_their_own_kv_apart_from_the_joint_steps(
+    moe_model_dir, tmp_path, stand_in_connector
+):
+    """Served with DP=2 and EP in real mode, each DP rank logs its own KV
+    records under its global DP rank (DP rank 1 into `steps.dp1.jsonl`);
+    only DP rank 0's log holds the timing record and the joint steps, which
+    keep the request's DP rank."""
+    import requests
+
+    from tests.utils import RemoteOpenAIServer
+
+    stand_in_connector(recording_connector)
+    log = tmp_path / "steps.jsonl"
+    simulation = {
+        "kv_transfer_mode": "real",
+        "kv_pattern_fill": True,
+        "timing": "linear",
+        "timing_args": {"fixed_us": 100},
+        "log_path": str(log),
+    }
+    kv_transfer = {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_producer",
+        "kv_buffer_device": "cpu",
+    }
+    args = [
+        "--skip-tokenizer-init",
+        "--dtype", "float32",
+        "--max-model-len", "256",
+        "--block-size", "32",
+        "--kv-cache-memory-bytes", str(8 * 1024**2),
+        "--no-enable-prefix-caching",
+        "--enforce-eager",
+        "--data-parallel-size", "2",
+        "--enable-expert-parallel",
+        "--simulate-forward",
+        "--simulation-config", json.dumps(simulation),
+        "--kv-transfer-config", json.dumps(kv_transfer),
+    ]  # fmt: skip
+    with RemoteOpenAIServer(moe_model_dir, args, max_wait_seconds=600) as server:
+        response = requests.post(
+            server.url_for("v1/completions"),
+            json={
+                "model": moe_model_dir,
+                "prompt": [5] * 70,
+                "max_tokens": 1,
+                "ignore_eos": True,
+            },
+            headers={"X-data-parallel-rank": "1"},
+            timeout=120,
+        )
+        response.raise_for_status()
+    joint, own = log_records(log), log_records(tmp_path / "steps.dp1.jsonl")
+    for records, rank in ((joint, 0), (own, 1)):
+        (layout,) = [r["kv_layout"] for r in records if "kv_layout" in r]
+        assert (layout["dp_rank"], layout["dp_local_rank"]) == (rank, rank)
+    # The request ran on DP rank 1: its KV events are in its own log.
+    assert any("kv_events" in r for r in own)
+    assert not any("kv_events" in r for r in joint)
+    assert not any("step" in r or "timing" in r for r in own)
+    assert sum("timing" in r for r in joint) == 1
+    steps = [r for r in joint if "step" in r]
+    assert steps
+    assert all(q["dp_rank"] == 1 for s in steps for q in s["step"]["requests"])
 
 
 class SlowRankConnector:
@@ -867,6 +962,32 @@ def test_a_slower_rank_holds_the_request_until_its_load_finishes(
     assert first["t_start"] >= rank1["t"]
 
 
+@pytest.mark.parametrize("dp_local_size", [2, 1])
+@pytest.mark.parametrize(
+    "dp_local_rank, tp_rank, port", [(0, 0, 9100), (0, 1, 9101), (1, 0, 9102), (1, 1, 9103)]
+)
+def test_dp_ranks_on_a_host_serve_tent_metrics_on_their_own_ports(
+    monkeypatch, dp_local_size, dp_local_rank, tp_rank, port
+):
+    """Two DP engines of TP=2 on one host: four transfer engines, four ports,
+    whether served together or launched one by one (local size 1, keeping
+    their local ranks)."""
+    from vllm.distributed import parallel_state
+    from vllm.v1.worker.simulated import worker
+
+    for name in ("TENT_METRICS_HTTP_PORT", "VLLM_SIM_TENT_METRICS_BASE_PORT", "MC_TENT_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    group = SimpleNamespace(rank_in_group=tp_rank, world_size=2)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_rank_local=dp_local_rank, data_parallel_size_local=dp_local_size
+        )
+    )
+    worker._rank_tent_metrics_port(config)
+    assert os.environ["TENT_METRICS_HTTP_PORT"] == str(port)
+
+
 @pytest.mark.parametrize(
     "env, conf, rank, port, conf_port",
     [
@@ -900,12 +1021,15 @@ def test_each_rank_serves_tent_metrics_on_its_own_port(
     elif conf == "file":
         (tmp_path / "tent.json").write_text(json.dumps(tent))
         monkeypatch.setenv("MC_TENT_CONF", str(tmp_path / "tent.json"))
-    group = SimpleNamespace(rank_in_group=rank)
+    group = SimpleNamespace(rank_in_group=rank, world_size=2)
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank_local=None, data_parallel_size_local=1)
+    )
 
     # A second initialization (a restarted connector) keeps the port.
     for _ in range(2):
-        worker._rank_tent_metrics_port()
+        worker._rank_tent_metrics_port(config)
         assert os.environ["TENT_METRICS_HTTP_PORT"] == str(port)
         if conf_port is not None:
             resolved = json.loads(os.environ["MC_TENT_CONF"])

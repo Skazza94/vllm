@@ -366,6 +366,52 @@ lease of an unregistered request (a full prefix hit) expires. Here the
 prefill instance records the transfers, so fit `kv_transfer_timing` to its
 step log.
 
+#### Real KV transfers
+
+With `"kv_transfer_mode": "real"`, compute stays simulated but the KV cache
+is real: CPU tensors that a native connector (`NixlConnector`,
+`NixlPullConnector` or `MooncakeConnector`) registers and moves between the
+instances, so transfers take their actual time over the actual network. It
+needs an explicit `kv_cache_memory_bytes`. Supported layouts:
+
+* Full-attention models, dense or MoE (experts hold no KV), and dense MLA
+  models (one latent per token and layer). Not hybrid, sliding-window,
+  attention-free or sparse-MLA models, nor speculative decoding.
+* One rank per instance, or, over `MooncakeConnector` only:
+    * tensor parallelism of the same size on both instances: each rank moves
+      its own KV heads to its peer, or the whole MLA latent, which every rank
+      holds;
+    * an MoE model's data-parallel attention with expert parallelism
+      (`--data-parallel-size N --enable-expert-parallel`): each DP rank holds
+      its own requests' KV; the proxy pins a request's prefill DP rank, and
+      decode's load balancer picks its own, so the instances' DP sizes may
+      differ.
+* No pipeline or context parallelism, nor data parallelism of dense models
+  (independent engines).
+* Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
+  forced to the CPU MLA kernel's 16.
+
+`kv_pattern_fill` (prefill instance) writes a pattern into each request's KV
+blocks, derived from the request, the TP rank, the layer and the block, and
+`kv_pattern_check` (decode instance) checks every byte it receives, logging
+`kv_check` records (it needs `log_path`); the pattern needs prefix caching
+off.
+
+`MooncakeConnector` takes one KV address per rank in its extra config,
+`"rank_addresses": [...]` (IPv4), so each rank can use a NIC of its own: its
+handshakes, TENT's RPC server and `hp_tcp` bind there. The list holds the
+ranks of an engine, by TP rank; an MoE model's DP engines on one host share
+it, local DP rank by TP rank (`local_kv_rank`), and so must be launched
+together. Each rank's transfer engine serves TENT's metrics on the base port
+(`MC_TENT_CONF`'s `metrics/http_port`, else `TENT_METRICS_HTTP_PORT`, else
+9100) plus its local DP rank times the TP size plus its TP rank.
+
+Every rank of the last pipeline stage logs its own KV (`kv_layout`,
+`kv_transfers`, `kv_check`, `kv_events` and `threads` records) into
+`<log_path>[.dp<i>][.tp<r>]`, for its global DP rank `i` and TP rank `r`
+when not 0; its `kv_layout` record names both and its local DP rank. Under
+MoE DP the timing record and the joint steps stay in DP rank 0's logs.
+
 ### Running without a GPU
 
 A CPU build of vLLM (`VLLM_TARGET_DEVICE=cpu`, which installs Triton's CPU
@@ -396,10 +442,12 @@ MXFP4 weights, online FP8 quantization) fails to build there. The CPU build need
 * Pipeline stages are assumed balanced.
 * No LoRA, pooling or diffusion models, and speculative decoding without
   adaptive verification only.
-* KV transfer is limited to CPU offloading by the `OffloadingConnector` and
-  disaggregated prefill by the `NixlConnector`: in-process instances in pull
-  mode with one rank each; served instances in pull mode without pipeline
-  parallelism, or in push mode with it on the prefill instance.
+* Simulated KV transfer is limited to CPU offloading by the
+  `OffloadingConnector` and disaggregated prefill by the `NixlConnector`:
+  in-process instances in pull mode with one rank each; served instances in
+  pull mode without pipeline parallelism, or in push mode with it on the
+  prefill instance. For real transfers, see
+  [Real KV transfers](#real-kv-transfers).
 * The `fast_forward` and `virtual` clocks need a single process with one
   rank; served and multi-rank simulations run on the real clock.
 * Token ids are not meaningful; only their counts are.

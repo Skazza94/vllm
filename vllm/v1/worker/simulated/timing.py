@@ -2021,30 +2021,45 @@ def step_log_path(vllm_config: VllmConfig) -> str | None:
     under MoE DP (which logs joint steps), else `<log_path>.dp<i>` for an
     independent DP rank i > 0. Under pipeline parallelism a recorded step is
     timed on the last stage, so its device time spans the whole pipeline.
-    With real KV transfers every tensor-parallel rank moves and checks its
-    own KV heads: rank r > 0 logs into `<log_path>.tp<r>`."""
-    from vllm.distributed.parallel_state import get_tp_group
+    With real KV transfers every rank of the last stage moves and checks
+    its own KV, and logs it into `<log_path>[.dp<i>][.tp<r>]` (its global
+    DP rank i and tensor-parallel rank r, when not 0); under MoE DP only DP
+    rank 0's logs hold the joint steps (`logs_steps`)."""
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
-    path = vllm_config.simulation_config.log_path
+    simulation = vllm_config.simulation_config
+    path = simulation.log_path
     if path is None:
         return None
-    if not is_output_rank():
-        if vllm_config.simulation_config.kv_transfer_mode != "real":
-            return None
-        from vllm.distributed.parallel_state import get_pp_group
-
+    parallel_config = vllm_config.parallel_config
+    if simulation.kv_transfer_mode == "real":
         if not get_pp_group().is_last_rank:
             return None
-        root, ext = os.path.splitext(path)
-        return f"{root}.tp{get_tp_group().rank_in_group}{ext}"
-    parallel_config = vllm_config.parallel_config
+    elif not is_output_rank() or (
+        parallel_config.data_parallel_size > 1
+        and parallel_config.data_parallel_rank != 0
+    ):
+        return None
     dp_index = parallel_config.data_parallel_index
-    if parallel_config.data_parallel_size > 1:
-        return path if parallel_config.data_parallel_rank == 0 else None
-    if dp_index > 0:
-        root, ext = os.path.splitext(path)
-        path = f"{root}.dp{dp_index}{ext}"
-    return path
+    tp_rank = get_tp_group().rank_in_group
+    suffix = (f".dp{dp_index}" if dp_index > 0 else "") + (
+        f".tp{tp_rank}" if tp_rank > 0 else ""
+    )
+    if not suffix:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}"
+
+
+def logs_steps(vllm_config: VllmConfig) -> bool:
+    """Whether this rank's step log holds step records and the timing
+    record: not an MoE-DP rank but DP rank 0, whose log holds the joint
+    steps (the others log only their own KV)."""
+    parallel_config = vllm_config.parallel_config
+    return not (
+        parallel_config.data_parallel_size > 1
+        and parallel_config.data_parallel_rank != 0
+    )
 
 
 class StepLogWriter:
