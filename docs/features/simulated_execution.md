@@ -86,16 +86,30 @@ delta-net layers (Qwen3-Next, Qwen3.5; `mamba_cache_mode` none, prefix
 caching off): a request's step takes the recurrent decode when it schedules
 one token after others, else FLA's Triton chunk path (64-token chunks),
 whichever kernel the GPU would select (FlashInfer on Hopper), with its
-states, temporaries and inputs counted as logical bytes. Other attention
+states, temporaries and inputs counted as logical bytes; and Mamba2
+layers (`MambaMixer2`: Nemotron-H, Granite-4.0-H): the state update for
+one token after others, else vLLM's Triton SSD scan, a request's chunks
+cut at multiples of the chunk size of its own positions, its batch's
+continuing prefills preparing every prefill's state. Layers without
+attention (an MLP-only layer) take none; each layer's tensor-parallel
+all-reduces are its own (one for a Nemotron-H layer; a Granite-4.0-H
+layer's mixer or attention, routed experts and shared MLP, and its
+one-group norm's sums), and a shared MLP, run on the experts' input once
+they return and its output added to theirs, is timed after them under
+expert parallelism. Other attention
 layers (chunked local or RSWA attention, say), other recurrent layers
-(Mamba, Kimi's or OLMo's delta-nets) and attention layers whose heads or
-head sizes differ from the model's are rejected. It
+(Mamba, Kimi's or OLMo's delta-nets), a recurrent mixer beside attention
+(Falcon-H1, Zamba2) and attention layers whose heads or head sizes differ
+from the model's are rejected. It
 records what it rests on in the step log's `timing` record. Other parallel
 layouts are rejected rather than mispriced:
 
-* Tensor parallelism adds two all-reduces per layer at the GPU's NVLink
-  bandwidth (`interconnect_gbs`, `interconnect_efficiency`,
-  `collective_latency_us`).
+* Tensor parallelism adds each layer's all-reduces, each with its own
+  payload and latency, at the GPU's NVLink bandwidth (`interconnect_gbs`,
+  `interconnect_efficiency`, `collective_latency_us`): two hidden-width
+  ones a layer unless the model's layers record their own, as Mamba2
+  hybrids' do. The `communication` record lists them
+  (`events_per_step`).
 * MLA requests take the decode or prefill path as vLLM's MLA backend on the
   GPU splits the batch (`mla_backend` overrides it).
 * MoE models with data-parallel attention and expert parallelism

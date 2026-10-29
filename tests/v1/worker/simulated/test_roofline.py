@@ -518,6 +518,11 @@ def test_communication_assumptions_are_recorded():
     assert communication["effective_gbs"] == pytest.approx(360.0)
     assert communication["collective_latency_us"] == 10.0
     assert "embedding and LM-head (logits) collectives" in communication["omitted"]
+    # No layer records its own: two hidden-width all-reduces a layer.
+    assert communication["event_source"] == "legacy_default"
+    assert communication["events_per_step"] == [
+        {"label": "hidden", "elements": 3584, "dtype_bytes": 2, "count": 2 * 28}
+    ]
 
 
 def test_tensor_parallel_moe_keeps_every_expert_with_its_matrices_split(
@@ -2056,3 +2061,456 @@ def test_a_built_qwen3_next_is_timed_from_its_gdn_layers(tmp_path, monkeypatch):
     assert record["recurrent"]["constructed_prefill"] == ["triton"]
     # 40 prompt tokens, then a decode step.
     assert [s["cost"]["breakdown"]["gdn_decode_reqs"] for s in steps] == [0, 1]
+
+
+from vllm.v1.worker.simulated.timing import Collective, Mamba2Geometry  # noqa: E402
+
+# Nemotron-Nano-9B-v2's Mamba2 on one rank: 128 heads of 80, 8 groups,
+# states of 128, chunks of 128; an FP32 SSM state, a BF16 convolution.
+NEMOTRON = Mamba2Geometry(
+    num_heads=128,
+    head_dim=80,
+    n_groups=8,
+    state_size=128,
+    conv_dim=12288,
+    conv_kernel=4,
+    chunk_size=128,
+    conv_state_bytes=3 * 12288 * 2,
+    ssm_state_bytes=128 * 80 * 128 * 4,
+    ssm_dtype_bytes=4,
+    activation_bytes=2,
+)
+M2_STATE, M2_CONV = 128 * 80 * 128 * 4, 3 * 12288 * 2
+M2_CHUNK_FLOPS = 128 * (4 * 128 * 80 * 128 + 2 * 128 * 128 * 80 + 2 * 80 * 128) + (
+    8 * 2 * 128 * 128 * 128
+)
+
+
+@pytest.mark.parametrize(
+    "computed_scheduled",
+    [
+        [(0, 65), (0, 65)],  # fresh: a chunk each
+        [(127, 2)],  # finishes a chunk, starts another
+        [(128, 128)],  # aligned continuation
+        [(100, 300), (0, 1), (256, 129)],
+        [(5, 1000)],
+    ],
+)
+def test_mamba2_chunks_follow_each_requests_own_positions(computed_scheduled):
+    from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadataBuilder
+
+    computed = torch.tensor([c for c, _ in computed_scheduled])
+    starts = [0]
+    for _, t in computed_scheduled:
+        starts.append(starts[-1] + t)
+    _, seq_idx, _, _ = BaseMambaAttentionMetadataBuilder._compute_chunk_metadata(
+        128, len(computed_scheduled), computed, torch.tensor(starts)
+    )
+    native = [seq_idx.count(i) for i in range(len(computed_scheduled))]
+    ours = [NEMOTRON.chunks(sim_req("r", t, c, c + t)) for c, t in computed_scheduled]
+    assert ours == native
+
+
+def test_a_mamba2_update_reads_and_writes_its_states():
+    decode = sim_req("d", 1, 500, 400)
+    assert NEMOTRON.batch_flops((decode,)) == 5 * 128 * 80 * 128 == 6_553_600
+    assert NEMOTRON.batch_bytes((decode,)) == 2 * M2_STATE + 2 * M2_CONV
+
+
+def ssd_bytes(geometry, chunked, prepared):
+    """The SSD batch's logical bytes, term by term."""
+    h, p, n, g, c = 128, 80, 128, 8, 128
+    a, state, conv = 2, geometry.ssm_state_bytes, geometry.conv_state_bytes
+    b = len(chunked)
+    chunks = sum(geometry.chunks(r) for r in chunked)
+    tokens = sum(r.num_scheduled_tokens for r in chunked)
+    terms = {
+        "preparation": 6 * b * state if prepared else 0,
+        "final": b * state,
+        "conv": 2 * b * conv,
+        "dt_dA": 2 * h * chunks * c * 4 + 4 * h * chunks * c * 4 + h * chunks * 4,
+        "chunk_states": 2 * chunks * h * p * n * 4,
+        "passed": (2 * chunks - b) * state,
+        "cb": 4 * chunks * g * c * c + 4 * chunks * h * c * c,
+        "inputs": 2 * tokens * h * p * a + 2 * tokens * (h + g) * n * a + tokens * h * a,
+        "output": tokens * h * p * a,
+    }
+    # The passed states and the final writes: 2 n S.
+    assert terms["passed"] + terms["final"] == 2 * chunks * state
+    return sum(terms.values())
+
+
+def test_a_fresh_ssd_prefill_prepares_no_state():
+    fresh = sim_req("f", 300, 0, 300)  # 3 chunks
+    assert NEMOTRON.batch_flops((fresh,)) == 3 * M2_CHUNK_FLOPS
+    assert NEMOTRON.batch_bytes((fresh,)) == ssd_bytes(NEMOTRON, [fresh], prepared=False)
+
+
+def test_a_continuing_prefill_prepares_every_prefill_of_its_batch():
+    fresh, later = sim_req("f", 300, 0, 300), sim_req("l", 2, 127, 400)
+    assert NEMOTRON.chunks(later) == 2
+    batch = (fresh, later)
+    assert NEMOTRON.batch_flops(batch) == 5 * M2_CHUNK_FLOPS
+    assert NEMOTRON.batch_bytes(batch) == ssd_bytes(NEMOTRON, [fresh, later], prepared=True)
+    # With a decode beside them: its in-place update on top.
+    decode = sim_req("d", 1, 50, 40)
+    assert NEMOTRON.batch_bytes(batch + (decode,)) == NEMOTRON.batch_bytes(batch) + (
+        2 * M2_STATE + 2 * M2_CONV
+    )
+
+
+def test_mamba2_state_bytes_follow_their_dtype():
+    bf16 = dataclasses.replace(NEMOTRON, ssm_state_bytes=M2_STATE // 2, ssm_dtype_bytes=2)
+    decode = sim_req("d", 1, 500, 400)
+    assert bf16.batch_bytes((decode,)) == M2_STATE + 2 * M2_CONV
+    fresh = sim_req("f", 300, 0, 300)
+    assert bf16.batch_bytes((fresh,)) == ssd_bytes(bf16, [fresh], prepared=False)
+
+
+class StubMamba2:
+    """A built `MambaMixer2`'s fields: global heads, groups (extended for
+    tensor parallelism) and convolution width, its rank's state shapes."""
+
+    def __init__(self, tp, heads=128, head_dim=80, groups=8, ssm=torch.float32):
+        self.tp_size = tp
+        self.num_heads, self.head_dim, self.ssm_state_size = heads, head_dim, 128
+        # One group follows the heads under tensor parallelism: extended.
+        self.n_groups = groups if groups % tp == 0 else groups + tp - groups
+        self.conv_dim = heads * head_dim + 2 * self.n_groups * 128
+        self.conv_kernel_size = 4
+        self.num_spec = 0
+        self.use_replayssm = False
+        self._ssm = ssm
+
+    def get_state_shape(self):
+        tp = self.tp_size
+        return (3, self.conv_dim // tp), (self.num_heads // tp, self.head_dim, 128)
+
+    def get_state_dtype(self):
+        return torch.bfloat16, self._ssm
+
+
+def test_mamba2_geometry_is_this_ranks_once():
+    one = Mamba2Geometry.from_module(StubMamba2(1), 2, 128)
+    assert one == NEMOTRON
+    two = Mamba2Geometry.from_module(StubMamba2(2), 2, 128)
+    assert (two.num_heads, two.n_groups, two.conv_dim) == (64, 4, 6144)
+    assert two.ssm_state_bytes == M2_STATE // 2
+    # Granite: one group, replicated on each rank.
+    granite = Mamba2Geometry.from_module(
+        StubMamba2(2, head_dim=64, groups=1, ssm=torch.bfloat16), 2, 256
+    )
+    assert (granite.num_heads, granite.n_groups, granite.conv_dim) == (64, 1, 4352)
+    assert granite.ssm_state_bytes + granite.conv_state_bytes == 1_074_688
+    for name, value in (("num_spec", 1), ("use_replayssm", True)):
+        stub = StubMamba2(1)
+        setattr(stub, name, value)
+        with pytest.raises(ValueError, match="speculative state or ReplaySSM"):
+            Mamba2Geometry.from_module(stub, 2, 128)
+
+
+def test_collectives_are_summed_by_size():
+    """Two layers of one hidden reduction each, one with an FP32 norm sum,
+    on two ranks of 1 GB/s and no latency."""
+    hidden = Collective("hidden", 3584, 2)
+    norm = Collective("gated_norm_sums", 1, 4)
+    geometry = dataclasses.replace(
+        QWEN_7B,
+        tensor_parallel_size=2,
+        num_layers=2,
+        layers=(
+            LayerGeometry(1000, collectives=(hidden,)),
+            LayerGeometry(1000, collectives=(hidden, norm)),
+        ),
+    )
+    provider = RooflineTimingProvider(
+        None, gpu="h100", geometry=geometry, interconnect_gbs=1.0,
+        interconnect_efficiency=1.0, collective_latency_us=10.0,
+    )
+    tokens = 100
+    expected = 3 * 10e-6 + (2 * 100 * 3584 * 2 + 100 * 4) / 1e9
+    assert provider.communication_s(tokens) == pytest.approx(expected)
+    # Layers without their own: two hidden reductions each, as before.
+    legacy = dataclasses.replace(geometry, layers=(LayerGeometry(1000),) * 2)
+    plain = RooflineTimingProvider(
+        None, gpu="h100", geometry=legacy, interconnect_gbs=1.0,
+        interconnect_efficiency=1.0, collective_latency_us=10.0,
+    )
+    assert plain.communication_s(tokens) == pytest.approx(4 * 10e-6 + 4 * 100 * 3584 * 2 / 1e9)
+
+
+def test_a_shared_mlp_after_the_moe_combine_runs_in_the_next_segment():
+    """Granite under DP+EP: the shared MLP's weights, a part of the layer's
+    dense ones, move after the experts. Rank 0 prefills, rank 1 decodes;
+    the dense layer before is heavy, the shared MLP heavier still."""
+    moe_layer = LayerGeometry(1000 + 50_000_000, (SEGMENT_EXPERTS,), post_moe_params=50_000_000)
+    geometry = dataclasses.replace(TWO_RANKS, layers=(LayerGeometry(10_000_000), moe_layer))
+    prefill = on_rank(0, sim_req("a", 1000, 0, 2000))
+    decodes = [on_rank(1, sim_req(f"d{i}", 1, 10, 10)) for i in range(50)]
+    after = unit_rates(geometry).estimate(sim_step(0, prefill, *decodes))
+    before = unit_rates(
+        dataclasses.replace(geometry, layers=(geometry.layers[0], dataclasses.replace(moe_layer, post_moe_params=0)))
+    ).estimate(sim_step(0, prefill, *decodes))
+    assert after.breakdown["local_us"] != pytest.approx(before.breakdown["local_us"])
+
+    def seconds(flops, nbytes):
+        return max(flops / 1e12, nbytes / 1e12)
+
+    kv = 2 * 32 * 2
+    dense, shared = 10_000_000 + 1000, 50_000_000
+    lm_head = 64 * 1_000_000
+    first = [
+        seconds(2 * dense * 1000 + 2 * 4 * 2 * 32 * (1000 * 1001 // 2), dense * 2 + 2 * (1000 + 1000) * kv),
+        seconds(2 * dense * 50 + 2 * 4 * 2 * 32 * 50 * 11, dense * 2 + 2 * 50 * 12 * kv),
+    ]
+    second = [
+        seconds(2 * shared * 1000, (shared + lm_head) * 2),
+        seconds(2 * shared * 50 + 2 * lm_head * 50, (shared + lm_head) * 2),
+    ]
+    assert after.breakdown["local_us"] == pytest.approx((max(first) + max(second)) * 1e6)
+    # The weights read are conserved: only where they are read moved.
+    assert moe_layer.dense_params == dense - 10_000_000 + shared
+
+
+def test_dp_ranks_prepare_states_for_their_own_batches():
+    """A fresh prefill on rank 0, a continuing one on rank 1: only rank 1's
+    batch prepares its state."""
+    layer = LayerGeometry(10_000, recurrent=NEMOTRON, attention=False)
+    geometry = dataclasses.replace(TWO_RANKS, layers=(layer, TWO_RANKS.layers[1]))
+    fresh, later = sim_req("f", 300, 0, 300), sim_req("l", 2, 127, 400)
+    cost = unit_rates(geometry).estimate(sim_step(0, on_rank(0, fresh), on_rank(1, later)))
+
+    def seconds(flops, nbytes):
+        return max(flops / 1e12, nbytes / 1e12)
+
+    kv = 2 * 32 * 2
+    dense = 10_000 + 1000
+    lm_head = 64 * 1_000_000
+    first = [
+        seconds(2 * dense * 300 + NEMOTRON.batch_flops((fresh,)) + 4 * 2 * 32 * (300 * 301 // 2),
+                dense * 2 + NEMOTRON.batch_bytes((fresh,)) + 600 * kv),
+        seconds(2 * dense * 2 + NEMOTRON.batch_flops((later,)) + 4 * 2 * 32 * (2 * 127 + 3),
+                dense * 2 + NEMOTRON.batch_bytes((later,)) + (2 + 127 + 2) * kv),
+    ]
+    second = [seconds(2 * lm_head, lm_head * 2), seconds(0, lm_head * 2)]
+    assert cost.breakdown["local_us"] == pytest.approx((max(first) + max(second)) * 1e6)
+    # Pooled, the fresh prefill would have been prepared too.
+    assert NEMOTRON.batch_bytes((fresh, later)) > (
+        NEMOTRON.batch_bytes((fresh,)) + NEMOTRON.batch_bytes((later,))
+    )
+
+
+def mamba2_layer(kind=None, groups=8, **fields):
+    """A built Mamba2 mixer of `kind` (default `MambaMixer2`) with
+    `StubMamba2`'s fields and a gated norm of `groups` groups."""
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+
+    kind = kind or MambaMixer2
+    layer = kind.__new__(kind)
+    torch.nn.Module.__init__(layer)
+    stub = StubMamba2(1, groups=groups)
+    for name in ("tp_size", "num_heads", "head_dim", "ssm_state_size", "n_groups",
+                 "conv_dim", "conv_kernel_size", "num_spec", "use_replayssm"):
+        setattr(layer, name, getattr(stub, name))
+    layer.get_state_shape = stub.get_state_shape
+    layer.get_state_dtype = stub.get_state_dtype
+    layer.norm = SimpleNamespace(n_groups=groups, use_rms_norm=True)
+    for name, value in fields.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def decoder_layer(name, **children):
+    """A decoder layer of class `name` (the collectives follow it)."""
+    layer = type(name, (torch.nn.Module,), {})()
+    for child, module in children.items():
+        setattr(layer, child, module)
+    return layer
+
+
+def mamba2_config(tp=1):
+    config = hybrid_config()
+    config.model_config.get_mamba_chunk_size = lambda: 128
+    config.parallel_config.tensor_parallel_size = tp
+    return config
+
+
+def mamba2_model(layers):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(layers)
+    return model
+
+
+def test_nemotron_layers_reduce_once_and_mlp_only_layers_take_no_attention():
+    pattern = ["M", "-", "M", "-"] * 7  # Nemotron's `M-M-`, no attention
+    layers = [
+        decoder_layer("NemotronHMambaDecoderLayer", mixer=mamba2_layer())
+        if kind == "M"
+        else decoder_layer("NemotronHMLPDecoderLayer", mixer=torch.nn.Linear(8, 8, device="meta"))
+        for kind in pattern
+    ]
+    geometry = ModelGeometry.from_model(mamba2_config(), mamba2_model(layers))
+    hidden = Collective("hidden", 3584, 2)
+    assert all(layer.collectives == (hidden,) for layer in geometry.layers)
+    assert geometry._attention_layers == (0, ())
+    assert geometry.kv_bytes_per_token == 0
+    assert [layer.recurrent is not None for layer in geometry.layers[:2]] == [True, False]
+    request = sim_req("r", 100, 0, 100)
+    assert geometry.attention_flops((request,), (False,)) == 0
+    assert geometry.recurrent_flops((request,)) == 14 * NEMOTRON.batch_flops((request,))
+    # The saved record counts one all-reduce a layer, not two.
+    record = RooflineTimingProvider(None, gpu="h100", geometry=geometry).assumptions()
+    assert record["communication"]["event_source"] == "layers"
+    assert record["communication"]["events_per_step"] == [
+        {"label": "hidden", "elements": 3584, "dtype_bytes": 2, "count": 28}
+    ]
+
+
+def test_granite_layers_reduce_each_branch_they_have():
+    moe, shared = torch.nn.Module(), torch.nn.Module()
+    shared.down = torch.nn.Linear(16, 8, bias=False, device="meta")
+    hidden = Collective("hidden", 3584, 2)
+    norm = Collective("gated_norm_sums", 1, 4)
+    for tp, children, events, post_moe in (
+        (1, {"block_sparse_moe": moe, "shared_mlp": shared}, (hidden,) * 3, 128),
+        # A missing branch reduces nothing.
+        (1, {"block_sparse_moe": moe}, (hidden,) * 2, 0),
+        # One group on two ranks: its norm's FP32 sums too.
+        (2, {"block_sparse_moe": moe, "shared_mlp": shared}, (hidden,) * 3 + (norm,), 128),
+    ):
+        layer = decoder_layer(
+            "GraniteMoeHybridMambaDecoderLayer", mamba=mamba2_layer(groups=1), **children
+        )
+        layer.mamba.tp_size = tp
+        layer.mamba.get_state_shape = StubMamba2(tp, groups=1).get_state_shape
+        layer.mamba.n_groups = StubMamba2(tp, groups=1).n_groups
+        layer.mamba.conv_dim = StubMamba2(tp, groups=1).conv_dim
+        geometry = ModelGeometry.from_model(mamba2_config(tp), mamba2_model([layer] * 28))
+        assert geometry.layers[0].collectives == events, (tp, children)
+        assert geometry.layers[0].post_moe_params == post_moe
+    # The saved record of the last (two ranks, every branch): three
+    # hidden-width all-reduces a layer and the norm's FP32 sums.
+    record = RooflineTimingProvider(None, gpu="h100", geometry=geometry).assumptions()
+    assert record["communication"]["event_source"] == "layers"
+    assert record["communication"]["events_per_step"] == [
+        {"label": "hidden", "elements": 3584, "dtype_bytes": 2, "count": 3 * 28},
+        {"label": "gated_norm_sums", "elements": 1, "dtype_bytes": 4, "count": 28},
+    ]
+
+
+def test_other_mamba2_layouts_are_rejected():
+    from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+
+    class SubMixer(MambaMixer2):
+        pass
+
+    def model(layer):
+        return mamba2_model([layer] * 28)
+
+    cases = (
+        (decoder_layer("NemotronHMambaDecoderLayer", mixer=mamba2_layer(SubMixer)),
+         r"not \['SubMixer'\]", 1),
+        (decoder_layer("NemotronHMambaDecoderLayer", mixer=mamba2_layer(use_replayssm=True)),
+         "ReplaySSM", 1),
+        (decoder_layer("NemotronHMoEDecoderLayer", mixer=torch.nn.Linear(8, 8, device="meta")),
+         "NemotronHMoEDecoderLayer's collectives", 1),
+        (decoder_layer("FalconH1DecoderLayer", mamba=mamba2_layer()),
+         "FalconH1DecoderLayer's collectives", 1),
+        (decoder_layer("FalconH1DecoderLayer", mamba=mamba2_layer(), attn=attention_layer()),
+         "without attention beside it", 1),
+        # Six groups on four ranks: the norm all-gathers.
+        (decoder_layer("NemotronHMambaDecoderLayer", mixer=mamba2_layer(groups=6)), "all-gather", 4),
+    )
+    for layer, message, tp in cases:
+        if tp > 1:
+            layer.mixer.tp_size = tp
+            layer.mixer.num_heads, layer.mixer.n_groups, layer.mixer.conv_dim = 128, 8, 8192
+            layer.mixer.get_state_shape = lambda: ((3, 2048), (32, 80, 128))
+        with pytest.raises(ValueError, match=message):
+            ModelGeometry.from_model(mamba2_config(tp), model(layer))
+
+
+NEMOTRON_H = {
+    "architectures": ["NemotronHForCausalLM"],
+    "model_type": "nemotron_h",
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "hybrid_override_pattern": "M-*M",
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "mamba_num_heads": 8,
+    "mamba_head_dim": 8,
+    "n_groups": 2,
+    "ssm_state_size": 16,
+    "conv_kernel": 4,
+    "chunk_size": 16,
+    "mamba_hidden_act": "silu",
+    "use_conv_bias": True,
+    "mamba_proj_bias": False,
+    "mlp_hidden_act": "relu2",
+    "tie_word_embeddings": False,
+}
+GRANITE_4_H = {
+    "architectures": ["GraniteMoeHybridForCausalLM"],
+    "model_type": "granitemoehybrid",
+    "hidden_size": 64,
+    "intermediate_size": 32,
+    "shared_intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "layer_types": ["mamba", "mamba", "mamba", "attention"],
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_local_experts": 4,
+    "num_experts_per_tok": 2,
+    "mamba_n_heads": 8,
+    "mamba_d_head": 8,
+    "mamba_n_groups": 1,
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 1,
+    "mamba_chunk_size": 16,
+    "mamba_conv_bias": True,
+    "mamba_proj_bias": False,
+    "tie_word_embeddings": False,
+}
+
+
+@pytest.mark.parametrize(
+    "config, kinds, events, post_moe",
+    [
+        # Mamba2, MLP-only, attention, Mamba2: one reduction each.
+        (NEMOTRON_H, ["mamba2", None, "attention", "mamba2"], [1, 1, 1, 1], 0),
+        # Mamba2 x 3, attention; each with routed experts and a shared MLP.
+        (GRANITE_4_H, ["mamba2"] * 3 + ["attention"], [3, 3, 3, 3], 2 * 64 * 64 + 64 * 64),
+    ],
+    ids=["nemotron-h", "granite-4.0-h"],
+)
+def test_a_built_mamba2_hybrid_is_timed_from_its_layers(
+    tmp_path, monkeypatch, config, kinds, events, post_moe
+):
+    model_dir = write_config(tmp_path / config["model_type"], config)
+    steps = []
+    record = timing_record(
+        tmp_path, model_dir, monkeypatch, steps=steps, block_size=None,
+        enable_prefix_caching=False,
+    )
+    expanded = [g for g in record["geometry"]["layers"] for _ in range(g["last"] - g["first"] + 1)]
+    recorded = [
+        "mamba2" if "mamba2" in g else ("attention" if g.get("attention", True) else None)
+        for g in expanded
+    ]
+    assert recorded == kinds
+    assert [len(g.get("collectives", [None, None])) for g in expanded] == events
+    assert record["communication"]["event_source"] == "layers"
+    assert record["communication"]["events_per_step"] == [
+        {"label": "hidden", "elements": 64, "dtype_bytes": 2, "count": sum(events)}
+    ]
+    assert {g.get("post_moe_params", 0) for g in expanded} == {post_moe}
+    mamba2 = next(g["mamba2"] for g in expanded if "mamba2" in g)
+    assert (mamba2["num_heads"], mamba2["head_dim"], mamba2["state_size"], mamba2["chunk_size"]) == (
+        8, 8, 16, 16
+    )
+    assert record["mamba2"]["modeled_prefill"].startswith("triton_ssd")
+    assert [s["cost"]["breakdown"]["mamba2_decode_reqs"] for s in steps] == [0, 1]

@@ -518,6 +518,46 @@ class LatentAttentionGeometry:
 GDN_CHUNK_SIZE = 64
 GDN_PREFILL_BACKENDS = ("triton_fla",)
 
+# Mamba2 as modeled (`Mamba2Geometry`), recorded with a model's timing.
+MAMBA2_ASSUMPTIONS = {
+    "kind": "mamba2",
+    "modeled_prefill": "triton_ssd (mamba_chunk_scan_combined_varlen)",
+    "modeled_decode": "triton selective_state_update",
+    "not_modeled": [
+        "FlashInfer and ReplaySSM state updates",
+        "the Blackwell variant of the update kernel",
+        "prefill checkpoints (align mode)",
+    ],
+    "dispatch": (
+        "the update for a request scheduling one token after others, else "
+        "the SSD scan over its scheduled tokens"
+    ),
+    "chunks": (
+        "ceil((computed + scheduled) / chunk_size) - floor(computed / "
+        "chunk_size) a request (its own positions); each a whole chunk's tiles"
+    ),
+    "chunk_flops": (
+        "H (4 C P N + 2 C^2 P + 2 P N) + G 2 C^2 N a chunk; a dense-tile "
+        "approximation (native chunk state stops at actual lengths, the scan "
+        "is causal)"
+    ),
+    "decode_flops": "5 H P N a request (dt B and other elementwise work omitted)",
+    "bytes": (
+        "logical global traffic, a tensor read once by each consuming "
+        "kernel's programs (a head, or a group), not measured HBM: updates "
+        "2 S + 2 S_conv; the SSD batch 6 S a sequence when any continues "
+        "(gathered, masked, read twice), its final states S, convolution "
+        "states 2 S_conv, dt and dA (FP32), chunk states (FP32), passed states "
+        "(2 n - b) S, C B^T (FP32, written a group, read a head), inputs and "
+        "output"
+    ),
+    "omitted": [
+        "elementwise work (softplus, exponentials, D skip, gated norm)",
+        "buffer initialization",
+        "loads repeated within a kernel, autotuner reloads, cache reuse",
+    ],
+}
+
 
 @dataclass(frozen=True)
 class RecurrentGeometry:
@@ -617,6 +657,13 @@ class RecurrentGeometry:
             return self.decode_bytes()
         return self.chunk_bytes(request.num_scheduled_tokens)
 
+    def batch_flops(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """A rank's batch: each request's own (`step_flops`)."""
+        return sum(self.step_flops(request) for request in requests)
+
+    def batch_bytes(self, requests: tuple[SimRequestStep, ...]) -> float:
+        return sum(self.step_bytes(request) for request in requests)
+
     @classmethod
     def from_module(cls, module: Any, activation_bytes: int) -> RecurrentGeometry:
         """A built `QwenGatedDeltaNetAttention`: its heads, dims and
@@ -662,6 +709,171 @@ class RecurrentGeometry:
                 f"of {expected}, not {tuple(ssm_shape)}."
             )
         return geometry
+
+
+@dataclass(frozen=True)
+class Mamba2Geometry:
+    """One layer's Mamba2 mixer (`MambaMixer2`) on this rank: its heads,
+    their dim, its groups (extended to follow the heads under tensor
+    parallelism), the state's size, the convolution's width, the chunk the
+    SSD scan works in and its cached states' bytes, as resolved. Its
+    projections and convolution weights are dense weights.
+
+    A request's step takes the recurrent update when it schedules one
+    token after others (the Mamba metadata's split), else vLLM's Triton
+    SSD over its scheduled tokens, cut at multiples of `chunk_size` of the
+    request's own positions, a chunk costing a whole chunk's tiles. Costs
+    are a rank's batch's (`batch_flops`, `batch_bytes`): its continuing
+    prefills prepare every prefill's initial state. Bytes are logical
+    global traffic, a tensor read once by each consuming kernel's programs
+    (per head, or per group), not measured HBM traffic."""
+
+    num_heads: int
+    head_dim: int
+    n_groups: int
+    state_size: int
+    conv_dim: int
+    conv_kernel: int
+    chunk_size: int
+    conv_state_bytes: int
+    """The cached convolution state, (conv_kernel - 1) x conv_dim."""
+    ssm_state_bytes: int
+    """The cached SSM state, num_heads x head_dim x state_size."""
+    ssm_dtype_bytes: int
+    activation_bytes: int
+
+    def takes_decode(self, request: SimRequestStep) -> bool:
+        return request.num_scheduled_tokens == 1 and request.num_computed_tokens > 0
+
+    def chunks(self, request: SimRequestStep) -> int:
+        """The SSD scan's chunks of a request's step: cut at multiples of
+        `chunk_size` of its positions, `num_computed_tokens` on."""
+        c, t = request.num_computed_tokens, request.num_scheduled_tokens
+        return math.ceil((c + t) / self.chunk_size) - c // self.chunk_size
+
+    def _split(
+        self, requests: tuple[SimRequestStep, ...]
+    ) -> tuple[list[SimRequestStep], list[SimRequestStep]]:
+        for request in requests:
+            if request.num_spec_tokens:
+                raise ValueError(
+                    "The roofline timing provider models Mamba2 without "
+                    "speculative decoding."
+                )
+        decodes = [r for r in requests if self.takes_decode(r)]
+        chunked = [
+            r for r in requests if r.num_scheduled_tokens and not self.takes_decode(r)
+        ]
+        return decodes, chunked
+
+    def batch_flops(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """Each update's 5 H P N (decay, dt B x, the update, h C); each SSD
+        chunk's chunk state and inter-chunk output (2 C P N each a head),
+        intra-chunk output (2 C^2 P), state passing (2 P N) and C B^T
+        (2 C^2 N a group)."""
+        decodes, chunked = self._split(requests)
+        h, p, n, g, c = (
+            self.num_heads,
+            self.head_dim,
+            self.state_size,
+            self.n_groups,
+            self.chunk_size,
+        )
+        per_chunk = h * (4 * c * p * n + 2 * c * c * p + 2 * p * n) + g * 2 * c * c * n
+        chunks = sum(self.chunks(r) for r in chunked)
+        return len(decodes) * 5 * h * p * n + chunks * per_chunk
+
+    def batch_bytes(self, requests: tuple[SimRequestStep, ...]) -> float:
+        """Updates read and write their states in place. The SSD batch: if
+        any of its requests continues, every one's initial state is
+        gathered, masked (each a written and read copy) and read by two
+        kernels; each final state is written into the cache, each
+        convolution state read and written. Temporaries: dt and dA's
+        cumsum (FP32, read twice each, dA's last values once more), the
+        chunks' states (FP32), the states passed between chunks (all
+        written, the non-final ones read) and C B^T (FP32, written a group,
+        read a head). Inputs: x by two kernels, B and C by two each (a head
+        and a group), dt by one; the output written."""
+        decodes, chunked = self._split(requests)
+        h, p, n, g, c = (
+            self.num_heads,
+            self.head_dim,
+            self.state_size,
+            self.n_groups,
+            self.chunk_size,
+        )
+        state, conv = self.ssm_state_bytes, self.conv_state_bytes
+        a = self.activation_bytes
+        total = len(decodes) * (2 * state + 2 * conv)
+        if not chunked:
+            return total
+        b = len(chunked)
+        chunks = sum(self.chunks(r) for r in chunked)
+        tokens = sum(r.num_scheduled_tokens for r in chunked)
+        if any(r.num_computed_tokens for r in chunked):
+            total += 6 * b * state
+        total += b * state + 2 * b * conv
+        total += 6 * h * chunks * c * 4 + h * chunks * 4
+        total += 2 * chunks * h * p * n * 4
+        total += (2 * chunks - b) * state
+        total += 4 * chunks * g * c * c + 4 * chunks * h * c * c
+        total += tokens * (3 * h * p + 2 * (h + g) * n + h) * a
+        return total
+
+    @classmethod
+    def from_module(
+        cls, module: Any, activation_bytes: int, chunk_size: int
+    ) -> Mamba2Geometry:
+        """A built `MambaMixer2`: its heads and (extended) groups and its
+        convolution width are the model's, divided by its tensor-parallel
+        size here; its state shapes and dtypes are already this rank's."""
+        tp = module.tp_size
+        if getattr(module, "num_spec", 0) or getattr(module, "use_replayssm", False):
+            raise ValueError(
+                "The roofline timing provider models Mamba2 without speculative "
+                "state or ReplaySSM."
+            )
+        for name in ("num_heads", "n_groups", "conv_dim"):
+            if getattr(module, name) % tp:
+                raise ValueError(
+                    f"The roofline timing provider needs Mamba2's {name} "
+                    f"({getattr(module, name)}) divisible by the tensor-parallel "
+                    f"size {tp}."
+                )
+        (conv_shape, ssm_shape), (conv_dtype, ssm_dtype) = (
+            tuple(module.get_state_shape()),
+            tuple(module.get_state_dtype()),
+        )
+        geometry = cls(
+            num_heads=module.num_heads // tp,
+            head_dim=module.head_dim,
+            n_groups=module.n_groups // tp,
+            state_size=module.ssm_state_size,
+            conv_dim=module.conv_dim // tp,
+            conv_kernel=module.conv_kernel_size,
+            chunk_size=chunk_size,
+            conv_state_bytes=math.prod(conv_shape) * conv_dtype.itemsize,
+            ssm_state_bytes=math.prod(ssm_shape) * ssm_dtype.itemsize,
+            ssm_dtype_bytes=ssm_dtype.itemsize,
+            activation_bytes=activation_bytes,
+        )
+        expected = (geometry.num_heads, geometry.head_dim, geometry.state_size)
+        if tuple(ssm_shape) != expected:
+            raise ValueError(
+                f"The roofline timing provider expects Mamba2's state on this "
+                f"rank of {expected}, not {tuple(ssm_shape)}."
+            )
+        return geometry
+
+
+@dataclass(frozen=True)
+class Collective:
+    """A tensor-parallel all-reduce a decoder layer runs on each token."""
+
+    label: str
+    elements: int
+    """Elements a token contributes."""
+    dtype_bytes: float
 
 
 @dataclass(frozen=True)
@@ -810,8 +1022,16 @@ class LayerGeometry:
     sliding_window: int | None = None
     """Its attention's window, in tokens (each attends to at most this many,
     itself included); None: full attention."""
-    recurrent: RecurrentGeometry | None = None
-    """Its gated delta-net, in place of attention."""
+    recurrent: RecurrentGeometry | Mamba2Geometry | None = None
+    """Its gated delta-net or Mamba2 mixer, in place of attention."""
+    attention: bool = True
+    """Whether it attends (an MLP-only layer does not)."""
+    collectives: tuple[Collective, ...] | None = None
+    """Its tensor-parallel all-reduces; None: two of the hidden state (its
+    attention's and its MLP's or MoE's outputs)."""
+    post_moe_params: int = 0
+    """Dense weights run after its MoE's combine (a shared MLP added to the
+    routed experts' output), among `dense_params`."""
 
 
 # How an MoE step's expert reads are estimated, as recorded with the geometry.
@@ -853,6 +1073,59 @@ class UnsupportedModelLayout(ValueError):
     """The built model's decoder layers cannot be told apart."""
 
 
+def _layer_collectives(
+    layer: Any, mixer: Any, geometry: ModelGeometry, weights: Any
+) -> tuple[tuple[Collective, ...] | None, int]:
+    """A built decoder layer's tensor-parallel all-reduces, and the dense
+    weights it runs after its MoE's combine (`weights`: a module's linear
+    weights). Most decoder layers reduce
+    their attention's and their MLP's or MoE's outputs (None). A Nemotron-H
+    layer is one sublayer (a Mamba2 mixer, attention or an MLP): one
+    reduction. A Granite-4.0-H layer reduces its mixer's or attention's
+    output, its routed experts' and its shared MLP's, each it has; the
+    shared MLP runs on the experts' input once they return, its output
+    added to theirs. A Mamba2 mixer of one
+    group under tensor parallelism also reduces each token's FP32 sum in
+    its gated norm."""
+    name = type(layer).__name__
+    hidden = Collective("hidden", geometry.hidden_size, geometry.activation_bytes)
+    post_moe = 0
+    if name.startswith("NemotronH"):
+        if name not in (
+            "NemotronHMambaDecoderLayer",
+            "NemotronHAttentionDecoderLayer",
+            "NemotronHMLPDecoderLayer",
+        ):
+            raise ValueError(
+                f"The roofline timing provider does not model {name}'s collectives."
+            )
+        events = [hidden]
+    elif name.startswith("GraniteMoeHybrid"):
+        moe = getattr(layer, "block_sparse_moe", None)
+        shared = getattr(layer, "shared_mlp", None)
+        events = [hidden] * (1 + (moe is not None) + (shared is not None))
+        if moe is not None and shared is not None:
+            post_moe = weights(shared)
+    elif mixer is not None and type(mixer).__name__ == "MambaMixer2":
+        raise ValueError(
+            f"The roofline timing provider does not model {name}'s collectives."
+        )
+    else:
+        return None, 0
+    norm = getattr(mixer, "norm", None) if mixer is not None else None
+    tp = geometry.tensor_parallel_size
+    if norm is not None and tp > 1 and getattr(norm, "use_rms_norm", True):
+        groups = norm.n_groups
+        if groups == 1:
+            events.append(Collective("gated_norm_sums", 1, 4))
+        elif groups % tp:
+            raise ValueError(
+                f"The roofline timing provider does not model Mamba2's gated norm "
+                f"of {groups} groups on {tp} ranks (an all-gather)."
+            )
+    return tuple(events), post_moe
+
+
 def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
     """Consecutive layers of one geometry, as ``first``-``last`` ranges."""
     groups: list[dict[str, Any]] = []
@@ -870,8 +1143,16 @@ def _group_layers(layers: tuple[LayerGeometry, ...]) -> list[dict[str, Any]]:
                 group["latent"] = asdict(layer.latent)
             if layer.sliding_window is not None:
                 group["sliding_window"] = layer.sliding_window
-            if layer.recurrent is not None:
+            if isinstance(layer.recurrent, RecurrentGeometry):
                 group["recurrent"] = asdict(layer.recurrent)
+            elif layer.recurrent is not None:
+                group["mamba2"] = asdict(layer.recurrent)
+            if not layer.attention and layer.recurrent is None:
+                group["attention"] = False
+            if layer.collectives is not None:
+                group["collectives"] = [asdict(c) for c in layer.collectives]
+            if layer.post_moe_params:
+                group["post_moe_params"] = layer.post_moe_params
             groups.append(group)
     return groups
 
@@ -938,6 +1219,7 @@ class ModelGeometry:
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             QwenGatedDeltaNetAttention,
         )
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 
         def linear_params(module: torch.nn.Module) -> int:
             if isinstance(module, LinearBase):
@@ -1000,29 +1282,51 @@ class ModelGeometry:
                         "layers of the model's heads, KV heads, K and V head "
                         f"sizes per rank {heads}, not {built}."
                     )
-            recurrent = None
-            if mixers := [m for m in layer.modules() if isinstance(m, MambaBase)]:
+            recurrent: RecurrentGeometry | Mamba2Geometry | None = None
+            mixers = [m for m in layer.modules() if isinstance(m, MambaBase)]
+            if mixers:
                 if others := sorted(
                     {
                         type(m).__name__
                         for m in mixers
-                        if type(m) is not QwenGatedDeltaNetAttention
+                        if type(m) not in (QwenGatedDeltaNetAttention, MambaMixer2)
                     }
                 ):
                     raise ValueError(
                         "The roofline timing provider models Qwen's gated "
-                        f"delta-net (QwenGatedDeltaNetAttention) only, not {others}."
+                        "delta-net (QwenGatedDeltaNetAttention) and Mamba2 "
+                        f"(MambaMixer2) only, not {others}."
                     )
                 if len(mixers) > 1 or plain or any(
                     isinstance(m, MLAAttention) for m in layer.modules()
                 ):
                     raise ValueError(
-                        "The roofline timing provider models one gated "
-                        "delta-net per decoder layer, without attention beside it."
+                        "The roofline timing provider models one recurrent "
+                        "mixer per decoder layer, without attention beside it."
                     )
-                recurrent = RecurrentGeometry.from_module(
-                    mixers[0], int(geometry.activation_bytes)
-                )
+                if type(mixers[0]) is MambaMixer2:
+                    recurrent = Mamba2Geometry.from_module(
+                        mixers[0],
+                        int(geometry.activation_bytes),
+                        vllm_config.model_config.get_mamba_chunk_size(),
+                    )
+                else:
+                    recurrent = RecurrentGeometry.from_module(
+                        mixers[0], int(geometry.activation_bytes)
+                    )
+            attends = bool(plain) or any(
+                isinstance(m, MLAAttention) for m in layer.modules()
+            )
+            collectives, post_moe = _layer_collectives(
+                layer,
+                mixers[0] if mixers else None,
+                geometry,
+                lambda root: sum(
+                    linear_params(m)
+                    for m in root.modules()
+                    if isinstance(m, (LinearBase, torch.nn.Linear))
+                ),
+            )
             windows = {m.sliding_window for m in plain}
             if len(windows) > 1:
                 raise UnsupportedModelLayout(
@@ -1078,8 +1382,23 @@ class ModelGeometry:
                 elif isinstance(module, (LinearBase, torch.nn.Linear)):
                     dense += linear_params(module)
             layers.append(
-                LayerGeometry(dense, tuple(experts), latent, window, recurrent)
+                LayerGeometry(
+                    dense,
+                    tuple(experts),
+                    latent,
+                    window,
+                    recurrent,
+                    attends,
+                    collectives,
+                    post_moe,
+                )
             )
+        if not vllm_config.model_config.is_hybrid and not any(
+            layer.attention or layer.recurrent for layer in layers
+        ):
+            # Decoder layers whose attention modules the model does not
+            # expose: each attends, as the config says.
+            layers = [dataclasses.replace(layer, attention=True) for layer in layers]
         routers = [
             module.moe_config
             for layer in candidates[0]
@@ -1290,14 +1609,18 @@ class ModelGeometry:
         latent = collections.Counter(
             layer.latent
             for layer in self.layers
-            if layer.sliding_window is None and layer.recurrent is None
+            if layer.attention
+            and layer.sliding_window is None
+            and layer.recurrent is None
         )
         plain = latent.pop(None, 0)
         return plain, tuple(latent.items())  # type: ignore[arg-type]
 
     @functools.cached_property
-    def _recurrent_layers(self) -> tuple[tuple[RecurrentGeometry, int], ...]:
-        """Layers of gated delta-net, by geometry."""
+    def _recurrent_layers(
+        self,
+    ) -> tuple[tuple[RecurrentGeometry | Mamba2Geometry, int], ...]:
+        """Layers of gated delta-net or Mamba2, by geometry."""
         recurrent = collections.Counter(
             layer.recurrent
             for layer in self.layers or ()
@@ -1306,19 +1629,18 @@ class ModelGeometry:
         return tuple(recurrent.items())
 
     def recurrent_flops(self, requests: tuple[SimRequestStep, ...]) -> float:
-        """A step's gated delta-net work in every such layer."""
+        """A batch's gated delta-net and Mamba2 work in every such layer."""
         return sum(
-            count * geometry.step_flops(request)
+            count * geometry.batch_flops(requests)
             for geometry, count in self._recurrent_layers
-            for request in requests
         )
 
     def recurrent_bytes(self, requests: tuple[SimRequestStep, ...]) -> float:
-        """The states, temporaries and inputs a step's gated delta-nets move."""
+        """The states, temporaries and inputs a batch's recurrent layers
+        move."""
         return sum(
-            count * geometry.step_bytes(request)
+            count * geometry.batch_bytes(requests)
             for geometry, count in self._recurrent_layers
-            for request in requests
         )
 
     @functools.cached_property
@@ -1349,9 +1671,12 @@ class ModelGeometry:
         self, layer: LayerGeometry, request: SimRequestStep, absorbed: bool
     ) -> float:
         """One request's QK^T and AV in one layer, and its MLA `kv_b_proj`;
-        a gated delta-net layer's own work."""
+        a recurrent layer's own work (alone in its batch); none in an
+        MLP-only layer."""
         if layer.recurrent is not None:
-            return layer.recurrent.step_flops(request)
+            return layer.recurrent.batch_flops((request,))
+        if not layer.attention:
+            return 0
         pairs = attention_pairs(
             request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
         )
@@ -1362,10 +1687,13 @@ class ModelGeometry:
         )
 
     def layer_kv_bytes(self, layer: LayerGeometry, request: SimRequestStep) -> float:
-        """The KV one request's step reads and writes in one layer; a gated
-        delta-net layer's states, temporaries and inputs."""
+        """The KV one request's step reads and writes in one layer; a
+        recurrent layer's states, temporaries and inputs (alone in its
+        batch); none in an MLP-only layer."""
         if layer.recurrent is not None:
-            return layer.recurrent.step_bytes(request)
+            return layer.recurrent.batch_bytes((request,))
+        if not layer.attention:
+            return 0
         return kv_tokens(
             request.num_computed_tokens, request.num_scheduled_tokens, layer.sliding_window
         ) * self.layer_kv_bytes_per_token(layer)
@@ -1487,6 +1815,10 @@ class RooflineTimingProvider:
     Triton chunk path (``gdn_prefill_backend``, `GDN_PREFILL_BACKENDS`),
     whichever GPU's default prefill kernel is (FlashInfer on Hopper), with
     its states, temporaries and inputs as logical bytes.
+    Mamba2 layers (`Mamba2Geometry`) likewise, over vLLM's Triton SSD scan,
+    a rank's batch at a time. Each layer's tensor-parallel all-reduces are
+    its own (`LayerGeometry.collectives`, by default two of the hidden
+    state); a layer without attention takes none.
 
     Data-parallel attention with expert parallelism (TP=1 per DP rank, up to
     `NVLINK_DOMAIN_GPUS` ranks): a joint step's segments between the MoE
@@ -1546,11 +1878,17 @@ class RooflineTimingProvider:
         self._communication = {
             "model": "no_overlap_approximation",
             "collectives": (
-                "2 all-reduces per decoder layer (attention output, MLP or MoE "
-                "output) of scheduled_tokens x hidden_size x activation_bytes"
+                "each decoder layer's all-reduces (events_per_step), an event's "
+                "payload scheduled_tokens x elements x dtype_bytes: the layer's "
+                "own events where its geometry records them (a Nemotron-H layer: "
+                "one hidden-width; a Granite-4.0-H layer: its mixer's or "
+                "attention's, its routed experts' and its shared MLP's, each it "
+                "has, and under N > 1 a one-group gated norm's FP32 sums), else "
+                "2 hidden-width events (attention output, MLP or MoE output), "
+                "the legacy default"
             ),
             "time": (
-                "2 * layers * (latency + 2 * (N - 1) / N * payload / "
+                "sum over events of (latency + 2 * (N - 1) / N * payload / "
                 "effective_bandwidth), 0 for N = 1; added to the step"
             ),
             "algorithm_factor": "2 (N - 1) / N: a ring all-reduce's bus bandwidth (NCCL)",
@@ -1883,12 +2221,31 @@ class RooflineTimingProvider:
         if n == 1:
             return 0.0
         assert self.collective_bytes_per_s is not None
-        payload = num_tokens * g.hidden_size * g.activation_bytes
-        per_collective = (
+        events, _ = self._collective_events(g)
+        return sum(
             self.collective_latency_s
-            + 2 * (n - 1) / n * payload / self.collective_bytes_per_s
+            + 2
+            * (n - 1)
+            / n
+            * num_tokens
+            * event.elements
+            * event.dtype_bytes
+            / self.collective_bytes_per_s
+            for event in events
         )
-        return 2 * g.num_layers * per_collective
+
+    @staticmethod
+    def _collective_events(g: ModelGeometry) -> tuple[list[Collective], bool]:
+        """A step's all-reduces, a layer's own where its geometry records
+        them, else two hidden-width ones; and whether any layer records its
+        own (else the legacy two a layer throughout)."""
+        hidden = Collective("hidden", g.hidden_size, g.activation_bytes)
+        if g.layers is None or all(layer.collectives is None for layer in g.layers):
+            return [hidden, hidden] * g.num_layers, False
+        events = [
+            event for layer in g.layers for event in (layer.collectives or (hidden, hidden))
+        ]
+        return events, True
 
     def _bound(self) -> ModelGeometry:
         if self.geometry is None:
@@ -1904,16 +2261,31 @@ class RooflineTimingProvider:
         geometry = self._bound()
         assumptions = {
             **self._assumptions,
-            "communication": self._communication,
+            "communication": self._communication_record(geometry),
             "geometry": geometry.describe(),
         }
         if geometry.has_latent_attention:
             assumptions["latent_attention"] = self._latent_attention
         if geometry.ep_size > 1:
             assumptions["expert_parallel"] = self._expert_parallel
-        if geometry._recurrent_layers:
+        if any(isinstance(r, RecurrentGeometry) for r, _ in geometry._recurrent_layers):
             assumptions["recurrent"] = self._recurrent_assumptions(geometry)
+        if any(isinstance(r, Mamba2Geometry) for r, _ in geometry._recurrent_layers):
+            assumptions["mamba2"] = MAMBA2_ASSUMPTIONS
         return assumptions
+
+    def _communication_record(self, geometry: ModelGeometry) -> dict[str, Any]:
+        """The communication model with this model's events, each distinct
+        one with its count a step (time per token count: `communication_s`)."""
+        events, own = self._collective_events(geometry)
+        return {
+            **self._communication,
+            "event_source": "layers" if own else "legacy_default",
+            "events_per_step": [
+                {**asdict(event), "count": count}
+                for event, count in collections.Counter(events).items()
+            ],
+        }
 
     def _recurrent_assumptions(self, geometry: ModelGeometry) -> dict[str, Any]:
         return {
@@ -1925,7 +2297,11 @@ class RooflineTimingProvider:
                 "fused_recurrent_gated_delta_rule_packed_decode in pure decode)"
             ),
             "constructed_prefill": sorted(
-                {str(g.constructed_prefill) for g, _ in geometry._recurrent_layers}
+                {
+                    str(g.constructed_prefill)
+                    for g, _ in geometry._recurrent_layers
+                    if isinstance(g, RecurrentGeometry)
+                }
             ),
             "not_modeled": [
                 "FlashInfer (vLLM's default on SM90, and on SM100/SM120 with "
@@ -2004,10 +2380,11 @@ class RooflineTimingProvider:
         }
         if g.has_latent_attention:
             breakdown["mla_decode_path_reqs"] = float(sum(absorbed))
-        if g._recurrent_layers:
-            gdn = g._recurrent_layers[0][0]
-            decodes = sum(map(gdn.takes_decode, step.requests))
-            breakdown["gdn_decode_reqs"] = float(decodes)
+        for geometry, _ in g._recurrent_layers[:1]:
+            # Both kinds' update rule: one token after others.
+            decodes = sum(map(geometry.takes_decode, step.requests))
+            kind = "gdn" if isinstance(geometry, RecurrentGeometry) else "mamba2"
+            breakdown[f"{kind}_decode_reqs"] = float(decodes)
         return StepCost(
             device_s=(self.fixed_us + max(compute_us, memory_us) + communication_us) * 1e-6,
             host_s=self.host.host_s(step),
@@ -2045,20 +2422,27 @@ class RooflineTimingProvider:
             return slowest
 
         for layer in g.layers or ():
+            # A shared MLP run on the experts' combined output: after them.
+            before = layer.dense_params - layer.post_moe_params
             for rank, batch in enumerate(batches):
                 if not batch:
                     continue  # an idle rank's dummy batch is not modeled
                 paths = any(absorbed[rank]) + (not all(absorbed[rank]))
-                weights = layer.dense_params
+                weights = before
                 if layer.latent is not None:
                     weights += layer.latent.kv_b_params * paths
-                flops[rank] += 2 * layer.dense_params * tokens[rank] + sum(
-                    g.layer_attention_flops(layer, r, a)
-                    for r, a in zip(batch, absorbed[rank])
-                )
-                memory[rank] += weights * g.weight_bytes + sum(
-                    g.layer_kv_bytes(layer, r) for r in batch
-                )
+                flops[rank] += 2 * before * tokens[rank]
+                memory[rank] += weights * g.weight_bytes
+                if layer.recurrent is not None:
+                    # A rank's prefills share their state preparation.
+                    flops[rank] += layer.recurrent.batch_flops(tuple(batch))
+                    memory[rank] += layer.recurrent.batch_bytes(tuple(batch))
+                else:
+                    flops[rank] += sum(
+                        g.layer_attention_flops(layer, r, a)
+                        for r, a in zip(batch, absorbed[rank])
+                    )
+                    memory[rank] += sum(g.layer_kv_bytes(layer, r) for r in batch)
             for experts in layer.experts:
                 local_s += segment()  # dispatch
                 share = experts.local_experts / experts.global_experts
@@ -2070,6 +2454,11 @@ class RooflineTimingProvider:
                     expert_flops / self.flops_per_s, expert_bytes / self.bytes_per_s
                 )
                 communication_s += self.expert_all2all_s(tokens, experts, g)
+            if layer.post_moe_params:
+                for rank, batch in enumerate(batches):
+                    if batch:
+                        flops[rank] += 2 * layer.post_moe_params * tokens[rank]
+                        memory[rank] += layer.post_moe_params * g.weight_bytes
         lm_head = g.hidden_size * g.vocab_size
         for rank, batch in enumerate(batches):
             if batch:
