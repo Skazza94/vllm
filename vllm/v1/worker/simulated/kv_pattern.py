@@ -27,7 +27,7 @@ block itself holds no request's KV and is neither filled nor checked.
 """
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -51,21 +51,44 @@ SENTINEL = 0
 
 
 def block_views(
-    kv_caches: dict[str, torch.Tensor], num_blocks: int
+    kv_caches: dict[str, torch.Tensor],
+    num_blocks: int,
+    page_bytes: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Each layer's KV cache as `[num_blocks, block_bytes]` raw bytes.
+    """Each layer's KV cache as `[num_blocks, page]` raw bytes.
 
-    Needs block-major, contiguous tensors (the NIXL connector's layout on CPU),
-    which is what makes a block one contiguous range of bytes."""
+    A block's page is what a connector moves of it: `page_bytes[layer]`
+    (a gated delta-net's state padded to the attention page), at the
+    tensor's block stride and storage offset, never beyond the page (the
+    stride may cover another layer's). Without `page_bytes`, a block-major
+    contiguous tensor's rows."""
     views = {}
     for name, tensor in kv_caches.items():
-        if tensor.shape[0] != num_blocks or not tensor.is_contiguous():
+        if tensor.shape[0] != num_blocks or (
+            page_bytes is None and not tensor.is_contiguous()
+        ):
             raise ValueError(
                 f"KV pattern checks need block-major contiguous KV tensors; "
                 f"layer {name} has shape {tuple(tensor.shape)} for {num_blocks} "
                 "blocks."
             )
-        views[name] = tensor.view(torch.uint8).reshape(num_blocks, -1)
+        size = tensor.element_size()
+        stride = tensor.stride(0) * size
+        page = (
+            page_bytes[name] if page_bytes is not None else tensor[0].numel() * size
+        )
+        storage = tensor.untyped_storage()
+        offset = tensor.storage_offset() * size
+        end = offset + (num_blocks - 1) * stride + page
+        if stride < page or end > storage.nbytes():
+            raise ValueError(
+                f"KV pattern checks need each block's {page}-byte page within "
+                f"its layer's {stride}-byte block stride and its storage; layer "
+                f"{name} starts at byte {offset} of {storage.nbytes()}."
+            )
+        views[name] = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+            storage, offset, (num_blocks, page), (stride, 1)
+        )
     return views
 
 

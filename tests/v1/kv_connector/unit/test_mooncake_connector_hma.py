@@ -229,6 +229,87 @@ def test_pulls_carry_where_each_groups_blocks_start(
         assert blocks[first:] == pulled
 
 
+def gdn_kv_cache_config(block_size: int = 16) -> KVCacheConfig:
+    """Qwen3-Next's groups, small: full attention, and a gated delta-net's
+    state, one block a request (mamba_cache_mode none, its block the model
+    length)."""
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return KVCacheConfig(
+        num_blocks=1000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer3"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer0"],
+                MambaSpec(
+                    block_size=1024,
+                    shapes=((16,), (16,)),
+                    dtypes=(torch.float16, torch.float16),
+                    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+                ),
+            ),
+        ],
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_tokens", [16, 17, 33])
+def test_a_gdn_pull_holds_the_prompt_but_its_last_token(num_tokens):
+    """The decoder pulls N - 1 tokens' attention blocks and the state after
+    them (one block, at place 0), then computes the last token itself."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        block_size=16,
+        disable_hybrid_kv_cache_manager=False,
+    )
+    vllm_config.cache_config.enable_prefix_caching = False
+    # Scheduled in multiples of every group's block: the state's, 1024.
+    vllm_config.cache_config.block_size = 1024
+    scheduler = create_scheduler(vllm_config, kv_cache_config=gdn_kv_cache_config())
+    request = create_request(
+        request_id=1, block_size=16, num_tokens=num_tokens, do_remote_prefill=True
+    )
+    request.kv_transfer_params.update(
+        {"transfer_id": request.request_id, "remote_bootstrap_addr": 54321}
+    )
+    scheduler.add_request(request)
+
+    metadata = scheduler.schedule().kv_connector_metadata
+    pull = metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    attention_blocks = -(-(num_tokens - 1) // 16)
+    assert [len(group) for group in pull.local_block_ids] == [attention_blocks, 1]
+    assert pull.first_block_indices == [0, 0]
+
+
+@pytest.mark.cpu_test
+def test_a_gdn_producer_prefills_all_but_the_last_token():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=16
+    )
+    connector = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=gdn_kv_cache_config(),
+    )
+    request = create_request(
+        request_id=1, block_size=16, num_tokens=17, do_remote_decode=True
+    )
+    request.kv_transfer_params["transfer_id"] = request.request_id
+    connector.on_new_request(request)
+    assert (request.num_prompt_tokens, request.max_tokens) == (16, 1)
+
+
 # ---------------------------------------------------------------------------
 #  test_metadata_hma_block_ids: MooncakeConnectorMetadata stores per-group IDs
 # ---------------------------------------------------------------------------

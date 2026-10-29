@@ -235,8 +235,10 @@ class SimulationConfig:
         every tensor-parallel rank holds whole), on one rank, tensor-parallel
         ones, or an MoE model's data-parallel ranks with expert parallelism.
         Sliding-window layers, alone or beside full-attention ones, over
-        Mooncake, which moves each window's blocks only. The native connector
-        stays in place."""
+        Mooncake, which moves each window's blocks only; Qwen gated
+        delta-net layers (a hybrid model's) over Mooncake, without prefix
+        caching, each request's state one block. The native connector stays
+        in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -321,21 +323,28 @@ class SimulationConfig:
             getattr(model.hf_text_config, "index_topk", None) is not None
             or getattr(model.hf_config, "model_type", None) == "deepseek_v4"
         )
-        if sparse_mla or model.is_hybrid or model.is_attention_free:
+        if sparse_mla or model.is_attention_free:
             problems.append(
                 "an attention model, dense, MoE or dense MLA, its layers full "
-                "or sliding-window attention (no sparse MLA, hybrid or "
-                "attention-free models)"
+                "or sliding-window attention or Qwen gated delta-nets (no "
+                "sparse MLA or attention-free models)"
             )
         elif (
-            model.get_sliding_window() is not None
-            and kv_transfer.kv_connector != "MooncakeConnector"
-        ):
+            model.get_sliding_window() is not None or model.is_hybrid
+        ) and kv_transfer.kv_connector != "MooncakeConnector":
             # Only Mooncake's plan is followed group by group: a sliding
-            # window's blocks are clipped to the window on both sides.
+            # window's blocks are clipped to the window on both sides, a
+            # delta-net's state is one block.
             problems.append(
-                "MooncakeConnector for a sliding-window model, not "
+                "MooncakeConnector for a sliding-window or hybrid model, not "
                 f"{kv_transfer.kv_connector}"
+            )
+        if model.is_hybrid and (
+            cache.enable_prefix_caching or cache.mamba_cache_mode != "none"
+        ):
+            # Align mode keeps a state per block, which is not modeled.
+            problems.append(
+                "a hybrid model without prefix caching (mamba_cache_mode none)"
             )
         if vllm_config.speculative_config is not None:
             problems.append("no speculative decoding")

@@ -745,7 +745,8 @@ def test_kv_layout_counts_memory_shared_by_groups_once():
         SlidingWindowSpec,
     )
 
-    spec = {"block_size": 4, "num_kv_heads": 2, "head_size": 8, "dtype": torch.float32}
+    # A block of a layer: K and V of 4 tokens, one head of 8, FP32.
+    spec = {"block_size": 4, "num_kv_heads": 1, "head_size": 8, "dtype": torch.float32}
     groups = [
         KVCacheGroupSpec(list(SLIDING), SlidingWindowSpec(sliding_window=8, **spec)),
         KVCacheGroupSpec(list(FULL), FullAttentionSpec(**spec)),
@@ -756,11 +757,10 @@ def test_kv_layout_counts_memory_shared_by_groups_once():
         2 * 4 * 8 * 4,
         2 * 16 * 2 * 4 * 8 * 4,
     )
+    page = {"layers": 2, "block_bytes": 256, "real_page_bytes": 256, "block_stride": 256}
     assert layout["groups"] == [
-        {"kind": "SlidingWindowSpec", "sliding_window": 8, "block_size": 4,
-         "layers": 2, "block_bytes": 256},
-        {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 4,
-         "layers": 2, "block_bytes": 256},
+        {"kind": "SlidingWindowSpec", "sliding_window": 8, "block_size": 4, **page},
+        {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 4, **page},
     ]
 
 
@@ -797,3 +797,180 @@ def test_real_transfers_take_full_and_sliding_window_groups_only():
                 ChunkedLocalAttentionSpec(attention_chunk_size=32, **spec),
             )
         )
+
+
+# Qwen3-Next's KV cache on a small scale: an attention group and a gated
+# delta-net group, two layers each, layer i of both in slot i of one
+# allocation (slot 1 at a nonzero offset). A block of an attention layer is
+# 256 bytes; a delta-net's state is 240, padded to the same 256-byte page.
+ATTENTION = ("model.layers.3.self_attn.attn", "model.layers.7.self_attn.attn")
+GDN = ("model.layers.0.linear_attn", "model.layers.4.linear_attn")
+HYBRID_GROUPS = [list(GDN), list(ATTENTION)]
+PAGE, STATE_BYTES, BLOCKS = 256, 240, 8
+
+
+def hybrid_caches(storage_bytes=None):
+    memory = torch.zeros(storage_bytes or 2 * BLOCKS * PAGE, dtype=torch.uint8)
+    caches = {}
+    for slot, (gdn, attention) in enumerate(zip(GDN, ATTENTION)):
+        offset = slot * BLOCKS * PAGE
+        if offset + BLOCKS * PAGE <= len(memory):
+            caches[attention] = (
+                memory[offset : offset + BLOCKS * PAGE]
+                .view(torch.float32)
+                .view(BLOCKS, 2, 4, 8)
+            )
+        # The state's bytes, then the page's padding, as vLLM views them.
+        caches[gdn] = memory.view(torch.int8).as_strided(
+            (BLOCKS, 1, 1, STATE_BYTES), (PAGE, STATE_BYTES, STATE_BYTES, 1), offset
+        )
+    return caches
+
+
+PAGES = {name: PAGE for name in GDN + ATTENTION}
+
+
+def test_a_padded_state_is_viewed_as_the_page_moved():
+    caches = hybrid_caches()
+    assert not caches[GDN[0]].is_contiguous()
+    views = block_views(caches, BLOCKS, PAGES)
+    assert {tuple(v.shape) for v in views.values()} == {(BLOCKS, PAGE)}
+    # Slot 1's layers start past slot 0's blocks.
+    assert views[GDN[1]].data_ptr() - views[GDN[0]].data_ptr() == BLOCKS * PAGE
+    # Layer i of both groups is the same memory; the padding is the page's.
+    views[GDN[0]][2] = 7
+    assert int((views[ATTENTION[0]][2] == 7).sum()) == PAGE
+    # Never another layer's: slot 1 untouched.
+    assert int(views[GDN[1]].sum()) == int(views[ATTENTION[1]].sum()) == 0
+
+
+def test_a_page_beyond_its_stride_or_storage_is_refused():
+    with pytest.raises(ValueError, match="300-byte page within its layer's 256-byte"):
+        block_views(hybrid_caches(), BLOCKS, {**PAGES, GDN[0]: 300})
+    # Slot 1's last state fits its storage, its padded page does not.
+    short = hybrid_caches(2 * BLOCKS * PAGE - (PAGE - STATE_BYTES))
+    with pytest.raises(ValueError, match="starts at byte 2048"):
+        block_views(short, BLOCKS, PAGES)
+
+
+def test_a_delta_net_state_is_filled_and_checked_whole_padding_included():
+    prefill = block_views(hybrid_caches(), BLOCKS, PAGES)
+    # The state's one block (place 0), the attention group's two.
+    PatternFiller(prefill, groups=HYBRID_GROUPS).after_update(
+        groups_step(PREFILL_ID, [5], [3, 4])
+    )
+    for layer in GDN:
+        assert torch.equal(prefill[layer][5], pattern(PREFILL_ID, layer, 0, PAGE))
+    decode = block_views(hybrid_caches(), BLOCKS, PAGES)
+    checker = PatternChecker(decode, groups=HYBRID_GROUPS, transfer_group_ids=[0, 1])
+
+    def pull():
+        checker.before_step(mooncake_pull(DECODE_ID, [[7], [1, 2]], [0, 0]))
+        copy_blocks(prefill, decode, GDN, [(7, 5)])
+        copy_blocks(prefill, decode, ATTENTION, [(1, 3), (2, 4)])
+
+    pull()
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert result["ok"], result
+    assert [(g["group"], g["blocks"], g["layers"], g["bytes"]) for g in result["groups"]] == [
+        (0, 1, 2, 2 * PAGE),
+        (1, 2, 2, 4 * PAGE),
+    ]
+    # A byte of the state's padding not delivered fails.
+    pull()
+    decode[GDN[1]][7][PAGE - 1] ^= 0xFF
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+    assert result["mismatched_blocks"] == [[GDN[1], 0, 7, 1]]
+
+
+def test_kv_layout_describes_a_padded_state_and_counts_storage_once():
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    groups = [
+        KVCacheGroupSpec(
+            list(GDN),
+            MambaSpec(
+                block_size=4096,
+                shapes=((STATE_BYTES // 4,),),
+                dtypes=(torch.float32,),
+                page_size_padded=PAGE,
+                mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            ),
+        ),
+        KVCacheGroupSpec(
+            list(ATTENTION),
+            FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float32),
+        ),
+    ]
+    layout = kv_layout(hybrid_caches(), BLOCKS, 4, "LBHNC", groups)
+    # One allocation, as the connector registers it.
+    assert layout["bytes"] == 2 * BLOCKS * PAGE
+    assert layout["groups"][0] == {
+        "kind": "MambaSpec", "sliding_window": None, "block_size": 4096, "layers": 2,
+        "block_bytes": PAGE, "real_page_bytes": STATE_BYTES, "block_stride": PAGE,
+        "mamba_type": "GDN_ATTN",
+    }
+
+
+def test_real_transfers_take_a_gated_delta_nets_single_state_only():
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_groups
+
+    def config(**mamba):
+        spec = {"block_size": 16, "shapes": ((4,),), "dtypes": (torch.float32,),
+                "mamba_type": MambaAttentionBackendEnum.GDN_ATTN, **mamba}
+        return KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["a"],
+                    FullAttentionSpec(
+                        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+                    ),
+                ),
+                KVCacheGroupSpec(["m"], MambaSpec(**spec)),
+            ],
+        )
+
+    check_real_kv_groups(config())
+    for mamba, message in (
+        ({"mamba_type": MambaAttentionBackendEnum.MAMBA2}, "MAMBA2"),
+        ({"mamba_cache_mode": "align"}, "mamba_cache_mode align"),
+        ({"num_speculative_blocks": 1}, "1 speculative blocks"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            check_real_kv_groups(config(**mamba))
+
+
+def test_real_transfers_take_qwens_gated_delta_net_layers_only():
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_layers
+
+    class KimiDeltaAttention(QwenGatedDeltaNetAttention):  # shares GDN_ATTN
+        pass
+
+    def model(kind):
+        layer = kind.__new__(kind)
+        torch.nn.Module.__init__(layer)
+        container = torch.nn.Module()
+        container.layers = torch.nn.ModuleList([layer])
+        return container
+
+    check_real_kv_layers(model(QwenGatedDeltaNetAttention))
+    with pytest.raises(ValueError, match="not KimiDeltaAttention"):
+        check_real_kv_layers(model(KimiDeltaAttention))

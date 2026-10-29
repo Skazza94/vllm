@@ -148,6 +148,44 @@ def gpt_oss_model_dir(tmp_path_factory):
     return str(directory)
 
 
+# A tiny Qwen3-Next: three gated delta-net layers, then full attention.
+QWEN3_NEXT = {
+    "architectures": ["Qwen3NextForCausalLM"],
+    "model_type": "qwen3_next",
+    "vocab_size": 128,
+    "hidden_size": 64,
+    "intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "full_attention_interval": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "norm_topk_prob": True,
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10000,
+    "tie_word_embeddings": False,
+    "max_position_embeddings": 256,
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_next_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("tiny-qwen3-next")
+    (directory / "config.json").write_text(json.dumps(QWEN3_NEXT))
+    return str(directory)
+
+
 @pytest.fixture(params=["model_dir", "moe_model_dir", "mla_model_dir"])
 def any_model_dir(request):
     """The dense model, the MoE one, then the MLA one: blocks of each layer's
@@ -278,6 +316,20 @@ def test_real_mode_takes_sliding_window_models_over_mooncake_only(gpt_oss_model_
     # NIXL's plan is not followed group by group.
     with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window"):
         engine_config(gpt_oss_model_dir)
+
+
+def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
+    qwen3_next_model_dir,
+):
+    mooncake = {"kv_connector": "MooncakeConnector"}
+    config = engine_config(qwen3_next_model_dir, kv_transfer=mooncake)
+    assert config.model_config.is_hybrid
+    assert config.cache_config.mamba_cache_mode == "none"
+    # A state per block (align mode) is not modeled, byte checks or not.
+    with pytest.raises(ValueError, match="hybrid model without prefix caching"):
+        engine_config(qwen3_next_model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
+    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window or hybrid"):
+        engine_config(qwen3_next_model_dir)
 
 
 def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
@@ -598,6 +650,86 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
         # The window's freed blocks were given to it again, at later places.
         given = [block for block in places[window].values() if block]
         assert len(given) > len(set(given))
+    finally:
+        del llm
+
+
+def test_a_gdn_producer_fills_each_groups_pages_padding_included(
+    qwen3_next_model_dir, monkeypatch, tmp_path
+):
+    """Tiny Qwen3-Next: three delta-net groups and an attention group in one
+    allocation, the platform's attention block covering a state's page. A
+    chunked prompt: each attention block holds its place's pattern, each
+    delta-net's single state block (place 0) its pattern over the whole
+    page, padding included; the layout record describes the padding."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+
+    connector = RecordingConnector.make(hma=True)
+    RecordingConnector.registered.clear()
+    RecordingConnector.finished.clear()
+    monkeypatch.setattr(
+        KVConnectorFactory, "get_connector_class", classmethod(lambda cls, c: connector)
+    )
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=qwen3_next_model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "MooncakeConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+        },
+    )
+    try:
+        llm.generate(
+            [{"prompt_token_ids": [5] * 200}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        config = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_config
+        groups = config.kv_cache_groups
+        kinds = [type(g.kv_cache_spec).__name__ for g in groups]
+        assert sorted(kinds) == ["FullAttentionSpec"] + ["MambaSpec"] * 3
+        pages = {
+            name: g.kv_cache_spec.page_size_bytes for g in groups for name in g.layer_names
+        }
+        views = block_views(RecordingConnector.registered[0], config.num_blocks, pages)
+        ((req_id, block_ids),) = RecordingConnector.finished
+        for group, held in zip(groups, block_ids):
+            spec = group.kv_cache_spec
+            if type(spec).__name__ == "MambaSpec":
+                # The state, one block, padded to the attention page.
+                assert len(held) == 1 and spec.real_page_size_bytes < spec.page_size_bytes
+            for logical, block in enumerate(held):
+                for layer in group.layer_names:
+                    want = pattern(req_id, layer, logical, spec.page_size_bytes)
+                    assert torch.equal(views[layer][block], want), (layer, logical)
+        (layout,) = [r["kv_layout"] for r in log_records(log) if "kv_layout" in r]
+        storages = {
+            t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+            for t in RecordingConnector.registered[0].values()
+        }
+        assert layout["bytes"] == sum(storages.values())
+        gdn = [g for g in layout["groups"] if g["kind"] == "MambaSpec"]
+        assert {g["mamba_type"] for g in gdn} == {"GDN_ATTN"}
+        assert all(g["real_page_bytes"] < g["block_bytes"] == g["block_stride"] for g in gdn)
     finally:
         del llm
 

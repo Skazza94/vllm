@@ -42,6 +42,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     SimulatedTransfers,
     GroupAllocations,
     check_real_kv_groups,
+    check_real_kv_layers,
     completed_transfers,
     group_allocations,
     kv_layout,
@@ -219,6 +220,9 @@ class SimulatedModelRunner(GPUModelRunner):
 
     def load_model(self, *args, **kwargs) -> None:  # type: ignore[override]
         super().load_model(*args, **kwargs)
+        if self._real_kv_transfer:
+            # Whatever the timing provider: the states moved are the layers'.
+            check_real_kv_layers(self.get_model())
         # Step times may rest on the built model (each layer's weights):
         # resolve them before any step is timed, then record them.
         bind = getattr(self.timing_provider, "bind_model", None)
@@ -246,7 +250,13 @@ class SimulatedModelRunner(GPUModelRunner):
         groups = self.kv_cache_config.kv_cache_groups
         self._kv_allocations = group_allocations(self.kv_cache_config)
         if sim.kv_pattern_fill or sim.kv_pattern_check:
-            views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks)
+            # A block's bytes are its group's page, as the connector moves it.
+            pages = {
+                name: group.kv_cache_spec.page_size_bytes
+                for group in groups
+                for name in group.layer_names
+            }
+            views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
             layers = [group.layer_names for group in groups]
             if sim.kv_pattern_fill:
                 self._kv_filler = PatternFiller(views, tp.rank_in_group, layers)

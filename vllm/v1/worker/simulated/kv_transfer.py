@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
@@ -314,25 +315,62 @@ def completed_transfers(
 
 # The KV cache groups real transfers move and check: full attention (MLA's
 # included) and sliding-window attention, whose blocks are the tokens' in
-# order, a window's head left null.
-REAL_KV_SPECS = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec)
+# order, a window's head left null; and a gated delta-net's state, one block
+# a request (mamba_cache_mode none).
+REAL_KV_SPECS = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, MambaSpec)
 
 
 def check_real_kv_groups(kv_cache_config: KVCacheConfig) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
-    RSWA attention, attention sinks, Mamba states), whose blocks follow other
-    rules."""
+    RSWA attention, attention sinks), and of Mamba states other than a
+    gated delta-net's in mamba_cache_mode none without speculative blocks,
+    whose blocks follow other rules."""
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+    other = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if type(spec) not in REAL_KV_SPECS:
+            other.add(type(spec).__name__)
+        elif isinstance(spec, MambaSpec) and (
+            spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN
+            or spec.mamba_cache_mode != "none"
+            or spec.num_speculative_blocks
+        ):
+            other.add(
+                f"MambaSpec ({spec.mamba_type.name}, mamba_cache_mode "
+                f"{spec.mamba_cache_mode}, {spec.num_speculative_blocks} "
+                "speculative blocks)"
+            )
+    if other:
+        raise ValueError(
+            "kv_transfer_mode real moves full and sliding-window attention KV "
+            "and gated delta-net states (mamba_cache_mode none) only, not "
+            f"{'; '.join(sorted(other))}."
+        )
+
+
+def check_real_kv_layers(model: torch.nn.Module) -> None:
+    """Refuse real KV transfers of a model whose recurrent layers are not
+    Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself): Kimi's and
+    OLMo's share its KV cache groups but not its states' rules."""
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
     other = sorted(
         {
-            type(group.kv_cache_spec).__name__
-            for group in kv_cache_config.kv_cache_groups
-            if type(group.kv_cache_spec) not in REAL_KV_SPECS
+            type(module).__name__
+            for module in model.modules()
+            if isinstance(module, MambaBase)
+            and type(module) is not QwenGatedDeltaNetAttention
         }
     )
     if other:
         raise ValueError(
-            "kv_transfer_mode real moves full and sliding-window attention KV "
-            f"only, not {', '.join(other)}."
+            "kv_transfer_mode real moves Qwen's gated delta-net states "
+            f"(QwenGatedDeltaNetAttention) only, not {', '.join(other)}."
         )
 
 
@@ -345,12 +383,15 @@ def kv_layout(
 ) -> dict[str, object]:
     """The KV cache a connector registers, for a step log's `kv_layout`
     record: what each block of each layer is in bytes and tokens, and, with
-    the KV cache groups, each group's. Layers of different groups may share
-    memory (a block is one group's at a time): it counts once."""
+    the KV cache groups, each group's: the page a block moves of each layer
+    (`block_bytes`; a gated delta-net's state padded to it,
+    `real_page_bytes`) and the distance between blocks. Layers of different
+    groups may share memory (a block is one group's at a time): the bytes
+    count each storage once, as the connector registers them."""
     first = next(iter(kv_caches.values()))
     layer_bytes = first.numel() * first.element_size()
-    regions = {
-        (tensor.data_ptr(), tensor.numel() * tensor.element_size())
+    storages = {
+        tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
         for tensor in kv_caches.values()
     }
     record: dict[str, object] = {
@@ -361,27 +402,32 @@ def kv_layout(
         "dtype": str(first.dtype).removeprefix("torch."),
         "shape": list(first.shape),
         "block_bytes": layer_bytes // num_blocks,
-        "bytes": sum(size for _, size in regions),
+        "bytes": sum(storages.values()),
     }
     if groups is not None:
-        record["groups"] = [
-            {
-                "kind": type(group.kv_cache_spec).__name__,
-                "sliding_window": getattr(group.kv_cache_spec, "sliding_window", None),
-                "block_size": group.kv_cache_spec.block_size,
+        described = []
+        for group in groups:
+            spec = group.kv_cache_spec
+            layers = [name for name in group.layer_names if name in kv_caches]
+            tensor = kv_caches[layers[0]] if layers else None
+            entry = {
+                "kind": type(spec).__name__,
+                "sliding_window": getattr(spec, "sliding_window", None),
+                "block_size": spec.block_size,
                 "layers": len(layers),
                 # Each layer's.
-                "block_bytes": (
-                    kv_caches[layers[0]].numel()
-                    * kv_caches[layers[0]].element_size()
-                    // num_blocks
-                    if layers
+                "block_bytes": spec.page_size_bytes,
+                "real_page_bytes": spec.real_page_size_bytes,
+                "block_stride": (
+                    tensor.stride(0) * tensor.element_size()
+                    if tensor is not None
                     else 0
                 ),
             }
-            for group in groups
-            for layers in [[name for name in group.layer_names if name in kv_caches]]
-        ]
+            if isinstance(spec, MambaSpec):
+                entry["mamba_type"] = spec.mamba_type.name
+            described.append(entry)
+        record["groups"] = described
     return record
 
 

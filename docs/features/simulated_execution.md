@@ -389,9 +389,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   models (one latent per token and layer); over `MooncakeConnector`,
   sliding-window attention too, alone or beside full attention (each layer
   kind a KV cache group, groups sharing memory, a block being one group's at
-  a time): Mooncake moves each window's last blocks only. Not hybrid
-  (Mamba), attention-free, sparse-MLA, chunked local or RSWA attention
-  models, nor speculative decoding.
+  a time): Mooncake moves each window's last blocks only; and over
+  `MooncakeConnector` without prefix caching, hybrid models of Qwen's gated
+  delta-net (Qwen3-Next, Qwen3.5): each request's state is one block of its
+  delta-net groups (`mamba_cache_mode` none), padded to the attention page,
+  and prefill computes the prompt but its last token, which decode computes.
+  Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets),
+  attention-free, sparse-MLA, chunked local or RSWA attention models, nor
+  speculative decoding.
 * One rank per instance, or, over `MooncakeConnector` only:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
@@ -412,9 +417,11 @@ place among the request's blocks of its KV cache group, and
 `kv_pattern_check` (decode instance) checks every byte it receives, logging
 one `kv_check` record per request, each group's result nested in it (it
 needs `log_path`); the pattern needs prefix caching off. A group's blocks
-are its layers' only, and the null block that pads a window's head is
-neither filled nor checked. The `kv_layout` record describes each group and
-counts memory groups share once.
+are its layers' only, each block the page the connector moves (a state's
+padding included), and the null block that pads a window's head is neither
+filled nor checked. The `kv_layout` record describes each group (its page,
+the state's real bytes, the stride between blocks) and counts each storage
+once, as the connector registers it.
 
 `MooncakeConnector` takes one KV address per rank in its extra config,
 `"rank_addresses": [...]` (IPv4), so each rank can use a NIC of its own: its
