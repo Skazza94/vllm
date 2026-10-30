@@ -65,7 +65,6 @@ its startup log reports it: prefix-cache hit rates and preemption depend on it.
 | `linear` | `fixed_us + prefill_us_per_token * P + decode_us_per_req * D + decode_us_per_kv_token * K` | those four, plus `host_us` or `host_fit_log` |
 | `table` | nearest-neighbor interpolation over a step log | `path`, `k` |
 | `replay` | exact match on the step's batch composition, else `fallback` | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
-| `roofline` | a GPU's FLOPs and HBM bandwidth over the model's layers (below) | `gpu` or `peak_tflops`/`hbm_tbps`, efficiencies, `fixed_us`, `host_us`, interconnect, `mla_backend`, `ep_all2all`, `ep_moe_interface` |
 | `aisimulate` | AISimulate's forward-pass estimate of the published model (below) | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` |
 | `module.Class` | a `vllm.v1.worker.simulated.timing.TimingProvider` | its keyword arguments |
 
@@ -75,7 +74,8 @@ admission, draft tokens, whether it is prefilling and, in an MoE-DP joint
 step, its DP rank; plus batch totals, common-prefix blocks and the parallel
 configuration. It returns a `StepCost`.
 
-`aisimulate` asks [AISimulate](https://github.com/ai-dynamo/aisimulate)'s
+For a GPU's step times without a recording, `aisimulate` asks
+[AISimulate](https://github.com/ai-dynamo/aisimulate)'s
 forward-pass performance model for each step. It needs the optional
 `aisimulate` package and prices the scheduler's actual batch, one workload
 per attention data-parallel rank, from kernel timings measured on that GPU
@@ -96,58 +96,6 @@ parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism, EPLB
 and speculative decoding are rejected, and so are models or layouts
 AISimulate has no timing for. The `timing` record names the target, the
 resolved estimator configuration and its data's vLLM version.
-
-`roofline` prices a step as `fixed_us` plus the longer of its FLOPs at
-`peak_tflops * compute_efficiency` and its bytes at `hbm_tbps *
-bandwidth_efficiency` (presets: `gpu` = `a100`, `h100`, `h200`, `b200`), from
-the built model's layers: dense, MoE (each token through its top-k experts,
-the experts a step's tokens are expected to route to read), dense MLA, and
-sliding-window attention (each new token attends to at most the window's
-tokens, itself included; a step reads each token's KV it needs once: its new
-tokens and up to `window - 1` cached ones), and hybrid models' Qwen gated
-delta-net layers (Qwen3-Next, Qwen3.5; `mamba_cache_mode` none, prefix
-caching off): a request's step takes the recurrent decode when it schedules
-one token after others, else FLA's Triton chunk path (64-token chunks),
-whichever kernel the GPU would select (FlashInfer on Hopper), with its
-states, temporaries and inputs counted as logical bytes; and Mamba2
-layers (`MambaMixer2`: Nemotron-H, Granite-4.0-H): the state update for
-one token after others, else vLLM's Triton SSD scan, a request's chunks
-cut at multiples of the chunk size of its own positions, its batch's
-continuing prefills preparing every prefill's state. Layers without
-attention (an MLP-only layer) take none; each layer's tensor-parallel
-all-reduces are its own (one for a Nemotron-H layer; a Granite-4.0-H
-layer's mixer or attention, routed experts and shared MLP, and its
-one-group norm's sums), and a shared MLP, run on the experts' input once
-they return and its output added to theirs, is timed after them under
-expert parallelism. Other attention
-layers (chunked local or RSWA attention, say), other recurrent layers
-(Mamba, Kimi's or OLMo's delta-nets), a recurrent mixer beside attention
-(Falcon-H1, Zamba2) and attention layers whose heads or head sizes differ
-from the model's are rejected. It
-records what it rests on in the step log's `timing` record. Other parallel
-layouts are rejected rather than mispriced:
-
-* Tensor parallelism adds each layer's all-reduces, each with its own
-  payload and latency, at the GPU's NVLink bandwidth (`interconnect_gbs`,
-  `interconnect_efficiency`, `collective_latency_us`): two hidden-width
-  ones a layer unless the model's layers record their own, as Mamba2
-  hybrids' do. The `communication` record lists them
-  (`events_per_step`).
-* MLA requests take the decode or prefill path as vLLM's MLA backend on the
-  GPU splits the batch (`mla_backend` overrides it).
-* MoE models with data-parallel attention and expert parallelism
-  (`--data-parallel-size N --enable-expert-parallel`, one rank per DP rank,
-  N up to 8, experts split evenly) are priced per joint step: between the
-  synchronizations at each MoE layer, the slowest rank's own requests set the
-  pace; every rank then runs its share of the experts, and the all-to-all is
-  added without overlap. `ep_all2all` models `allgather_reducescatter`
-  (vLLM's default) or `deepep_high_throughput`, independently of the backend
-  the CPU build constructs; `ep_moe_interface` (`modular` or `monolithic`)
-  sets whether `allgather_reducescatter` gathers top-k ids and weights or
-  every router logit: `modular` by default, and required on `b200`, where
-  vLLM's default MoE kernel may be either. Routing is taken as uniform and
-  balanced: routing skew, grouped routing, EPLB and DeepEP low-latency are
-  not modeled.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also
 be written by hand, as JSONL records of

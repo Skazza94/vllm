@@ -856,7 +856,7 @@ def test_real_mode_refuses_a_mixer_beside_attention_whatever_the_timing(
 ):
     """Falcon-H1 runs attention and a Mamba2 mixer in each layer, Zamba2's
     hybrid layers a shared transformer block beside theirs: refused as built,
-    under linear timing too (no roofline)."""
+    under linear timing too: the refusal does not depend on the timing."""
     from vllm import LLM
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
