@@ -96,9 +96,16 @@ but a later batch of another shape can still lack data and fail then.
 
 Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
 or 8) and an MoE model's local data-parallel attention with expert
-parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism, EPLB
-and speculative decoding are rejected, and so are models or layouts
-AISimulate has no timing for. The `timing` record names the target, the
+parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism and
+EPLB are rejected, and so are models or layouts AISimulate has no timing
+for. Speculative decoding is timed for DeepSeek-V3's native single-module
+MTP only (`method: mtp`, 1 to 5 tokens, the draft at the target's
+parallelism and precision), as AISimulate's MTP depth: a decode step
+verifies k + 1 tokens a request and runs k target-shaped draft layers, the
+full width even when a step drafted fewer; draft weights and KV, prefill
+draft work and host glue are omitted. Acceptance comes from
+`spec_acceptance_rates` and does not change a step's cost. Real KV
+transfers do not support speculative decoding. The `timing` record names the target, the
 resolved estimator configuration and its data's vLLM version.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also

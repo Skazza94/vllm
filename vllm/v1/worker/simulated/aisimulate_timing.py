@@ -125,6 +125,28 @@ V4_APPROXIMATION = (
     "ratio 0) with its HCA (ratio 128) module tables; its capacity model keeps "
     "the real ratios"
 )
+# Speculative decoding: DeepSeek-V3's native single-module MTP only, as
+# AISimulate's MTP depth (`nextn`, 1 to 5).
+MTP_TARGETS = ("DeepseekV3ForCausalLM",)
+MTP_MAX_DEPTH = 5
+MTP_APPROXIMATIONS = [
+    (
+        "a decode step verifies k + 1 tokens a request (the configured depth k, "
+        "whatever drafts the step actually scheduled: a step with fewer is "
+        "charged the full width)"
+    ),
+    (
+        "the MTP drafter is k target-shaped layers of operations, not a measured "
+        "drafter; its weights and KV, prefill-side draft work and host glue are "
+        "omitted"
+    ),
+    (
+        "MLA verification lacks the sequence-basis width treatment AISimulate "
+        "gives other attention"
+    ),
+    "acceptance does not enter the cost",
+    "graph-based kernel tables: an off-graph deployment is not modeled",
+]
 GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(
         (
@@ -235,7 +257,8 @@ class AisimulateTimingProvider:
     Supported: pure tensor parallelism within one node (TP 1, 2, 4 or 8), or
     an MoE model's local data-parallel attention with expert parallelism
     (TP 1, 2 to 8 local DP ranks). Anything else is refused, as are pipeline
-    and context parallelism, EPLB and speculative decoding."""
+    and context parallelism, EPLB and speculative decoding other than
+    DeepSeek-V3's native single-module MTP."""
 
     def __init__(
         self,
@@ -313,6 +336,8 @@ class AisimulateTimingProvider:
             modes.update(quant_modes)
         kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4)
 
+        nextn, speculation = self._speculation(vllm_config, target_config, topology)
+
         kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
         worker_type = {"kv_producer": "prefill", "kv_consumer": "decode"}.get(
             kv_role, "aggregated"
@@ -328,7 +353,7 @@ class AisimulateTimingProvider:
             "dcp": None,
             "cp_size": 1,
             "enable_eplb": False,
-            "nextn": 0,
+            "nextn": nextn,
             **modes,
             "kvcache_quant_mode": kv_mode,
             "estimation_mode": "auto",
@@ -374,6 +399,7 @@ class AisimulateTimingProvider:
             "kv_cache_format": kv_format,
             "expert_dtype": expert_dtype,
             "startup_probes": probes,
+            "speculation": speculation,
             "kv_cache_mode_note": (
                 "an FP16 KV cache is timed as BF16 (two bytes; an approximation)"
                 if kv_mode == "bfloat16" and self._kv_dtype(vllm_config) == "float16"
@@ -387,7 +413,9 @@ class AisimulateTimingProvider:
                 f"vLLM {resolved.get('backend_version') or backend_version} "
                 f"data; the simulator runs vLLM {vllm_version}"
             ),
-            "approximations": APPROXIMATIONS + ([V4_APPROXIMATION] if v4 else []),
+            "approximations": APPROXIMATIONS
+            + ([V4_APPROXIMATION] if v4 else [])
+            + (MTP_APPROXIMATIONS if nextn else []),
             "host_us": host_us,
         }
         logger.info("AISimulate timing: %s", self._assumptions["deployment"])
@@ -403,8 +431,6 @@ class AisimulateTimingProvider:
             problems.append("context parallelism")
         if pc.enable_eplb:
             problems.append("EPLB")
-        if vllm_config.speculative_config is not None:
-            problems.append("speculative decoding")
         if pc.nnodes > 1:
             problems.append("several nodes")
         tp, dp, ep = (
@@ -457,6 +483,62 @@ class AisimulateTimingProvider:
             "attention_dp": 1,
             "moe_tp_size": None,
             "moe_ep_size": None,
+        }
+
+    @staticmethod
+    def _speculation(
+        vllm_config: "VllmConfig", target_config: dict[str, Any], topology: dict
+    ) -> tuple[int, dict[str, Any] | None]:
+        """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's
+        native single-module MTP (its own checkpoint's layer, the target's
+        parallelism and precision) only."""
+        spec = vllm_config.speculative_config
+        if spec is None:
+            return 0, None
+        draft = getattr(spec.draft_model_config, "hf_config", None)
+        k = spec.num_speculative_tokens
+        problems = []
+        if spec.method not in ("mtp", "deepseek_mtp"):
+            problems.append(f"method {spec.method}")
+        if target_config.get("architectures", [None])[0] not in MTP_TARGETS:
+            problems.append(f"target {target_config.get('architectures')}")
+        if getattr(draft, "model_type", None) != "deepseek_mtp":
+            problems.append(f"draft {getattr(draft, 'model_type', None)}")
+        architectures = list(
+            getattr(spec.draft_model_config, "architectures", None) or []
+        )
+        if architectures != ["DeepSeekMTPModel"]:
+            problems.append(f"draft architectures {architectures}")
+        if spec.model not in (None, vllm_config.model_config.model):
+            problems.append(f"draft checkpoint {spec.model}")
+        if spec.use_multi_module_mtp():
+            problems.append("multi-module MTP")
+        if not 1 <= k <= MTP_MAX_DEPTH:
+            problems.append(f"{k} speculative tokens (1 to {MTP_MAX_DEPTH})")
+        if spec.draft_tensor_parallel_size not in (None, topology["tp"]):
+            problems.append(
+                f"draft tensor parallelism {spec.draft_tensor_parallel_size}"
+            )
+        if spec.quantization not in (None, vllm_config.model_config.quantization):
+            problems.append(f"draft quantization {spec.quantization}")
+        # The draft's own precision choices: its KV cache (None inherits the
+        # target's) and its copy of the target's LM head.
+        if spec.kv_cache_dtype not in (None, vllm_config.cache_config.cache_dtype):
+            problems.append(f"draft KV cache dtype {spec.kv_cache_dtype}")
+        if getattr(spec, "draft_lm_head_quantization", None) is not None:
+            problems.append(
+                f"draft LM head quantization {spec.draft_lm_head_quantization}"
+            )
+        if problems:
+            raise ValueError(
+                "The aisimulate timing provider times DeepSeek-V3's native "
+                f"single-module MTP only, not {', '.join(problems)}."
+            )
+        return k, {
+            "method": spec.method,
+            "num_speculative_tokens": k,
+            "verify_width": k + 1,
+            "draft_architectures": architectures,
         }
 
     @staticmethod
@@ -629,8 +711,18 @@ class AisimulateTimingProvider:
             raise ValueError(
                 f"AISimulate returned {ms!r} ms for step {step.step_index}."
             )
+        breakdown = {"aisimulate_ms": ms}
+        if nextn := self.config["nextn"]:
+            # The configured width against the drafts this step scheduled.
+            decode = [r for r in step.requests if not r.is_prefill]
+            breakdown["spec_draft_tokens"] = float(
+                sum(r.num_spec_tokens for r in decode)
+            )
+            breakdown["spec_requests_below_width"] = float(
+                sum(r.num_spec_tokens < nextn for r in decode)
+            )
         return StepCost(
             device_s=ms / 1000.0,
             host_s=self.host.host_s(step),
-            breakdown={"aisimulate_ms": ms},
+            breakdown=breakdown,
         )

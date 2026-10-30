@@ -200,6 +200,7 @@ def engine_config(
             if is_moe is None
             else is_moe,
             hf_text_config=HfConfig(local),
+            quantization=None,
         ),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         parallel_config=SimpleNamespace(**{**defaults, **parallel}),
@@ -409,9 +410,80 @@ def test_unsupported_layouts_are_refused(fake_aisimulate, parallel, problem):
     assert not fake_aisimulate.instances
 
 
-def test_speculative_decoding_is_refused(fake_aisimulate):
-    with pytest.raises(ValueError, match="speculative decoding"):
-        provider(engine_config(speculative=SimpleNamespace(num_speculative_tokens=3)))
+def mtp(k=1, method="mtp", draft="deepseek_mtp", modules=1, **fields):
+    """A speculative configuration: DeepSeek MTP of depth k by default."""
+    spec = SimpleNamespace(
+        method=method,
+        num_speculative_tokens=k,
+        kv_cache_dtype=None,
+        draft_lm_head_quantization=None,
+        draft_model_config=SimpleNamespace(
+            architectures=["DeepSeekMTPModel"],
+            hf_config=SimpleNamespace(
+                model_type=draft,
+                architectures=["DeepSeekMTPModel"],
+                num_nextn_predict_layers=modules,
+            ),
+        ),
+        model=None,
+        draft_tensor_parallel_size=None,
+        quantization=None,
+    )
+    spec.__dict__.update(fields)
+    spec.use_multi_module_mtp = lambda: method == "mtp" and min(modules, k) > 1
+    return spec
+
+
+V3 = "deepseek-ai/DeepSeek-V3"
+
+
+def test_deepseek_v3_mtp_is_timed_as_aisimulates_mtp_depth(fake_aisimulate):
+    p = provider(engine_config(V3, DEEPSEEK_V3, speculative=mtp(k=2)))
+    assert fake_aisimulate.instances[0].config.kwargs["nextn"] == 2
+    record = p.assumptions()["aisimulate"]
+    assert record["speculation"]["verify_width"] == 3
+    assert any("k + 1 tokens" in a for a in record["approximations"])
+    # Without speculation: no depth, no speculation record or step fields.
+    plain = provider(engine_config(V3, DEEPSEEK_V3))
+    assert plain.config["nextn"] == 0
+    assert plain.assumptions()["aisimulate"]["speculation"] is None
+    cost = plain.estimate(sim_step(0, sim_req("d", 1, 10, 5)))
+    assert cost.breakdown == {"aisimulate_ms": 7.0}
+
+
+def test_a_step_records_its_drafts_against_the_width(fake_aisimulate):
+    p = provider(engine_config(V3, DEEPSEEK_V3, speculative=mtp(k=2)))
+    full = dataclasses.replace(sim_req("a", 3, 100, 50), num_spec_tokens=2)
+    fewer = dataclasses.replace(sim_req("b", 2, 100, 50), num_spec_tokens=1)
+    none = sim_req("c", 1, 100, 50)
+    cost = p.estimate(sim_step(0, full, fewer, none, sim_req("p", 64, 0, 64)))
+    assert cost.breakdown["spec_draft_tokens"] == 3.0
+    assert cost.breakdown["spec_requests_below_width"] == 2.0
+    # The decode requests stay logical requests (the estimator applies k + 1).
+    work = fake_aisimulate.instances[0].queries[-1]["scheduled_requests"]
+    assert work["num_decode_requests"] == 3
+    assert work["extend_lengths"] == [3, 2, 1, 64]
+
+
+@pytest.mark.parametrize(
+    "target, spec, problem",
+    [
+        (V3, mtp(method="ngram"), "method ngram"),
+        (V3, mtp(method="eagle3", draft="llama"), "method eagle3"),
+        (V3, mtp(k=2, modules=2), "multi-module MTP"),
+        (V3, mtp(k=6), "6 speculative tokens"),
+        (V3, mtp(model="org/other-mtp"), "draft checkpoint"),
+        (V3, mtp(draft_tensor_parallel_size=2), "draft tensor parallelism 2"),
+        (V3, mtp(quantization="fp8"), "draft quantization fp8"),
+        ("Qwen/Qwen3-30B-A3B", mtp(), "target"),
+    ],
+)
+def test_other_speculative_configurations_are_refused(
+    fake_aisimulate, target, spec, problem
+):
+    local = DEEPSEEK_V3 if target == V3 else QWEN3_MOE
+    with pytest.raises(ValueError, match=problem):
+        provider(engine_config(target, local, speculative=spec))
 
 
 def test_dp_attention_with_expert_parallelism_is_mapped(fake_aisimulate):
@@ -973,3 +1045,122 @@ def test_a_deepseek_v4_engine_runs_on_aisimulate_timing(
         assert steps and all(math.isfinite(c) and c > 0 for c in costs)
     finally:
         del llm
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("k", [1, 3])
+def test_deepseek_v3_mtp_depths_match_the_pinned_estimator(k):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    local = HfConfig(bundled_config(V3))
+    p = provider(
+        engine_config(V3, local, tensor_parallel_size=8, speculative=mtp(k=k)),
+        gpu="h200",
+    )
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=V3,
+            system="h200_sxm",
+            backend="vllm",
+            worker_type="aggregated",
+            tp=8,
+            moe_tp_size=8,
+            moe_ep_size=1,
+            nextn=k,
+            kvcache_quant_mode="bfloat16",
+            fallback_policy="deny",
+        )
+    )
+    drafted = dataclasses.replace(sim_req("d", 1 + k, 1024, 512), num_spec_tokens=k)
+    step = sim_step(
+        0, *[dataclasses.replace(drafted, req_id=f"d{i}") for i in range(8)]
+    )
+    ms = p.estimate(step).device_s * 1000
+    assert ms == pytest.approx(
+        direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+        rel=1e-9,
+    )
+    # A partial-width step is priced at the configured width.
+    partial = sim_step(1, *[sim_req(f"e{i}", 1, 1024, 512) for i in range(8)])
+    assert p.estimate(partial).device_s * 1000 == pytest.approx(ms, rel=1e-9)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_a_deepseek_v3_mtp_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
+    """Native single-module MTP through the engine: drafts scheduled and
+    accepted (sampled), every step priced at depth 1."""
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    directory = model_dir(tmp_path, "deepseek-ai--DeepSeek-V3", bundled_config(V3))
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=directory,
+        skip_tokenizer_init=True,
+        max_model_len=4096,
+        kv_cache_memory_bytes=1 << 30,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "h200"},
+            "spec_acceptance_rates": [0.7],
+            "log_path": str(log),
+        },
+    )
+    try:
+        (output,) = llm.generate(
+            [{"prompt_token_ids": [5] * 512}],
+            SamplingParams(max_tokens=16, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(output.outputs[0].token_ids) == 16
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+        assert timing["config"]["nextn"] == 1
+        assert timing["speculation"]["verify_width"] == 2
+        steps = [r for r in records if "step" in r and r["step"]["requests"]]
+        drafted = [r for r in steps if r["cost"]["breakdown"].get("spec_draft_tokens")]
+        assert drafted, "no step scheduled drafts"
+        assert all(r["cost"]["breakdown"]["aisimulate_ms"] > 0 for r in steps)
+        # Accepted drafts are recorded (sampled), not priced.
+        assert any(r["cost"].get("num_accepted") for r in drafted)
+    finally:
+        del llm
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_deepseek_v3_mtp_draft_precision_through_native_configs(tmp_path):
+    """Real `EngineArgs`/`SpeculativeConfig`: the draft inheriting the
+    target's precision is accepted; its own KV cache dtype or LM-head
+    quantization is not."""
+    v3 = bundled_config(V3)
+    spec = {"method": "mtp", "num_speculative_tokens": 1}
+    config = real_engine_config(
+        tmp_path, "deepseek-ai--DeepSeek-V3", v3, speculative_config=spec
+    )
+    assert config.speculative_config.draft_model_config.architectures == [
+        "DeepSeekMTPModel"
+    ]
+    p = provider(config, gpu="h200")
+    assert p.config["nextn"] == 1
+    for name, extra, problem in (
+        ("kv", {"kv_cache_dtype": "fp8"}, "draft KV cache dtype fp8"),
+        (
+            "head",
+            {"draft_lm_head_quantization": "fp8"},
+            "draft LM head quantization fp8",
+        ),
+    ):
+        config = real_engine_config(
+            tmp_path,
+            f"deepseek-ai--DeepSeek-V3-{name}",
+            v3,
+            speculative_config={**spec, **extra},
+        )
+        with pytest.raises(ValueError, match=problem):
+            provider(config, gpu="h200", target_model=V3)
