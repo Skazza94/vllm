@@ -174,18 +174,23 @@ def test_get_sw_clipped_blocks_noop_no_hma():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "num_tokens,window_first,window_blocks",
+    "window,num_tokens,window_first,window_blocks,window_held",
     [
-        (40, 0, 3),  # within the window: every block
+        (64, 40, 0, 3, 3),  # within the window: every block
         # 320 tokens, 20 blocks: the next token's 64-token window skips
         # tokens 0..256, the first 16 blocks (null); 4 blocks are pulled.
-        (320, 16, 4),
+        (64, 320, 16, 4, 4),
         # 325 tokens, 21 blocks: still 16 null; 5, the clip's cdiv(64, 16) + 1.
-        (325, 16, 5),
+        (64, 325, 16, 5, 5),
+        # A 1-token window skips the whole block-aligned prompt: every block
+        # is null, none of the window's is pulled.
+        (1, 320, 20, 0, 0),
+        # Unaligned, the prompt's last block stays: it is pulled.
+        (1, 325, 20, 1, 1),
     ],
 )
 def test_pulls_carry_where_each_groups_blocks_start(
-    num_tokens, window_first, window_blocks
+    window, num_tokens, window_first, window_blocks, window_held
 ):
     """A consumer pulls only a sliding window's last blocks, null blocks
     padding the window's head: the pull says where each group's blocks start
@@ -198,7 +203,7 @@ def test_pulls_carry_where_each_groups_blocks_start(
         disable_hybrid_kv_cache_manager=False,
     )
     kv_cache_config = make_kv_cache_config(
-        block_size=block_size, swa_enabled=True, sw_size=64, num_blocks=1000
+        block_size=block_size, swa_enabled=True, sw_size=window, num_blocks=1000
     )
     scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
     request = create_request(
@@ -223,6 +228,10 @@ def test_pulls_carry_where_each_groups_blocks_start(
     assert [len(blocks) for blocks in held] == [total, total]
     assert pull.first_block_indices == [0, window_first]
     assert [len(pulled) for pulled in pull.local_block_ids] == [total, window_blocks]
+    assert [sum(1 for b in pulled if b) for pulled in pull.local_block_ids] == [
+        total,
+        window_held,
+    ]
     for blocks, first, pulled in zip(
         held, pull.first_block_indices, pull.local_block_ids
     ):
