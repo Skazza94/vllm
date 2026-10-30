@@ -105,6 +105,39 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(flag(fp8, role, "--kv-cache-dtype"), "fp8")
             self.assertEqual(flag(fp8, role, "--dtype"), "auto")  # the weights' unchanged
 
+    def test_nixl_moves_the_kv_over_its_mooncake_backend_on_the_kv_address(self) -> None:
+        nixl = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
+        for role in ("prefill", "decode"):
+            command = pd.server_command(nixl, role, ["10.100.0.1"])
+            config = json.loads(command[command.index("--kv-transfer-config") + 1])
+            self.assertEqual((config["kv_connector"], config["kv_connector_extra_config"]),
+                             ("NixlConnector", {"backends": ["Mooncake"]}))
+            env = dict(item.split("=", 1) for item in command[1:command.index(pd.VLLM)])
+            self.assertEqual((env["VLLM_NIXL_SIDE_CHANNEL_HOST"], env["NIXL_MOONCAKE_IP_ADDR"]),
+                             ("10.100.0.1", "10.100.0.1"))
+            self.assertEqual(json.loads(env["MC_TENT_CONF"])["rpc_server_hostname"], "10.100.0.1")
+            self.assertNotIn("VLLM_MOONCAKE_BOOTSTRAP_PORT", env)
+        mooncake = pd.server_command(RUN, "prefill", ["10.100.0.1"])
+        self.assertEqual(json.loads(mooncake[mooncake.index("--kv-transfer-config") + 1])["kv_connector"],
+                         "MooncakeConnector")
+
+    def test_the_connector_is_mooncake_or_nixl_on_one_rank(self) -> None:
+        base = {"name": "t", "topology": "t", "model": ".", "client": "c", "control_network": "control",
+                "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"}}
+
+        def load(server: dict) -> pd.Run:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "run.yaml"
+                path.write_text(json.dumps({**base, "server": {"timing": "zero", **server}}))
+                return pd.load(path)
+
+        self.assertEqual((load({}).server.connector, load({}).proxy), ("mooncake", pd.DEFAULT_PROXY))
+        self.assertEqual(load({"connector": "nixl"}).proxy, pd.NIXL_PROXY)
+        for server, message in (({"connector": "ucx"}, "server.connector is one of mooncake, nixl"),
+                                ({"connector": "nixl", "tensor_parallel_size": 2}, "one rank per instance")):
+            with self.subTest(server=server), self.assertRaisesRegex(ValueError, message):
+                load(server)
+
     def test_the_platform_may_choose_the_block_size(self) -> None:
         default = pd.server_command(RUN, "prefill", ["10.100.0.1"])
         self.assertEqual(default[default.index("--block-size") + 1], "16")
@@ -755,6 +788,49 @@ class DataParallelCheckTests(unittest.TestCase):
         self.assertIn('"rank_addresses": ["10.100.0.1", "10.101.0.1", "10.100.0.1", "10.101.0.1"]', command)
         self.assertIn("--data-parallel-size 2 --enable-expert-parallel", command)
         self.assertNotIn("--data-parallel-size", " ".join(pd.server_command(TP2, "prefill", ["a", "b"])))
+
+
+NIXL = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
+
+
+class NixlCheckTests(unittest.TestCase):
+    """NIXL's decode reads the KV: its connector's loads and TENT's reads
+    count the bytes, prefill moves none."""
+
+    def verdict(self, loads=None, decode_tent=None, routers=None, run=NIXL) -> dict:
+        loads = loads or {"count": 2, "bytes": 2000, "failed": 0}
+        decode = ONE_RANK + line(kv_transfers={"load": loads}) + line(kv_check=checked("a")) + line(
+            kv_check=checked("b"))
+        tents = {"prefill": [{"tent_registered_buffer_bytes": 1600}],
+                 "decode": [decode_tent if decode_tent is not None else {
+                     "tent_read_bytes_total": 2000, "tent_registered_buffer_bytes": 1600}]}
+        return pd.check({"completed": 2, "errors": []}, [ONE_RANK + allocated("a", "b")], [decode],
+                        routers or {"control": 50, "data0": 2100}, run, tents)
+
+    def test_decode_reads_the_bytes_it_checks(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["transfers"], {"count": 2, "bytes": 2000, "failed": 0})
+
+    def test_each_failure_is_reported(self) -> None:
+        cases = {
+            "decode's connector failed 1 transfer": {"loads": {"count": 2, "bytes": 2000, "failed": 1}},
+            "moved 1000 bytes, not the 2000 decode checked": {
+                "loads": {"count": 1, "bytes": 1000, "failed": 0}, "routers": {"control": 50, "data0": 5000}},
+            "TENT read 1500 bytes, not the 2000": {
+                "decode_tent": {"tent_read_bytes_total": 1500, "tent_registered_buffer_bytes": 1600}},
+            # Unavailable telemetry is a problem, not zero.
+            "decode's TENT metrics lack tent_read_bytes_total": {
+                "decode_tent": {"tent_registered_buffer_bytes": 1600}},
+            "fewer than the 2000 its ranks moved": {"routers": {"control": 50, "data0": 100}},
+        }
+        for message, given in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**given)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+        # Mooncake's decode needs no reads; its prefill needs its writes.
+        problems = self.verdict(run=RUN)["problems"]
+        self.assertTrue(any("prefill's TENT metrics lack tent_write_bytes_total" in p for p in problems), problems)
 
 
 @unittest.skipUnless(os.environ.get("E2E_VLLM") == "1", "set E2E_VLLM=1 to run vLLM in docker")

@@ -1,10 +1,12 @@
 """A prefill/decode run of the vLLM simulator in an up topology.
 
 Prefill and decode each run ``vllm serve`` with simulated compute and real
-KV transfers through MooncakeConnector over TENT's hp_tcp, bound to the
-node's address on its KV network (other TENT transports off). HTTP, the
+KV transfers through MooncakeConnector (prefill writes), or NixlConnector
+over NIXL's Mooncake backend (decode reads; ``server.connector: nixl``, one
+rank per instance), over TENT's hp_tcp, bound to the node's address on its
+KV network (other TENT transports off), as is NIXL's handshake. HTTP, the
 proxy and Mooncake's bootstrap use the control network. The client node runs
-MooncakeConnector's proxy and ``vllm bench serve``.
+the connector's proxy and ``vllm bench serve``.
 
 With tensor parallelism, every rank moves its own KV heads: on the side's KV
 network, or on its own one (``kv_network`` a list, one per rank, the same
@@ -40,6 +42,8 @@ E2E = Path(__file__).resolve().parent.parent
 REPOSITORY = E2E.parent
 DEFAULT_PROXY = (REPOSITORY / "vllm" / "examples" / "disaggregated" / "mooncake_connector"
                  / "mooncake_connector_proxy.py")
+NIXL_PROXY = REPOSITORY / "vllm" / "tests" / "v1" / "kv_connector" / "nixl_integration" / "toy_proxy_server.py"
+CONNECTORS = ("mooncake", "nixl")
 RESULTS = E2E / "results"
 VLLM = "/opt/venv/bin/vllm"
 PYTHON = "/opt/venv/bin/python"
@@ -98,6 +102,10 @@ class Server:
     saved run from before it was (timed by the former roofline provider)."""
     timing_args: dict | None = None
     """Its arguments; aisimulate's default to {gpu} (plus a target_model)."""
+    connector: str = "mooncake"
+    """The KV connector: mooncake (MooncakeConnector, prefill writes) or nixl
+    (NixlConnector over NIXL's Mooncake backend, decode reads); both move
+    the KV through TENT's hp_tcp."""
 
 
 @dataclass
@@ -142,7 +150,8 @@ def load(path: str | Path) -> Run:
             client=raw["client"], control_network=raw["control_network"],
             kv_check=bool(raw.get("kv_check", True)),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
-            proxy=(path.parent / raw["proxy"]).resolve() if "proxy" in raw else DEFAULT_PROXY,
+            proxy=(path.parent / raw["proxy"]).resolve() if "proxy" in raw else (
+                NIXL_PROXY if (raw.get("server") or {}).get("connector") == "nixl" else DEFAULT_PROXY),
             startup_timeout=float(raw.get("startup_timeout", 600)),
         )
     except KeyError as missing:
@@ -152,6 +161,11 @@ def load(path: str | Path) -> Run:
     if run.server.timing is None:
         raise ValueError("run config needs server.timing (zero, linear, table, replay, aisimulate or a "
                          "module.Class)")
+    if run.server.connector not in CONNECTORS:
+        raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
+    if run.server.connector == "nixl" and (run.server.tensor_parallel_size > 1 or any(
+            side.data_parallel_size > 1 for side in (run.prefill, run.decode))):
+        raise ValueError("the nixl connector runs one rank per instance (no TP or DP yet)")
     if run.kv_check and run.server.enable_prefix_caching:
         raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
     ranks = run.server.tensor_parallel_size
@@ -189,18 +203,25 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
                   "log_path": STEP_LOG, "kv_transfer_mode": "real"}
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
-    kv_transfer = {"kv_connector": "MooncakeConnector",
+    nixl = run.server.connector == "nixl"
+    kv_transfer = {"kv_connector": "NixlConnector" if nixl else "MooncakeConnector",
                    "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
-                   "kv_buffer_device": "cpu", "kv_connector_extra_config": {"mooncake_protocol": "tcp"}}
+                   "kv_buffer_device": "cpu",
+                   # NIXL's default backend is UCX, which the image lacks.
+                   "kv_connector_extra_config": {"backends": ["Mooncake"]} if nixl else {"mooncake_protocol": "tcp"}}
     if len(set(kv_addresses)) > 1:
         kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
+    connector_env = {
+        # NIXL's handshake and its Mooncake backend's segment on the KV network.
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
+    } if nixl else {"VLLM_MOONCAKE_BOOTSTRAP_PORT": str(BOOTSTRAP_PORT)}
     env = {
         "TRITON_CPU_BACKEND": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1", "OMP_NUM_THREADS": "1",
         # The address Mooncake's workers register (vLLM's get_ip).
         "VLLM_HOST_IP": kv_address,
         "MC_USE_TENT": "1",
         "MC_TENT_CONF": json.dumps(tent_config(kv_address, run.server.hp_tcp_args), separators=(",", ":")),
-        "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(BOOTSTRAP_PORT),
+        **connector_env,
         # TENT's metrics, read from inside the node.
         "TENT_METRICS_HTTP_HOST": "127.0.0.1",
         "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
@@ -265,10 +286,13 @@ def execute(run: Run, output: Path | None = None) -> dict:
         for role in ("prefill", "decode"):
             _wait(container[run.client], f"http://{address[f'{role}_control']}:{SERVER_PORT}/health",
                   run.startup_timeout, container[getattr(run, role).node], f"{WORK}/logs/{role}.log")
-        _background(container[run.client], [
-            PYTHON, f"{WORK}/proxy.py", "--host", "127.0.0.1", "--port", str(PROXY_PORT),
+        instances = ["--prefiller-hosts", address["prefill_control"], "--prefiller-ports", str(SERVER_PORT),
+                     "--decoder-hosts", address["decode_control"], "--decoder-ports", str(SERVER_PORT)] if (
+            run.server.connector == "nixl") else [
             "--prefill", f"http://{address['prefill_control']}:{SERVER_PORT}", str(BOOTSTRAP_PORT),
-            "--decode", f"http://{address['decode_control']}:{SERVER_PORT}"], f"{WORK}/logs/proxy.log")
+            "--decode", f"http://{address['decode_control']}:{SERVER_PORT}"]
+        _background(container[run.client], [PYTHON, f"{WORK}/proxy.py", "--host", "127.0.0.1",
+                                             "--port", str(PROXY_PORT), *instances], f"{WORK}/logs/proxy.log")
         # The proxy has no health endpoint: FastAPI's docs page.
         _wait(container[run.client], f"http://127.0.0.1:{PROXY_PORT}/docs", 120,
               container[run.client], f"{WORK}/logs/proxy.log")
@@ -298,6 +322,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
     tent = {role: [_tent_delta(before, after) for before, after in zip(tent_before[role], tent_after[role])]
             for role in tent_before}
     (output / "tent.json").write_text(json.dumps(tent, indent=2) + "\n")
+    # As served after the workload: their labels (transports) included.
+    (output / "tent-after.json").write_text(json.dumps(tent_after, indent=2) + "\n")
     verdict = check(
         json.loads((output / "bench.json").read_text()),
         *[[(output / _step_log_name(role, dp, tp)).read_text() for dp, tp in getattr(run, role).ranks(ranks)]
@@ -404,8 +430,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 for req_id in ((r.get("kv_events") or {}).get("allocated") or {})}
             counters = tents.get(role, {}).get((dp, tp)) if tents else None
             if tents:
-                required = {"prefill": ("tent_registered_buffer_bytes", "tent_write_bytes_total"),
-                            "decode": ("tent_registered_buffer_bytes",)}[role]
+                # Mooncake's prefill writes the KV, NIXL's decode reads it.
+                mover, moved_counter = ("decode", "tent_read_bytes_total") if (
+                    run.server.connector == "nixl") else ("prefill", "tent_write_bytes_total")
+                required = ("tent_registered_buffer_bytes",) + ((moved_counter,) if role == mover else ())
                 if counters is None:
                     problems.append(f"{at}{role}'s TENT metrics did not answer")
                 elif missing := [name for name in required if name not in counters]:
@@ -414,10 +442,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 if registered is not None and layout and registered < layout["bytes"]:
                     problems.append(f"{at}{role}'s TENT registered {registered:.0f} bytes, less than its "
                                     f"{layout['bytes']} of KV")
-                written = (counters or {}).get("tent_write_bytes_total")
-                if role == "prefill" and written is not None and written != sent["bytes"]:
-                    problems.append(f"{at}TENT wrote {written:.0f} bytes, not the {sent['bytes']} its connector "
-                                    "moved")
+                counted = (counters or {}).get(moved_counter)
+                if role == mover and counted is not None and counted != sent["bytes"]:
+                    problems.append(f"{at}TENT {'read' if mover == 'decode' else 'wrote'} {counted:.0f} bytes, "
+                                    f"not the {sent['bytes']} its connector moved")
             ranks[role][(dp, tp)] = {
                 "transfers": sent, "kv_checks": len(checks),
                 "checked_ids": {c["req_id"] for c in checks if "req_id" in c and "error" not in c},
@@ -499,9 +527,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     # other: each carries its ranks' bytes and little more (headers,
     # acknowledgements).
     expected: dict[str, int] = {}
-    for (dp, tp), summary in ranks["prefill"].items():
-        network = run.prefill.rank_networks(tp_size)[tp]
-        expected[network] = expected.get(network, 0) + summary["transfers"]["bytes"]
+    # One side's connector counts them: Mooncake's prefill, NIXL's decode.
+    for role in sides:
+        for (dp, tp), summary in ranks[role].items():
+            network = sides[role].rank_networks(tp_size)[tp]
+            expected[network] = expected.get(network, 0) + summary["transfers"]["bytes"]
     for network, carried_by_ranks in expected.items():
         carried = routers.get(network, 0)
         if carried < carried_by_ranks:
