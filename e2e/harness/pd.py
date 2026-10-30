@@ -2,9 +2,10 @@
 
 Prefill and decode each run ``vllm serve`` with simulated compute and real
 KV transfers through MooncakeConnector (prefill writes), or NixlConnector
-over NIXL's Mooncake backend (decode reads; ``server.connector: nixl``, one
-rank per instance), over TENT's hp_tcp, bound to the node's address on its
-KV network (other TENT transports off), as is NIXL's handshake. HTTP, the
+over NIXL's Mooncake backend (decode reads; ``server.connector: nixl``, no
+data parallelism), over TENT's hp_tcp, bound to the node's address on its
+KV network (other TENT transports off), as is NIXL's handshake (on rank 0's
+network: one side channel an instance). HTTP, the
 proxy and Mooncake's bootstrap use the control network. The client node runs
 the connector's proxy and ``vllm bench serve``.
 
@@ -163,9 +164,8 @@ def load(path: str | Path) -> Run:
                          "module.Class)")
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
-    if run.server.connector == "nixl" and (run.server.tensor_parallel_size > 1 or any(
-            side.data_parallel_size > 1 for side in (run.prefill, run.decode))):
-        raise ValueError("the nixl connector runs one rank per instance (no TP or DP yet)")
+    if run.server.connector == "nixl" and any(side.data_parallel_size > 1 for side in (run.prefill, run.decode)):
+        raise ValueError("the nixl connector runs without data parallelism (TP only, for now)")
     if run.kv_check and run.server.enable_prefix_caching:
         raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
     ranks = run.server.tensor_parallel_size

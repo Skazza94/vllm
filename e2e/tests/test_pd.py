@@ -121,22 +121,34 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(json.loads(mooncake[mooncake.index("--kv-transfer-config") + 1])["kv_connector"],
                          "MooncakeConnector")
 
-    def test_the_connector_is_mooncake_or_nixl_on_one_rank(self) -> None:
+    def test_nixl_ranks_take_their_own_addresses(self) -> None:
+        nixl = pd.Run(**{**TP2.__dict__, "server": pd.Server(connector="nixl", tensor_parallel_size=2)})
+        command = pd.server_command(nixl, "decode", ["10.100.0.1", "10.101.0.1"])
+        config = json.loads(command[command.index("--kv-transfer-config") + 1])
+        self.assertEqual(config["kv_connector_extra_config"],
+                         {"backends": ["Mooncake"], "rank_addresses": ["10.100.0.1", "10.101.0.1"]})
+        env = dict(item.split("=", 1) for item in command[1:command.index(pd.VLLM)])
+        # Rank 0's address until each rank binds its own; one side channel.
+        self.assertEqual((env["VLLM_NIXL_SIDE_CHANNEL_HOST"], env["NIXL_MOONCAKE_IP_ADDR"]),
+                         ("10.100.0.1", "10.100.0.1"))
+
+    def test_the_connector_is_mooncake_or_nixl_without_dp(self) -> None:
         base = {"name": "t", "topology": "t", "model": ".", "client": "c", "control_network": "control",
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"}}
 
-        def load(server: dict) -> pd.Run:
+        def load(server: dict, **sides) -> pd.Run:
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "run.yaml"
-                path.write_text(json.dumps({**base, "server": {"timing": "zero", **server}}))
+                path.write_text(json.dumps({**base, **sides, "server": {"timing": "zero", **server}}))
                 return pd.load(path)
 
         self.assertEqual((load({}).server.connector, load({}).proxy), ("mooncake", pd.DEFAULT_PROXY))
         self.assertEqual(load({"connector": "nixl"}).proxy, pd.NIXL_PROXY)
-        for server, message in (({"connector": "ucx"}, "server.connector is one of mooncake, nixl"),
-                                ({"connector": "nixl", "tensor_parallel_size": 2}, "one rank per instance")):
-            with self.subTest(server=server), self.assertRaisesRegex(ValueError, message):
-                load(server)
+        self.assertEqual(load({"connector": "nixl", "tensor_parallel_size": 2}).server.tensor_parallel_size, 2)
+        with self.assertRaisesRegex(ValueError, "server.connector is one of mooncake, nixl"):
+            load({"connector": "ucx"})
+        with self.assertRaisesRegex(ValueError, "without data parallelism"):
+            load({"connector": "nixl"}, decode={"node": "d", "kv_network": "data0", "data_parallel_size": 2})
 
     def test_the_platform_may_choose_the_block_size(self) -> None:
         default = pd.server_command(RUN, "prefill", ["10.100.0.1"])
