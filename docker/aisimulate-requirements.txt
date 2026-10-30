@@ -1,0 +1,5 @@
+# AISimulate for `timing: aisimulate`, pinned by version and wheel hash
+# (pypi.nvidia.com; PyPI has only a source package). Installed with
+# --no-deps: its forward-pass estimator needs nothing beyond vLLM's own.
+aisimulate==0.13.0.dev202610290000000087 \
+    --hash=sha256:8da05b9ad25c26a70aeec4ac9cd674ab097a7db3a41797bb3f69c72b856a63a1
