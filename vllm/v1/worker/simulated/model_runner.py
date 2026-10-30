@@ -46,6 +46,9 @@ from vllm.v1.worker.simulated.kv_transfer import (
     completed_transfers,
     group_allocations,
     kv_layout,
+    layer_specs,
+    packed_pages,
+    registered_block_bytes,
     scheduled_kv_events,
     simulated_kv_connector,
 )
@@ -183,7 +186,12 @@ class SimulatedModelRunner(GPUModelRunner):
         kv_cache_allocation_context: AbstractContextManager | None,
     ) -> None:
         if self._real_kv_transfer:
-            check_real_kv_groups(self.kv_cache_config)
+            model = self.vllm_config.model_config
+            check_real_kv_groups(
+                self.kv_cache_config,
+                v4=model is not None
+                and getattr(model.hf_config, "model_type", None) == "deepseek_v4",
+            )
             # The native path allocates the tensors, binds their layouts and
             # installs the connector that registers their memory for NIXL.
             super().initialize_kv_cache_tensors(
@@ -250,12 +258,9 @@ class SimulatedModelRunner(GPUModelRunner):
         groups = self.kv_cache_config.kv_cache_groups
         self._kv_allocations = group_allocations(self.kv_cache_config)
         if sim.kv_pattern_fill or sim.kv_pattern_check:
-            # A block's bytes are its group's page, as the connector moves it.
-            pages = {
-                name: group.kv_cache_spec.page_size_bytes
-                for group in groups
-                for name in group.layer_names
-            }
+            # A block's bytes are each layer's page, as the connector moves
+            # it (in a packed layout, its real page).
+            pages = packed_pages(kv_caches_dict, layer_specs(groups))
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
             layers = [group.layer_names for group in groups]
             if sim.kv_pattern_fill:
@@ -272,6 +277,7 @@ class SimulatedModelRunner(GPUModelRunner):
                 "fill" if sim.kv_pattern_fill else "check",
                 len(views),
             )
+        connector = super()._make_kv_connector(kv_caches_dict)
         if self.step_log is not None:
             # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
@@ -282,6 +288,7 @@ class SimulatedModelRunner(GPUModelRunner):
                         self.cache_config.block_size,
                         self.cache_config.get_resolved_kv_cache_layout().name,
                         groups,
+                        registered_block_bytes(),
                     ),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
@@ -292,7 +299,7 @@ class SimulatedModelRunner(GPUModelRunner):
                 },
                 self.clock.now(),
             )
-        return super()._make_kv_connector(kv_caches_dict)
+        return connector
 
     def _init_kv_zero_meta(self) -> None:
         """Without real KV tensors there is nothing to zero."""

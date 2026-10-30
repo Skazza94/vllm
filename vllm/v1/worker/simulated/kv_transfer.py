@@ -44,9 +44,12 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
@@ -318,20 +321,66 @@ def completed_transfers(
 # order, a window's head left null; and a gated delta-net's or a Mamba2
 # mixer's state, one block a request (mamba_cache_mode none).
 REAL_KV_SPECS = (FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, MambaSpec)
+# DeepSeek-V4's beside those: its sliding windows and compressor states
+# (SlidingWindowMLASpec, a SlidingWindowSpec) and its compressed latents and
+# indexer keys (MLAAttentionSpec of several tokens a state), several kinds
+# in one group (UniformTypeKVCacheSpecs).
+V4_REAL_KV_SPECS = (SlidingWindowMLASpec, UniformTypeKVCacheSpecs)
 
 
-def check_real_kv_groups(kv_cache_config: KVCacheConfig) -> None:
+def layer_specs(groups: Sequence[KVCacheGroupSpec]) -> dict[str, KVCacheSpec]:
+    """Each layer's own KV cache spec: a group of several kinds
+    (UniformTypeKVCacheSpecs) names each layer's."""
+    specs = {}
+    for group in groups:
+        spec = group.kv_cache_spec
+        for name in group.layer_names:
+            specs[name] = (
+                spec.kv_cache_specs[name]
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else spec
+            )
+    return specs
+
+
+def packed_pages(
+    kv_caches: dict[str, torch.Tensor], specs: dict[str, KVCacheSpec]
+) -> dict[str, int]:
+    """Each layer's bytes a block holds, as pattern checks cover them: its
+    page (a gated delta-net's state padded to the attention page), or, in
+    a packed layout (each block all of a group's layers, DeepSeek-V4's), its
+    real page only, its padding unchecked."""
+    pages = {}
+    for name, tensor in kv_caches.items():
+        spec = specs[name]
+        stride = tensor.stride(0) * tensor.element_size()
+        pages[name] = (
+            spec.real_page_size_bytes
+            if stride > spec.page_size_bytes
+            else spec.page_size_bytes
+        )
+    return pages
+
+
+def check_real_kv_groups(kv_cache_config: KVCacheConfig, v4: bool = False) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
     RSWA attention, attention sinks), and of Mamba states other than a
     gated delta-net's or a Mamba2 mixer's in mamba_cache_mode none without
-    speculative blocks, whose blocks follow other rules."""
+    speculative blocks, whose blocks follow other rules; DeepSeek-V4's
+    (`v4`) groups too, of its own kinds."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
     states = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.MAMBA2)
+    kinds = REAL_KV_SPECS + (V4_REAL_KV_SPECS if v4 else ())
     other = set()
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
-        if type(spec) not in REAL_KV_SPECS:
+        members = (
+            list(spec.kv_cache_specs.values())
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        if type(spec) not in kinds or any(type(m) not in kinds for m in members):
             other.add(type(spec).__name__)
         elif isinstance(spec, MambaSpec) and (
             spec.mamba_type not in states
@@ -428,6 +477,7 @@ def kv_layout(
     block_size: int,
     layout: str,
     groups: Sequence[KVCacheGroupSpec] | None = None,
+    transfer_block_bytes: int | None = None,
 ) -> dict[str, object]:
     """The KV cache a connector registers, for a step log's `kv_layout`
     record: what each block of each layer is in bytes and tokens, and, with
@@ -435,7 +485,16 @@ def kv_layout(
     (`block_bytes`; a gated delta-net's state padded to it,
     `real_page_bytes`) and the distance between blocks. Layers of different
     groups may share memory (a block is one group's at a time): the bytes
-    count each storage once, as the connector registers them."""
+    count each storage once, as the connector registers them.
+
+    In a packed layout (DeepSeek-V4's: each block all of a group's layers,
+    at offsets within it) a group also names its `members` (each kind of
+    layer: count, offsets, page and real page, dtype), the bytes pattern
+    checks cover of a block (`checked_bytes_per_block`, the real pages) and
+    those the connector moves of it (`transfer_bytes_per_block`, its
+    registered region's block; None if unknown). A model whose decoder
+    loads N - 1 of a prompt's N tokens and computes the last (a recurrent
+    state, or a window spec with `bounded_replay`) has `prefill_backoff` 1."""
     first = next(iter(kv_caches.values()))
     layer_bytes = first.numel() * first.element_size()
     storages = {
@@ -453,19 +512,21 @@ def kv_layout(
         "bytes": sum(storages.values()),
     }
     if groups is not None:
+        specs = layer_specs(groups)
         described = []
         for group in groups:
             spec = group.kv_cache_spec
             layers = [name for name in group.layer_names if name in kv_caches]
             tensor = kv_caches[layers[0]] if layers else None
+            own = specs[layers[0]] if layers else spec
             entry = {
                 "kind": type(spec).__name__,
-                "sliding_window": getattr(spec, "sliding_window", None),
+                "sliding_window": getattr(own, "sliding_window", None),
                 "block_size": spec.block_size,
                 "layers": len(layers),
                 # Each layer's.
-                "block_bytes": spec.page_size_bytes,
-                "real_page_bytes": spec.real_page_size_bytes,
+                "block_bytes": own.page_size_bytes,
+                "real_page_bytes": own.real_page_size_bytes,
                 "block_stride": (
                     tensor.stride(0) * tensor.element_size()
                     if tensor is not None
@@ -474,9 +535,80 @@ def kv_layout(
             }
             if isinstance(spec, MambaSpec):
                 entry["mamba_type"] = spec.mamba_type.name
+            if packed := packed_members(kv_caches, specs, layers):
+                entry["members"] = packed
+                entry["checked_bytes_per_block"] = sum(
+                    member["real_page_bytes"] * member["layers"] for member in packed
+                )
+                entry["transfer_bytes_per_block"] = transfer_block_bytes
             described.append(entry)
         record["groups"] = described
+        if any(spec.prefix_replay_tokens > 0 or isinstance(spec, MambaSpec)
+               for spec in specs.values()):
+            record["prefill_backoff"] = 1
     return record
+
+
+def registered_block_bytes() -> int | None:
+    """The bytes a block of the connector's registered KV region moves, when
+    it registered regions of one block length (NIXL's packed DeepSeek-V4
+    cache: one region); None otherwise."""
+    worker = getattr(get_kv_transfer_group(), "connector_worker", None)
+    lengths = set(getattr(worker, "block_len_per_layer", None) or ())
+    return lengths.pop() if len(lengths) == 1 else None
+
+
+def packed_members(
+    kv_caches: dict[str, torch.Tensor],
+    specs: dict[str, KVCacheSpec],
+    layers: Sequence[str],
+) -> list[dict[str, object]]:
+    """A packed group's kinds of layer, from the allocated tensors: each
+    layer's page at its offset within the block, none overlapping another
+    of the group or beyond the block. Empty when the group is not packed
+    (each layer's block stride its page)."""
+    placed = []
+    for name in layers:
+        tensor, spec = kv_caches[name], specs[name]
+        size = tensor.element_size()
+        stride = tensor.stride(0) * size
+        if stride <= spec.page_size_bytes:
+            continue
+        placed.append((tensor.storage_offset() * size, name, spec, stride))
+    if not placed:
+        return []
+    if len(placed) != len(layers) or len({stride for *_, stride in placed}) != 1:
+        raise ValueError(
+            "KV pattern checks need a group's layers packed alike: "
+            f"{len(placed)} of {len(layers)} packed, block strides "
+            f"{sorted({stride for *_, stride in placed})}."
+        )
+    stride = placed[0][3]
+    end = 0
+    members: dict[tuple, dict[str, object]] = {}
+    for offset, name, spec, _ in sorted(placed, key=lambda p: p[0]):
+        if offset < end or offset + spec.page_size_bytes > stride:
+            raise ValueError(
+                f"KV pattern checks need a packed group's pages apart within "
+                f"its {stride}-byte block; layer {name}'s "
+                f"{spec.page_size_bytes} bytes at {offset} overlap."
+            )
+        end = offset + spec.page_size_bytes
+        dtype = str(kv_caches[name].dtype).removeprefix("torch.")
+        key = (type(spec).__name__, spec.page_size_bytes, spec.real_page_size_bytes, dtype)
+        member = members.setdefault(key, {
+            "kind": key[0],
+            "layers": 0,
+            "offsets": [],
+            "page_bytes": key[1],
+            "real_page_bytes": key[2],
+            "dtype": dtype,
+            # Tokens a state (DeepSeek-V4's compressed latents: several).
+            "tokens_per_state": float(getattr(spec, "tokens_per_state", 1)),
+        })
+        member["layers"] += 1
+        member["offsets"].append(offset)
+    return list(members.values())
 
 
 @dataclass(frozen=True)

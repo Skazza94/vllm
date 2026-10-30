@@ -395,8 +395,16 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
-  sparse-MLA, chunked local or RSWA attention models, nor speculative
-  decoding.
+  sparse-MLA (but DeepSeek-V4's), chunked local or RSWA attention models,
+  nor speculative decoding.
+* DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`) on one rank,
+  without prefix caching, its cache the packed FP8 one (`fp8_ds_mla`): its
+  sliding windows, compressed latents, indexer keys and compressor states
+  are KV cache groups packed into one allocation, each block all of one
+  group's layers; NIXL moves whole blocks. Decode loads all N prompt
+  tokens and computes the last one again to sample; with
+  bounded window replay on (a cache whose SWA spec sets `bounded_replay`,
+  DeepSeek-V4.1's), NIXL loads N - 1 and decode computes the last.
 * One rank per instance, or:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
@@ -420,8 +428,9 @@ place among the request's blocks of its KV cache group, and
 one `kv_check` record per request, each group's result nested in it (it
 needs `log_path`); the pattern needs prefix caching off. A group's blocks
 are its layers' only, each block the page the connector moves (a state's
-padding included), and the null block that pads a window's head is neither
-filled nor checked. The `kv_layout` record describes each group (its page,
+padding included; in DeepSeek-V4's packed blocks, each layer's real page,
+its padding unchecked), and the null block that pads a window's head is
+neither filled nor checked. The `kv_layout` record describes each group (its page,
 the state's real bytes, the stride between blocks) and counts each storage
 once, as the connector registers it.
 

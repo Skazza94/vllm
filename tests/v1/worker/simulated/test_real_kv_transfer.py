@@ -101,6 +101,76 @@ DEEPSEEK_V2 = {
 LATENT = 512 + 64
 
 
+# DeepSeek-V4-Flash's published config: sparse MLA with sliding windows,
+# compressed latents and compressor states (KV cache groups packed in one
+# allocation), its cache the packed FP8 one.
+DEEPSEEK_V4_FLASH = {'architectures': ['DeepseekV4ForCausalLM'],
+ 'attention_bias': False,
+ 'attention_dropout': 0.0,
+ 'bos_token_id': 0,
+ 'eos_token_id': 1,
+ 'expert_dtype': 'fp4',
+ 'hc_eps': 1e-06,
+ 'hc_mult': 4,
+ 'hc_sinkhorn_iters': 20,
+ 'head_dim': 512,
+ 'hidden_act': 'silu',
+ 'hidden_size': 4096,
+ 'index_head_dim': 128,
+ 'index_n_heads': 64,
+ 'index_topk': 512,
+ 'initializer_range': 0.02,
+ 'max_position_embeddings': 1048576,
+ 'model_type': 'deepseek_v4',
+ 'moe_intermediate_size': 2048,
+ 'n_routed_experts': 256,
+ 'n_shared_experts': 1,
+ 'norm_topk_prob': True,
+ 'num_attention_heads': 64,
+ 'num_experts_per_tok': 6,
+ 'num_hidden_layers': 43,
+ 'num_hash_layers': 3,
+ 'num_key_value_heads': 1,
+ 'num_nextn_predict_layers': 1,
+ 'o_groups': 8,
+ 'o_lora_rank': 1024,
+ 'q_lora_rank': 1024,
+ 'qk_rope_head_dim': 64,
+ 'quantization_config': {'activation_scheme': 'dynamic',
+                         'fmt': 'e4m3',
+                         'quant_method': 'fp8',
+                         'scale_fmt': 'ue8m0',
+                         'weight_block_size': [128, 128]},
+ 'rms_norm_eps': 1e-06,
+ 'rope_scaling': {'beta_fast': 32,
+                  'beta_slow': 1,
+                  'factor': 16,
+                  'original_max_position_embeddings': 65536,
+                  'type': 'yarn'},
+ 'rope_theta': 10000,
+ 'routed_scaling_factor': 1.5,
+ 'scoring_func': 'sqrtsoftplus',
+ 'sliding_window': 128,
+ 'swiglu_limit': 10.0,
+ 'tie_word_embeddings': False,
+ 'topk_method': 'noaux_tc',
+ 'torch_dtype': 'bfloat16',
+ 'transformers_version': '4.57.1',
+ 'use_cache': True,
+ 'vocab_size': 129280,
+ 'compress_rope_theta': 160000,
+ 'compress_ratios': [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+                     128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+                     128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0]}
+
+
+@pytest.fixture(scope="module")
+def v4_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("deepseek-v4-flash")
+    (directory / "config.json").write_text(json.dumps(DEEPSEEK_V4_FLASH))
+    return str(directory)
+
+
 @pytest.fixture(scope="module")
 def mla_model_dir(tmp_path_factory):
     directory = tmp_path_factory.mktemp("tiny-deepseek-v2")
@@ -433,6 +503,84 @@ def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
         )
     with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
         engine_config(nemotron_h_model_dir)
+
+
+def test_real_mode_takes_deepseek_v4_over_nixl_on_one_rank(v4_model_dir):
+    """V4's groups move over NIXL, which keeps each group's own blocks;
+    Mooncake cannot pair its block sizes. One rank, no prefix caching, the
+    packed FP8 cache."""
+    v4 = {
+        "dtype": "bfloat16",
+        "max_model_len": 4096,
+        "block_size": None,
+        "kv_cache_memory_bytes": 4 << 30,
+    }
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        config = engine_config(v4_model_dir, kv_transfer={"kv_connector": connector}, **v4)
+        assert config.model_config.hf_config.model_type == "deepseek_v4"
+    for kwargs, message in (
+        ({"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "NixlConnector for DeepSeek-V4"),
+        ({"tensor_parallel_size": 2}, "DeepSeek-V4 on one rank"),
+        ({"enable_prefix_caching": True}, "DeepSeek-V4 without prefix caching"),
+        ({"kv_cache_dtype": "bfloat16"}, "packed FP8 cache"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            engine_config(v4_model_dir, **{**v4, **kwargs})
+
+
+def test_packed_layers_resolve_their_own_specs_and_places():
+    """A group of several kinds names each layer's spec; a packed block (each
+    block all of a group's layers) places each layer's page at its offset,
+    checked over its real bytes only, none overlapping."""
+    from vllm.v1.kv_cache_interface import (
+        KVCacheGroupSpec,
+        MLAAttentionSpec,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import (
+        layer_specs,
+        packed_members,
+        packed_pages,
+    )
+
+    def mla(real, padded):
+        return MLAAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=real,
+            dtype=torch.uint8,
+            page_size_padded=padded,
+        )
+
+    specs = {"a": mla(6, 8), "b": mla(10, 12)}
+    group = KVCacheGroupSpec(
+        ["a", "b"], UniformTypeKVCacheSpecs(block_size=1, kv_cache_specs=specs)
+    )
+    resolved = layer_specs([group])
+    assert resolved == specs
+    storage = torch.zeros(4 * 24, dtype=torch.uint8)
+
+    def placed(offset, page):
+        return torch.empty(0, dtype=torch.uint8).set_(
+            storage.untyped_storage(), offset, (4, page), (24, 1)
+        )
+
+    caches = {"a": placed(0, 8), "b": placed(8, 12)}
+    assert packed_pages(caches, resolved) == {"a": 6, "b": 10}
+    members = packed_members(caches, resolved, ["a", "b"])
+    assert [(m["layers"], m["offsets"], m["page_bytes"], m["real_page_bytes"]) for m in members] == [
+        (1, [0], 8, 6),
+        (1, [8], 12, 10),
+    ]
+    # Overlapping pages, or a page beyond the block, are refused.
+    with pytest.raises(ValueError, match="overlap"):
+        packed_members({"a": placed(0, 8), "b": placed(4, 12)}, resolved, ["a", "b"])
+    with pytest.raises(ValueError, match="overlap"):
+        packed_members({"a": placed(0, 8), "b": placed(16, 12)}, resolved, ["a", "b"])
+    # A layout whose block stride is its page is not packed.
+    plain = {"a": storage[: 4 * 8].view(4, 8)}
+    assert packed_pages(plain, {"a": specs["a"]}) == {"a": 8}
+    assert packed_members(plain, {"a": specs["a"]}, ["a"]) == []
 
 
 def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
@@ -1165,8 +1313,11 @@ def test_runner_uses_native_kv_tensors_only_in_real_mode(monkeypatch, real):
             name,
             lambda self, *args, _name=name, **kwargs: calls.append(_name),
         )
+    from vllm.config import VllmConfig
+
     runner = object.__new__(SimulatedModelRunner)
     runner._real_kv_transfer = real
+    runner.vllm_config = VllmConfig()
     runner.kv_cache_config = type("Config", (), {"kv_cache_groups": [], "num_blocks": 0})
     runner.kv_caches = []
     runner.device = "cpu"

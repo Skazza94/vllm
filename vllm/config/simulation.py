@@ -310,10 +310,29 @@ class SimulationConfig:
                 "data parallelism only as an MoE model's data-parallel attention, "
                 "with expert parallelism"
             )
-        # DeepSeek-V3.2's and V4's MLA is sparse: an indexer picks the tokens.
-        sparse_mla = model.use_mla and (
-            getattr(model.hf_text_config, "index_topk", None) is not None
-            or getattr(model.hf_config, "model_type", None) == "deepseek_v4"
+        # DeepSeek-V3.2's MLA is sparse: an indexer picks the tokens. V4's is
+        # too; its caches (packed FP8 latents, sliding windows, compressor
+        # states) move over NIXL, which keeps each group's own blocks.
+        v4 = getattr(model.hf_config, "model_type", None) == "deepseek_v4"
+        if v4:
+            if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
+                problems.append(
+                    f"NixlConnector for DeepSeek-V4, not {kv_transfer.kv_connector}"
+                )
+            if sizes["TP"] != 1 or sizes["DP"] != 1:
+                problems.append(
+                    f"DeepSeek-V4 on one rank, not TP={sizes['TP']}, DP={sizes['DP']}"
+                )
+            if cache.enable_prefix_caching:
+                problems.append("DeepSeek-V4 without prefix caching")
+            if cache.cache_dtype not in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla"):
+                problems.append(
+                    f"DeepSeek-V4's packed FP8 cache, not {cache.cache_dtype}"
+                )
+        sparse_mla = (
+            model.use_mla
+            and not v4
+            and getattr(model.hf_text_config, "index_topk", None) is not None
         )
         if sparse_mla or model.is_attention_free:
             problems.append(

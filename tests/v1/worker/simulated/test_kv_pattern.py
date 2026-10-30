@@ -1095,3 +1095,56 @@ def test_real_transfers_take_one_mamba2_mixer_a_decoder_layer_without_attention(
     ):
         with pytest.raises(ValueError, match=message):
             check_real_kv_layers(model)
+
+
+def test_packed_blocks_check_each_layers_real_page_at_its_offset():
+    """DeepSeek-V4's packed blocks: each 24-byte block holds both layers'
+    pages (8 bytes at 0, 12 at 8), of which 6 and 10 bytes are real. The
+    pattern lands on the real bytes at their raw offsets, padding and other
+    blocks untouched; a connector moving whole blocks passes the check, a
+    corrupted real byte fails it, a corrupted padding byte does not."""
+    stride, untouched = 24, 0xAB
+    places = {LAYERS[0]: (0, 6), LAYERS[1]: (8, 10)}
+
+    def side():
+        storage = torch.full((4 * stride,), untouched, dtype=torch.uint8)
+        caches = {
+            name: torch.empty(0, dtype=torch.uint8).set_(
+                storage.untyped_storage(), offset, (4, page), (stride, 1)
+            )
+            for name, (offset, page) in places.items()
+        }
+        pages = {name: page for name, (_, page) in places.items()}
+        return storage, block_views(caches, 4, pages)
+
+    prefill_raw, prefill = side()
+    PatternFiller(prefill).after_update(new_request_step(PREFILL_ID, [1, 3]))
+    for logical, block in enumerate([1, 3]):
+        row = prefill_raw[block * stride : (block + 1) * stride]
+        for name, (offset, page) in places.items():
+            assert torch.equal(
+                row[offset : offset + page], pattern(PREFILL_ID, name, logical, page)
+            )
+        assert bool((row[6:8] == untouched).all()) and bool((row[18:] == untouched).all())
+    for block in (0, 2):
+        assert bool((prefill_raw[block * stride : (block + 1) * stride] == untouched).all())
+
+    def received(corrupt=None):
+        decode_raw, decode = side()
+        checker = PatternChecker(decode)
+        checker.before_step(recv_step([2, 3], [1, 3]))
+        # The connector moves whole blocks, padding included.
+        for d_block, p_block in ((2, 1), (3, 3)):
+            decode_raw[d_block * stride : (d_block + 1) * stride] = prefill_raw[
+                p_block * stride : (p_block + 1) * stride
+            ]
+        if corrupt is not None:
+            decode_raw[corrupt] ^= 0xFF
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        return result
+
+    result = received()
+    assert result["ok"], result
+    assert result["bytes"] == 2 * (6 + 10)  # the real pages only
+    assert not received(corrupt=2 * stride + 8 + 3)["ok"]  # layer 1's real byte
+    assert received(corrupt=2 * stride + 7)["ok"]  # padding is not checked
