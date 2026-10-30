@@ -94,6 +94,17 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(hp_tcp["max_outstanding_tasks"], 8192)
         self.assertTrue(all(not t["enable"] for name, t in tent["transports"].items() if name != "hp_tcp"))
 
+    def test_the_kv_cache_dtype_reaches_both_servers(self) -> None:
+        def flag(run: pd.Run, role: str, name: str) -> str:
+            command = pd.server_command(run, role, ["10.100.0.1"])
+            return command[command.index(name) + 1]
+
+        self.assertEqual(flag(RUN, "prefill", "--kv-cache-dtype"), "auto")  # the model's
+        fp8 = pd.Run(**{**RUN.__dict__, "server": pd.Server(kv_cache_dtype="fp8")})
+        for role in ("prefill", "decode"):
+            self.assertEqual(flag(fp8, role, "--kv-cache-dtype"), "fp8")
+            self.assertEqual(flag(fp8, role, "--dtype"), "auto")  # the weights' unchanged
+
     def test_the_platform_may_choose_the_block_size(self) -> None:
         default = pd.server_command(RUN, "prefill", ["10.100.0.1"])
         self.assertEqual(default[default.index("--block-size") + 1], "16")

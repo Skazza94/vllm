@@ -88,6 +88,8 @@ class Server:
     max_num_seqs: int = 32
     tensor_parallel_size: int = 1
     dtype: str = "auto"
+    kv_cache_dtype: str = "auto"
+    """The KV cache dtype (--kv-cache-dtype, e.g. fp8); auto: the model's."""
     hp_tcp_args: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
     timing: str | None = None
@@ -209,7 +211,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     return [
         "env", *(f"{name}={value}" for name, value in env.items()),
         VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(SERVER_PORT),
-        "--served-model-name", MODEL_NAME, "--dtype", s.dtype,
+        "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
         *(["--block-size", str(s.block_size)] if s.block_size is not None else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
