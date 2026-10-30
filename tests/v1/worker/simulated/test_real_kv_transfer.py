@@ -453,7 +453,7 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_real_mode_allows_tensor_and_dp_attention_only_over_mooncake(
+def test_real_mode_allows_tensor_parallelism_and_dp_attention_over_mooncake(
     model_dir, moe_model_dir
 ):
     mooncake = {"kv_connector": "MooncakeConnector"}
@@ -461,9 +461,12 @@ def test_real_mode_allows_tensor_and_dp_attention_only_over_mooncake(
     assert config.parallel_config.tensor_parallel_size == 2
     with pytest.raises(ValueError, match="data-parallel attention at most"):
         engine_config(model_dir, kv_transfer=mooncake, pipeline_parallel_size=2)
-    # NIXL does not check the peer's TP size.
-    with pytest.raises(ValueError, match="MooncakeConnector for tensor or data"):
-        engine_config(model_dir, tensor_parallel_size=2)
+    # NIXL too: its handshake refuses a peer of another TP size.
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        config = engine_config(
+            model_dir, kv_transfer={"kv_connector": connector}, tensor_parallel_size=2
+        )
+        assert config.parallel_config.tensor_parallel_size == 2
     # An MoE model's DP ranks with EP: each holds its own requests' KV.
     config = engine_config(
         moe_model_dir, kv_transfer=mooncake, data_parallel_size=2, enable_expert_parallel=True
@@ -475,8 +478,89 @@ def test_real_mode_allows_tensor_and_dp_attention_only_over_mooncake(
     ):
         with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
             engine_config(model, kv_transfer=mooncake, data_parallel_size=2, **kwargs)
-    with pytest.raises(ValueError, match="MooncakeConnector for tensor or data"):
+    with pytest.raises(ValueError, match="MooncakeConnector for data parallelism"):
         engine_config(moe_model_dir, data_parallel_size=2, enable_expert_parallel=True)
+
+
+@pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (2, 2)])
+def test_real_transfers_pair_equal_tp_sizes_only(model_dir, local_tp, remote_tp):
+    """What NIXL's handshake (and Mooncake's) checks first: real transfers
+    pair equal TP sizes (each rank's pattern is its own); ordinary execution
+    keeps heterogeneous TP."""
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    simulated = engine_config(model_dir, tensor_parallel_size=local_tp)
+    mismatch = simulated_tp_mismatch(simulated, local_tp, remote_tp)
+    if local_tp == remote_tp:
+        assert mismatch is None
+    else:
+        assert f"local TP {local_tp} and remote TP {remote_tp}" in mismatch
+    assert simulated_tp_mismatch(VllmConfig(), local_tp, remote_tp) is None
+
+
+def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
+    monkeypatch, model_dir
+):
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1 import rank_kv
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    def config(backends, addresses=None):
+        extra = {"backends": backends}
+        if addresses is not None:
+            extra["rank_addresses"] = addresses
+        return engine_config(
+            model_dir,
+            kv_transfer={"kv_connector_extra_config": extra},
+            tensor_parallel_size=2,
+        )
+
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setenv(tent_config.ENV, json.dumps({"rpc_server_hostname": "10.100.0.1"}))
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "10.100.0.1")
+    addresses = ["10.100.0.1", "10.101.0.1"]
+
+    _bind_rank_kv_address(config(["Mooncake"]), ["Mooncake"])  # the host's
+    assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.100.0.1"
+    _bind_rank_kv_address(config(["Mooncake"], addresses), ["Mooncake"])
+    assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.101.0.1"
+    conf = json.loads(os.environ[tent_config.ENV])
+    assert tent_config.lookup(conf, "rpc_server_hostname") == (True, "10.101.0.1")
+    assert tent_config.lookup(conf, "transports/hp_tcp/bind_address") == (
+        True,
+        "10.101.0.1",
+    )
+    for backends in (["UCX"], ["Mooncake", "UCX"]):
+        with pytest.raises(ValueError, match="Mooncake backend only"):
+            _bind_rank_kv_address(config(backends, addresses), backends)
+
+    # Simulated transfers (no real KV) and ordinary execution are left alone.
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "10.100.0.1")
+    before = os.environ[tent_config.ENV]
+    simulated = engine_config(
+        model_dir,
+        simulation={"kv_transfer_mode": "simulated"},
+        kv_transfer={"kv_connector_extra_config": {"rank_addresses": addresses}},
+        tensor_parallel_size=2,
+    )
+    ordinary = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"rank_addresses": addresses},
+        )
+    )
+    for vllm_config in (simulated, ordinary):
+        _bind_rank_kv_address(vllm_config, ["UCX"])
+        assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.100.0.1"
+        assert os.environ[tent_config.ENV] == before
 
 
 @pytest.mark.parametrize(

@@ -396,11 +396,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
   sparse-MLA, chunked local or RSWA attention models, nor speculative
   decoding.
-* One rank per instance, or, over `MooncakeConnector` only:
+* One rank per instance, or:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
-      holds;
-    * an MoE model's data-parallel attention with expert parallelism
+      holds; a peer of another size is refused at the handshake;
+    * over `MooncakeConnector` only, an MoE model's data-parallel attention with expert parallelism
       (`--data-parallel-size N --enable-expert-parallel`): each DP rank holds
       its own requests' KV; the proxy pins a request's prefill DP rank, and
       decode's load balancer picks its own, so the instances' DP sizes may
@@ -424,7 +424,11 @@ once, as the connector registers it.
 
 `MooncakeConnector` takes one KV address per rank in its extra config,
 `"rank_addresses": [...]` (IPv4), so each rank can use a NIC of its own: its
-handshakes, TENT's RPC server and `hp_tcp` bind there. The list holds the
+handshakes, TENT's RPC server and `hp_tcp` bind there. So does
+`NixlConnector` over NIXL's Mooncake backend alone (`"backends":
+["Mooncake"]`): each rank's backend segment and `hp_tcp` bind to its
+address, while NIXL's handshake stays on the instance's side channel
+(`VLLM_NIXL_SIDE_CHANNEL_HOST`). The list holds the
 ranks of an engine, by TP rank; an MoE model's DP engines on one host share
 it, local DP rank by TP rank (`local_kv_rank`), and so must be launched
 together. Each rank's transfer engine serves TENT's metrics on the base port

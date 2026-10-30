@@ -46,12 +46,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _pp_mismatch_hides_packed_layers,
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
+    should_launch_bootstrap_server,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1 import rank_kv
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     bind_hp_tcp,
     local_kv_rank,
     rank_kv_address,
-    this_rank_kv_address,
-    should_launch_bootstrap_server,
     simulated_tp_mismatch,
+    this_rank_kv_address,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
@@ -3153,8 +3156,8 @@ def test_an_engine_launched_alone_needs_no_addresses(monkeypatch):
         mooncake_connector,
     )
 
-    monkeypatch.setattr(mooncake_connector, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(mooncake_connector, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_world_size", lambda: 2)
     assert this_rank_kv_address(_dp_state(2, 1, 1)) is None
     with pytest.raises(ValueError, match="local DP rank 1 is not one of its 1"):
         this_rank_kv_address(_dp_state(2, 1, 1, ["10.100.0.1", "10.101.0.1"]))
@@ -3222,6 +3225,8 @@ def test_a_worker_uses_its_rank_address(monkeypatch):
         patch(f"{module}.TransferEngine", RecordingEngine),
         patch(f"{module}.get_tensor_model_parallel_rank", return_value=1),
         patch(f"{module}.get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(rank_kv, "get_tensor_model_parallel_rank", return_value=1),
+        patch.object(rank_kv, "get_tensor_model_parallel_world_size", return_value=2),
         patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
     ):
         worker = MooncakeConnector(

@@ -62,6 +62,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     kv_lease_extension,
     zmq_ctx,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    bind_hp_tcp,
+    simulated_tp_mismatch,
+    this_rank_kv_address,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
     derive_mamba_conv_split,
@@ -124,6 +129,32 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     block_strides = {cache.stride(0) * cache.element_size() for cache in caches}
     storage_ptrs = {cache.untyped_storage().data_ptr() for cache in caches}
     return len(block_strides) == len(storage_ptrs) == 1
+
+
+def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> None:
+    """With ``rank_addresses`` in the connector's extra config (real KV
+    transfers under simulated execution), this rank's own address carries
+    its KV: NIXL's Mooncake backend registers its segment there
+    (NIXL_MOONCAKE_IP_ADDR, read when the backend is created) and TENT's
+    hp_tcp binds there, as MooncakeConnector's ranks do. Other backends are
+    not bound, so are refused. The handshake stays on the instance's
+    side channel."""
+    sim = vllm_config.simulation_config
+    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+        return
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    if kv_transfer_config.kv_connector_extra_config.get("rank_addresses") is None:
+        return
+    if list(backends) != ["Mooncake"]:
+        raise ValueError(
+            "rank_addresses binds NIXL's Mooncake backend only, not backends "
+            f"{backends}."
+        )
+    address = this_rank_kv_address(vllm_config)
+    assert address is not None
+    os.environ["NIXL_MOONCAKE_IP_ADDR"] = address
+    bind_hp_tcp(address)
 
 
 def _reserve_cores_for_kv(vllm_config: "VllmConfig") -> None:
@@ -760,6 +791,7 @@ class NixlBaseConnectorWorker:
         sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
         if sleep_mode:
             config = nixl_agent_config(backends=[], capture_telemetry=True)
+        _bind_rank_kv_address(vllm_config, self.nixl_backends)
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         if sleep_mode:
             # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
@@ -1115,6 +1147,12 @@ class NixlBaseConnectorWorker:
         notif_agents_only: bool = False,
     ) -> tuple[dict[tuple[int, int], str], float]:
         """Do a NIXL handshake with a remote instance."""
+        # Before any remote agent is added: a failed handshake fails the
+        # requests waiting on it.
+        if mismatch := simulated_tp_mismatch(
+            self.vllm_config, self.world_size, remote_tp_size
+        ):
+            raise RuntimeError(mismatch)
         if self._is_csa_linear:
             self._validate_csa_linear_tp_layout(remote_tp_size)
 

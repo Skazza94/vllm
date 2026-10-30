@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import ipaddress
 import itertools
 import logging
 import os
@@ -44,7 +43,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    bind_hp_tcp,
+    simulated_tp_mismatch,
+    this_rank_kv_address,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -150,110 +153,6 @@ def _block_ids_for_region(
         "Transfer region references a missing KV group."
     )
     return list(block_ids_by_group[group_index])
-
-
-def local_kv_rank(vllm_config: VllmConfig, tp_rank: int, tp_size: int) -> tuple[int, int]:
-    """This rank's place in ``rank_addresses``, and their count. An engine
-    of its own (no DP, or a dense model's independent DP engine, which runs
-    as DP=1) lists its TP ranks; an MoE model's DP engines on one host list
-    theirs in turn, local DP rank by TP rank."""
-    parallel_config = vllm_config.parallel_config
-    if parallel_config.data_parallel_size == 1:
-        return tp_rank, tp_size
-    dp_local_rank = parallel_config.data_parallel_rank_local or 0
-    dp_local_size = parallel_config.data_parallel_size_local
-    if not 0 <= dp_local_rank < dp_local_size:
-        # An engine launched on its own (offline MoE DP) keeps its host-local
-        # rank among engines its configuration does not count.
-        raise ValueError(
-            f"rank_addresses needs this host's MoE DP engines launched "
-            f"together: local DP rank {dp_local_rank} is not one of its "
-            f"{dp_local_size} local engines."
-        )
-    return dp_local_rank * tp_size + tp_rank, dp_local_size * tp_size
-
-
-def this_rank_kv_address(vllm_config: VllmConfig) -> str | None:
-    """`rank_kv_address` of this worker's rank, None without
-    ``rank_addresses``."""
-    kv_transfer_config = vllm_config.kv_transfer_config
-    assert kv_transfer_config is not None
-    if kv_transfer_config.kv_connector_extra_config.get("rank_addresses") is None:
-        return None
-    return rank_kv_address(
-        kv_transfer_config,
-        *local_kv_rank(
-            vllm_config,
-            get_tensor_model_parallel_rank(),
-            get_tensor_model_parallel_world_size(),
-        ),
-    )
-
-
-def rank_kv_address(
-    kv_transfer_config: KVTransferConfig, rank: int, ranks: int
-) -> str | None:
-    """This rank's own address, from ``rank_addresses`` in the connector's
-    extra config (one IPv4 address per rank of the instance on this host,
-    as `local_kv_rank` orders them, the same for every PP stage): its
-    handshakes and TENT's hp_tcp use it, so each rank can have a NIC of
-    its own. None without it: the host's."""
-    addresses = kv_transfer_config.kv_connector_extra_config.get("rank_addresses")
-    if addresses is None:
-        return None
-    if not isinstance(addresses, list) or len(addresses) != ranks:
-        raise ValueError(
-            "rank_addresses needs one address per rank on this host (local "
-            f"DP ranks x TP ranks: {ranks}), got {addresses!r}."
-        )
-    for address in addresses:
-        # IPv4Address() also takes integers.
-        try:
-            if not isinstance(address, str):
-                raise ValueError
-            ipaddress.IPv4Address(address)
-        except ValueError:
-            raise ValueError(
-                f"rank_addresses: {address!r} is not an IPv4 address."
-            ) from None
-    return addresses[rank]
-
-
-def bind_hp_tcp(address: str) -> None:
-    """Make TENT in this process use `address` only: its RPC server (control
-    metadata) and hp_tcp's listening, advertised and sending address (its
-    MC_TENT_CONF; other settings kept). TENT does not derive its RPC host
-    from initialize()'s hostname, and MOONCAKE_LOCAL_HOSTNAME overrides the
-    config's."""
-    conf = tent_config.load() or {}
-    if "MOONCAKE_LOCAL_HOSTNAME" in os.environ:
-        os.environ["MOONCAKE_LOCAL_HOSTNAME"] = address
-    for key, value in (
-        ("rpc_server_hostname", address),
-        ("transports/hp_tcp/bind_address", address),
-        ("transports/hp_tcp/advertise_address", address),
-        ("transports/hp_tcp/rail_addresses", [address]),
-    ):
-        tent_config.store(conf, key, value)
-    tent_config.save(conf)
-
-
-def simulated_tp_mismatch(
-    vllm_config: VllmConfig, local_tp_size: int, remote_tp_size: int
-) -> str | None:
-    """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
-    real KV transfers under simulated compute pair ranks of equal sizes only."""
-    sim = vllm_config.simulation_config
-    if (
-        sim.simulate_forward
-        and sim.kv_transfer_mode == "real"
-        and local_tp_size != remote_tp_size
-    ):
-        return (
-            "Simulated real KV transfers pair equal tensor-parallel sizes, not "
-            f"local TP {local_tp_size} and remote TP {remote_tp_size}."
-        )
-    return None
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:

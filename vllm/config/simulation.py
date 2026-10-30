@@ -293,8 +293,9 @@ class SimulationConfig:
         }
         model = vllm_config.model_config
         # Tensor parallelism: each rank moves its own KV heads, to the
-        # matching rank of an instance of the same TP size (the connector
-        # checks the peer's). Data-parallel attention (an MoE model's DP
+        # matching rank of an instance of the same TP size (either connector
+        # refuses a peer of another, `simulated_tp_mismatch`: their patterns
+        # differ). Data-parallel attention (an MoE model's DP
         # ranks, with expert parallelism): each DP rank holds its own
         # requests' KV, paired with whichever DP rank serves the request on
         # the other instance.
@@ -309,13 +310,9 @@ class SimulationConfig:
                 "data parallelism only as an MoE model's data-parallel attention, "
                 "with expert parallelism"
             )
-        if (sizes["TP"] > 1 or sizes["DP"] > 1) and (
-            kv_transfer.kv_connector != "MooncakeConnector"
-        ):
-            # Only Mooncake checks the peer's TP size (simulated_tp_mismatch):
-            # NIXL would pair unequal ranks, whose patterns differ.
+        if sizes["DP"] > 1 and kv_transfer.kv_connector != "MooncakeConnector":
             problems.append(
-                "MooncakeConnector for tensor or data parallelism, not "
+                "MooncakeConnector for data parallelism, not "
                 f"{kv_transfer.kv_connector}"
             )
         # DeepSeek-V3.2's and V4's MLA is sparse: an indexer picks the tokens.
