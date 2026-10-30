@@ -154,6 +154,19 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     local_block_ids = self.get_exchange_clipped_blocks(
                         unhashed_local_block_ids
                     )
+                    if local_block_ids:
+                        # The blocks pulled end each group's blocks (null
+                        # blocks pad a sliding window's head): where they
+                        # start there.
+                        self._recv_first_block_indices[request.request_id] = tuple(
+                            len(group) - len(pulled)
+                            for group, pulled in zip(
+                                self.kv_cache_config.select_transfer_block_ids(
+                                    blocks.get_block_ids()
+                                ),
+                                local_block_ids,
+                            )
+                        )
                     # Blocks covered by the local prefix cache, per KV cache group.
                     # Each count fixes where that group's DCP slice starts, which the
                     # worker needs to line up with the remote's slice.

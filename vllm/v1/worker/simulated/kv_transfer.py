@@ -522,13 +522,15 @@ def requested_reads(metadata: object) -> list[RequestedRead]:
                 reads.append(RequestedRead(req_id, groups, remote, list(first)))
         elif value.remote is not None:  # NIXL
             groups = [list(group) for group in value.local_block_ids]
-            computed = value.local_num_computed_blocks
+            # Where the scheduler placed the pull (a window's clipped head
+            # included), else its prefix hit.
+            first = value.local_first_block_indices or value.local_num_computed_blocks
             reads.append(
                 RequestedRead(
                     key,
                     groups,
                     value.remote.request_id,
-                    list(computed) if computed else [0] * len(groups),
+                    list(first) if first else [0] * len(groups),
                 )
             )
     return reads

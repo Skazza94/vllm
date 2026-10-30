@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
 
 from .utils import (
     create_request,
+    create_scheduler,
     create_vllm_config,
     expand_strided_descs,
     make_kv_cache_config,
@@ -383,6 +384,7 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     scheduler._reqs_in_batch = set()
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_recv = {}
+    scheduler._recv_first_block_indices = {}
     scheduler.use_host_buffer = False
     scheduler.is_bidirectional_kv_xfer_enabled = False
     scheduler._is_hma_required = False
@@ -437,6 +439,7 @@ def test_full_local_hit_is_not_awaited_by_the_scheduler():
     scheduler._reqs_in_batch = set()
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_recv = {}
+    scheduler._recv_first_block_indices = {}
     scheduler.use_host_buffer = False
     scheduler.is_bidirectional_kv_xfer_enabled = False
     scheduler._is_hma_required = False
@@ -2442,3 +2445,81 @@ def test_sync_recved_kv_issues_one_copy_per_request(group_block_ids, expected_id
     worker.sync_recved_kv_to_device("req", meta)
 
     assert calls == [(expected_ids, expected_ids, "h2d")]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "window,num_tokens,window_first,window_held",
+    [
+        (64, 40, 0, 3),  # within the window: every block
+        # 320 tokens, 20 blocks: the next token's 64-token window skips the
+        # first 16 blocks (null); the 4 after them are pulled.
+        (64, 320, 16, 4),
+        # 325 tokens, 21 blocks: still 16 null; 5, the clip's cdiv(64, 16) + 1.
+        (64, 325, 16, 5),
+        (1, 320, 20, 0),  # a 1-token window skips the aligned prompt whole
+    ],
+)
+def test_pulls_say_where_each_groups_blocks_start(
+    window, num_tokens, window_first, window_held
+):
+    """A consumer pulls a sliding window's last blocks only; the pull says
+    where each group's pulled blocks start among the request's blocks (null
+    blocks padding a window's head), apart from its prefix hit."""
+    from vllm.v1.worker.simulated.kv_transfer import requested_reads
+
+    block_size = 16
+    vllm_config = create_vllm_config(
+        kv_connector="NixlConnector",
+        kv_role="kv_consumer",
+        block_size=block_size,
+        disable_hybrid_kv_cache_manager=False,
+    )
+    kv_cache_config = make_kv_cache_config(
+        block_size=block_size, swa_enabled=True, sw_size=window, num_blocks=1000
+    )
+    scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=num_tokens,
+        do_remote_prefill=True,
+    )
+    scheduler.add_request(request)
+
+    metadata = scheduler.schedule().kv_connector_metadata
+    pull = metadata.reqs_to_recv[request.request_id]
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    held = [
+        [block.block_id for block in manager.req_to_blocks[request.request_id]]
+        for manager in managers
+    ]
+    total = -(-num_tokens // block_size)
+    assert [len(blocks) for blocks in held] == [total, total]
+    assert pull.local_first_block_indices == (0, window_first)
+    assert pull.local_num_computed_blocks == (0, 0)  # no prefix hit
+    for blocks, first, pulled in zip(
+        held, pull.local_first_block_indices, pull.local_block_ids
+    ):
+        assert blocks[first:] == list(pulled)
+    assert all(block == 0 for block in held[1][: min(window_first, 16)])
+    assert sum(1 for block in pull.local_block_ids[1] if block) == window_held
+    (read,) = requested_reads(metadata)
+    assert read.first_logical_blocks == [0, window_first]
+
+
+@pytest.mark.cpu_test
+def test_a_notification_only_pull_places_no_blocks():
+    """A pull of nothing (a full prefix hit, or an aborted request) only
+    frees the producer's blocks: no group places any."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="r",
+        local_block_ids=[],
+        kv_transfer_params=create_request(do_remote_prefill=True).kv_transfer_params,
+    )
+    assert metadata.reqs_to_recv["r"].local_first_block_indices == ()

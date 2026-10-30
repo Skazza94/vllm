@@ -253,6 +253,10 @@ class ReqMeta:
     # the remote's; kept per-group since hybrid models (e.g. SWA+FA) can have
     # different cache-hit counts per group.
     local_num_computed_blocks: tuple[int, ...] = ()
+    # Per transfer group, where the pulled blocks start among the request's
+    # blocks of that group: after a prefix hit, or a sliding window's head
+    # (null blocks) that is not pulled. Empty: not recorded.
+    local_first_block_indices: tuple[int, ...] = ()
     remote: RemoteMeta | None = None
     # Remote block size, discovered during NIXL handshake (push mode).
     remote_block_size: int | None = None
@@ -294,6 +298,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
+        local_first_block_indices: tuple[int, ...] = (),
     ) -> ReqMeta:
         return ReqMeta(
             local_block_ids=local_block_ids,
@@ -305,6 +310,7 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             pp_size=kv_transfer_params.get("pp_size", 1),
             local_num_computed_blocks=local_num_computed_blocks,
             awaiting_kvs=awaiting_kvs,
+            local_first_block_indices=local_first_block_indices,
         )
 
     def add_new_req_to_save(
@@ -324,12 +330,14 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_num_computed_blocks: tuple[int, ...] = (),
         awaiting_kvs: bool = False,
+        local_first_block_indices: tuple[int, ...] = (),
     ):
         req = self._add_new_req(
             local_block_ids,
             kv_transfer_params,
             local_num_computed_blocks,
             awaiting_kvs,
+            local_first_block_indices,
         )
         req.remote = RemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],

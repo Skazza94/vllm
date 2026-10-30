@@ -396,14 +396,14 @@ def test_real_mode_accepts_moe_and_dense_mla_models(moe_model_dir, mla_model_dir
         engine_config(str(tmp_path))
 
 
-def test_real_mode_takes_sliding_window_models_over_mooncake_only(gpt_oss_model_dir):
-    config = engine_config(
-        gpt_oss_model_dir, kv_transfer={"kv_connector": "MooncakeConnector"}
-    )
-    assert config.model_config.get_sliding_window() == 32
-    # NIXL's plan is not followed group by group.
-    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window"):
-        engine_config(gpt_oss_model_dir)
+def test_real_mode_takes_sliding_window_models_over_either_connector(
+    gpt_oss_model_dir,
+):
+    for connector in ("MooncakeConnector", "NixlConnector", "NixlPullConnector"):
+        config = engine_config(
+            gpt_oss_model_dir, kv_transfer={"kv_connector": connector}
+        )
+        assert config.model_config.get_sliding_window() == 32
 
 
 def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
@@ -416,7 +416,7 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
     # A state per block (align mode) is not modeled, byte checks or not.
     with pytest.raises(ValueError, match="hybrid model without prefix caching"):
         engine_config(qwen3_next_model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
-    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window or hybrid"):
+    with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
         engine_config(qwen3_next_model_dir)
 
 
@@ -431,7 +431,7 @@ def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
         engine_config(
             nemotron_h_model_dir, kv_transfer=mooncake, enable_prefix_caching=True
         )
-    with pytest.raises(ValueError, match="MooncakeConnector for a sliding-window"):
+    with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
         engine_config(nemotron_h_model_dir)
 
 

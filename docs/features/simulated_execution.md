@@ -382,10 +382,11 @@ instances, so transfers take their actual time over the actual network. It
 needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 
 * Full-attention models, dense or MoE (experts hold no KV), and dense MLA
-  models (one latent per token and layer); over `MooncakeConnector`,
-  sliding-window attention too, alone or beside full attention (each layer
-  kind a KV cache group, groups sharing memory, a block being one group's at
-  a time): Mooncake moves each window's last blocks only; and over
+  models (one latent per token and layer); sliding-window attention too,
+  alone or beside full attention (each layer kind a KV cache group, groups
+  sharing memory, a block being one group's at a time): either connector
+  moves each window's last blocks only, and says where they start among
+  the request's blocks (NIXL: `local_first_block_indices`); and over
   `MooncakeConnector` without prefix caching, hybrid models of Qwen's gated
   delta-net (Qwen3-Next, Qwen3.5) or of Mamba2 (`MambaMixer2`: Nemotron-H,
   Granite-4.0-H): each request's state is one block of its recurrent groups

@@ -120,6 +120,9 @@ class NixlBaseConnectorScheduler:
         self._reqs_need_recv: dict[
             ReqId, tuple[Request, BlockIds, tuple[int, ...], bool]
         ] = {}
+        # Where each pull's blocks start in their groups (ReqMeta's
+        # local_first_block_indices), by request.
+        self._recv_first_block_indices: dict[ReqId, tuple[int, ...]] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
@@ -494,6 +497,9 @@ class NixlBaseConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
                 local_num_computed_blocks=cached,
                 awaiting_kvs=awaiting_kvs,
+                local_first_block_indices=self._recv_first_block_indices.pop(
+                    req_id, ()
+                ),
             )
 
         if self.use_host_buffer:
@@ -516,6 +522,7 @@ class NixlBaseConnectorScheduler:
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
+        self._recv_first_block_indices.clear()
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}

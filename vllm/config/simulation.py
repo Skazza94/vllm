@@ -234,8 +234,8 @@ class SimulationConfig:
         no KV), or of a dense MLA one (one latent per token and layer, which
         every tensor-parallel rank holds whole), on one rank, tensor-parallel
         ones, or an MoE model's data-parallel ranks with expert parallelism.
-        Sliding-window layers, alone or beside full-attention ones, over
-        Mooncake, which moves each window's blocks only; Qwen gated
+        Sliding-window layers, alone or beside full-attention ones, of which
+        either connector moves each window's blocks only; Qwen gated
         delta-net or Mamba2 layers (a hybrid model's) over Mooncake, without
         prefix caching, each request's state one block. The native connector
         stays in place."""
@@ -321,15 +321,12 @@ class SimulationConfig:
                 "or sliding-window attention, Qwen gated delta-nets or Mamba2 "
                 "mixers (no sparse MLA or attention-free models)"
             )
-        elif (
-            model.get_sliding_window() is not None or model.is_hybrid
-        ) and kv_transfer.kv_connector != "MooncakeConnector":
-            # Only Mooncake's plan is followed group by group: a sliding
-            # window's blocks are clipped to the window on both sides, a
-            # recurrent layer's state is one block.
+        elif model.is_hybrid and kv_transfer.kv_connector != "MooncakeConnector":
+            # Only Mooncake's plan is followed for a recurrent layer's state,
+            # one block. Both connectors clip a sliding window's blocks to
+            # the window and say where the pull starts.
             problems.append(
-                "MooncakeConnector for a sliding-window or hybrid model, not "
-                f"{kv_transfer.kv_connector}"
+                f"MooncakeConnector for a hybrid model, not {kv_transfer.kv_connector}"
             )
         if model.is_hybrid and (
             cache.enable_prefix_caching or cache.mamba_cache_mode != "none"
