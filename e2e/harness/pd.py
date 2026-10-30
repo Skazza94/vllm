@@ -559,7 +559,8 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
     blocks times its layers times the layout's block bytes. Otherwise each
     check has blocks, bytes and nested results covering each KV cache group
     once, its blocks and bytes their sums; each group holds blocks (with
-    prefix caching off a pull has some of every group), its bytes being
+    prefix caching off a pull has some of every group, but a 1-token
+    window's of a block-aligned prompt, all skipped), its bytes being
     its blocks times its layers' block bytes; a window pulls its last
     blocks only (Mooncake's cdiv(window, block) + 1), other attention from
     the first, all of the request's prompt (`prompts`, by decode's request
@@ -600,16 +601,25 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             spec = groups[g["group"]] if 0 <= g["group"] < len(groups) else None
             if spec is None:
                 continue
-            if g["blocks"] < 1:
+            window = spec.get("sliding_window")
+            prompt = (prompts or {}).get(request)
+            # A hybrid's decoder computes the last of N > 1 tokens; one
+            # token's pages are pulled whole, the token computed again.
+            tokens = prompt - 1 if hybrid and prompt is not None and prompt > 1 else prompt
+            # The next token's 1-token window skips a block-aligned prompt whole.
+            skipped = window == 1 and tokens is not None and tokens % spec["block_size"] == 0
+            if skipped and (g["blocks"], g["first_logical_block"]) != (0, tokens // spec["block_size"]):
+                problems.append(f"{request}'s 1-token window group {g['group']} checked {g['blocks']} blocks from "
+                                f"{g['first_logical_block']}, not 0 from {tokens // spec['block_size']} (a "
+                                f"block-aligned prompt's end)")
+            elif g["blocks"] < 1 and not skipped:
                 problems.append(f"{request}'s group {g['group']} checked no blocks")
             if (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["layers"] * spec["block_bytes"]):
                 problems.append(f"{request}'s group {g['group']} check disagrees with the layout "
                                 f"({spec['layers']} layers of {spec['block_bytes']} bytes a block)")
-            window = spec.get("sliding_window")
             if window is None and g["first_logical_block"] != 0:
                 problems.append(f"{request}'s group {g['group']} ({spec.get('kind')}) was pulled from block "
                                 f"{g['first_logical_block']}, not 0")
-            prompt = (prompts or {}).get(request)
             if spec.get("kind") == "MambaSpec":
                 if g["blocks"] != 1:
                     problems.append(f"{request}'s state group {g['group']} checked {g['blocks']} blocks, not 1")
@@ -617,9 +627,6 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                 problems.append(f"{request}'s group {g['group']} pages cannot be checked: decode logged no "
                                 "steps of it")
             elif window is None:
-                # A hybrid's decoder computes the last of N > 1 tokens; one
-                # token's pages are pulled whole, the token computed again.
-                tokens = prompt - 1 if hybrid and prompt > 1 else prompt
                 if g["blocks"] != -(-tokens // spec["block_size"]):
                     problems.append(f"{request}'s group {g['group']} checked {g['blocks']} blocks, not the "
                                     f"cdiv({tokens}, {spec['block_size']}) of its prompt")
@@ -629,7 +636,9 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                     problems.append(f"{request}'s window group {g['group']} pulled {g['blocks']} blocks, "
                                     f"more than its window's {bound}")
                 clipped[g["group"]] += g["first_logical_block"] > 0
-            if plan is not None and plan.get(g["group"]) != (g["first_logical_block"], g["blocks"]):
+            # A pull posts no entry for a group it pulls nothing of.
+            if plan is not None and plan.get(g["group"], (tokens // spec["block_size"], 0) if skipped else None) != (
+                    g["first_logical_block"], g["blocks"]):
                 first, blocks = plan.get(g["group"]) or (None, 0)
                 problems.append(f"{request}'s group {g['group']} checked {g['blocks']} block(s) from "
                                 f"{g['first_logical_block']}, not the pull's {blocks} from {first}")

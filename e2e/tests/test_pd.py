@@ -284,6 +284,58 @@ class GroupCheckTests(unittest.TestCase):
         self.assertTrue(any("cmpl-a-0-d's group 1 checked no blocks" in p for p in problems), problems)
         self.assertTrue(any("not the pull's 0 from None" in p for p in problems), problems)
 
+    def test_a_one_token_window_pulls_none_of_a_block_aligned_prompt(self) -> None:
+        # The next token's window skips the 1024-token prompt whole: the pull
+        # posts no window entry and checks none of its blocks.
+        def verdict(window_blocks: int) -> dict:
+            layout = GROUPS_LAYOUT.replace('"sliding_window": 32', '"sliding_window": 1')
+            checks = [grouped(r, window=(64, window_blocks)) for r in ("a", "b")]
+            entries = [{"group": 1, "first": 0, "blocks": list(range(10, 74))}]
+            if window_blocks:
+                entries.insert(0, {"group": 0, "first": 64, "blocks": list(range(window_blocks))})
+            pulls = "".join(line(kv_events={"reads_posted": [f"cmpl-{r}-0-d"],
+                                            "allocated_groups": {f"cmpl-{r}-0-d": entries}}) for r in ("a", "b"))
+            moved = sum(c["bytes"] for c in checks)
+            prefill = (layout + allocated("a", "b")
+                       + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
+            decode = layout + pulls + FIRST_STEPS + "".join(line(kv_check=c) for c in checks)
+            return pd.check({"completed": 2, "errors": []}, [prefill], [decode],
+                            {"control": 50, "data0": moved + 100}, RUN)
+
+        self.assertEqual(verdict(0)["problems"], [])
+        problems = verdict(1)["problems"]
+        self.assertTrue(any("1-token window group 0 checked 1 blocks from 64, not 0 from 64" in p
+                            for p in problems), problems)
+
+    def test_a_skipped_window_starts_at_the_prompts_end(self) -> None:
+        # The empty group's first block is the prompt's end, cdiv'd: tokens
+        # over block size, N - 1 tokens for a hybrid; its pull posts no
+        # entry or an empty one.
+        window = {"kind": "SlidingWindowSpec", "sliding_window": 1, "block_size": 16, "layers": 2,
+                  "block_bytes": 4}
+        full = {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
+                "block_bytes": 4}
+        state = {"kind": "MambaSpec", "sliding_window": None, "block_size": 4096, "layers": 2, "block_bytes": 4}
+
+        def problems(groups: list[dict], prompt: int, first: int, posted: dict) -> list[str]:
+            nested = [group_check(0, first, 0)] + [
+                group_check(1, 0, 1 if groups[1] is state else -(-prompt // 16))]
+            check = checked("a", blocks=sum(g["blocks"] for g in nested), layers=4,
+                            bytes=sum(g["bytes"] for g in nested), groups=nested)
+            plan = {"cmpl-a-0-d": {1: (0, nested[1]["blocks"]), **posted}}
+            return pd._byte_check_problems({"groups": groups}, [check], prompt, plan, {"cmpl-a-0-d": prompt})
+
+        self.assertEqual(problems([window, full], 1024, 64, {}), [])
+        self.assertEqual(problems([window, full], 1024, 64, {0: (64, 0)}), [])
+        bogus = problems([window, full], 1024, 999, {})
+        self.assertTrue(any("checked 0 blocks from 999, not 0 from 64" in p for p in bogus), bogus)
+        posted = problems([window, full], 1024, 999, {0: (999, 0)})
+        self.assertTrue(any("not 0 from 64" in p for p in posted), posted)
+        # A hybrid's 33-token prompt hands 32 tokens over: aligned, first 2.
+        self.assertEqual(problems([window, state], 33, 2, {}), [])
+        hybrid = problems([window, state], 33, 3, {})
+        self.assertTrue(any("not 0 from 2" in p for p in hybrid), hybrid)
+
 
 # Qwen3-Next-like: a gated delta-net's state group (one 8-byte padded page a
 # layer, 6 real) and a full-attention group of 16-token blocks, 2 layers
