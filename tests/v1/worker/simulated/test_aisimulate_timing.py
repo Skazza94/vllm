@@ -425,6 +425,54 @@ def test_dp_attention_with_expert_parallelism_is_mapped(fake_aisimulate):
     ) == (1, 8, 1, 8)
 
 
+def test_startup_probes_cover_a_prefill_and_a_decode_step(fake_aisimulate):
+    p = provider(engine_config())
+    prefill, decode = fake_aisimulate.instances[0].queries
+    assert prefill["scheduled_requests"]["sum_prefill_tokens"] == 1024
+    assert decode["scheduled_requests"]["num_decode_requests"] == 4
+    record = p.assumptions()["aisimulate"]["startup_probes"]
+    assert [(r["kind"], r["ms"]) for r in record] == [("prefill", 7.0), ("decode", 7.0)]
+    saved = record[0]["metrics"]["scheduled_requests"]
+    assert (saved["extend_lengths"], saved["past_kv_lengths"]) == ([1024], [0])
+    saved = record[1]["metrics"]["scheduled_requests"]
+    assert (saved["extend_lengths"], saved["past_kv_lengths"]) == ([1] * 4, [1024] * 4)
+    # Data-parallel attention: rank 0 busy, the others idle, in order.
+    p = provider(engine_config(data_parallel_size=4, enable_expert_parallel=True))
+    saved = p.assumptions()["aisimulate"]["startup_probes"][0]["metrics"]
+    busy = [r["scheduled_requests"]["num_prefill_requests"] for r in saved]
+    assert busy == [1, 0, 0, 0]
+    assert fake_aisimulate.instances[1].queries[0] == saved
+
+
+def test_unresolved_v4_geometry_has_no_fallback(fake_aisimulate):
+    from vllm.v1.worker.simulated.aisimulate_timing import V4_FIELDS, _geometry
+
+    config = HfConfig({name: 1 for name in V4_FIELDS if name != "head_dim"})
+    config["hidden_size"] = 4096
+    with pytest.raises(ValueError, match="head_dim"):
+        _geometry(config, V4_FIELDS)
+
+
+@pytest.mark.parametrize("ms", [None, math.nan, 0.0])
+def test_a_failing_startup_probe_is_refused(fake_aisimulate, monkeypatch, ms):
+    monkeypatch.setattr(fake_aisimulate, "ms", ms)
+    with pytest.raises(ValueError, match="for a prefill step"):
+        provider(engine_config())
+
+
+def test_an_estimator_without_data_for_the_shapes_is_refused(
+    fake_aisimulate, monkeypatch
+):
+    def missing(self, metrics):
+        raise RuntimeError("perf database error: MoE data missing")
+
+    monkeypatch.setattr(fake_aisimulate, "estimate_forward_pass_time_ms", missing)
+    with pytest.raises(
+        ValueError, match="cannot time a prefill step.*MoE data missing"
+    ):
+        provider(engine_config())
+
+
 def test_an_unready_estimator_is_refused(fake_aisimulate, monkeypatch):
     monkeypatch.setattr(fake_aisimulate, "readiness", "unsupported_config")
     monkeypatch.setattr(fake_aisimulate, "source", "fallback_regression")
@@ -466,7 +514,7 @@ def test_a_step_becomes_one_workload(fake_aisimulate):
         sim_req("decode2", 1, 1000, 900),
     )
     cost = p.estimate(step)
-    (query,) = fake_aisimulate.instances[0].queries
+    _, _, query = fake_aisimulate.instances[0].queries  # two startup probes first
     work = query["scheduled_requests"]
     assert (work["num_prefill_requests"], work["sum_prefill_tokens"]) == (3, 1001)
     assert work["sum_prefill_kv_tokens"] == 512 + 1023
@@ -493,7 +541,7 @@ def test_data_parallel_ranks_are_passed_in_order_idle_included(fake_aisimulate):
         on_rank(sim_req("c", 1, 300, 50), 2),
     )
     p.estimate(step)
-    (query,) = fake_aisimulate.instances[0].queries
+    _, _, query = fake_aisimulate.instances[0].queries  # two startup probes first
     assert isinstance(query, list) and len(query) == 4
     counts = [
         (
@@ -510,7 +558,7 @@ def test_data_parallel_ranks_are_passed_in_order_idle_included(fake_aisimulate):
 def test_an_empty_step_costs_nothing_without_a_query(fake_aisimulate):
     p = provider(engine_config())
     assert p.estimate(sim_step(0)).device_s == 0.0
-    assert not fake_aisimulate.instances[0].queries
+    assert len(fake_aisimulate.instances[0].queries) == 2  # the startup probes only
 
 
 @pytest.mark.parametrize("ms", [None, math.nan, math.inf, -1.0])
@@ -785,5 +833,143 @@ def test_an_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
         assert timing["aisimulate"]["source"] == "aic"
         steps = [r for r in records if "step" in r]
         assert steps and all(r["cost"]["breakdown"]["aisimulate_ms"] > 0 for r in steps)
+    finally:
+        del llm
+
+
+V4 = "deepseek-ai/DeepSeek-V4-Flash"
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_deepseek_v4_ratios_are_compared_as_the_native_helper_resolves_them(
+    tmp_path,
+):
+    published = bundled_config(V4)
+    p = provider(
+        real_engine_config(tmp_path, "deepseek-ai--DeepSeek-V4-Flash", published),
+        gpu="b200",
+    )
+    record = p.assumptions()["aisimulate"]
+    assert record["compared_geometry"]["compress_ratios"][:4] == [0, 0, 4, 128]
+    assert (record["expert_dtype"], p.config["moe_quant_mode"]) == (
+        "fp4",
+        "w4a8_mxfp4_mxfp8",
+    )
+    assert (record["kv_cache_format"], p.config["kvcache_quant_mode"]) == (
+        "fp8_ds_mla",
+        "fp8",
+    )
+    # The legacy spelling: layer 2's ratio 4 -> 128.
+    legacy = {**published, "compress_ratios": list(published["compress_ratios"])}
+    legacy["compress_ratios"][2] = 128
+    with pytest.raises(ValueError, match="compress_ratios"):
+        provider(
+            real_engine_config(tmp_path, "deepseek-ai--DeepSeek-V4-legacy", legacy),
+            gpu="b200",
+            target_model=V4,
+        )
+    # The class's own spelling (layer types and their rates), one rate changed.
+    from vllm.engine.arg_utils import EngineArgs  # noqa: F401
+
+    native = (
+        type(
+            real_engine_config(
+                tmp_path, "deepseek-ai--DeepSeek-V4-x", published
+            ).model_config.hf_text_config
+        )
+        .from_dict(published)
+        .to_dict()
+    )
+    native.pop("compress_ratios", None)
+    rate = next(k for k, v in native["compress_rates"].items() if v == 4)
+    native["compress_rates"] = {**native["compress_rates"], rate: 128}
+    with pytest.raises(ValueError, match="compress_ratios"):
+        provider(
+            real_engine_config(tmp_path, "deepseek-ai--DeepSeek-V4-rates", native),
+            gpu="b200",
+            target_model=V4,
+        )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_deepseek_v4_modes_and_cache_precision_with_the_real_package():
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    published = HfConfig(bundled_config(V4))
+    tp4 = engine_config(V4, published, tensor_parallel_size=4)
+    explicit = provider(tp4, gpu="b200")
+    default = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=V4,
+            system="b200_sxm",
+            backend="vllm",
+            worker_type="aggregated",
+            tp=4,
+            moe_tp_size=4,
+            moe_ep_size=1,
+            fallback_policy="deny",
+        )
+    )
+    step = sim_step(0, sim_req("p", 1024, 0, 1024), sim_req("d", 1, 2048, 1024))
+    assert explicit.estimate(step).device_s * 1000 == pytest.approx(
+        default.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+        rel=1e-9,
+    )
+    # An explicit FP8 cache is the same; BF16 has no V4 tables.
+    provider(engine_config(V4, published, cache_dtype="fp8"), gpu="b200")
+    with pytest.raises(ValueError, match="packed FP8 cache"):
+        provider(engine_config(V4, published, cache_dtype="bfloat16"), gpu="b200")
+    # Ready on H200 at TP1, but no MoE data for its shapes: refused at startup.
+    with pytest.raises(ValueError, match="cannot time a"):
+        provider(engine_config(V4, published), gpu="h200")
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
+def test_a_deepseek_v4_engine_runs_on_aisimulate_timing(
+    tmp_path, monkeypatch, cache_dtype
+):
+    """The provider is built before the model (cache dtype still `auto`):
+    V4-Flash on the meta device, one request, every step priced."""
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    directory = model_dir(
+        tmp_path, "deepseek-ai--DeepSeek-V4-Flash", bundled_config(V4)
+    )
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=directory,
+        skip_tokenizer_init=True,
+        max_model_len=4096,
+        kv_cache_memory_bytes=4 << 30,
+        kv_cache_dtype=cache_dtype,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "b200"},
+            "log_path": str(log),
+        },
+    )
+    try:
+        (output,) = llm.generate(
+            [{"prompt_token_ids": [5] * 1024}],
+            SamplingParams(max_tokens=4, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(output.outputs[0].token_ids) == 4
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+        assert (timing["kv_cache_dtype"], timing["kv_cache_format"]) == (
+            cache_dtype,
+            "fp8_ds_mla",
+        )
+        steps = [r for r in records if "step" in r and r["step"]["requests"]]
+        costs = [r["cost"]["breakdown"]["aisimulate_ms"] for r in steps]
+        assert steps and all(math.isfinite(c) and c > 0 for c in costs)
     finally:
         del llm

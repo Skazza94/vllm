@@ -88,7 +88,11 @@ directory with `DERIVED.md`) must name it explicitly. The local model only
 holds the KV cache and serves the scheduler, so its KV and state geometry
 must match the target's bundled config, and the local KV cache precision is
 the one timed. `quant_modes` overrides the published precision, which
-records the target as modified.
+records the target as modified. DeepSeek-V4 is timed with its packed FP8
+cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
+and its FP4 experts. Startup also times one prefill and one decode step:
+a target AISimulate lacks data for at those shapes fails before serving,
+but a later batch of another shape can still lack data and fail then.
 
 Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
 or 8) and an MoE model's local data-parallel attention with expert

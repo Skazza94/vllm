@@ -102,6 +102,29 @@ MAMBA2_FIELDS = (
     "ssm_state_size",
     "conv_kernel",
 )
+# DeepSeek-V4: its sparse attention's widths, and the compress ratio of each
+# decoder layer (compared apart, as the native helper resolves them).
+V4_FIELDS = (
+    "num_hidden_layers",
+    "num_attention_heads",
+    "head_dim",
+    "qk_rope_head_dim",
+    "sliding_window",
+    "index_n_heads",
+    "index_head_dim",
+    "index_topk",
+    "o_groups",
+)
+V4_COMPRESS_RATIOS = (0, 1, 4, 128)
+# DeepSeek-V4's cache is the packed FP8 latent (`fp8_ds_mla`), which vLLM's
+# supported path resolves `auto` to (and `fp8`); AISimulate's V4 tables are
+# FP8 KV only.
+V4_KV_CACHE_DTYPES = ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla")
+V4_APPROXIMATION = (
+    "AISimulate prices DeepSeek-V4's pure sliding-window layers (compress "
+    "ratio 0) with its HCA (ratio 128) module tables; its capacity model keeps "
+    "the real ratios"
+)
 GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(
         (
@@ -116,6 +139,7 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
         ATTENTION_FIELDS,
     ),
     "DeepseekV3ForCausalLM": MLA_FIELDS,
+    "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,
 }
 APPROXIMATIONS = [
@@ -132,9 +156,40 @@ def _geometry(config: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     attention head size its class leaves unset is the model's own fallback,
     hidden size over attention heads (Mixtral's, say)."""
     geometry = {name: getattr(config, name, None) for name in fields}
-    if "head_dim" in geometry and geometry["head_dim"] is None:
+    if fields is V4_FIELDS:
+        # No fallback: each of V4's fields must be resolved.
+        if missing := [name for name, value in geometry.items() if value is None]:
+            raise ValueError(f"DeepSeek-V4 geometry not resolved: {missing}.")
+    elif "head_dim" in geometry and geometry["head_dim"] is None:
         geometry["head_dim"] = config.hidden_size // config.num_attention_heads
     return geometry
+
+
+def _compress_ratios(config: Any) -> list[int]:
+    """DeepSeek-V4's compress ratio of each decoder layer, as the native
+    helper resolves them from either config spelling (MTP layers left out)."""
+    from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
+
+    ratios = list(get_compress_ratios(config))[: config.num_hidden_layers]
+    if len(ratios) != config.num_hidden_layers or any(
+        r not in V4_COMPRESS_RATIOS for r in ratios
+    ):
+        raise ValueError(f"DeepSeek-V4 compress ratios not resolved: {ratios}.")
+    return ratios
+
+
+def _probe_request(
+    scheduled: int, computed: int, prompt: int, prefill: bool
+) -> SimRequestStep:
+    return SimRequestStep(
+        req_id="probe",
+        num_scheduled_tokens=scheduled,
+        num_computed_tokens=computed,
+        num_prompt_tokens=prompt,
+        num_cached_tokens=0,
+        num_spec_tokens=0,
+        is_prefill=prefill,
+    )
 
 
 def _file_sha256(path: str) -> str:
@@ -232,12 +287,23 @@ class AisimulateTimingProvider:
             target_config = json.load(f)
         geometry = self._check_geometry(vllm_config, target_config, target)
 
+        v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
         quant = _infer_quantization_fields(target_config).get("quant_algo")
-        modes = QUANT_MODES.get(quant)
+        # V4's experts follow the raw config's `expert_dtype` (AISimulate's own
+        # V4 override): FP4 experts with FP8 activations.
+        expert_dtype = target_config.get("expert_dtype") if v4 else None
+        modes = QUANT_MODES.get(quant) if not v4 else None
+        if v4 and (quant, expert_dtype) == ("fp8_block", "fp4"):
+            modes = {
+                "gemm_quant_mode": "fp8_block",
+                "moe_quant_mode": "w4a8_mxfp4_mxfp8",
+                "fmha_quant_mode": "bfloat16",
+            }
         if modes is None:
             raise ValueError(
                 f"The aisimulate timing provider does not map {target}'s "
-                f"quantization {quant!r} to estimator modes."
+                f"quantization {quant!r} (experts {expert_dtype!r}) to estimator "
+                "modes."
             )
         modes = {**modes, "comm_quant_mode": "half"}
         if quant_modes:
@@ -245,7 +311,7 @@ class AisimulateTimingProvider:
             if unknown:
                 raise ValueError(f"Unknown quant_modes {sorted(unknown)}.")
             modes.update(quant_modes)
-        kv_mode = self._kv_cache_mode(vllm_config)
+        kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4)
 
         kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
         worker_type = {"kv_producer": "prefill", "kv_consumer": "decode"}.get(
@@ -282,6 +348,7 @@ class AisimulateTimingProvider:
                 f"{topology}: {diagnostics.get('readiness')} "
                 f"({diagnostics.get('last_warning')})."
             )
+        probes = self._startup_probes(target, system, topology)
         try:
             version = importlib.metadata.version("aisimulate")
         except importlib.metadata.PackageNotFoundError:
@@ -304,6 +371,9 @@ class AisimulateTimingProvider:
             "local_config": local_config,
             "local_dtype": str(vllm_config.model_config.dtype).removeprefix("torch."),
             "kv_cache_dtype": vllm_config.cache_config.cache_dtype,
+            "kv_cache_format": kv_format,
+            "expert_dtype": expert_dtype,
+            "startup_probes": probes,
             "kv_cache_mode_note": (
                 "an FP16 KV cache is timed as BF16 (two bytes; an approximation)"
                 if kv_mode == "bfloat16" and self._kv_dtype(vllm_config) == "float16"
@@ -317,7 +387,7 @@ class AisimulateTimingProvider:
                 f"vLLM {resolved.get('backend_version') or backend_version} "
                 f"data; the simulator runs vLLM {vllm_version}"
             ),
-            "approximations": APPROXIMATIONS,
+            "approximations": APPROXIMATIONS + ([V4_APPROXIMATION] if v4 else []),
             "host_us": host_us,
         }
         logger.info("AISimulate timing: %s", self._assumptions["deployment"])
@@ -439,6 +509,15 @@ class AisimulateTimingProvider:
         local_config = vllm_config.model_config.hf_text_config
         local = _geometry(local_config, fields)
         published = _geometry(type(local_config).from_dict(target_config), fields)
+        if fields is V4_FIELDS:
+            target_class_config = type(local_config).from_dict(target_config)
+            for name, config in (
+                ("local", local_config),
+                ("target", target_class_config),
+            ):
+                ratios = _compress_ratios(config)
+                (local if name == "local" else published)["compress_ratios"] = ratios
+            fields = (*fields, "compress_ratios")
         differences = {
             name: (local[name], published[name])
             for name in fields
@@ -475,7 +554,19 @@ class AisimulateTimingProvider:
         }
 
     @classmethod
-    def _kv_cache_mode(cls, vllm_config: "VllmConfig") -> str:
+    def _kv_cache_mode(cls, vllm_config: "VllmConfig", v4: bool) -> tuple[str, str]:
+        """The KV cache's effective format and AISimulate's KV mode for it.
+        The provider is built before the model resolves `auto`: DeepSeek-V4's
+        is resolved here as its supported packed path does."""
+        if v4:
+            configured = vllm_config.cache_config.cache_dtype
+            if configured not in V4_KV_CACHE_DTYPES:
+                raise ValueError(
+                    f"The aisimulate timing provider times DeepSeek-V4 with its "
+                    f"packed FP8 cache (cache dtype {V4_KV_CACHE_DTYPES}), not "
+                    f"{configured}."
+                )
+            return "fp8_ds_mla", "fp8"
         dtype = cls._kv_dtype(vllm_config)
         mode = KV_CACHE_MODES.get(dtype)
         if mode is None:
@@ -483,7 +574,37 @@ class AisimulateTimingProvider:
                 f"The aisimulate timing provider maps KV cache dtypes "
                 f"{sorted(KV_CACHE_MODES)}, not {dtype}."
             )
-        return mode
+        return dtype, mode
+
+    def _startup_probes(
+        self, target: str, system: str, topology: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """A prefill and a decode step at startup, on rank 0 (the others
+        idle): readiness alone does not show the estimator has data for the
+        target's shapes. Only these shapes are established."""
+        probes = []
+        for kind, requests in (
+            ("prefill", [_probe_request(1024, 0, 1024, True)]),
+            ("decode", [_probe_request(1, 1024, 1024, False)] * 4),
+        ):
+            metrics = [rank_metrics(requests)] + [
+                rank_metrics([]) for _ in range(self.num_ranks - 1)
+            ]
+            sent = metrics[0] if self.num_ranks == 1 else metrics
+            try:
+                ms = self.model.estimate_forward_pass_time_ms(sent)
+            except Exception as e:
+                raise ValueError(
+                    f"AISimulate cannot time a {kind} step of {target} on {system} "
+                    f"with {topology}: {e}"
+                ) from e
+            if ms is None or not math.isfinite(ms) or ms <= 0:
+                raise ValueError(
+                    f"AISimulate returned {ms!r} ms for a {kind} step of {target} "
+                    f"on {system} with {topology}."
+                )
+            probes.append({"kind": kind, "metrics": sent, "ms": ms})
+        return probes
 
     def assumptions(self) -> dict[str, Any]:
         """What the step times rest on, for the step log."""
