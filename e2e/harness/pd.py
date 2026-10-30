@@ -90,9 +90,12 @@ class Server:
     dtype: str = "auto"
     hp_tcp_args: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
-    # The simulator's timing provider; roofline's arguments default to {gpu}.
-    timing: str = "roofline"
+    timing: str | None = None
+    """The simulator's timing provider (zero, linear, table, replay,
+    aisimulate or a module.Class), required for a new run; None only in a
+    saved run from before it was (timed by the former roofline provider)."""
     timing_args: dict | None = None
+    """Its arguments; aisimulate's default to {gpu} (plus a target_model)."""
 
 
 @dataclass
@@ -144,6 +147,9 @@ def load(path: str | Path) -> Run:
         raise ValueError(f"run config needs {missing}") from None
     except TypeError as error:
         raise ValueError(f"run config: {error}") from None
+    if run.server.timing is None:
+        raise ValueError("run config needs server.timing (zero, linear, table, replay, aisimulate or a "
+                         "module.Class)")
     if run.kv_check and run.server.enable_prefix_caching:
         raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
     ranks = run.server.tensor_parallel_size
@@ -176,7 +182,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
 
     timing_args = run.server.timing_args
     if timing_args is None:
-        timing_args = {"gpu": run.server.gpu} if run.server.timing == "roofline" else {}
+        timing_args = {"gpu": run.server.gpu} if run.server.timing == "aisimulate" else {}
     simulation = {"clock": "real", "timing": run.server.timing, "timing_args": timing_args,
                   "log_path": STEP_LOG, "kv_transfer_mode": "real"}
     if run.kv_check:

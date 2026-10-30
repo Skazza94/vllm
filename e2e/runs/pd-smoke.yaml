@@ -47,7 +47,7 @@ kv_check: true
 # startup_timeout: 600      # seconds for the servers to come up
 
 server:  # both servers; defaults shown where set
-  gpu: h100                   # roofline GPU preset: a100, h100, h200, b200
+  gpu: h100                   # aisimulate's default GPU (a100, h100, h200, b200)
   block_size: 16              # tokens per KV block (a multiple of 16); null: the platform's (a hybrid model's)
   # enable_prefix_caching: null  # null: off with kv_check, else vLLM's default (on);
   #                               a hybrid model's real transfers need false
@@ -57,8 +57,13 @@ server:  # both servers; defaults shown where set
   max_num_seqs: 32
   # tensor_parallel_size: 1   # > 1 needs a topology with --shm-size 4g
   # dtype: auto
-  # timing: roofline          # the simulator's timing provider
-  # timing_args: {gpu: h100}  # its arguments (roofline: {gpu} by default)
+  # The simulator's timing provider, required: zero, linear, table, replay,
+  # aisimulate or a module.Class. aisimulate times a published model it covers
+  # offline: timing_args {gpu, target_model: <org>/<name>} (the servers see
+  # the model as /model). Here fixed linear costs: a functional smoke setup,
+  # not a GPU prediction.
+  timing: linear
+  timing_args: {fixed_us: 5000, prefill_us_per_token: 20, decode_us_per_req: 200}
   # hp_tcp_args: {max_outstanding_tasks: 1048576}  # extra hp_tcp settings
   # env: {VLLM_LOGGING_LEVEL: DEBUG}               # extra server environment
 

@@ -119,6 +119,14 @@ class CheckTests(unittest.TestCase):
                 pd.load(spec)
             self.assertIn("kv_check needs prefix caching off", str(raised.exception))
 
+    def test_a_new_run_names_its_timing_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "run.yaml"
+            spec.write_text((E2E / "runs" / "pd-smoke.yaml").read_text().replace("  timing: linear\n", ""))
+            with self.assertRaises(ValueError) as raised:
+                pd.load(spec)
+            self.assertIn("needs server.timing", str(raised.exception))
+
     def test_the_example_run_loads(self) -> None:
         run = pd.load(E2E / "runs" / "pd-smoke.yaml")
         self.assertEqual((run.prefill.node, run.decode.kv_network), ("prefill0", "data0"))
@@ -447,10 +455,12 @@ class HybridCheckTests(unittest.TestCase):
 class RecheckTests(unittest.TestCase):
     """`python -m harness recheck` on a saved results directory."""
 
-    def save(self, directory: Path, checks: list[dict]) -> None:
+    def save(self, directory: Path, checks: list[dict], timing: bool = True) -> None:
         moved = sum(c["bytes"] for c in checks)
-        (directory / "run.json").write_text(json.dumps(
-            {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}}, default=str))
+        saved = {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}}
+        if not timing:  # saved before server.timing existed (the roofline's runs)
+            saved["server"] = {k: v for k, v in saved["server"].items() if k not in ("timing", "timing_args")}
+        (directory / "run.json").write_text(json.dumps(saved, default=str))
         (directory / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
         (directory / "routers.json").write_text(json.dumps({"control": 50, "data0": moved + 100}))
         (directory / "tent.json").write_text("{}")
@@ -470,6 +480,15 @@ class RecheckTests(unittest.TestCase):
                 verdict = json.loads((Path(directory) / "verdict-recheck.json").read_text())
                 self.assertEqual(json.loads(printed.getvalue())["problems"], verdict["problems"])
                 self.assertEqual(bool(verdict["problems"]), bool(status))
+
+    def test_a_run_saved_without_a_timing_provider_still_rechecks(self) -> None:
+        from harness.__main__ import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.save(Path(directory), [grouped("a"), grouped("b")], timing=False)
+            self.assertNotIn("timing", json.loads((Path(directory) / "run.json").read_text())["server"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["recheck", directory]), 0)
 
 
 TP2 = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", ["data0", "data1"]),
