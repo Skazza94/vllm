@@ -38,6 +38,7 @@ DEEPSEEK_V3 = {
     "qk_nope_head_dim": 128,
     "v_head_dim": 128,
     "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]},
+    "num_nextn_predict_layers": 1,
 }
 GPT_OSS = {
     "architectures": ["GptOssForCausalLM"],
@@ -410,7 +411,9 @@ def test_unsupported_layouts_are_refused(fake_aisimulate, parallel, problem):
     assert not fake_aisimulate.instances
 
 
-def mtp(k=1, method="mtp", draft="deepseek_mtp", modules=1, **fields):
+def mtp(
+    k=1, method="mtp", draft="deepseek_mtp", modules=1, arch="DeepSeekMTPModel", **fields
+):
     """A speculative configuration: DeepSeek MTP of depth k by default."""
     spec = SimpleNamespace(
         method=method,
@@ -418,10 +421,10 @@ def mtp(k=1, method="mtp", draft="deepseek_mtp", modules=1, **fields):
         kv_cache_dtype=None,
         draft_lm_head_quantization=None,
         draft_model_config=SimpleNamespace(
-            architectures=["DeepSeekMTPModel"],
+            architectures=[arch],
             hf_config=SimpleNamespace(
                 model_type=draft,
-                architectures=["DeepSeekMTPModel"],
+                architectures=[arch],
                 num_nextn_predict_layers=modules,
             ),
         ),
@@ -471,6 +474,9 @@ def test_a_step_records_its_drafts_against_the_width(fake_aisimulate):
         (V3, mtp(method="ngram"), "method ngram"),
         (V3, mtp(method="eagle3", draft="llama"), "method eagle3"),
         (V3, mtp(k=2, modules=2), "multi-module MTP"),
+        # A checkpoint of several MTP layers, even at depth 1.
+        (V3, mtp(modules=2), r"\[1, 2\] MTP layers"),
+        (V3, mtp(arch="DeepSeekV4MTPModel"), "draft architectures"),
         (V3, mtp(k=6), "6 speculative tokens"),
         (V3, mtp(model="org/other-mtp"), "draft checkpoint"),
         (V3, mtp(draft_tensor_parallel_size=2), "draft tensor parallelism 2"),
@@ -1129,6 +1135,21 @@ def test_a_deepseek_v3_mtp_engine_runs_on_aisimulate_timing(tmp_path, monkeypatc
         assert all(r["cost"]["breakdown"]["aisimulate_ms"] > 0 for r in steps)
         # Accepted drafts are recorded (sampled), not priced.
         assert any(r["cost"].get("num_accepted") for r in drafted)
+        # The rank's own acceptance records: every drafted request, each step,
+        # as the step's counts.
+        logged = {
+            r["spec_acceptance"]["step_index"]: r["spec_acceptance"]["requests"]
+            for r in records
+            if "spec_acceptance" in r
+        }
+        for r in drafted:
+            expected = {
+                q["req_id"]: [q["num_spec_tokens"], a]
+                for q, a in zip(r["step"]["requests"], r["cost"]["num_accepted"])
+                if q["num_spec_tokens"]
+            }
+            assert logged.pop(r["step"]["step_index"]) == expected
+        assert not logged
     finally:
         del llm
 
@@ -1164,3 +1185,76 @@ def test_deepseek_v3_mtp_draft_precision_through_native_configs(tmp_path):
         )
         with pytest.raises(ValueError, match=problem):
             provider(config, gpu="h200", target_model=V3)
+
+
+V4_FLASH = "deepseek-ai/DeepSeek-V4-Flash"
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_a_deepseek_v4_mtp_engine_builds_its_draft_layer_on_aisimulate_timing(
+    tmp_path, monkeypatch
+):
+    """Native single-module MTP of DeepSeek-V4 through the engine: the CPU
+    drafter is built for simulation, its one MTP layer (sliding-window,
+    compress ratio 0) a KV cache layer of the target's groups, every step
+    priced at depth 1 with V4's draft architecture."""
+    from vllm import LLM, SamplingParams
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    v4 = bundled_config(V4_FLASH)
+    directory = model_dir(tmp_path, "deepseek-ai--DeepSeek-V4-Flash", v4)
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=directory,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=4096,
+        kv_cache_memory_bytes=2 << 30,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "b200"},
+            "spec_acceptance_rates": [0.7],
+            "log_path": str(log),
+        },
+    )
+    try:
+        mtp_layer = v4["num_hidden_layers"]
+        groups = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_config
+        drafted = [
+            (group.kv_cache_spec, name)
+            for group in groups.kv_cache_groups
+            for name in group.layer_names
+            if f".layers.{mtp_layer}." in name
+        ]
+        assert [name for _, name in drafted] == [f"model.layers.{mtp_layer}.attn.swa_cache"]
+        ((spec, _),) = drafted
+        assert isinstance(spec, SlidingWindowMLASpec)
+        assert (spec.sliding_window, spec.block_size) == (128, 64)
+        (output,) = llm.generate(
+            [{"prompt_token_ids": [5] * 512}],
+            SamplingParams(max_tokens=16, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(output.outputs[0].token_ids) == 16
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+        assert timing["config"]["nextn"] == 1
+        assert timing["speculation"]["draft_architectures"] == ["DeepSeekV4MTPModel"]
+        steps = [r for r in records if "step" in r and r["step"]["requests"]]
+        assert any(r["cost"]["breakdown"].get("spec_draft_tokens") for r in steps)
+        assert all(r["cost"]["breakdown"]["aisimulate_ms"] > 0 for r in steps)
+    finally:
+        del llm
+
+
+def test_deepseek_v4_mtp_does_not_run_on_cpu_outside_simulation():
+    from vllm.config import VllmConfig
+    from vllm.models.deepseek_v4.cpu.mtp import DeepSeekV4MTP
+
+    with pytest.raises(NotImplementedError, match="not implemented on CPU"):
+        DeepSeekV4MTP(vllm_config=VllmConfig())

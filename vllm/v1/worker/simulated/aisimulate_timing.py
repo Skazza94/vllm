@@ -125,9 +125,13 @@ V4_APPROXIMATION = (
     "ratio 0) with its HCA (ratio 128) module tables; its capacity model keeps "
     "the real ratios"
 )
-# Speculative decoding: DeepSeek-V3's native single-module MTP only, as
-# AISimulate's MTP depth (`nextn`, 1 to 5).
-MTP_TARGETS = ("DeepseekV3ForCausalLM",)
+# Speculative decoding: DeepSeek-V3's and DeepSeek-V4's native single-module
+# MTP only (each target with its own draft architecture), as AISimulate's MTP
+# depth (`nextn`, 1 to 5).
+MTP_TARGETS = {
+    "DeepseekV3ForCausalLM": "DeepSeekMTPModel",
+    "DeepseekV4ForCausalLM": "DeepSeekV4MTPModel",
+}
 MTP_MAX_DEPTH = 5
 MTP_APPROXIMATIONS = [
     (
@@ -258,7 +262,7 @@ class AisimulateTimingProvider:
     an MoE model's local data-parallel attention with expert parallelism
     (TP 1, 2 to 8 local DP ranks). Anything else is refused, as are pipeline
     and context parallelism, EPLB and speculative decoding other than
-    DeepSeek-V3's native single-module MTP."""
+    DeepSeek-V3's or DeepSeek-V4's native single-module MTP."""
 
     def __init__(
         self,
@@ -490,8 +494,8 @@ class AisimulateTimingProvider:
         vllm_config: "VllmConfig", target_config: dict[str, Any], topology: dict
     ) -> tuple[int, dict[str, Any] | None]:
         """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's
-        native single-module MTP (its own checkpoint's layer, the target's
-        parallelism and precision) only."""
+        or DeepSeek-V4's native single-module MTP (its own checkpoint's one MTP
+        layer, the target's parallelism and precision) only."""
         spec = vllm_config.speculative_config
         if spec is None:
             return 0, None
@@ -500,14 +504,23 @@ class AisimulateTimingProvider:
         problems = []
         if spec.method not in ("mtp", "deepseek_mtp"):
             problems.append(f"method {spec.method}")
-        if target_config.get("architectures", [None])[0] not in MTP_TARGETS:
+        target = target_config.get("architectures", [None])[0]
+        if target not in MTP_TARGETS:
             problems.append(f"target {target_config.get('architectures')}")
+        # One MTP layer, which every step reuses (a checkpoint with several
+        # is refused even at k = 1).
+        layers = {
+            target_config.get("num_nextn_predict_layers"),
+            getattr(draft, "num_nextn_predict_layers", None),
+        }
+        if layers != {1}:
+            problems.append(f"{sorted(layers, key=str)} MTP layers (one)")
         if getattr(draft, "model_type", None) != "deepseek_mtp":
             problems.append(f"draft {getattr(draft, 'model_type', None)}")
         architectures = list(
             getattr(spec.draft_model_config, "architectures", None) or []
         )
-        if architectures != ["DeepSeekMTPModel"]:
+        if target in MTP_TARGETS and architectures != [MTP_TARGETS[target]]:
             problems.append(f"draft architectures {architectures}")
         if spec.model not in (None, vllm_config.model_config.model):
             problems.append(f"draft checkpoint {spec.model}")
@@ -531,8 +544,9 @@ class AisimulateTimingProvider:
             )
         if problems:
             raise ValueError(
-                "The aisimulate timing provider times DeepSeek-V3's native "
-                f"single-module MTP only, not {', '.join(problems)}."
+                "The aisimulate timing provider times DeepSeek-V3's or "
+                "DeepSeek-V4's native single-module MTP only, not "
+                f"{', '.join(problems)}."
             )
         return k, {
             "method": spec.method,

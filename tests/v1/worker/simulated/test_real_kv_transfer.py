@@ -535,6 +535,61 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
             engine_config(v4_model_dir, **{**v4, **kwargs})
 
 
+# A tiny DeepSeek-V3 with its native MTP layer(s).
+def deepseek_v3(mtp_layers):
+    return {
+        **DEEPSEEK_V2,
+        "architectures": ["DeepseekV3ForCausalLM"],
+        "model_type": "deepseek_v3",
+        "num_nextn_predict_layers": mtp_layers,
+    }
+
+
+def test_real_mode_takes_native_single_module_mtp_over_nixl(
+    tmp_path_factory, v4_model_dir, model_dir
+):
+    """DeepSeek-V3's and DeepSeek-V4's one MTP layer moves with the target's
+    KV over NIXL, whose handshake checks the speculative configuration; no
+    other speculative decoding, connector or draft."""
+    v3 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3", deepseek_v3(1))
+    v3_two = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-two", deepseek_v3(2))
+    v4 = {
+        "dtype": "bfloat16",
+        "max_model_len": 4096,
+        "block_size": None,
+        "kv_cache_memory_bytes": 4 << 30,
+    }
+
+    def mtp(k=1, **fields):
+        return {"method": "mtp", "num_speculative_tokens": k, **fields}
+
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        nixl = {"kv_connector": connector}
+        for k in (1, 5):
+            config = engine_config(v3, kv_transfer=nixl, speculative_config=mtp(k))
+            assert config.speculative_config.draft_model_config.architectures == [
+                "DeepSeekMTPModel"
+            ]
+        config = engine_config(
+            v4_model_dir, kv_transfer=nixl, speculative_config=mtp(), **v4
+        )
+        assert config.speculative_config.draft_model_config.architectures == [
+            "DeepSeekV4MTPModel"
+        ]
+    for model, kwargs, problem in (
+        (v3, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
+        (v3, {"speculative_config": mtp(6)}, "6 speculative tokens"),
+        # A checkpoint of two MTP layers, even at depth 1.
+        (v3_two, {"speculative_config": mtp()}, "2 MTP layers"),
+        (v3, {"speculative_config": mtp(kv_cache_dtype="fp8")}, "draft KV cache dtype fp8"),
+        (model_dir, {"speculative_config": {"method": "ngram", "num_speculative_tokens": 2,
+                                            "prompt_lookup_max": 2}}, "method ngram"),
+    ):
+        kwargs.setdefault("speculative_config", mtp())
+        with pytest.raises(ValueError, match=problem):
+            engine_config(model, **kwargs)
+
+
 def test_packed_layers_resolve_their_own_specs_and_places():
     """A group of several kinds names each layer's spec; a packed block (each
     block all of a group's layers) places each layer's page at its offset,

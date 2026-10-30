@@ -156,7 +156,12 @@ class SimulatedModelRunner(GPUModelRunner):
         self._last_output: SimulatedAsyncOutput | None = None
         self._parallel = parallel_summary(vllm_config)
         self._prompt_lens: dict[str, int] = {}
-        self._rng = np.random.default_rng(vllm_config.model_config.seed)
+        # Draft acceptance is sampled for this rank's requests: a DP rank's
+        # own stream (its TP ranks share it, their counts must agree), DP
+        # rank 0's the seed's alone.
+        seed = vllm_config.model_config.seed
+        dp = self.parallel_config.data_parallel_index
+        self._rng = np.random.default_rng(seed if dp == 0 else (seed, dp))
         self._acceptance_rates = None
         spec = vllm_config.speculative_config
         if spec is not None and spec.enable_adaptive_verification:
@@ -470,6 +475,9 @@ class SimulatedModelRunner(GPUModelRunner):
         )
         row = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
         num_drafts = input_batch.num_draft_tokens_per_req
+        # This rank's requests' drafts and accepted drafts: a joint MoE-DP
+        # step's record lacks the other ranks' (`accepted_in_step_order`).
+        acceptance: dict[str, tuple[int, int]] = {}
         if num_drafts is None or input_batch.num_draft_tokens == 0:
             num_drafts = np.zeros(num_reqs, dtype=np.int32)
             num_accepted = num_drafts
@@ -484,6 +492,11 @@ class SimulatedModelRunner(GPUModelRunner):
                     {r: int(num_accepted[i]) for r, i in row.items()},
                 ),
             )
+            acceptance = {
+                r: (int(num_drafts[i]), int(num_accepted[i]))
+                for r, i in row.items()
+                if num_drafts[i] > 0
+            }
         num_sampled_np = np.where(completes, 1 + num_accepted, 0).astype(np.int32)
 
         # Output tokens: the request's trace, else the fallback token.
@@ -536,6 +549,10 @@ class SimulatedModelRunner(GPUModelRunner):
                 pending.t_start,
                 pending.t_deadline,
                 list(pending.finished_req_ids),
+            )
+        if self.step_log is not None and acceptance:
+            self.step_log.write_spec_acceptance(
+                pending.descriptor.step_index, acceptance, self.clock.now()
             )
         # Hold the engine thread for the rest of the step's host time.
         self.clock.sleep_until(pending.t_entry + pending.cost.host_s)

@@ -98,15 +98,16 @@ Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
 or 8) and an MoE model's local data-parallel attention with expert
 parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism and
 EPLB are rejected, and so are models or layouts AISimulate has no timing
-for. Speculative decoding is timed for DeepSeek-V3's native single-module
-MTP only (`method: mtp`, 1 to 5 tokens, the draft at the target's
-parallelism and precision), as AISimulate's MTP depth: a decode step
+for. Speculative decoding is timed for DeepSeek-V3's and DeepSeek-V4's
+native single-module MTP only (`method: mtp`, the checkpoint's one MTP layer,
+1 to 5 tokens, the draft at the target's parallelism and precision), as
+AISimulate's MTP depth: a decode step
 verifies k + 1 tokens a request and runs k target-shaped draft layers, the
 full width even when a step drafted fewer; draft weights and KV, prefill
 draft work and host glue are omitted. Acceptance comes from
-`spec_acceptance_rates` and does not change a step's cost. Real KV
-transfers do not support speculative decoding. The `timing` record names the target, the
-resolved estimator configuration and its data's vLLM version.
+`spec_acceptance_rates` and does not change a step's cost. The `timing`
+record names the target, the resolved estimator configuration and its
+data's vLLM version.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also
 be written by hand, as JSONL records of
@@ -395,8 +396,7 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
-  sparse-MLA (but DeepSeek-V4's), chunked local or RSWA attention models,
-  nor speculative decoding.
+  sparse-MLA (but DeepSeek-V4's), chunked local or RSWA attention models.
 * DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
   with tensor parallelism or with data-parallel attention and expert
   parallelism (not both: the simulator's AISimulate timing provider does not
@@ -408,6 +408,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   tokens and computes the last one again to sample; with
   bounded window replay on (a cache whose SWA spec sets `bounded_replay`,
   DeepSeek-V4.1's), NIXL loads N - 1 and decode computes the last.
+* Speculative decoding only as DeepSeek-V3's or DeepSeek-V4's native
+  single-module MTP (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
+  tokens, the draft at the target's parallelism and precision) over
+  `NixlConnector` (or `NixlPullConnector`), whose handshake checks the
+  instances' transfer compatibility, the draft among it (a peer without
+  the MTP draft is refused): the MTP layer's KV is a layer of the target's
+  KV cache groups and moves with them. Drafts are not computed; their
+  acceptance follows `spec_acceptance_rates`.
 * One rank per instance, or:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
@@ -451,7 +459,9 @@ together. Each rank's transfer engine serves TENT's metrics on the base port
 9100) plus its local DP rank times the TP size plus its TP rank.
 
 Every rank of the last pipeline stage logs its own KV (`kv_layout`,
-`kv_transfers`, `kv_check`, `kv_events` and `threads` records) into
+`kv_transfers`, `kv_check`, `kv_events` and `threads` records), and with
+speculative decoding its own requests' drafts and accepted drafts each
+step (`spec_acceptance`), into
 `<log_path>[.dp<i>][.tp<r>]`, for its global DP rank `i` and TP rank `r`
 when not 0; its `kv_layout` record names both and its local DP rank. Under
 MoE DP the timing record and the joint steps stay in DP rank 0's logs. With

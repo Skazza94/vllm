@@ -16,6 +16,13 @@ _RECORDING_WORKER = "vllm.v1.worker.simulated.recording.RecordingWorker"
 # Native connectors that move real KV under kv_transfer_mode real: NIXL's
 # decode-pulled READs, or Mooncake's prefill-written transfers.
 REAL_KV_CONNECTORS = ("NixlConnector", "NixlPullConnector", "MooncakeConnector")
+# Speculative decoding with real KV transfers: a model's native single-module
+# MTP (its draft architecture), whose one MTP layer's KV joins the target's.
+REAL_KV_MTP_DRAFTS = {
+    "deepseek_v3": "DeepSeekMTPModel",
+    "deepseek_v4": "DeepSeekV4MTPModel",
+}
+REAL_KV_MTP_MAX_DEPTH = 5
 
 
 @config
@@ -175,6 +182,59 @@ class SimulationConfig:
         for load_config in load_configs:
             load_config.load_format = "dummy"
             load_config.device = "meta"
+
+    @staticmethod
+    def _real_kv_mtp_problems(vllm_config: "VllmConfig") -> list[str]:
+        """Speculative decoding moves its draft's KV with the target's only as
+        DeepSeek-V3's or DeepSeek-V4's native single-module MTP over NIXL,
+        whose handshake checks the instances' transfer compatibility, the
+        draft among it: the checkpoint's one MTP layer, at the target's
+        parallelism and precision."""
+        spec = vllm_config.speculative_config
+        model = vllm_config.model_config
+        kv_transfer = vllm_config.kv_transfer_config
+        k = spec.num_speculative_tokens
+        draft = REAL_KV_MTP_DRAFTS.get(getattr(model.hf_config, "model_type", None))
+        architectures = list(
+            getattr(spec.draft_model_config, "architectures", None) or []
+        )
+        layers = getattr(model.hf_text_config, "num_nextn_predict_layers", None)
+        mismatches = []
+        if spec.method != "mtp":
+            mismatches.append(f"method {spec.method}")
+        if draft is None or architectures != [draft]:
+            mismatches.append(
+                f"draft architectures {architectures} for "
+                f"{getattr(model.hf_config, 'model_type', None)}"
+            )
+        if spec.model != model.model:
+            mismatches.append(f"draft checkpoint {spec.model}")
+        if layers != 1 or spec.use_multi_module_mtp():
+            mismatches.append(f"{layers} MTP layers")
+        if not 1 <= k <= REAL_KV_MTP_MAX_DEPTH:
+            mismatches.append(f"{k} speculative tokens")
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        if spec.draft_tensor_parallel_size not in (None, tp):
+            mismatches.append(
+                f"draft tensor parallelism {spec.draft_tensor_parallel_size}"
+            )
+        if spec.quantization not in (None, model.quantization):
+            mismatches.append(f"draft quantization {spec.quantization}")
+        if spec.kv_cache_dtype not in (None, vllm_config.cache_config.cache_dtype):
+            mismatches.append(f"draft KV cache dtype {spec.kv_cache_dtype}")
+        if getattr(spec, "draft_lm_head_quantization", None) is not None:
+            mismatches.append(
+                f"draft LM head quantization {spec.draft_lm_head_quantization}"
+            )
+        if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
+            mismatches.append(kv_transfer.kv_connector)
+        if not mismatches:
+            return []
+        return [
+            "speculative decoding only as DeepSeek-V3's or DeepSeek-V4's "
+            f"native single-module MTP (1 to {REAL_KV_MTP_MAX_DEPTH} tokens) "
+            f"over NIXL, not {', '.join(mismatches)}"
+        ]
 
     def _verify_kv_transfer(self, vllm_config: "VllmConfig") -> None:
         if self.kv_transfer_mode == "real":
@@ -359,7 +419,7 @@ class SimulationConfig:
                 "a hybrid model without prefix caching (mamba_cache_mode none)"
             )
         if vllm_config.speculative_config is not None:
-            problems.append("no speculative decoding")
+            problems.extend(self._real_kv_mtp_problems(vllm_config))
         if self.kv_pattern_fill and kv_transfer.kv_role != "kv_producer":
             problems.append("kv_role kv_producer for kv_pattern_fill")
         if self.kv_pattern_check and kv_transfer.kv_role != "kv_consumer":

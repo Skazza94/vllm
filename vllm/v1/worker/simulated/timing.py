@@ -802,6 +802,22 @@ class StepLogWriter:
         self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self._f.flush()
 
+    def write_spec_acceptance(
+        self, step_index: int, acceptance: dict[str, tuple[int, int]], t: float
+    ) -> None:
+        """Append a step's speculative drafts on this rank: each of its
+        requests' drafts and accepted drafts, every rank its own (a joint
+        MoE-DP step's record holds no counts)."""
+        rec = {
+            "spec_acceptance": {
+                "step_index": step_index,
+                "requests": {r: list(counts) for r, counts in acceptance.items()},
+            },
+            "t": t,
+        }
+        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._f.flush()
+
     def write_transfers(self, transfers: dict[str, dict[str, float]], t: float) -> None:
         """Append the KV transfers that completed in a step, per direction:
         their count, bytes and summed duration."""
