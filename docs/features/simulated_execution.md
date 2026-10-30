@@ -455,7 +455,8 @@ TRITON_CPU_BACKEND=1 vllm serve Qwen/Qwen3-235B-A22B --simulate-forward \
 
 Ranks need no devices, so a layout larger than any one GPU host runs on a
 CPU host. Simulated workers share the host's cores instead of each taking a
-NUMA node, and keep the modeled GPU deployment's settings (async scheduling,
+NUMA node (nor does a `NixlConnector` worker pin itself to each node's last
+core for its transfers), and keep the modeled GPU deployment's settings (async scheduling,
 the in-process executor) rather than the CPU platform's: an MLA model keeps
 its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a

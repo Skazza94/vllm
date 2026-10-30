@@ -442,3 +442,29 @@ def test_simulated_nixl_push_fails_rejected_layouts():
         assert decode.get_transfer_results().failed_recving == {"r1"}
     finally:
         decode.shutdown()
+
+
+@pytest.mark.parametrize("simulate_forward", [True, False])
+def test_only_cpu_inference_reserves_cores_for_kv(monkeypatch, simulate_forward):
+    """A CPU NIXL worker pins itself to the last core of each NUMA node, for
+    transfers beside the model; simulated execution keeps its affinity."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+    pinned = []
+    monkeypatch.setattr(
+        base_worker.current_platform,
+        "discover_numa_topology",
+        lambda: [[0, 1, 2], [3, 4, 5]],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        base_worker.os, "sched_setaffinity", lambda pid, cores: pinned.append(cores)
+    )
+    from vllm.config import VllmConfig
+    from vllm.config.simulation import SimulationConfig
+
+    config = VllmConfig(
+        simulation_config=SimulationConfig(simulate_forward=simulate_forward)
+    )
+    base_worker._reserve_cores_for_kv(config)
+    assert pinned == ([] if simulate_forward else [[2, 5]])
