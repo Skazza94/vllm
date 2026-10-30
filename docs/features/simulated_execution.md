@@ -400,9 +400,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
       holds; a peer of another size is refused at the handshake;
-    * over `MooncakeConnector` only, an MoE model's data-parallel attention with expert parallelism
+    * an MoE model's data-parallel attention with expert parallelism
       (`--data-parallel-size N --enable-expert-parallel`): each DP rank holds
-      its own requests' KV; the proxy pins a request's prefill DP rank, and
+      its own requests' KV; a request's prefill DP rank (pinned by
+      Mooncake's proxy, else prefill's load balancer) names itself in its
+      transfer parameters (NIXL: its engine id and side-channel port), and
       decode's load balancer picks its own, so the instances' DP sizes may
       differ.
 * No pipeline or context parallelism, nor data parallelism of dense models

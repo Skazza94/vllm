@@ -310,11 +310,6 @@ class SimulationConfig:
                 "data parallelism only as an MoE model's data-parallel attention, "
                 "with expert parallelism"
             )
-        if sizes["DP"] > 1 and kv_transfer.kv_connector != "MooncakeConnector":
-            problems.append(
-                "MooncakeConnector for data parallelism, not "
-                f"{kv_transfer.kv_connector}"
-            )
         # DeepSeek-V3.2's and V4's MLA is sparse: an indexer picks the tokens.
         sparse_mla = model.use_mla and (
             getattr(model.hf_text_config, "index_topk", None) is not None

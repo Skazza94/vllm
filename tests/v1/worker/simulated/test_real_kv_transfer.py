@@ -453,7 +453,7 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_real_mode_allows_tensor_parallelism_and_dp_attention_over_mooncake(
+def test_real_mode_allows_tensor_parallelism_and_dp_attention(
     model_dir, moe_model_dir
 ):
     mooncake = {"kv_connector": "MooncakeConnector"}
@@ -478,8 +478,25 @@ def test_real_mode_allows_tensor_parallelism_and_dp_attention_over_mooncake(
     ):
         with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
             engine_config(model, kv_transfer=mooncake, data_parallel_size=2, **kwargs)
-    with pytest.raises(ValueError, match="MooncakeConnector for data parallelism"):
-        engine_config(moe_model_dir, data_parallel_size=2, enable_expert_parallel=True)
+    # Over NIXL too: each DP engine has its own side channel and engine id.
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        nixl = {"kv_connector": connector}
+        config = engine_config(
+            moe_model_dir, kv_transfer=nixl, data_parallel_size=2, enable_expert_parallel=True
+        )
+        assert config.parallel_config.data_parallel_size == 2
+        for model, kwargs in ((model_dir, {"enable_expert_parallel": True}), (moe_model_dir, {})):
+            with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
+                engine_config(model, kv_transfer=nixl, data_parallel_size=2, **kwargs)
+        with pytest.raises(ValueError, match="data-parallel attention at most"):
+            engine_config(model_dir, kv_transfer=nixl, pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="one of NixlConnector"):
+        engine_config(
+            moe_model_dir,
+            kv_transfer={"kv_connector": "NixlPushConnector"},
+            data_parallel_size=2,
+            enable_expert_parallel=True,
+        )
 
 
 @pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (2, 2)])
