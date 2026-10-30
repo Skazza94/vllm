@@ -66,6 +66,7 @@ its startup log reports it: prefix-cache hit rates and preemption depend on it.
 | `table` | nearest-neighbor interpolation over a step log | `path`, `k` |
 | `replay` | exact match on the step's batch composition, else `fallback` | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
 | `roofline` | a GPU's FLOPs and HBM bandwidth over the model's layers (below) | `gpu` or `peak_tflops`/`hbm_tbps`, efficiencies, `fixed_us`, `host_us`, interconnect, `mla_backend`, `ep_all2all`, `ep_moe_interface` |
+| `aisimulate` | AISimulate's forward-pass estimate of the published model (below) | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` |
 | `module.Class` | a `vllm.v1.worker.simulated.timing.TimingProvider` | its keyword arguments |
 
 A provider receives a `StepDescriptor`: per request, the tokens scheduled in
@@ -73,6 +74,28 @@ the step, the KV length before it, the prompt length, prefix-cache hits at
 admission, draft tokens, whether it is prefilling and, in an MoE-DP joint
 step, its DP rank; plus batch totals, common-prefix blocks and the parallel
 configuration. It returns a `StepCost`.
+
+`aisimulate` asks [AISimulate](https://github.com/ai-dynamo/aisimulate)'s
+forward-pass performance model for each step. It needs the optional
+`aisimulate` package and prices the scheduler's actual batch, one workload
+per attention data-parallel rank, from kernel timings measured on that GPU
+under a vLLM release, with no analytical fallback.
+
+The deployment it times is the published model `target_model`, with that
+model's published weight precision. The model's own Hugging Face id or a
+`<org>--<name>/<commit>` directory names the target; a derived copy (a
+directory with `DERIVED.md`) must name it explicitly. The local model only
+holds the KV cache and serves the scheduler, so its KV and state geometry
+must match the target's bundled config, and the local KV cache precision is
+the one timed. `quant_modes` overrides the published precision, which
+records the target as modified.
+
+Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
+or 8) and an MoE model's local data-parallel attention with expert
+parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism, EPLB
+and speculative decoding are rejected, and so are models or layouts
+AISimulate has no timing for. The `timing` record names the target, the
+resolved estimator configuration and its data's vLLM version.
 
 `roofline` prices a step as `fixed_us` plus the longer of its FLOPs at
 `peak_tflops * compute_efficiency` and its bytes at `hbm_tbps *

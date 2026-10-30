@@ -2730,12 +2730,17 @@ def get_timing_provider(
     name: str, args: dict[str, Any], vllm_config: VllmConfig
 ) -> TimingProvider:
     cls = BUILTIN_TIMING_PROVIDERS.get(name)
+    if cls is None and name == "aisimulate":
+        # Its optional package loads only when chosen.
+        from vllm.v1.worker.simulated.aisimulate_timing import (
+            AisimulateTimingProvider as cls,
+        )
     if cls is None:
         if "." not in name:
             raise ValueError(
                 f"Unknown timing provider {name!r}. Built-ins: "
-                f"{sorted(BUILTIN_TIMING_PROVIDERS)}; otherwise pass a "
-                "fully-qualified class name."
+                f"{sorted([*BUILTIN_TIMING_PROVIDERS, 'aisimulate'])}; otherwise "
+                "pass a fully-qualified class name."
             )
         cls = resolve_obj_by_qualname(name)
     provider = cls(vllm_config, **args)
