@@ -132,7 +132,7 @@ class CheckTests(unittest.TestCase):
         self.assertEqual((env["VLLM_NIXL_SIDE_CHANNEL_HOST"], env["NIXL_MOONCAKE_IP_ADDR"]),
                          ("10.100.0.1", "10.100.0.1"))
 
-    def test_the_connector_is_mooncake_or_nixl_without_dp(self) -> None:
+    def test_the_connector_is_mooncake_or_nixl(self) -> None:
         base = {"name": "t", "topology": "t", "model": ".", "client": "c", "control_network": "control",
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"}}
 
@@ -147,8 +147,8 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(load({"connector": "nixl", "tensor_parallel_size": 2}).server.tensor_parallel_size, 2)
         with self.assertRaisesRegex(ValueError, "server.connector is one of mooncake, nixl"):
             load({"connector": "ucx"})
-        with self.assertRaisesRegex(ValueError, "without data parallelism"):
-            load({"connector": "nixl"}, decode={"node": "d", "kv_network": "data0", "data_parallel_size": 2})
+        dp = load({"connector": "nixl"}, decode={"node": "d", "kv_network": "data0", "data_parallel_size": 2})
+        self.assertEqual(dp.decode.data_parallel_size, 2)
 
     def test_the_platform_may_choose_the_block_size(self) -> None:
         default = pd.server_command(RUN, "prefill", ["10.100.0.1"])
