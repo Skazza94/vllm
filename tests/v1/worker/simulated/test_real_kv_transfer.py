@@ -505,9 +505,10 @@ def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
         engine_config(nemotron_h_model_dir)
 
 
-def test_real_mode_takes_deepseek_v4_over_nixl_on_one_rank(v4_model_dir):
+def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     """V4's groups move over NIXL, which keeps each group's own blocks;
-    Mooncake cannot pair its block sizes. One rank, no prefix caching, the
+    Mooncake cannot pair its block sizes. Tensor parallelism or data-parallel
+    attention with expert parallelism (not both), no prefix caching, the
     packed FP8 cache."""
     v4 = {
         "dtype": "bfloat16",
@@ -515,12 +516,18 @@ def test_real_mode_takes_deepseek_v4_over_nixl_on_one_rank(v4_model_dir):
         "block_size": None,
         "kv_cache_memory_bytes": 4 << 30,
     }
+    dp_ep = {"data_parallel_size": 2, "enable_expert_parallel": True}
     for connector in ("NixlConnector", "NixlPullConnector"):
-        config = engine_config(v4_model_dir, kv_transfer={"kv_connector": connector}, **v4)
-        assert config.model_config.hf_config.model_type == "deepseek_v4"
+        for kwargs in ({}, {"tensor_parallel_size": 2}, {"tensor_parallel_size": 4}, dp_ep):
+            config = engine_config(
+                v4_model_dir, kv_transfer={"kv_connector": connector}, **{**v4, **kwargs}
+            )
+            assert config.model_config.hf_config.model_type == "deepseek_v4"
     for kwargs, message in (
         ({"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "NixlConnector for DeepSeek-V4"),
-        ({"tensor_parallel_size": 2}, "DeepSeek-V4 on one rank"),
+        ({**dp_ep, "tensor_parallel_size": 2}, "DeepSeek-V4 with tensor parallelism or"),
+        ({"data_parallel_size": 2}, "MoE model's data-parallel attention"),
+        ({"pipeline_parallel_size": 2}, "tensor parallelism and data-parallel attention at most"),
         ({"enable_prefix_caching": True}, "DeepSeek-V4 without prefix caching"),
         ({"kv_cache_dtype": "bfloat16"}, "packed FP8 cache"),
     ):

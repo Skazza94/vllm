@@ -397,7 +397,10 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
   sparse-MLA (but DeepSeek-V4's), chunked local or RSWA attention models,
   nor speculative decoding.
-* DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`) on one rank,
+* DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
+  with tensor parallelism or with data-parallel attention and expert
+  parallelism (not both: the simulator's AISimulate timing provider does not
+  time TP inside DP), each TP rank holding and moving the whole caches;
   without prefix caching, its cache the packed FP8 one (`fp8_ds_mla`): its
   sliding windows, compressed latents, indexer keys and compressor states
   are KV cache groups packed into one allocation, each block all of one

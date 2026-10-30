@@ -319,9 +319,13 @@ class SimulationConfig:
                 problems.append(
                     f"NixlConnector for DeepSeek-V4, not {kv_transfer.kv_connector}"
                 )
-            if sizes["TP"] != 1 or sizes["DP"] != 1:
+            # Its caches are one replicated shard: each TP rank moves them
+            # whole. TP inside DP is left out: the aisimulate timing provider
+            # does not time it.
+            if sizes["TP"] > 1 and sizes["DP"] > 1:
                 problems.append(
-                    f"DeepSeek-V4 on one rank, not TP={sizes['TP']}, DP={sizes['DP']}"
+                    "DeepSeek-V4 with tensor parallelism or data-parallel "
+                    f"attention, not both (TP={sizes['TP']}, DP={sizes['DP']})"
                 )
             if cache.enable_prefix_caching:
                 problems.append("DeepSeek-V4 without prefix caching")
