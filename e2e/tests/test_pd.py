@@ -802,6 +802,124 @@ class DataParallelCheckTests(unittest.TestCase):
         self.assertNotIn("--data-parallel-size", " ".join(pd.server_command(TP2, "prefill", ["a", "b"])))
 
 
+# DeepSeek-V4-like packed blocks: every 20-byte block is all of one group's
+# 2 layers, 8-byte pages of 6 real bytes; a 16-token window and compressed
+# latents (16 tokens a block), decode recomputing the prompt's last token.
+def packed_group(kind: str, window: int | None, **changes) -> dict:
+    return {"kind": kind, "sliding_window": window, "block_size": 16, "layers": 2, "block_bytes": 8,
+            "real_page_bytes": 6, "block_stride": 20,
+            "members": [{"kind": kind, "layers": 2, "offsets": [0, 8], "page_bytes": 8, "real_page_bytes": 6,
+                         "dtype": "uint8", "tokens_per_state": 1.0}],
+            "checked_bytes_per_block": 12, "transfer_bytes_per_block": 20, **changes}
+
+
+def packed_layout(window=None, full=None, **changes) -> str:
+    return line(kv_layout={"tp_rank": 0, "tp_size": 1, "block_bytes": 20, "bytes": 2000, "prefill_backoff": 1,
+                           "groups": [window or packed_group("SlidingWindowMLASpec", 16),
+                                      full or packed_group("MLAAttentionSpec", None)], **changes})
+
+
+def packed_check(request: str, window=(1, 1), full=(0, 2)) -> dict:
+    groups = [{"group": 0, "first_logical_block": window[0], "blocks": window[1], "layers": 2, "block_bytes": 12,
+               "bytes": window[1] * 12, "mismatched_bytes": 0},
+              {"group": 1, "first_logical_block": full[0], "blocks": full[1], "layers": 2, "block_bytes": 12,
+               "bytes": full[1] * 12, "mismatched_bytes": 0}]
+    return checked(request, blocks=window[1] + full[1], layers=4, bytes=sum(g["bytes"] for g in groups),
+                   groups=groups)
+
+
+def packed_pull(request: str, window=(1, 1), full=(0, 2), offset: int = 100) -> str:
+    return line(kv_events={"reads_posted": [f"cmpl-{request}-0-d"], "allocated_groups": {f"cmpl-{request}-0-d": [
+        {"group": 0, "first": window[0], "blocks": list(range(offset, offset + window[1]))},
+        {"group": 1, "first": full[0], "blocks": list(range(offset + 10, offset + 10 + full[1]))}]}})
+
+
+class PackedCheckTests(unittest.TestCase):
+    """33-token prompts: decode loads 32 tokens (2 blocks of the latents,
+    the window's last block from place 1) and computes the last."""
+
+    def verdict(self, layout=None, checks=None, loaded=None, prompt=33, pulls=None) -> dict:
+        layout = layout or packed_layout()
+        checks = checks or [packed_check("a"), packed_check("b")]
+        loaded = loaded if loaded is not None else 2 * 3 * 20
+        decode = (layout + (pulls or packed_pull("a") + packed_pull("b", offset=300))
+                  + "".join(stepped(r, "d", prompt - 1, 1, prompt) for r in ("a", "b"))
+                  + line(kv_transfers={"load": {"count": 2, "bytes": loaded, "failed": 0}})
+                  + "".join(line(kv_check=c) for c in checks))
+        prefill = layout + allocated("a", "b") + "".join(stepped(r, "p", 0, prompt - 1, prompt - 1) for r in ("a", "b"))
+        return pd.check({"completed": 2, "errors": []}, [prefill], [decode], {"control": 1, "data0": loaded + 100},
+                        NIXL)
+
+    def test_checked_pages_and_moved_blocks_reconcile(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["kv_bytes_checked"], 2 * 3 * 12)  # real pages only
+        self.assertEqual(verdict["ranks"][0]["kv_bytes_spanned"], 2 * 3 * 20)  # whole blocks
+        self.assertIsNotNone(verdict["ranks"][0]["handoff"])  # N - 1 handed over
+
+    def test_each_packed_failure_is_reported(self) -> None:
+        malformed = packed_group("MLAAttentionSpec", None, transfer_bytes_per_block=None)
+        cases = {
+            # Moving checked bytes only is not the connector's whole blocks.
+            "moved 72 bytes, not the 120 decode's checked blocks span (72 checked)": {"loaded": 72},
+            "check disagrees with the layout (2 layers, 12 bytes checked a block)": {
+                "checks": [packed_check("a"), {**packed_check("b"), "bytes": 30, "groups": [
+                    {**packed_check("b")["groups"][0], "bytes": 6}, packed_check("b")["groups"][1]]}]},
+            "group 1 has a malformed packed layout": {"layout": packed_layout(full=malformed)},
+            "group 0 checks 10 bytes a block, not its members' 12 real bytes": {
+                "layout": packed_layout(window=packed_group("SlidingWindowMLASpec", 16, checked_bytes_per_block=10))},
+            "group 1 packs 1 layers, not its 2": {"layout": packed_layout(full=packed_group(
+                "MLAAttentionSpec", None,
+                members=[{**packed_group("x", None)["members"][0], "layers": 1, "offsets": [0]}]))},
+            "prefill_backoff is 2, not 1": {"layout": packed_layout(prefill_backoff=2)},
+            # The latents hold the 32 tokens handed over, not all 33.
+            "checked 3 blocks, not the cdiv(32, 16)": {
+                "checks": [packed_check("a", full=(0, 3)), packed_check("b")],
+                "pulls": packed_pull("a", full=(0, 3)) + packed_pull("b", offset=300), "loaded": 140},
+        }
+        for message, given in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**given)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+    def test_malformed_member_placements_are_reported(self) -> None:
+        member = packed_group("x", None)["members"][0]
+
+        def with_members(*members, **changes) -> str:
+            return packed_layout(full=packed_group("MLAAttentionSpec", None, members=list(members), **changes))
+
+        stripped = {key: value for key, value in member.items()
+                    if key not in ("offsets", "page_bytes", "kind", "dtype", "tokens_per_state")}
+        cases = {
+            "group 1 has a malformed packed member 0 (needs": with_members(stripped),
+            "group 1 has a malformed packed member 0 (": with_members({**member, "offsets": [0]}),
+            "member 0's page at 0 overlaps member 0's": with_members({**member, "offsets": [0, 0]}),
+            "member 0's page at 1000 ends beyond the 20-byte block": with_members({**member, "offsets": [0, 1000]}),
+            "member 0 has 9 real bytes in a 8-byte page": with_members(
+                {**member, "real_page_bytes": 9}, checked_bytes_per_block=18),
+            "group 1 has a malformed packed layout": with_members(member, checked_bytes_per_block=None),
+            "moves 16 bytes a block, less than its 20-byte block": with_members(
+                member, transfer_bytes_per_block=16),
+        }
+        for message, layout in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(layout=layout)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+    def test_a_single_token_prompt_is_handed_over_whole(self) -> None:
+        # One token: nothing is backed off; its latents' block is pulled.
+        checks = [packed_check(r, window=(0, 1), full=(0, 1)) for r in ("a", "b")]
+        pulls = packed_pull("a", (0, 1), (0, 1)) + packed_pull("b", (0, 1), (0, 1), offset=300)
+        decode = (packed_layout() + pulls + "".join(stepped(r, "d", 0, 1, 1) for r in ("a", "b"))
+                  + line(kv_transfers={"load": {"count": 2, "bytes": 80, "failed": 0}})
+                  + "".join(line(kv_check=c) for c in checks))
+        prefill = packed_layout() + allocated("a", "b") + "".join(stepped(r, "p", 0, 1, 1) for r in ("a", "b"))
+        short = pd.Run(**{**NIXL.__dict__, "workload": pd.Workload(num_prompts=2, input_len=1)})
+        verdict = pd.check({"completed": 2, "errors": []}, [prefill], [decode], {"control": 1, "data0": 180},
+                           short)
+        self.assertEqual(verdict["problems"], [])
+
+
 NIXL = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
 
 

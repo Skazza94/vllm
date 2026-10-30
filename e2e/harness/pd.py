@@ -449,9 +449,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "checked_ids": {c["req_id"] for c in checks if "req_id" in c and "error" not in c},
                 "allocated_ids": {req_id for r in records
                                   for req_id in ((r.get("kv_events") or {}).get("allocated") or {})},
-                "hybrid": bool(layout and any(g.get("kind") == "MambaSpec" for g in layout.get("groups") or [])),
+                "hybrid": bool(layout and _prefill_backoff(layout)),
                 "groups": layout and layout.get("groups") and _group_evidence(layout, checks, records),
                 "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
+                "kv_bytes_spanned": _spanned_bytes(layout, checks) if layout else 0,
                 "requests": owned, "tent": counters,
                 "kv_layout": layout and {key: layout.get(key) for key in (
                     "dp_rank", "dp_local_rank", "tp_rank", "tp_size", "shape", "block_bytes", "bytes",
@@ -467,8 +468,12 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         checked = sum(summary["kv_bytes_checked"] for summary in of["decode"].values())
         moved = sum(summary["transfers"]["bytes"] for role in sides for summary in of[role].values())
         # Decode checks every block the connector pulls: the transfer plan.
-        if moved < checked or (run.kv_check and moved != checked):
-            problems.append(f"{at}the connector moved {moved} bytes, not the {checked} decode checked")
+        # What the checked blocks span as the connector moves them (a packed
+        # block whole), which a packed layout's checked pages do not fill.
+        spanned = sum(summary["kv_bytes_spanned"] for summary in of["decode"].values())
+        if moved < spanned or (run.kv_check and moved != spanned):
+            what = "decode checked" if spanned == checked else f"decode's checked blocks span ({checked} checked)"
+            problems.append(f"{at}the connector moved {moved} bytes, not the {spanned} {what}")
         owners: dict[str, dict[str, set[int]]] = {}
         for role in sides:
             owners[role] = {}
@@ -503,7 +508,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 set().union(*(summary[consumed_ids] for summary in of["decode"].values())))
             problems.extend(f"{at}{problem}" for problem in handoff["problems"])
         per_tp.append({
-            "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked,
+            "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked, "kv_bytes_spanned": spanned,
             "transfers_bytes": moved,
             "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
             "groups": {role: {dp: summary["groups"] for dp, summary in of[role].items()}
@@ -578,6 +583,89 @@ def _pull_plans(records: list[dict]) -> dict[str, dict[int, tuple[int, int]]]:
     return plans
 
 
+def _prefill_backoff(layout: dict) -> bool:
+    """Whether decode loads N - 1 of a prompt's N tokens and computes the
+    last: a recurrent state's, or (``prefill_backoff``) a window replayed
+    after a load (DeepSeek-V4's)."""
+    return layout.get("prefill_backoff") == 1 or any(
+        group.get("kind") == "MambaSpec" for group in layout.get("groups") or [])
+
+
+def _packed_problems(group: dict) -> list[str]:
+    """How a packed group's layout (each block all of its layers' pages,
+    DeepSeek-V4's) is malformed: each member names its kind, dtype, tokens a
+    state, layer count and one offset per layer, its real bytes within its
+    page; every page lies within the block stride, none overlapping another;
+    the members count the group's layers, its checked bytes are their real
+    pages and the bytes a block moves span the block. Empty for a group that
+    is not packed."""
+    if not any(key in group for key in ("members", "checked_bytes_per_block", "transfer_bytes_per_block")):
+        return []
+
+    def size(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    members = group.get("members")
+    checked = group.get("checked_bytes_per_block")
+    moved = group.get("transfer_bytes_per_block")
+    stride = group.get("block_stride")
+    if not (isinstance(members, list) and members and size(checked) and size(moved) and size(stride)):
+        return [f"has a malformed packed layout (members, checked_bytes_per_block {checked!r}, "
+                f"transfer_bytes_per_block {moved!r}, block_stride {stride!r})"]
+    problems, pages = [], []
+    for index, member in enumerate(members):
+        fields = ("kind", "dtype", "tokens_per_state", "layers", "offsets", "page_bytes", "real_page_bytes")
+        if not isinstance(member, dict) or any(key not in member for key in fields):
+            return [f"has a malformed packed member {index} (needs {', '.join(fields)})"]
+        offsets, per_state = member["offsets"], member["tokens_per_state"]
+        if not (isinstance(member["kind"], str) and isinstance(member["dtype"], str)
+                and isinstance(per_state, (int, float)) and not isinstance(per_state, bool) and per_state > 0
+                and size(member["layers"]) and size(member["page_bytes"]) and size(member["real_page_bytes"])
+                and isinstance(offsets, list) and len(offsets) == member["layers"]
+                and all(isinstance(o, int) and not isinstance(o, bool) and o >= 0 for o in offsets)):
+            return [f"has a malformed packed member {index} ({member!r})"]
+        if member["real_page_bytes"] > member["page_bytes"]:
+            problems.append(f"member {index} has {member['real_page_bytes']} real bytes in a "
+                            f"{member['page_bytes']}-byte page")
+        for offset in offsets:
+            if offset + member["page_bytes"] > stride:
+                problems.append(f"member {index}'s page at {offset} ends beyond the {stride}-byte block")
+            pages.append((offset, offset + member["page_bytes"], index))
+    pages.sort()
+    for (_, end, first), (start, _, second) in zip(pages, pages[1:]):
+        if start < end:
+            problems.append(f"member {second}'s page at {start} overlaps member {first}'s, ending at {end}")
+    layers = sum(member["layers"] for member in members)
+    real = sum(member["real_page_bytes"] * member["layers"] for member in members)
+    if layers != group.get("layers"):
+        problems.append(f"packs {layers} layers, not its {group.get('layers')}")
+    if real != checked:
+        problems.append(f"checks {checked} bytes a block, not its members' {real} real bytes")
+    if moved < stride:
+        problems.append(f"moves {moved} bytes a block, less than its {stride}-byte block")
+    return problems
+
+
+def _spanned_bytes(layout: dict, checks: list[dict]) -> int:
+    """The bytes a rank's successful byte checks span as the connector moves
+    them: their checked bytes, but a packed group's blocks whole."""
+    by_group = {index: group for index, group in enumerate(layout.get("groups") or [])}
+    total = 0
+    for check in checks:
+        if "error" in check:
+            continue
+        nested = check.get("groups")
+        if nested is None:
+            total += int(check.get("bytes") or 0)
+            continue
+        for g in nested:
+            group = by_group.get(g.get("group"), {})
+            moved = group.get("transfer_bytes_per_block")
+            packed = isinstance(moved, int) and not _packed_problems(group)
+            total += g["blocks"] * moved if packed else int(g.get("bytes") or 0)
+    return total
+
+
 def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                          plans: dict[str, dict[int, tuple[int, int]]],
                          prompts: dict[str, int] | None = None) -> list[str]:
@@ -592,11 +680,14 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
     its blocks times its layers' block bytes; a window pulls its last
     blocks only (Mooncake's cdiv(window, block) + 1), other attention from
     the first, all of the request's prompt (`prompts`, by decode's request
-    id): cdiv(tokens, block) blocks of its N tokens, N - 1 for a hybrid
-    model, whose decoder computes the last token; a gated delta-net's state
+    id): cdiv(tokens, block) blocks of its N tokens, N - 1 when the
+    decoder computes the last token (a hybrid model's, or a layout's
+    ``prefill_backoff``); a gated delta-net's state
     is one block, at place 0. For several groups or a window, each group
     must also be the request's pull as posted (``_pull_plans``), and prompts
-    longer than a window must have had some pull clipped. Missing fields are
+    longer than a window must have had some pull clipped. A packed group
+    (each block all of its layers' pages, DeepSeek-V4's) checks its layers'
+    real pages, ``checked_bytes_per_block`` a block. Missing fields are
     problems."""
     groups = layout.get("groups")
     problems = []
@@ -608,7 +699,16 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                                 f"({layout['block_bytes']} bytes a block and layer)")
         return _capped(problems)
     grouped = len(groups) > 1 or any(spec.get("sliding_window") is not None for spec in groups)
-    hybrid = any(spec.get("kind") == "MambaSpec" for spec in groups)
+    # The decoder computes the last of N > 1 prompt tokens (a recurrent
+    # state, or a window replayed after a load).
+    hybrid = _prefill_backoff(layout)
+    if layout.get("prefill_backoff") not in (None, 1):
+        problems.append(f"the layout's prefill_backoff is {layout.get('prefill_backoff')!r}, not 1")
+    invalid = set()
+    for index, spec in enumerate(groups):
+        if found := _packed_problems(spec):
+            invalid.add(index)
+            problems.extend(f"group {index} {problem}" for problem in found)
     clipped = [0] * len(groups)
     for check in checks:
         request = check.get("req_id")
@@ -642,7 +742,15 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                                 f"block-aligned prompt's end)")
             elif g["blocks"] < 1 and not skipped:
                 problems.append(f"{request}'s group {g['group']} checked no blocks")
-            if (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["layers"] * spec["block_bytes"]):
+            if g["group"] in invalid:
+                pass  # its malformed layout is reported above
+            elif "checked_bytes_per_block" in spec:
+                # A packed block: its layers' real pages are checked.
+                if (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["checked_bytes_per_block"]):
+                    problems.append(f"{request}'s group {g['group']} check disagrees with the layout "
+                                    f"({spec['layers']} layers, {spec['checked_bytes_per_block']} bytes checked "
+                                    "a block)")
+            elif (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["layers"] * spec["block_bytes"]):
                 problems.append(f"{request}'s group {g['group']} check disagrees with the layout "
                                 f"({spec['layers']} layers of {spec['block_bytes']} bytes a block)")
             if window is None and g["first_logical_block"] != 0:
