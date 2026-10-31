@@ -382,7 +382,7 @@ class AisimulateTimingProvider:
             "nextn": nextn,
             **modes,
             "kvcache_quant_mode": kv_mode,
-            "estimation_mode": "auto",
+            "estimation_mode": "op_level",
             "database_mode": "SILICON",
             "fallback_policy": "deny",
         }
@@ -398,6 +398,16 @@ class AisimulateTimingProvider:
                 f"AISimulate has no timing for {target} on {system} with "
                 f"{topology}: {diagnostics.get('readiness')} "
                 f"({diagnostics.get('last_warning')})."
+            )
+        # Op-level estimates only: AISimulate's interpolation and regression
+        # modes are not taken, even when they would answer.
+        mode = (diagnostics.get("provenance") or {}).get("config", {}).get(
+            "estimation_mode"
+        )
+        if mode != "op_level":
+            raise ValueError(
+                f"AISimulate resolved {target} on {system} with {topology} to "
+                f"estimation mode {mode!r}, not op_level."
             )
         probes = self._startup_probes(target, system, topology)
         try:

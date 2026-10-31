@@ -559,6 +559,23 @@ def test_an_unready_estimator_is_refused(fake_aisimulate, monkeypatch):
         provider(engine_config())
 
 
+@pytest.mark.parametrize("mode", ["interpolation", "regression", None])
+def test_only_op_level_estimates_are_taken(fake_aisimulate, monkeypatch, mode):
+    """The provider asks for op-level estimates and refuses any other
+    resolution, or none recorded."""
+    diagnostics = fake_aisimulate.diagnostics
+
+    def resolved(self):
+        d = diagnostics(self)
+        d["provenance"]["config"]["estimation_mode"] = mode
+        return d
+
+    monkeypatch.setattr(fake_aisimulate, "diagnostics", resolved)
+    with pytest.raises(ValueError, match=f"estimation mode {mode!r}, not op_level"):
+        provider(engine_config())
+    assert fake_aisimulate.instances[-1].config.kwargs["estimation_mode"] == "op_level"
+
+
 def test_a_missing_package_is_a_clear_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "aisimulate_core", None)
     with pytest.raises(ImportError, match="aisimulate package"):
@@ -1023,6 +1040,12 @@ def test_deepseek_v4_modes_and_cache_precision_with_the_real_package():
     published = HfConfig(bundled_config(V4))
     tp4 = engine_config(V4, published, tensor_parallel_size=4)
     explicit = provider(tp4, gpu="b200")
+    # BF16 attention over the packed FP8 cache resolves to op-level estimates.
+    resolved = explicit.assumptions()["aisimulate"]["resolved_config"]
+    assert (resolved["estimation_mode"], resolved["kvcache_quant_mode"]) == (
+        "op_level",
+        "fp8",
+    )
     default = RustForwardPassPerfModel.best_available(
         ForwardPassPerfModelConfig(
             model=V4,
