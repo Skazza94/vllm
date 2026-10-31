@@ -107,6 +107,13 @@ class Server:
     """The KV connector: mooncake (MooncakeConnector, prefill writes) or nixl
     (NixlConnector over NIXL's Mooncake backend, decode reads); both move
     the KV through TENT's hp_tcp."""
+    speculative: dict | None = None
+    """Native MTP over NIXL: {method: mtp, num_speculative_tokens: k (1 to
+    5), acceptance_rates: [...], seed: 0}. Both instances take the same
+    speculative config (NIXL's handshake checks their transfer
+    compatibility, the draft among it). The rates are the
+    simulator's per-position conditional acceptance probabilities (the last
+    repeats), sampled with the seed: a run input, not a model's."""
 
 
 @dataclass
@@ -164,6 +171,8 @@ def load(path: str | Path) -> Run:
                          "module.Class)")
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
+    if run.server.speculative is not None:
+        _check_speculative(run.server)
     if run.kv_check and run.server.enable_prefix_caching:
         raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
     ranks = run.server.tensor_parallel_size
@@ -174,6 +183,26 @@ def load(path: str | Path) -> Run:
         # Each network routes only its own subnet.
         raise ValueError("prefill and decode rank r need the same KV network")
     return run
+
+
+SPECULATIVE_KEYS = {"method", "num_speculative_tokens", "acceptance_rates", "seed"}
+
+
+def _check_speculative(server: Server) -> None:
+    spec = server.speculative
+    if not isinstance(spec, dict) or (unknown := set(spec) - SPECULATIVE_KEYS):
+        raise ValueError(f"server.speculative takes {', '.join(sorted(SPECULATIVE_KEYS))}")
+    k = spec.get("num_speculative_tokens")
+    rates = spec.get("acceptance_rates")
+    if spec.get("method") != "mtp" or not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 5:
+        raise ValueError("server.speculative is native MTP (method mtp) of 1 to 5 tokens")
+    if (not isinstance(rates, list) or not 1 <= len(rates) <= k
+            or not all(isinstance(r, (int, float)) and not isinstance(r, bool) and 0 <= r <= 1 for r in rates)):
+        raise ValueError(f"server.speculative.acceptance_rates: 1 to {k} probabilities in [0, 1]")
+    if not isinstance(spec.get("seed", 0), int) or isinstance(spec.get("seed", 0), bool):
+        raise ValueError("server.speculative.seed is an integer")
+    if server.connector != "nixl":
+        raise ValueError("server.speculative needs the nixl connector (its handshake checks the draft)")
 
 
 def tent_config(address: str, hp_tcp_args: dict) -> dict:
@@ -201,6 +230,9 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
                   "log_path": STEP_LOG, "kv_transfer_mode": "real"}
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
+    spec = run.server.speculative
+    if spec is not None:
+        simulation["spec_acceptance_rates"] = spec["acceptance_rates"]
     nixl = run.server.connector == "nixl"
     kv_transfer = {"kv_connector": "NixlConnector" if nixl else "MooncakeConnector",
                    "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
@@ -243,6 +275,9 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         *_prefix_caching_flags(run),
         "--simulation-config", json.dumps(simulation),
         "--kv-transfer-config", json.dumps(kv_transfer),
+        *(["--speculative-config", json.dumps({"method": spec["method"],
+                                                "num_speculative_tokens": spec["num_speculative_tokens"]}),
+           "--seed", str(spec.get("seed", 0))] if spec is not None else []),
         "--simulate-forward",
     ]
 
@@ -549,6 +584,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         problems.append(f"the control network carried {control} bytes, too much beside {moved} of KV")
     sums = {key: sum(summary["transfers"][key] for role in sides for summary in ranks[role].values())
             for key in ("count", "bytes", "failed")}
+    speculation = None
+    if run.server.speculative is not None:
+        speculation = _speculation(bench, logs["decode"], run)
+        problems.extend(speculation.pop("problems"))
     return {
         "problems": problems,
         "requests": bench.get("completed"),
@@ -563,10 +602,101 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                                 if key not in ("requests", "checked_ids", "allocated_ids")},
                              "requests": len(summary["requests"])}
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
+        "speculation": speculation,
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
     }
 
+
+def _speculation(bench: dict, decode: dict[tuple[int, int], list[dict]], run: Run) -> dict:
+    """Speculative decoding's evidence: every request returned exactly its
+    output length (a last step's surplus drafts clipped); decode scheduled
+    drafts, and each of a step's drafted requests has exactly one acceptance
+    record (`spec_acceptance`) in its owning DP rank's log, for that step:
+    its drafts, and accepted drafts within them, the step's own count where
+    it has one (a joint MoE-DP step does not); all of them or none accepted
+    at rates all 1 or all 0. TP ranks log the same: TP rank 0's logs."""
+
+    spec = run.server.speculative
+    problems = []
+    lengths = bench.get("output_lens") or []
+    if len(lengths) != run.workload.num_prompts or any(n != run.workload.output_len for n in lengths):
+        problems.append(f"output lengths {sorted(set(lengths))} of {len(lengths)} request(s), not "
+                        f"{run.workload.output_len} each")
+
+    def count(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    # (owning DP rank, step, request): its drafts and the step's own count.
+    scheduled: dict[tuple[int, int, str], tuple[int, int | None]] = {}
+    logged: dict[tuple[int, int, str], list[object]] = {}
+    duplicates, invalid = [], []
+    steps = 0
+    for (dp, tp), records in decode.items():
+        if tp:
+            continue
+        for record in records:
+            if "step" in record:
+                step = record["step"]
+                requests = step["requests"]
+                drafts = [r["num_spec_tokens"] for r in requests]
+                steps += any(drafts)
+                counts = (record.get("cost") or {}).get("num_accepted")
+                if counts is not None and any(drafts) and (
+                        not isinstance(counts, list) or len(counts) != len(drafts)
+                        or not all(count(a) and a <= d for a, d in zip(counts, drafts))):
+                    problems.append(f"decode step {step['step_index']} accepted {counts} of drafts {drafts}")
+                    counts = None
+                for n, (request, d) in enumerate(zip(requests, drafts)):
+                    if d:
+                        owner = request.get("dp_rank", dp)
+                        scheduled[(owner, step["step_index"], request["req_id"])] = (
+                            d, counts[n] if counts is not None else None)
+            if "spec_acceptance" in record:
+                entry = record["spec_acceptance"]
+                for request, pair in (entry.get("requests") or {}).items():
+                    key = (dp, entry.get("step_index"), request)
+                    if not isinstance(pair, list) or len(pair) != 2 or not all(map(count, pair)) or (
+                            not 0 < pair[0] or pair[1] > pair[0]):
+                        invalid.append(f"DP rank {dp} step {key[1]}: request {request} accepted {pair} "
+                                       "(drafts, accepted)")
+                    elif key in logged:
+                        duplicates.append(f"DP rank {dp} step {key[1]}: request {request} logged twice")
+                    else:
+                        logged[key] = pair
+    problems.extend(_capped(invalid) + _capped(duplicates))
+    missing = [key for key in scheduled if key not in logged]
+    extra = [key for key in logged if key not in scheduled]
+    contradicted = [
+        f"DP rank {key[0]} step {key[1]}: request {key[2]} logged {logged[key]}, the step drafted {d}"
+        + (f" and accepted {a}" if a is not None else "")
+        for key, (d, a) in scheduled.items() if key in logged
+        and (logged[key][0] != d or (a is not None and logged[key][1] != a))]
+    drafted = sum(d for d, _ in scheduled.values())
+    accepted = sum(pair[1] for key, pair in logged.items() if key in scheduled)
+    if not drafted:
+        problems.append("decode scheduled no drafts")
+    if missing:
+        problems.append(f"{len(missing)} drafted request step(s) lack their owner's acceptance (spec_acceptance), "
+                        f"e.g. DP rank {missing[0][0]} step {missing[0][1]} request {missing[0][2]}")
+    if extra:
+        problems.append(f"{len(extra)} acceptance record(s) for no drafted request step of their DP rank, e.g. "
+                        f"DP rank {extra[0][0]} step {extra[0][1]} request {extra[0][2]}")
+    problems.extend(_capped(contradicted))
+    rates = spec["acceptance_rates"]
+    if drafted and set(rates) == {1} and accepted != drafted:
+        problems.append(f"{accepted} of {drafted} drafts accepted at acceptance rates 1")
+    elif set(rates) == {0} and accepted:
+        problems.append(f"{accepted} drafts accepted at acceptance rates 0")
+    by_dp: dict[str, dict[str, int]] = {}
+    for (owner, _, _), pair in sorted(logged.items(), key=lambda item: str(item[0])):
+        rank = by_dp.setdefault(str(owner), {"drafted": 0, "accepted": 0})
+        rank["drafted"] += pair[0]
+        rank["accepted"] += pair[1]
+    return {"problems": problems, "num_speculative_tokens": spec["num_speculative_tokens"],
+            "acceptance_rates": rates, "seed": spec.get("seed", 0), "steps_with_drafts": steps,
+            "drafted": drafted, "drafts_logged": sum(pair[0] for pair in logged.values()), "accepted": accepted,
+            "dp_ranks": by_dp}
 
 def _pull_plans(records: list[dict]) -> dict[str, dict[int, tuple[int, int]]]:
     """Decode's pulls as the connector posted them: for each request in a

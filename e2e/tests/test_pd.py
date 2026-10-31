@@ -963,6 +963,125 @@ class NixlCheckTests(unittest.TestCase):
         self.assertTrue(any("prefill's TENT metrics lack tent_write_bytes_total" in p for p in problems), problems)
 
 
+class SpeculativeCheckTests(unittest.TestCase):
+    """Native MTP over NIXL: both instances take it, decode schedules drafts,
+    every request returns exactly its output length."""
+
+    SPEC = {"method": "mtp", "num_speculative_tokens": 3, "acceptance_rates": [1.0], "seed": 7}
+
+    def run_with(self, **spec) -> pd.Run:
+        return pd.Run(**{**NIXL.__dict__, "server": pd.Server(connector="nixl", speculative={**self.SPEC, **spec})})
+
+    def test_both_instances_take_the_speculative_config(self) -> None:
+        for role in ("prefill", "decode"):
+            command = pd.server_command(self.run_with(), role, ["10.100.0.1"])
+            self.assertEqual(json.loads(command[command.index("--speculative-config") + 1]),
+                             {"method": "mtp", "num_speculative_tokens": 3})
+            self.assertEqual(command[command.index("--seed") + 1], "7")
+            simulation = json.loads(command[command.index("--simulation-config") + 1])
+            self.assertEqual(simulation["spec_acceptance_rates"], [1.0])
+        plain = pd.server_command(NIXL, "decode", ["10.100.0.1"])
+        self.assertNotIn("--speculative-config", plain)
+        self.assertNotIn("spec_acceptance_rates", json.loads(plain[plain.index("--simulation-config") + 1]))
+
+    def test_only_native_mtp_over_nixl_with_valid_rates(self) -> None:
+        for spec, connector, message in (
+            ({"method": "ngram"}, "nixl", "native MTP"),
+            ({"num_speculative_tokens": 6}, "nixl", "native MTP"),
+            ({"acceptance_rates": []}, "nixl", "1 to 3 probabilities"),
+            ({"acceptance_rates": [1.5]}, "nixl", "1 to 3 probabilities"),
+            ({"acceptance_rates": [0.5] * 4}, "nixl", "1 to 3 probabilities"),
+            ({"seed": "x"}, "nixl", "seed is an integer"),
+            ({"draft": "x"}, "nixl", "server.speculative takes"),
+            ({}, "mooncake", "needs the nixl connector"),
+        ):
+            with self.subTest(spec=spec, connector=connector):
+                with self.assertRaisesRegex(ValueError, message):
+                    pd._check_speculative(pd.Server(connector=connector, speculative={**self.SPEC, **spec}))
+
+    def verdict(self, steps, lengths=(16, 16), extra=(), owner=0, **spec) -> dict:
+        """Decode's steps: (drafts, the step's own counts, the rank's logged
+        (drafts, accepted) pairs; "same": the counts' pairs)."""
+        loads = {"count": 2, "bytes": 2000, "failed": 0}
+        decode = ONE_RANK + line(kv_transfers={"load": loads}) + line(kv_check=checked("a")) + line(
+            kv_check=checked("b"))
+        for i, (drafts, counts, logged) in enumerate(steps):
+            requests = [f"cmpl-{r}-0-d" for r in "ab"[:len(drafts)]]
+            decode += line(step={"step_index": i, "requests": [
+                {"req_id": r, "num_computed_tokens": 100 + i, "num_scheduled_tokens": 1 + d,
+                 "num_prompt_tokens": 100, "num_spec_tokens": d, "dp_rank": owner}
+                for r, d in zip(requests, drafts)]},
+                cost={"num_accepted": counts})
+            if logged == "same":
+                logged = [[d, a] for d, a in zip(drafts, counts)]
+            pairs = {r: pair for r, pair, d in zip(requests, logged or [], drafts) if d}
+            if pairs:
+                decode += line(spec_acceptance={"step_index": i, "requests": pairs})
+        decode += "".join(line(spec_acceptance=record) for record in extra)
+        tents = {"prefill": [{"tent_registered_buffer_bytes": 1600}],
+                 "decode": [{"tent_read_bytes_total": 2000, "tent_registered_buffer_bytes": 1600}]}
+        return pd.check({"completed": 2, "errors": [], "output_lens": list(lengths)},
+                        [ONE_RANK + allocated("a", "b")], [decode], {"control": 50, "data0": 2100},
+                        self.run_with(**spec), tents)
+
+    def test_drafts_are_scheduled_and_accepted_as_the_rates_say(self) -> None:
+        verdict = self.verdict([([0, 0], [0, 0], None), ([3, 3], [3, 3], "same"), ([3, 1], [3, 1], "same")])
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual({k: verdict["speculation"][k] for k in ("steps_with_drafts", "drafted", "accepted")},
+                         {"steps_with_drafts": 2, "drafted": 10, "accepted": 10})
+        self.assertEqual(verdict["speculation"]["seed"], 7)
+        # Rates all 0: none accepted. A joint MoE-DP step has no counts of its
+        # own; its rank's acceptance records cover it.
+        verdict = self.verdict([([3, 3], [0, 0], "same"), ([3], None, [[3, 0]])], acceptance_rates=[0.0])
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["speculation"]["drafts_logged"], 9)
+
+    def test_each_failure_is_reported(self) -> None:
+        cases = {
+            "decode scheduled no drafts": {"steps": [([0, 0], [0, 0], None)]},
+            "5 of 6 drafts accepted at acceptance rates 1": {"steps": [([3, 3], [3, 2], "same")]},
+            "2 drafts accepted at acceptance rates 0": {"steps": [([3, 3], [2, 0], "same")],
+                                                       "acceptance_rates": [0.0]},
+            "accepted [2, 1] of drafts [1, 3]": {"steps": [([1, 3], [2, 1], [[1, 1], [3, 1]])],
+                                                 "acceptance_rates": [0.5]},
+            "output lengths [15, 16] of 2 request(s), not 16 each": {"steps": [([3, 3], [3, 3], "same")],
+                                                                    "lengths": (16, 15)},
+            # Unobserved acceptance does not pass, even at rates all 1.
+            "2 drafted request step(s) lack their owner's acceptance": {"steps": [([3, 3], None, None)]},
+            "1 drafted request step(s) lack their owner's acceptance": {"steps": [([3, 3], None, [[3, 3]])]},
+            # Each record matches its own step: the step's drafts and counts.
+            "request cmpl-a-0-d logged [3, 3], the step drafted 3 and accepted 0": {
+                "steps": [([3, 3], [0, 0], [[3, 3], [3, 3]])]},
+            "step 0: request cmpl-a-0-d logged [3, 3], the step drafted 1": {
+                "steps": [([1, 1], None, [[3, 3], [3, 3]]), ([3, 3], None, [[1, 1], [1, 1]])]},
+            "request cmpl-a-0-d logged twice": {
+                "steps": [([3, 3], None, [[3, 3], [3, 3]])],
+                "extra": [{"step_index": 0, "requests": {"cmpl-a-0-d": [3, 3]}}]},
+            "1 acceptance record(s) for no drafted request step of their DP rank, e.g. DP rank 0 step 7": {
+                "steps": [([3, 3], None, [[3, 3], [3, 3]])],
+                "extra": [{"step_index": 7, "requests": {"cmpl-a-0-d": [3, 3]}}]},
+            # A step's counts: one per request, nonnegative.
+            "accepted [] of drafts [3, 3]": {"steps": [([3, 3], [], [[3, 1], [3, 1]])], "acceptance_rates": [0.5]},
+            "accepted [-1, 1] of drafts [3, 3]": {"steps": [([3, 3], [-1, 1], [[3, 0], [3, 0]])],
+                                                  "acceptance_rates": [0.0]},
+            "request cmpl-a-0-d accepted [3, -1]": {"steps": [([3, 3], None, [[3, -1], [3, 1]])],
+                                                    "acceptance_rates": [0.0]},
+            "request cmpl-b-0-d accepted [3, 4]": {"steps": [([3, 3], None, [[3, 3], [3, 4]])]},
+        }
+        for message, given in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**given)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+        # A record in another DP rank's log than the request's owner.
+        problems = self.verdict([([3, 3], None, [[3, 3], [3, 3]])], owner=1)["problems"]
+        for message in ("2 drafted request step(s) lack their owner's acceptance (spec_acceptance), e.g. DP rank 1",
+                        "2 acceptance record(s) for no drafted request step of their DP rank, e.g. DP rank 0"):
+            self.assertTrue(any(message in p for p in problems), problems)
+        # A rates-1 run with a request's acceptance missing does not pass on
+        # the drafts that were logged.
+        problems = self.verdict([([3, 3], None, [[3, 3]])])["problems"]
+        self.assertTrue(any("3 of 6 drafts accepted at acceptance rates 1" in p for p in problems), problems)
+
 @unittest.skipUnless(os.environ.get("E2E_VLLM") == "1", "set E2E_VLLM=1 to run vLLM in docker")
 class PrefillDecodeRunTests(unittest.TestCase):
     def test_a_byte_checked_run_keeps_its_kv_on_the_data_rail(self) -> None:
