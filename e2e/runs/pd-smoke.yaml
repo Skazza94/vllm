@@ -58,6 +58,7 @@ server:  # both servers; defaults shown where set
   # tensor_parallel_size: 1   # > 1 needs a topology with --shm-size 4g
   # dtype: auto
   # kv_cache_dtype: auto     # --kv-cache-dtype (e.g. fp8); auto: the model's
+  # language_model_only: false  # a multimodal model as its language model (aisimulate times only that)
   # The simulator's timing provider, required: zero, linear, table, replay,
   # aisimulate or a module.Class. aisimulate times a published model it covers
   # offline: timing_args {gpu, target_model: <org>/<name>} (the servers see

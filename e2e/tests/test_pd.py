@@ -113,6 +113,11 @@ class CheckTests(unittest.TestCase):
 
     def test_nixl_moves_the_kv_over_its_mooncake_backend_on_the_kv_address(self) -> None:
         nixl = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
+        # A hybrid's state as NIXL locates it; a spec's env may override.
+        self.assertIn("VLLM_SSM_CONV_STATE_LAYOUT=DS", pd.server_command(nixl, "prefill", ["10.100.0.1"]))
+        self.assertNotIn("VLLM_SSM_CONV_STATE_LAYOUT=DS", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
+        sd = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl", env={"VLLM_SSM_CONV_STATE_LAYOUT": "SD"})})
+        self.assertIn("VLLM_SSM_CONV_STATE_LAYOUT=SD", pd.server_command(sd, "prefill", ["10.100.0.1"]))
         for role in ("prefill", "decode"):
             command = pd.server_command(nixl, role, ["10.100.0.1"])
             config = json.loads(command[command.index("--kv-transfer-config") + 1])
@@ -420,7 +425,8 @@ def stepped(request: str, side: str, computed: int, scheduled: int, prompt: int)
 
 
 class HybridCheckTests(unittest.TestCase):
-    def verdict(self, checks=None, prefill_steps=None, decode_steps=None, pulls=None) -> dict:
+    def verdict(self, checks=None, prefill_steps=None, decode_steps=None, pulls=None,
+                layout=HYBRID_LAYOUT) -> dict:
         checks = checks or [hybrid_check("a"), hybrid_check("b")]
         moved = sum(c["bytes"] for c in checks)
         prefill_steps = prefill_steps if prefill_steps is not None else "".join(
@@ -428,9 +434,9 @@ class HybridCheckTests(unittest.TestCase):
         decode_steps = decode_steps if decode_steps is not None else "".join(
             stepped(r, "d", 32, 1, 33) for r in ("a", "b"))
         pulls = pulls if pulls is not None else hybrid_pull("a") + hybrid_pull("b", offset=300)
-        prefill = (HYBRID_LAYOUT + allocated("a", "b") + prefill_steps
+        prefill = (layout + allocated("a", "b") + prefill_steps
                    + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
-        decode = HYBRID_LAYOUT + pulls + decode_steps + "".join(line(kv_check=c) for c in checks)
+        decode = layout + pulls + decode_steps + "".join(line(kv_check=c) for c in checks)
         return pd.check({"completed": 2, "errors": []}, [prefill], [decode],
                         {"control": 1, "data0": moved + 100}, RUN)
 
@@ -480,6 +486,35 @@ class HybridCheckTests(unittest.TestCase):
                 for message in messages:
                     self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
                 self.assertLess(verdict["ranks"][0]["handoff"]["requests"], 2)
+
+    def test_over_nixl_the_checks_follow_its_native_selection(self) -> None:
+        """NIXL moves a state as its real spans in every state region, one
+        holding none of the group's layers included, not the padding: the
+        checks are compared with the layout's selection, not the pages."""
+        raw = json.loads(HYBRID_LAYOUT)
+        state, attention = raw["kv_layout"]["groups"]
+        # Two state regions of 6 real bytes (one transfer-only), 2 padding
+        # bytes each; the attention group's 8 bytes in each region.
+        state["transfer"] = {"bytes_per_block": 12, "transfer_only_bytes_per_block": 6,
+                             "padding_bytes_per_block": 4, "descriptors_per_block": 8}
+        attention["transfer"] = {"bytes_per_block": 16, "transfer_only_bytes_per_block": 0,
+                                 "padding_bytes_per_block": 0, "descriptors_per_block": 2}
+        layout = line(**raw)
+
+        def check(request: str, transfer_only: int = 6) -> dict:
+            nixl = hybrid_check(request)
+            state_check, attention_check = nixl["groups"]
+            state_check.update(bytes=12, transfer_only_bytes=transfer_only, padding_bytes=4, descriptors=8)
+            attention_check.update(bytes=32, transfer_only_bytes=0, padding_bytes=0, descriptors=4)
+            nixl["bytes"] = 44
+            return nixl
+
+        right = self.verdict(checks=[check("a"), check("b")], layout=layout)
+        self.assertEqual(right["problems"], [])
+        self.assertEqual(right["kv_bytes_transfer_only"], 12)
+        wrong = self.verdict(checks=[check("a", transfer_only=0), check("b")], layout=layout)["problems"]
+        self.assertTrue(any("cmpl-a-0-d's group 0 check disagrees with NIXL's selection" in p
+                            for p in wrong), wrong)
 
     def test_a_one_token_prompt_pulls_its_token(self) -> None:
         # Neither side truncates it: its one token's page is pulled, the token

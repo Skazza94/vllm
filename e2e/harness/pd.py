@@ -247,6 +247,9 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
+        # A hybrid model's state moves as NIXL locates it: conv state DS (a
+        # spec's env may set SD, which the simulator refuses).
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
     } if nixl else {"VLLM_MOONCAKE_BOOTSTRAP_PORT": str(BOOTSTRAP_PORT)}
     env = {
         "TRITON_CPU_BACKEND": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1", "OMP_NUM_THREADS": "1",
@@ -491,6 +494,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "hybrid": bool(layout and _prefill_backoff(layout)),
                 "groups": layout and layout.get("groups") and _group_evidence(layout, checks, records),
                 "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
+                # Of them, NIXL's moves of regions holding none of a group's
+                # layers (a hybrid's shorter state group).
+                "kv_bytes_transfer_only": sum(int(g.get("transfer_only_bytes") or 0)
+                                              for c in checks for g in c.get("groups") or []),
                 "kv_bytes_spanned": _spanned_bytes(layout, checks) if layout else 0,
                 "requests": owned, "tent": counters,
                 "kv_layout": layout and {key: layout.get(key) for key in (
@@ -548,6 +555,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             problems.extend(f"{at}{problem}" for problem in handoff["problems"])
         per_tp.append({
             "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked, "kv_bytes_spanned": spanned,
+            "kv_bytes_transfer_only": sum(summary["kv_bytes_transfer_only"] for summary in of["decode"].values()),
             "transfers_bytes": moved,
             "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
             "groups": {role: {dp: summary["groups"] for dp, summary in of[role].items()}
@@ -597,6 +605,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "requests": bench.get("completed"),
         "kv_checks": per_tp[0]["kv_checks"] if per_tp else 0,
         "kv_bytes_checked": sum(rank["kv_bytes_checked"] for rank in per_tp),
+        "kv_bytes_transfer_only": sum(rank.get("kv_bytes_transfer_only", 0) for rank in per_tp),
         "transfers": sums,
         "router_bytes": routers,
         "ranks": per_tp,
@@ -878,6 +887,17 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                 problems.append(f"{request}'s group {g['group']} checked no blocks")
             if g["group"] in invalid:
                 pass  # its malformed layout is reported above
+            elif "transfer" in spec:
+                # A hybrid over NIXL: the native selection of each block, its
+                # transfer-only regions and its state pages' unmoved padding.
+                transfer = spec["transfer"]
+                want = {key: g["blocks"] * transfer[per] for key, per in (
+                    ("bytes", "bytes_per_block"), ("transfer_only_bytes", "transfer_only_bytes_per_block"),
+                    ("padding_bytes", "padding_bytes_per_block"), ("descriptors", "descriptors_per_block"))}
+                got = {key: g.get(key) for key in want}
+                if (g["layers"], got) != (spec["layers"], want):
+                    problems.append(f"{request}'s group {g['group']} check disagrees with NIXL's selection "
+                                    f"({spec['layers']} layers, {want}; checked {g['layers']} layers, {got})")
             elif "checked_bytes_per_block" in spec:
                 # A packed block: its layers' real pages are checked.
                 if (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["checked_bytes_per_block"]):
