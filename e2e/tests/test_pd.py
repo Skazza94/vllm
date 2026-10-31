@@ -382,7 +382,7 @@ class GroupCheckTests(unittest.TestCase):
         self.assertTrue(any("not 0 from 2" in p for p in hybrid), hybrid)
 
 
-# Qwen3-Next-like: a gated delta-net's state group (one 8-byte padded page a
+# A gated delta-net hybrid's: its state group (one 8-byte padded page a
 # layer, 6 real) and a full-attention group of 16-token blocks, 2 layers
 # each; 33-token prompts, of which decode pulls 32 tokens' pages.
 HYBRID_LAYOUT = line(kv_layout={
