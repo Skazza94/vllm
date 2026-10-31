@@ -95,6 +95,9 @@ class Server:
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
     """The KV cache dtype (--kv-cache-dtype, e.g. fp8); auto: the model's."""
+    language_model_only: bool = False
+    """A multimodal model served as its language model (--language-model-only):
+    no modality, the encoders not built."""
     hp_tcp_args: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
     timing: str | None = None
@@ -270,6 +273,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         *(["--data-parallel-size", str(side.data_parallel_size), "--enable-expert-parallel"]
           if side.data_parallel_size > 1 else []),
         "--generation-config", "vllm", "--enforce-eager",
+        *(["--language-model-only"] if s.language_model_only else []),
         # The byte check's pattern is the request's: a block cached for
         # another request would not match it.
         *_prefix_caching_flags(run),

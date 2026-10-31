@@ -105,6 +105,12 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(flag(fp8, role, "--kv-cache-dtype"), "fp8")
             self.assertEqual(flag(fp8, role, "--dtype"), "auto")  # the weights' unchanged
 
+    def test_a_multimodal_model_serves_its_language_model_only_when_asked(self) -> None:
+        self.assertNotIn("--language-model-only", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
+        text = pd.Run(**{**RUN.__dict__, "server": pd.Server(language_model_only=True)})
+        for role in ("prefill", "decode"):
+            self.assertIn("--language-model-only", pd.server_command(text, role, ["10.100.0.1"]))
+
     def test_nixl_moves_the_kv_over_its_mooncake_backend_on_the_kv_address(self) -> None:
         nixl = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
         for role in ("prefill", "decode"):
