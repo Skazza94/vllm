@@ -3,12 +3,14 @@
 """Configuration of real NIXL KV transfers under simulated compute."""
 
 import json
+import math
 import os
 import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -531,8 +533,51 @@ def test_real_mode_takes_sliding_window_models_over_either_connector(
         assert config.model_config.get_sliding_window() == 32
 
 
-def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
-    qwen3_5_model_dir,
+@pytest.fixture
+def ds_conv_layout(monkeypatch):
+    """The DS conv-state layout, its cached resolutions cleared around."""
+    from vllm import envs
+    from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
+
+    def clear():
+        envs.disable_envs_cache()
+        get_conv_state_layout.cache_clear()
+
+    def use(layout):
+        if layout is None:
+            monkeypatch.delenv("VLLM_SSM_CONV_STATE_LAYOUT", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", layout)
+        clear()
+
+    use("DS")
+    yield use
+    monkeypatch.delenv("VLLM_SSM_CONV_STATE_LAYOUT", raising=False)
+    clear()
+
+
+def hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs):
+    """Over NIXL, a hybrid model's state moves as its DS conv sub-projections
+    and SSM state: refused in the SD layout (the default), taken in DS."""
+    for layout in (None, "SD"):
+        ds_conv_layout(layout)
+        with pytest.raises(ValueError, match="DS conv-state layout"):
+            engine_config(model_dir, **kwargs)
+    ds_conv_layout("DS")
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        config = engine_config(model_dir, kv_transfer={"kv_connector": connector}, **kwargs)
+        assert config.cache_config.mamba_cache_mode == "none"
+        with pytest.raises(ValueError, match="hybrid model without prefix caching"):
+            engine_config(
+                model_dir,
+                kv_transfer={"kv_connector": connector},
+                enable_prefix_caching=True,
+                **kwargs,
+            )
+
+
+def test_real_mode_takes_gdn_hybrids_over_mooncake_or_nixl_without_prefix_caching(
+    qwen3_5_model_dir, ds_conv_layout
 ):
     model_dir, kwargs = qwen3_5_model_dir, {"language_model_only": True}
     mooncake = {"kv_connector": "MooncakeConnector"}
@@ -544,13 +589,12 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
         engine_config(
             model_dir, kv_transfer=mooncake, enable_prefix_caching=True, **kwargs
         )
-    with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
-        engine_config(model_dir, **kwargs)
+    hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs)
 
 
 @pytest.mark.parametrize("model", ["nemotron_h_model_dir", "nemotron_3_model_dir"])
-def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
-    model, request
+def test_real_mode_takes_mamba2_hybrids_over_mooncake_or_nixl_without_prefix_caching(
+    model, request, ds_conv_layout
 ):
     model_dir = request.getfixturevalue(model)
     mooncake = {"kv_connector": "MooncakeConnector"}
@@ -559,8 +603,7 @@ def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
     assert config.cache_config.mamba_cache_mode == "none"
     with pytest.raises(ValueError, match="hybrid model without prefix caching"):
         engine_config(model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
-    with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
-        engine_config(model_dir)
+    hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout)
 
 
 def test_non_gated_cpu_experts_build_only_in_a_simulation(
@@ -1253,6 +1296,483 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
             assert set(experts.values()) == {(MoEActivation.RELU2_NO_MUL, (4, 32, 64))}
     finally:
         del llm
+
+
+# A tiny Nemotron-3 whose state groups differ: 3 Mamba2 layers in groups of
+# two slots (2 and 1), so one group holds no layer in the second slot.
+NEMOTRON_3_UNEQUAL = {
+    **NEMOTRON_3,
+    "num_hidden_layers": 7,
+    "hybrid_override_pattern": "M*EM*EM",
+}
+
+
+@pytest.mark.parametrize(
+    "config, kwargs, transfer_only",
+    [
+        (NEMOTRON_3_UNEQUAL, {}, True),
+        (NEMOTRON_3, {}, False),
+        (QWEN3_5_MOE, {"language_model_only": True}, False),
+    ],
+    ids=["nemotron-3-unequal", "nemotron-3", "qwen3.5"],
+)
+def test_nixl_checks_cover_a_hybrids_native_selection(
+    config, kwargs, transfer_only, tmp_path, monkeypatch, ds_conv_layout
+):
+    """Over NIXL a hybrid's blocks move as the native worker selects them:
+    deduplicated regions (a slot of each group's layers), every region of a
+    group's kind for each of its blocks (one holding none of its layers
+    included: transfer-only), a state as its conv sub-projections then its
+    SSM state, not its page's padding. The filler and the checker cover
+    exactly that selection, in its order, and catch a changed conv or SSM
+    byte, an unmoved transfer-only span, a written or copied padding byte."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.simulated.kv_pattern import (
+        POISON,
+        SENTINEL,
+        NativeChecker,
+        NativeFiller,
+    )
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    llm = LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+        **kwargs,
+    )
+    try:
+        # The runtime path: a chunked prompt filled through the selection.
+        llm.generate(
+            [{"prompt_token_ids": [5] * 200}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        engine = llm.llm_engine.engine_core.engine_core
+        runner = engine.model_executor.driver_worker.worker.model_runner
+        groups = engine.scheduler.kv_cache_config.kv_cache_groups
+        worker = get_kv_transfer_group().connector_worker
+        filler = runner._kv_filler
+        assert isinstance(filler, NativeFiller)
+        s = filler.selection
+
+        # One deduplicated region a slot, each state region prepared as
+        # three conv sub-projections and the SSM state.
+        slots = max(len(group.layer_names) for group in groups)
+        bases = worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank]
+        assert worker.num_regions == len(bases) == slots
+        state_regions = sorted(set(worker._ssm_region_indices))
+        for region in state_regions:
+            assert sum(row.state and row.region == region for row in s.rows) == 4
+
+        # Each group's spans a block, from its own spec: attention its page in
+        # every region; a state, in every state region, contiguous conv
+        # spans then the SSM state, together its real page.
+        for index, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            spans = [
+                (s.rows[row].region, s.rows[row].offset, s.rows[row].view.shape[1])
+                for row, _, _ in s.select(index, [1])
+            ]
+            if isinstance(spec, MambaSpec):
+                conv = spec.shapes[0]
+                conv_bytes = math.prod(conv) * spec.dtypes[0].itemsize
+                ssm_bytes = spec.real_page_size_bytes - conv_bytes
+                want = []
+                for region in state_regions:
+                    mine = [span for span in spans if span[0] == region]
+                    assert [span[1] for span in mine[:3]] == [
+                        0, mine[0][2], mine[0][2] + mine[1][2]
+                    ]
+                    assert sum(span[2] for span in mine[:3]) == conv_bytes
+                    want += mine[:3] + [(region, conv_bytes, ssm_bytes)]
+                assert spans == want
+            else:
+                assert spans == [(r, 0, spec.page_size_bytes) for r in range(slots)]
+            # A region holds the group's layers or is transfer-only.
+            assert len(s.members[index]) == len(group.layer_names)
+        has_transfer_only = any(
+            {s.rows[row].region for row, _, _ in s.select(index, [1])}
+            - s.members[index]
+            for index in range(len(groups))
+        )
+        assert has_transfer_only == transfer_only
+
+        # A request's ordered, paired descriptors: the native ids over the
+        # native local descriptors, block by block, duplicates included.
+        free = iter(range(2, 2 + 4 * len(groups)))
+        source = [[next(free), next(free)] for _ in groups]
+        target = [[next(free), next(free)] for _ in groups]
+        rows = worker.src_blocks_data
+        for index, blocks in enumerate(source):
+            lists = [[] for _ in groups]
+            lists[index] = blocks
+            native = [
+                (int(rows[r][0] + (d - s.starts[r]) * rows[r][3]), int(rows[r][1]))
+                for d in worker._compute_desc_ids(lists, worker.num_blocks, None, 1)
+                for r in [int(np.searchsorted(s.starts, d, side="right") - 1)]
+            ]
+            ours = [
+                (s.rows[row].view[block].data_ptr(), s.rows[row].view.shape[1])
+                for row, block, _ in s.select(index, blocks)
+            ]
+            assert ours == native
+            assert len(ours) == len(blocks) * len(s.select(index, [1]))
+
+        filler._extend("cmpl-a-0", source, replace=True)
+        for index, blocks in enumerate(source):
+            for region in s.state_regions(s.select(index, blocks)) & set(s.padding):
+                assert bool((s.padding[region].view[blocks] == POISON).all())
+
+        checker = NativeChecker(s)
+
+        def read(corrupt=None, whole_page=False, skip=None):
+            """The read NIXL would post: each selected span from the source
+            block to the target block, then a corruption; its check."""
+            checker.expect("cmpl-b-0", "cmpl-a-0", [0] * len(groups), target)
+            for index in range(len(groups)):
+                pairs = zip(
+                    s.select(index, source[index]), s.select(index, target[index])
+                )
+                for (row, src, place), (dst_row, dst, dst_place) in pairs:
+                    assert (row, place) == (dst_row, dst_place)
+                    if skip is not None and skip(index, row):
+                        continue
+                    s.rows[row].view[dst] = s.rows[row].view[src]
+                if whole_page:
+                    for region in s.state_regions(s.select(index, source[index])):
+                        if region in s.padding:
+                            pad = s.padding[region].view
+                            pad[target[index]] = pad[source[index]]
+            if corrupt is not None:
+                corrupt()
+            return checker._compare("cmpl-b-0", checker.pending.pop("cmpl-b-0"))
+
+        result = read()
+        assert result["ok"], result
+        for index, g in enumerate(result["groups"]):
+            per_block = sum(
+                s.rows[row].view.shape[1] for row, _, _ in s.select(index, [1])
+            )
+            assert g["bytes"] == 2 * per_block
+            assert g["descriptors"] == 2 * len(s.select(index, [1]))
+            assert g["layers"] == len(groups[index].layer_names)
+            if isinstance(groups[index].kv_cache_spec, MambaSpec):
+                assert g["padding_bytes"] > 0
+        assert (sum(g["transfer_only_bytes"] for g in result["groups"]) > 0) == (
+            transfer_only
+        )
+
+        state = next(
+            i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
+        )
+        conv_row = next(row for row, _, _ in s.select(state, [1]) if s.rows[row].state)
+        ssm_row = [row for row, _, _ in s.select(state, [1]) if s.rows[row].state][3]
+        padded = min(s.state_regions(s.select(state, [1])) & set(s.padding))
+
+        def flip(row):
+            def corrupt():
+                s.rows[row].view[target[state][0], 0] ^= 1
+            return corrupt
+
+        def pad():
+            s.padding[padded].view[target[state][1], 0] = 7
+
+        assert not read(flip(conv_row))["ok"]
+        assert not read(flip(ssm_row))["ok"]
+        padding = read(pad)
+        assert not padding["ok"] and sum(
+            g["padding_mismatched_bytes"] for g in padding["groups"]
+        ) == 1
+        assert not read(whole_page=True)["ok"]  # the padding was copied
+        if transfer_only:
+            unmoved = read(
+                skip=lambda index, row: s.rows[row].region not in s.members[index]
+            )
+            assert not unmoved["ok"]
+        # Two reads pending into disjoint blocks of the same storages: the
+        # second's initialization and a producer's fill of other blocks leave
+        # the first's landed payload and its padding untouched.
+        more = iter(range(2 + 4 * len(groups), worker.num_blocks))
+        first, second, fresh = (
+            [[next(more), next(more)] for _ in groups] for _ in range(3)
+        )
+
+        def land(blocks):
+            for index in range(len(groups)):
+                pairs = zip(s.select(index, source[index]), s.select(index, blocks[index]))
+                for (row, src, _), (_, dst, _) in pairs:
+                    s.rows[row].view[dst] = s.rows[row].view[src]
+
+        def snapshot(blocks):
+            spans = [
+                s.rows[row].view[block].clone()
+                for index in range(len(groups))
+                for row, block, _ in s.select(index, blocks[index])
+            ]
+            return spans + [
+                s.padding[region].view[blocks[index]].clone()
+                for index in range(len(groups))
+                for region in sorted(
+                    s.state_regions(s.select(index, blocks[index])) & set(s.padding)
+                )
+            ]
+
+        def complete(req_id):
+            return checker._compare(req_id, checker.pending.pop(req_id))
+
+        checker.expect("cmpl-d-0", "cmpl-a-0", [0] * len(groups), first)
+        land(first)
+        before = snapshot(first)
+        checker.expect("cmpl-e-0", "cmpl-a-0", [0] * len(groups), second)
+        filler._extend("cmpl-f-0", fresh, replace=True)
+        assert {"cmpl-d-0", "cmpl-e-0"} <= set(checker.pending)
+        assert all(torch.equal(a, b) for a, b in zip(before, snapshot(first)))
+        land(second)
+        assert complete("cmpl-d-0")["ok"]
+        assert complete("cmpl-e-0")["ok"]
+        # Completed and released, its blocks reused by another read take the
+        # sentinel again, and that read is checked on its own.
+        checker.expect("cmpl-g-0", "cmpl-a-0", [0] * len(groups), first)
+        assert all(
+            bool((s.rows[row].view[block] == SENTINEL).all())
+            for index in range(len(groups))
+            for row, block, _ in s.select(index, first[index])
+        )
+        assert not complete("cmpl-g-0")["ok"]  # nothing landed this time
+        checker.expect("cmpl-g-0", "cmpl-a-0", [0] * len(groups), first)
+        land(first)
+        assert complete("cmpl-g-0")["ok"]
+        assert not checker.pending
+        assert read()["ok"]
+        # A remote of another geometry is refused, not assumed equal.
+        worker = s.worker
+        for name, value in (
+            ("tp_mappings", {"remote": SimpleNamespace(
+                all_source_ranks=(0, 1), local_consumers=1)}),
+            ("src_xfer_handles_by_block_size", {
+                **worker.src_xfer_handles_by_block_size, worker.block_size + 1: object()}),
+            ("src_xfer_handles_by_tp_ratio", {(-2, worker.block_size): []}),
+        ):
+            saved = getattr(worker, name)
+            setattr(worker, name, value)
+            try:
+                with pytest.raises(ValueError, match="equal TP and block size"):
+                    read()
+            finally:
+                setattr(worker, name, saved)
+        assert read()["ok"]
+    finally:
+        del llm
+
+
+# One side of a NIXL pair, in a process of its own (the connector is a
+# process-wide singleton): the producer serves one prompt and waits; the
+# consumer reads it, recording the native descriptor lists and transfers.
+NIXL_PEER = r"""
+import json, os, sys, time
+import numpy as np
+
+def descriptors(rows, ids):
+    rows = np.asarray(rows, dtype=np.int64)
+    starts = np.cumsum(rows[:, 4]) - rows[:, 4]
+    out = []
+    for d in ids:
+        r = int(np.searchsorted(starts, d, side="right") - 1)
+        out.append([int(rows[r, 0] + (d - starts[r]) * rows[r, 3]), int(rows[r, 1])])
+    return out
+
+def main():
+    role, model, kwargs, out, memory = sys.argv[1:6]
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    producer = role == "producer"
+    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+                  "timing": "linear", "timing_args": {"fixed_us": 100}}
+    simulation.update({"kv_pattern_fill": True} if producer
+                      else {"kv_pattern_check": True, "log_path": out + ".steps"})
+    llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
+              max_model_len=256, kv_cache_memory_bytes=int(memory),
+              max_num_batched_tokens=64, enable_prefix_caching=False,
+              enforce_eager=True, simulation_config=simulation,
+              kv_transfer_config={
+                  "kv_connector": "NixlConnector",
+                  "kv_role": "kv_producer" if producer else "kv_consumer",
+                  "kv_buffer_device": "cpu",
+                  "kv_connector_extra_config": {"backends": ["Mooncake"]}},
+              **json.loads(kwargs))
+    engine = llm.llm_engine.engine_core.engine_core
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    worker = get_kv_transfer_group().connector_worker
+    mine = {"bases": [int(b) for b in worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank]],
+            "strides": [int(b) for b in worker.block_stride_per_layer],
+            "num_blocks": int(worker.num_blocks)}
+    prompt = [{"prompt_token_ids": [5] * 200}]
+    if producer:
+        params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False,
+                                extra_args={"kv_transfer_params": {"do_remote_decode": True}})
+        (output,) = llm.generate(prompt, params, use_tqdm=False)
+        with open(out + ".tmp", "w") as f:
+            json.dump({**mine, "params": output.kv_transfer_params}, f)
+        os.rename(out + ".tmp", out)
+        while not os.path.exists(out + ".done"):
+            time.sleep(0.2)
+        return
+    with open(sys.argv[6]) as f:
+        remote = json.load(f)
+    wrapper, checker = worker.nixl_wrapper, runner._kv_checker
+    dlists, transfers, reads = {}, [], []
+    prep, make, expect = wrapper.prep_xfer_dlist, wrapper.make_prepped_xfer, checker.expect
+
+    def prep_xfer_dlist(agent, blocks, *args, **kw):
+        handle = prep(agent, blocks, *args, **kw)
+        dlists[handle] = np.asarray(blocks).tolist()
+        return handle
+
+    def make_prepped_xfer(op, local, local_ids, remote_handle, remote_ids, *args, **kw):
+        transfers.append([op, local, [int(i) for i in local_ids], remote_handle,
+                          [int(i) for i in remote_ids]])
+        return make(op, local, local_ids, remote_handle, remote_ids, *args, **kw)
+
+    def record(req_id, remote_request_id, first, block_ids):
+        reads.append([[int(b) for b in ids] for ids in block_ids])
+        return expect(req_id, remote_request_id, first, block_ids)
+
+    wrapper.prep_xfer_dlist = prep_xfer_dlist
+    wrapper.make_prepped_xfer = make_prepped_xfer
+    checker.expect = record
+    params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
+                            extra_args={"kv_transfer_params": remote["params"]})
+    llm.generate(prompt, params, use_tqdm=False)
+    local_handle = worker.src_xfer_handles_by_block_size[worker.block_size]
+    native = []
+    for op, local, local_ids, remote_handle, remote_ids in transfers:
+        assert (op, local) == ("READ", local_handle), (op, local)
+        native += [a + b for a, b in zip(descriptors(worker.src_blocks_data, local_ids),
+                                         descriptors(dlists[remote_handle], remote_ids))]
+    # Ours: the selection of the consumer's blocks, each span paired with the
+    # same region and offset in the producer's block at the same place.
+    s = checker.selection
+    (block_ids,) = reads
+    ours = []
+    for group, (ids, remote_ids) in enumerate(zip(block_ids, remote["params"]["remote_block_ids"])):
+        remote_ids = remote_ids[len(remote_ids) - len(ids):]
+        for row, block, place in s.select(group, ids):
+            r = s.rows[row]
+            ours.append([r.view[block].data_ptr(), r.view.shape[1],
+                         remote["bases"][r.region] + r.offset
+                         + remote_ids[place] * remote["strides"][r.region],
+                         r.view.shape[1]])
+    with open(out + ".steps") as f:
+        checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
+    with open(out, "w") as f:
+        json.dump({**mine, "native": native, "ours": ours, "checks": checks,
+                   "transfers": len(transfers)}, f)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+@pytest.mark.parametrize(
+    "config, kwargs",
+    [
+        (NEMOTRON_3_UNEQUAL, {}),
+        (QWEN3_5_MOE, {"language_model_only": True}),
+    ],
+    ids=["nemotron-3-unequal", "qwen3.5"],
+)
+def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
+    """A producer and a consumer of different pools (their own processes,
+    backing addresses and block counts), joined by NIXL's own handshake: the
+    consumer's native READs pair, in order and with duplicates, each span of
+    our selection of its blocks with the same region and offset of the
+    producer's block at the same place, and its byte check passes."""
+    import socket
+    import subprocess
+    import sys
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text(json.dumps(config))
+    script = tmp_path / "peer.py"
+    script.write_text(NIXL_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+
+    def run(role, out, memory, *extra):
+        return [sys.executable, str(script), role, str(tmp_path / "model"),
+                json.dumps(kwargs), str(out), str(memory), *extra]
+
+    producer = subprocess.Popen(
+        run("producer", produced, 8 * 1024**2),
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, "the producer exited"
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        subprocess.run(
+            run("consumer", consumed, 12 * 1024**2, str(produced)),
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+            check=True,
+            timeout=600,
+        )
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            producer.kill()
+    p = json.loads(produced.read_text())
+    c = json.loads(consumed.read_text())
+    # Distinct pools and backing storage.
+    assert p["num_blocks"] != c["num_blocks"]
+    assert not set(p["bases"]) & set(c["bases"])
+    assert c["transfers"] >= 1
+    # The native pairs, in order and with their multiplicity, are ours.
+    assert c["native"] and c["native"] == c["ours"]
+    assert [d[1] for d in c["native"]] == [d[3] for d in c["native"]]
+    (check,) = c["checks"]
+    assert check["ok"], check
+    assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
+    assert sum(g["bytes"] for g in check["groups"]) == sum(d[1] for d in c["native"])
 
 
 @pytest.mark.parametrize(

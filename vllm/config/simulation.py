@@ -15,7 +15,8 @@ _SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 _RECORDING_WORKER = "vllm.v1.worker.simulated.recording.RecordingWorker"
 # Native connectors that move real KV under kv_transfer_mode real: NIXL's
 # decode-pulled READs, or Mooncake's prefill-written transfers.
-REAL_KV_CONNECTORS = ("NixlConnector", "NixlPullConnector", "MooncakeConnector")
+NIXL_CONNECTORS = ("NixlConnector", "NixlPullConnector")
+REAL_KV_CONNECTORS = (*NIXL_CONNECTORS, "MooncakeConnector")
 # Speculative decoding with real KV transfers: a model's native single-module
 # MTP (its draft architecture), whose one MTP layer's KV joins the target's.
 REAL_KV_MTP_DRAFTS = {
@@ -296,9 +297,10 @@ class SimulationConfig:
         ones, or an MoE model's data-parallel ranks with expert parallelism.
         Sliding-window layers, alone or beside full-attention ones, of which
         either connector moves each window's blocks only; Qwen gated
-        delta-net or Mamba2 layers (a hybrid model's) over Mooncake, without
-        prefix caching, each request's state one block. The native connector
-        stays in place."""
+        delta-net or Mamba2 layers (a hybrid model's) without prefix caching,
+        each request's state one block, over Mooncake or over NIXL with the
+        DS conv-state layout NIXL's state descriptors need. The native
+        connector stays in place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -404,13 +406,18 @@ class SimulationConfig:
                 "or sliding-window attention, Qwen gated delta-nets or Mamba2 "
                 "mixers (no sparse MLA or attention-free models)"
             )
-        elif model.is_hybrid and kv_transfer.kv_connector != "MooncakeConnector":
-            # Only Mooncake's plan is followed for a recurrent layer's state,
-            # one block. Both connectors clip a sliding window's blocks to
-            # the window and say where the pull starts.
-            problems.append(
-                f"MooncakeConnector for a hybrid model, not {kv_transfer.kv_connector}"
+        elif model.is_hybrid and kv_transfer.kv_connector in NIXL_CONNECTORS:
+            from vllm.model_executor.layers.mamba.mamba_utils import (
+                is_conv_state_dim_first,
             )
+
+            # NIXL moves a state as its conv sub-projections and SSM state,
+            # which it locates in the DS layout only.
+            if not is_conv_state_dim_first():
+                problems.append(
+                    "the DS conv-state layout for a hybrid model over NIXL "
+                    "(VLLM_SSM_CONV_STATE_LAYOUT=DS)"
+                )
         if model.is_hybrid and (
             cache.enable_prefix_caching or cache.mamba_cache_mode != "none"
         ):

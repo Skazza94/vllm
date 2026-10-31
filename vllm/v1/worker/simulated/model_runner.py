@@ -19,7 +19,8 @@ import torch.distributed as dist
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.config.simulation import NIXL_CONNECTORS
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
@@ -33,6 +34,9 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.simulated.kv_pattern import (
+    NativeChecker,
+    NativeFiller,
+    NativeSelection,
     PatternChecker,
     PatternFiller,
     block_views,
@@ -127,8 +131,8 @@ class SimulatedModelRunner(GPUModelRunner):
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.
         self._real_kv_transfer = sim.kv_transfer_mode == "real"
-        self._kv_filler: PatternFiller | None = None
-        self._kv_checker: PatternChecker | None = None
+        self._kv_filler: PatternFiller | NativeFiller | None = None
+        self._kv_checker: PatternChecker | NativeChecker | None = None
         # Real KV transfers: this step's lifecycle events, logged with the
         # connector's once it has posted the step's reads.
         self._kv_events: dict[str, object] | None = None
@@ -262,7 +266,13 @@ class SimulatedModelRunner(GPUModelRunner):
         tp = get_tp_group()
         groups = self.kv_cache_config.kv_cache_groups
         self._kv_allocations = group_allocations(self.kv_cache_config)
-        if sim.kv_pattern_fill or sim.kv_pattern_check:
+        # A hybrid model over NIXL: what the native worker selects, read
+        # once it registered the caches (below).
+        native = (
+            self.model_config.is_hybrid
+            and self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
+        )
+        if (sim.kv_pattern_fill or sim.kv_pattern_check) and not native:
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).
             pages = packed_pages(kv_caches_dict, layer_specs(groups))
@@ -283,18 +293,44 @@ class SimulatedModelRunner(GPUModelRunner):
                 len(views),
             )
         connector = super()._make_kv_connector(kv_caches_dict)
+        selection = None
+        if native:
+            selection = NativeSelection(
+                get_kv_transfer_group().connector_worker,
+                kv_caches_dict,
+                [group.layer_names for group in groups],
+                self.kv_cache_config.transfer_group_ids,
+            )
+            if sim.kv_pattern_fill:
+                self._kv_filler = NativeFiller(selection, tp.rank_in_group)
+            if sim.kv_pattern_check:
+                self._kv_checker = NativeChecker(
+                    selection,
+                    tp.rank_in_group,
+                    self.kv_cache_config.transfer_group_ids,
+                )
+            logger.info(
+                "KV pattern %s over NIXL's selection: %d descriptor rows.",
+                "fill" if sim.kv_pattern_fill else "check",
+                len(selection.rows),
+            )
         if self.step_log is not None:
+            layout = kv_layout(
+                kv_caches_dict,
+                self.kv_cache_config.num_blocks,
+                self.cache_config.block_size,
+                self.cache_config.get_resolved_kv_cache_layout().name,
+                groups,
+                registered_block_bytes(),
+            )
+            if selection is not None:
+                # What NIXL moves of each group's block, beside its layers.
+                for entry, transfer in zip(layout["groups"], selection.describe()):
+                    entry["transfer"] = transfer
             # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
                 {
-                    **kv_layout(
-                        kv_caches_dict,
-                        self.kv_cache_config.num_blocks,
-                        self.cache_config.block_size,
-                        self.cache_config.get_resolved_kv_cache_layout().name,
-                        groups,
-                        registered_block_bytes(),
-                    ),
+                    **layout,
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
                     # Its identity, and its place on the host (NIC, port).
