@@ -202,6 +202,7 @@ def engine_config(
             else is_moe,
             hf_text_config=HfConfig(local),
             quantization=None,
+            supports_multimodal_inputs=False,
         ),
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         parallel_config=SimpleNamespace(**{**defaults, **parallel}),
@@ -870,6 +871,50 @@ def test_real_configs_are_compared_through_their_own_classes(tmp_path):
                 ),
                 target_model="deepseek-ai/DeepSeek-V3",
             )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, gpu", [("Qwen/Qwen3.5-27B", "h100"), ("Qwen/Qwen3.5-35B-A3B", "h200")]
+)
+def test_a_multimodal_model_is_timed_as_its_language_model_only(tmp_path, target, gpu):
+    """Qwen3.5, published as a vision-language model: its language model's
+    geometry (the nested text config) is compared, and it is timed only
+    when no multimodal input can reach the encoders AISimulate does not
+    time."""
+    raw = bundled_config(target)
+    text = raw["text_config"]
+    name = target.replace("/", "--")
+
+    def config(suffix, local=raw, **kwargs):
+        return real_engine_config(
+            tmp_path, f"{name}-{suffix}", local, derived=True, **kwargs
+        )
+
+    for suffix, kwargs in (
+        ("text", {"language_model_only": True}),
+        ("zero", {"limit_mm_per_prompt": {"image": 0, "video": 0}}),
+    ):
+        p = provider(config(suffix, **kwargs), gpu=gpu, target_model=target)
+        geometry = p.assumptions()["aisimulate"]["compared_geometry"]
+        assert geometry["linear_num_value_heads"] == text["linear_num_value_heads"]
+        assert geometry["num_key_value_heads"] == text["num_key_value_heads"]
+    for suffix, kwargs in (
+        ("default", {}),
+        ("image-off", {"limit_mm_per_prompt": {"image": 0}}),
+        (
+            "embeds",
+            {"limit_mm_per_prompt": {"image": 0, "video": 0}, "enable_mm_embeds": True},
+        ),
+    ):
+        with pytest.raises(ValueError, match="language model only"):
+            provider(config(suffix, **kwargs), gpu=gpu, target_model=target)
+    # A changed delta-net width is not the target's state.
+    wide = {**raw, "text_config": {**text, "linear_num_value_heads": 64}}
+    with pytest.raises(ValueError, match="linear_num_value_heads"):
+        provider(
+            config("wide", wide, language_model_only=True), gpu=gpu, target_model=target
+        )
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")

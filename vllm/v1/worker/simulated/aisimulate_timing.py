@@ -102,6 +102,15 @@ MAMBA2_FIELDS = (
     "ssm_state_size",
     "conv_kernel",
 )
+# Qwen's gated delta-net: its state's widths (the convolution's and the
+# recurrent state's).
+GDN_FIELDS = (
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_conv_kernel_dim",
+)
 # DeepSeek-V4: its sparse attention's widths, and the compress ratio of each
 # decoder layer (compared apart, as the native helper resolves them).
 V4_FIELDS = (
@@ -167,6 +176,10 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     "DeepseekV3ForCausalLM": MLA_FIELDS,
     "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,
+    **dict.fromkeys(
+        ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"),
+        ATTENTION_FIELDS + GDN_FIELDS,
+    ),
 }
 APPROXIMATIONS = [
     (
@@ -262,7 +275,8 @@ class AisimulateTimingProvider:
     an MoE model's local data-parallel attention with expert parallelism
     (TP 1, 2 to 8 local DP ranks). Anything else is refused, as are pipeline
     and context parallelism, EPLB and speculative decoding other than
-    DeepSeek-V3's or DeepSeek-V4's native single-module MTP."""
+    DeepSeek-V3's or DeepSeek-V4's native single-module MTP. A multimodal
+    model is timed as its language model, served without multimodal inputs."""
 
     def __init__(
         self,
@@ -298,6 +312,14 @@ class AisimulateTimingProvider:
                 "(pip install --no-deps aisimulate from pypi.nvidia.com)."
             ) from e
 
+        # A multimodal model is timed as its language model: no input may
+        # reach the encoders AISimulate does not time.
+        if vllm_config.model_config.supports_multimodal_inputs:
+            raise ValueError(
+                "The aisimulate timing provider times a multimodal model's "
+                "language model only: serve it with language_model_only (no "
+                "modality, no multimodal embeddings)."
+            )
         topology = self._topology(vllm_config)
         target, local_config = self._target(vllm_config, target_model)
         bundled = os.path.join(
@@ -604,7 +626,9 @@ class AisimulateTimingProvider:
         # sides get the same defaults (a head size, layer types, KV heads).
         local_config = vllm_config.model_config.hf_text_config
         local = _geometry(local_config, fields)
-        published = _geometry(type(local_config).from_dict(target_config), fields)
+        # A multimodal wrapper's language model is its text config.
+        target_text = target_config.get("text_config", target_config)
+        published = _geometry(type(local_config).from_dict(target_text), fields)
         if fields is V4_FIELDS:
             target_class_config = type(local_config).from_dict(target_config)
             for name, config in (

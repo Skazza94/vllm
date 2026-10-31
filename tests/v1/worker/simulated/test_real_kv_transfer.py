@@ -255,6 +255,73 @@ QWEN3_NEXT = {
 }
 
 
+# A tiny Qwen3.5-MoE, a vision-language wrapper served as its language model
+# (language_model_only): three gated delta-net layers, then full attention.
+QWEN3_5_MOE = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "image_token_id": 250,
+    "video_token_id": 251,
+    "vision_end_token_id": 252,
+    "vision_start_token_id": 253,
+    "tie_word_embeddings": False,
+    "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "vocab_size": 256,
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        "full_attention_interval": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "shared_expert_intermediate_size": 32,
+        "mlp_only_layers": [],
+        "mtp_num_hidden_layers": 0,
+        "max_position_embeddings": 256,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "mrope_section": [2, 1, 1],
+        },
+        "dtype": "float32",
+    },
+    "vision_config": {
+        "model_type": "qwen3_5_moe",
+        "depth": 1,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_heads": 2,
+        "out_hidden_size": 64,
+        "num_position_embeddings": 64,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+        "in_channels": 3,
+        "hidden_act": "gelu_pytorch_tanh",
+        "deepstack_visual_indexes": [],
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("tiny-qwen3-5-moe")
+    (directory / "config.json").write_text(json.dumps(QWEN3_5_MOE))
+    return str(directory)
+
+
 @pytest.fixture(scope="module")
 def qwen3_next_model_dir(tmp_path_factory):
     directory = tmp_path_factory.mktemp("tiny-qwen3-next")
@@ -502,18 +569,26 @@ def test_real_mode_takes_sliding_window_models_over_either_connector(
         assert config.model_config.get_sliding_window() == 32
 
 
+@pytest.mark.parametrize(
+    "model, kwargs",
+    [("qwen3_next_model_dir", {}), ("qwen3_5_model_dir", {"language_model_only": True})],
+    ids=["qwen3-next", "qwen3.5"],
+)
 def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
-    qwen3_next_model_dir,
+    model, kwargs, request
 ):
+    model_dir = request.getfixturevalue(model)
     mooncake = {"kv_connector": "MooncakeConnector"}
-    config = engine_config(qwen3_next_model_dir, kv_transfer=mooncake)
+    config = engine_config(model_dir, kv_transfer=mooncake, **kwargs)
     assert config.model_config.is_hybrid
     assert config.cache_config.mamba_cache_mode == "none"
     # A state per block (align mode) is not modeled, byte checks or not.
     with pytest.raises(ValueError, match="hybrid model without prefix caching"):
-        engine_config(qwen3_next_model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
+        engine_config(
+            model_dir, kv_transfer=mooncake, enable_prefix_caching=True, **kwargs
+        )
     with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
-        engine_config(qwen3_next_model_dir)
+        engine_config(model_dir, **kwargs)
 
 
 @pytest.mark.parametrize("model", ["nemotron_h_model_dir", "nemotron_3_model_dir"])
@@ -1114,22 +1189,24 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
     "model, mamba_type",
     [
         ("qwen3_next_model_dir", "GDN_ATTN"),
+        ("qwen3_5_model_dir", "GDN_ATTN"),
         ("nemotron_h_model_dir", "MAMBA2"),
         ("nemotron_3_model_dir", "MAMBA2"),
     ],
-    ids=["qwen3-next", "nemotron-h", "nemotron-3"],
+    ids=["qwen3-next", "qwen3.5", "nemotron-h", "nemotron-3"],
 )
 def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
     model, mamba_type, request, monkeypatch, tmp_path
 ):
-    """Tiny Qwen3-Next (three delta-net groups), Nemotron-H (Mamba2 groups,
-    an MLP-only layer without KV) and Nemotron-3 (Mamba2 groups, MoE layers
-    without KV, their non-gated experts built as such): recurrent groups and
-    an attention group in one allocation, the platform's attention block covering a
-    state's page. A chunked prompt: each attention block holds its place's
-    pattern, each recurrent layer's single state block (place 0) its
-    pattern over the whole page, padding included; the layout record
-    describes the padding."""
+    """Tiny Qwen3-Next and Qwen3.5 (three delta-net groups; Qwen3.5 a
+    vision-language wrapper served as its language model), Nemotron-H
+    (Mamba2 groups, an MLP-only layer without KV) and Nemotron-3 (Mamba2
+    groups, MoE layers without KV, their non-gated experts built as such):
+    recurrent groups and an attention group in one allocation, the
+    platform's attention block covering a state's page. A chunked prompt:
+    each attention block holds its place's pattern, each recurrent layer's
+    single state block (place 0) its pattern over the whole page, padding
+    included; the layout record describes the padding."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
@@ -1151,6 +1228,7 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
         max_num_batched_tokens=64,
         enable_prefix_caching=False,
         enforce_eager=True,
+        language_model_only=model == "qwen3_5_model_dir",
         simulation_config={
             "simulate_forward": True,
             "kv_transfer_mode": "real",
@@ -1200,6 +1278,10 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
         assert all(
             g["real_page_bytes"] < g["block_bytes"] == g["block_stride"] for g in states
         )
+        if model == "qwen3_5_model_dir":
+            # Text only: the vision tower is not built.
+            (visual,) = llm.apply_model(lambda m: type(m.visual).__name__)
+            assert visual == "StageMissingLayer"
         if model == "nemotron_3_model_dir":
             from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
