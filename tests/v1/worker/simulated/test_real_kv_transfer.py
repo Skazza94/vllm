@@ -74,11 +74,11 @@ def moe_model_dir(tmp_path_factory):
     return str(directory)
 
 
-# A tiny DeepSeek-V2 (MLA and MoE) with DeepSeek's latent: kv_lora_rank 512
+# A tiny DeepSeek-V3 (MLA and MoE) with DeepSeek's latent: kv_lora_rank 512
 # plus a 64-wide rope key, 576 elements per token and layer.
-DEEPSEEK_V2 = {
-    "architectures": ["DeepseekV2ForCausalLM"],
-    "model_type": "deepseek_v2",
+DEEPSEEK_V3 = {
+    "architectures": ["DeepseekV3ForCausalLM"],
+    "model_type": "deepseek_v3",
     "vocab_size": 128,
     "hidden_size": 256,
     "intermediate_size": 512,
@@ -95,6 +95,11 @@ DEEPSEEK_V2 = {
     "n_shared_experts": 1,
     "num_experts_per_tok": 2,
     "first_k_dense_replace": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "scoring_func": "sigmoid",
+    "num_nextn_predict_layers": 0,
     "max_position_embeddings": 256,
     "torch_dtype": "float32",
 }
@@ -173,8 +178,8 @@ def v4_model_dir(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def mla_model_dir(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("tiny-deepseek-v2")
-    (directory / "config.json").write_text(json.dumps(DEEPSEEK_V2))
+    directory = tmp_path_factory.mktemp("tiny-deepseek-v3")
+    (directory / "config.json").write_text(json.dumps(DEEPSEEK_V3))
     return str(directory)
 
 
@@ -460,7 +465,7 @@ def test_real_mode_accepts_moe_and_dense_mla_models(moe_model_dir, mla_model_dir
     assert config.model_config.use_mla
     # DeepSeek-V3.2: an indexer makes its MLA sparse.
     (tmp_path / "config.json").write_text(
-        json.dumps({**DEEPSEEK_V2, "index_topk": 64, "index_n_heads": 2, "index_head_dim": 64})
+        json.dumps({**DEEPSEEK_V3, "index_topk": 64, "index_n_heads": 2, "index_head_dim": 64})
     )
     with pytest.raises(ValueError, match="no sparse MLA"):
         engine_config(str(tmp_path))
@@ -535,14 +540,9 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
             engine_config(v4_model_dir, **{**v4, **kwargs})
 
 
-# A tiny DeepSeek-V3 with its native MTP layer(s).
+# The tiny DeepSeek-V3 with its native MTP layer(s).
 def deepseek_v3(mtp_layers):
-    return {
-        **DEEPSEEK_V2,
-        "architectures": ["DeepseekV3ForCausalLM"],
-        "model_type": "deepseek_v3",
-        "num_nextn_predict_layers": mtp_layers,
-    }
+    return {**DEEPSEEK_V3, "num_nextn_predict_layers": mtp_layers}
 
 
 def test_real_mode_takes_native_single_module_mtp_over_nixl(

@@ -389,9 +389,9 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   moves each window's last blocks only, and says where they start among
   the request's blocks (NIXL: `local_first_block_indices`); and over
   `MooncakeConnector` without prefix caching, hybrid models of Qwen's gated
-  delta-net (Qwen3-Next, Qwen3.5) or of Mamba2 (`MambaMixer2`: Nemotron-H,
-  Granite-4.0-H): each request's state is one block of its recurrent groups
-  (`mamba_cache_mode` none), padded to the attention page, and prefill
+  delta-net or of Mamba2 (`MambaMixer2`): each request's state is one block
+  of its recurrent groups (`mamba_cache_mode` none), padded to the
+  attention page, and prefill
   computes the prompt but its last token, which decode computes. Each
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a

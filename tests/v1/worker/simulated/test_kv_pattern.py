@@ -799,9 +799,9 @@ def test_real_transfers_take_full_and_sliding_window_groups_only():
         )
 
 
-# Qwen3-Next's KV cache on a small scale: an attention group and a gated
-# delta-net group, two layers each, layer i of both in slot i of one
-# allocation (slot 1 at a nonzero offset). A block of an attention layer is
+# A gated delta-net hybrid's KV cache on a small scale: an attention group
+# and a gated delta-net group, two layers each, layer i of both in slot i of
+# one allocation (slot 1 at a nonzero offset). A block of an attention layer is
 # 256 bytes; a delta-net's state is 240, padded to the same 256-byte page.
 ATTENTION = ("model.layers.3.self_attn.attn", "model.layers.7.self_attn.attn")
 GDN = ("model.layers.0.linear_attn", "model.layers.4.linear_attn")
