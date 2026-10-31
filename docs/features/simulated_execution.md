@@ -387,13 +387,19 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   alone or beside full attention (each layer kind a KV cache group, groups
   sharing memory, a block being one group's at a time): either connector
   moves each window's last blocks only, and says where they start among
-  the request's blocks (NIXL: `local_first_block_indices`); and over
-  `MooncakeConnector` without prefix caching, hybrid models of Qwen's gated
-  delta-net (Qwen3.5, served as its language model) or of Mamba2 (`MambaMixer2`: Nemotron-H, Nemotron-3, whose
-  non-gated relu^2 experts the CPU platform builds only for a simulation):
-  each request's state is one block of its recurrent groups
-  (`mamba_cache_mode` none), padded to the attention page, and prefill
-  computes the prompt but its last token, which decode computes. Each
+  the request's blocks (NIXL: `local_first_block_indices`); and, without
+  prefix caching, hybrid models of Qwen's gated delta-net (Qwen3.5, served
+  as its language model) or of Mamba2 (`MambaMixer2`: Nemotron-H,
+  Nemotron-3, whose non-gated relu^2 experts the CPU platform builds only
+  for a simulation): each request's state is one block of its recurrent
+  groups (`mamba_cache_mode` none), padded to the attention page, and
+  prefill computes the prompt but its last token, which decode computes.
+  `MooncakeConnector` moves the padded state pages. NIXL needs the DS
+  conv-state layout (`VLLM_SSM_CONV_STATE_LAYOUT=DS`, set before startup)
+  and moves each state as it selects it: the conv sub-projections and the
+  SSM state of every state region, a region holding none of a group's
+  layers included (transfer-only), the page's padding not; the pattern
+  checks follow that selection. Each
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
