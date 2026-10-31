@@ -389,7 +389,7 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   moves each window's last blocks only, and says where they start among
   the request's blocks (NIXL: `local_first_block_indices`); and over
   `MooncakeConnector` without prefix caching, hybrid models of Qwen's gated
-  delta-net or of Mamba2 (`MambaMixer2`: Nemotron-H, Nemotron-3, whose
+  delta-net (Qwen3.5, served as its language model) or of Mamba2 (`MambaMixer2`: Nemotron-H, Nemotron-3, whose
   non-gated relu^2 experts the CPU platform builds only for a simulation):
   each request's state is one block of its recurrent groups
   (`mamba_cache_mode` none), padded to the attention page, and prefill

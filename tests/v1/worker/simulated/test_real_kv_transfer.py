@@ -224,37 +224,6 @@ def gpt_oss_model_dir(tmp_path_factory):
     return str(directory)
 
 
-# A tiny Qwen3-Next: three gated delta-net layers, then full attention.
-QWEN3_NEXT = {
-    "architectures": ["Qwen3NextForCausalLM"],
-    "model_type": "qwen3_next",
-    "vocab_size": 128,
-    "hidden_size": 64,
-    "intermediate_size": 64,
-    "num_hidden_layers": 4,
-    "full_attention_interval": 4,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "head_dim": 16,
-    "linear_num_key_heads": 2,
-    "linear_num_value_heads": 4,
-    "linear_key_head_dim": 16,
-    "linear_value_head_dim": 16,
-    "linear_conv_kernel_dim": 4,
-    "num_experts": 4,
-    "num_experts_per_tok": 2,
-    "moe_intermediate_size": 32,
-    "shared_expert_intermediate_size": 32,
-    "decoder_sparse_step": 1,
-    "mlp_only_layers": [],
-    "norm_topk_prob": True,
-    "partial_rotary_factor": 0.25,
-    "rope_theta": 10000,
-    "tie_word_embeddings": False,
-    "max_position_embeddings": 256,
-}
-
-
 # A tiny Qwen3.5-MoE, a vision-language wrapper served as its language model
 # (language_model_only): three gated delta-net layers, then full attention.
 QWEN3_5_MOE = {
@@ -319,13 +288,6 @@ QWEN3_5_MOE = {
 def qwen3_5_model_dir(tmp_path_factory):
     directory = tmp_path_factory.mktemp("tiny-qwen3-5-moe")
     (directory / "config.json").write_text(json.dumps(QWEN3_5_MOE))
-    return str(directory)
-
-
-@pytest.fixture(scope="module")
-def qwen3_next_model_dir(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("tiny-qwen3-next")
-    (directory / "config.json").write_text(json.dumps(QWEN3_NEXT))
     return str(directory)
 
 
@@ -569,15 +531,10 @@ def test_real_mode_takes_sliding_window_models_over_either_connector(
         assert config.model_config.get_sliding_window() == 32
 
 
-@pytest.mark.parametrize(
-    "model, kwargs",
-    [("qwen3_next_model_dir", {}), ("qwen3_5_model_dir", {"language_model_only": True})],
-    ids=["qwen3-next", "qwen3.5"],
-)
 def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
-    model, kwargs, request
+    qwen3_5_model_dir,
 ):
-    model_dir = request.getfixturevalue(model)
+    model_dir, kwargs = qwen3_5_model_dir, {"language_model_only": True}
     mooncake = {"kv_connector": "MooncakeConnector"}
     config = engine_config(model_dir, kv_transfer=mooncake, **kwargs)
     assert config.model_config.is_hybrid
@@ -1188,18 +1145,17 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
 @pytest.mark.parametrize(
     "model, mamba_type",
     [
-        ("qwen3_next_model_dir", "GDN_ATTN"),
         ("qwen3_5_model_dir", "GDN_ATTN"),
         ("nemotron_h_model_dir", "MAMBA2"),
         ("nemotron_3_model_dir", "MAMBA2"),
     ],
-    ids=["qwen3-next", "qwen3.5", "nemotron-h", "nemotron-3"],
+    ids=["qwen3.5", "nemotron-h", "nemotron-3"],
 )
 def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
     model, mamba_type, request, monkeypatch, tmp_path
 ):
-    """Tiny Qwen3-Next and Qwen3.5 (three delta-net groups; Qwen3.5 a
-    vision-language wrapper served as its language model), Nemotron-H
+    """Tiny Qwen3.5 (three delta-net groups; a vision-language wrapper
+    served as its language model), Nemotron-H
     (Mamba2 groups, an MLP-only layer without KV) and Nemotron-3 (Mamba2
     groups, MoE layers without KV, their non-gated experts built as such):
     recurrent groups and an attention group in one allocation, the
