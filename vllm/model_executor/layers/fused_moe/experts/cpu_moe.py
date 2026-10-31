@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+    cpu_simulated_forward,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -225,7 +226,9 @@ class CPUUnquantizedExperts(_CPUPaddedIntermediateMixin, mk.FusedMoEExpertsModul
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
-        return False
+        # Non-gated relu^2 experts (Nemotron-3's) only in a simulation, which
+        # builds them and never runs them.
+        return cpu_simulated_forward()
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -234,7 +237,7 @@ class CPUUnquantizedExperts(_CPUPaddedIntermediateMixin, mk.FusedMoEExpertsModul
             MoEActivation.SWIGLUOAI,
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
-        )
+        ) or (activation == MoEActivation.RELU2_NO_MUL and cpu_simulated_forward())
 
     @staticmethod
     def _supports_quant_scheme(

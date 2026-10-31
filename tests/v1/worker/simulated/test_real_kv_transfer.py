@@ -287,6 +287,22 @@ NEMOTRON_H = {
     "tie_word_embeddings": False,
     "max_position_embeddings": 256,
 }
+# A tiny Nemotron-3: Mamba2, MoE (non-gated relu^2 experts and a shared
+# one), attention layers.
+NEMOTRON_3 = {
+    **NEMOTRON_H,
+    "num_hidden_layers": 5,
+    "hybrid_override_pattern": "MEM*E",
+    "n_routed_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "n_shared_experts": 1,
+    "moe_shared_expert_intermediate_size": 32,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": True,
+    "routed_scaling_factor": 1.0,
+}
 # A tiny Falcon-H1: each layer runs a Mamba2 mixer beside attention.
 FALCON_H1 = {
     "architectures": ["FalconH1ForCausalLM"],
@@ -347,6 +363,11 @@ def write_model_dir(tmp_path_factory, name, config):
 @pytest.fixture(scope="module")
 def nemotron_h_model_dir(tmp_path_factory):
     return write_model_dir(tmp_path_factory, "tiny-nemotron-h", NEMOTRON_H)
+
+
+@pytest.fixture(scope="module")
+def nemotron_3_model_dir(tmp_path_factory):
+    return write_model_dir(tmp_path_factory, "tiny-nemotron-3", NEMOTRON_3)
 
 
 @pytest.fixture(params=["model_dir", "moe_model_dir", "mla_model_dir"])
@@ -495,19 +516,40 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_without_prefix_caching(
         engine_config(qwen3_next_model_dir)
 
 
+@pytest.mark.parametrize("model", ["nemotron_h_model_dir", "nemotron_3_model_dir"])
 def test_real_mode_takes_mamba2_hybrids_over_mooncake_without_prefix_caching(
-    nemotron_h_model_dir,
+    model, request
 ):
+    model_dir = request.getfixturevalue(model)
     mooncake = {"kv_connector": "MooncakeConnector"}
-    config = engine_config(nemotron_h_model_dir, kv_transfer=mooncake)
+    config = engine_config(model_dir, kv_transfer=mooncake)
     assert config.model_config.is_hybrid
     assert config.cache_config.mamba_cache_mode == "none"
     with pytest.raises(ValueError, match="hybrid model without prefix caching"):
-        engine_config(
-            nemotron_h_model_dir, kv_transfer=mooncake, enable_prefix_caching=True
-        )
+        engine_config(model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
     with pytest.raises(ValueError, match="MooncakeConnector for a hybrid model"):
-        engine_config(nemotron_h_model_dir)
+        engine_config(model_dir)
+
+
+def test_non_gated_cpu_experts_build_only_in_a_simulation(
+    nemotron_3_model_dir, monkeypatch
+):
+    """The CPU kernels do not run non-gated (relu^2) experts: a CPU engine
+    refuses Nemotron-3, a simulation builds them and never runs them."""
+    from vllm import LLM
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    with pytest.raises(NotImplementedError, match="is_act_and_mul=False"):
+        LLM(
+            model=nemotron_3_model_dir,
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            max_model_len=256,
+            kv_cache_memory_bytes=8 * 1024**2,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+            load_format="dummy",
+        )
 
 
 def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
@@ -1070,15 +1112,20 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
 
 @pytest.mark.parametrize(
     "model, mamba_type",
-    [("qwen3_next_model_dir", "GDN_ATTN"), ("nemotron_h_model_dir", "MAMBA2")],
-    ids=["qwen3-next", "nemotron-h"],
+    [
+        ("qwen3_next_model_dir", "GDN_ATTN"),
+        ("nemotron_h_model_dir", "MAMBA2"),
+        ("nemotron_3_model_dir", "MAMBA2"),
+    ],
+    ids=["qwen3-next", "nemotron-h", "nemotron-3"],
 )
 def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
     model, mamba_type, request, monkeypatch, tmp_path
 ):
-    """Tiny Qwen3-Next (three delta-net groups) and Nemotron-H (Mamba2
-    groups, an MLP-only layer without KV): recurrent groups and an attention
-    group in one allocation, the platform's attention block covering a
+    """Tiny Qwen3-Next (three delta-net groups), Nemotron-H (Mamba2 groups,
+    an MLP-only layer without KV) and Nemotron-3 (Mamba2 groups, MoE layers
+    without KV, their non-gated experts built as such): recurrent groups and
+    an attention group in one allocation, the platform's attention block covering a
     state's page. A chunked prompt: each attention block holds its place's
     pattern, each recurrent layer's single state block (place 0) its
     pattern over the whole page, padding included; the layout record
@@ -1153,6 +1200,19 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
         assert all(
             g["real_page_bytes"] < g["block_bytes"] == g["block_stride"] for g in states
         )
+        if model == "nemotron_3_model_dir":
+            from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+            (experts,) = llm.apply_model(
+                lambda m: {
+                    name: (e.activation, tuple(e.w13_weight.shape))
+                    for name, e in m.named_modules()
+                    if hasattr(e, "w13_weight")
+                }
+            )
+            # Layers 1 and 4, their up projection alone (not gate and up).
+            assert len(experts) == 2
+            assert set(experts.values()) == {(MoEActivation.RELU2_NO_MUL, (4, 32, 64))}
     finally:
         del llm
 

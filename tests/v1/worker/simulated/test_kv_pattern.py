@@ -1030,13 +1030,12 @@ def test_real_transfers_take_one_mamba2_mixer_a_decoder_layer_without_attention(
             decoder(mixer=mamba2_mixer()),
         ])
     )
-    # Granite-4.0-H's: a mixer's layer holds its MoE beside it, its
-    # attention layers attention.
-    moe = torch.nn.ModuleList([torch.nn.Linear(4, 4, device="meta")] * 2)
+    # Nemotron-3's: an MoE a layer of its own, its experts no KV.
+    moe = decoder(experts=torch.nn.ModuleList([torch.nn.Linear(4, 4, device="meta")] * 2))
     check_real_kv_layers(
         recurrent_model([
-            decoder(mamba=mamba2_mixer(), block_sparse_moe=moe),
-            decoder(self_attn=attention_layer(), block_sparse_moe=moe),
+            decoder(mixer=mamba2_mixer()), decoder(mixer=moe),
+            decoder(mixer=attention_layer()), decoder(mixer=moe),
         ])
     )
 

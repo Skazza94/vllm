@@ -1269,6 +1269,18 @@ class FusedMoEParallelConfig:
 _AITER_MOE_A4W4_DSV4_VALIDATED_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
 
 
+def cpu_simulated_forward() -> bool:
+    """Whether this is the CPU platform simulating forward: experts are built
+    on the meta device and never run, so a CPU kernel's support for them is
+    not needed."""
+    if not current_platform.is_cpu():
+        return False
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return config is not None and config.simulation_config.simulate_forward
+
+
 # Adapted from pplx-kernels tests/all_to_all_utils.py
 @dataclass
 class FusedMoEConfig:
@@ -1407,8 +1419,13 @@ class FusedMoEConfig:
                 "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
             )
 
-        if not self.is_act_and_mul and not (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        if (
+            not self.is_act_and_mul
+            and not (current_platform.is_cuda_alike() or current_platform.is_xpu())
+            and not (
+                self.activation == MoEActivation.RELU2_NO_MUL
+                and cpu_simulated_forward()
+            )
         ):
             raise NotImplementedError(
                 "is_act_and_mul=False is supported only for CUDA, XPU and ROCm for now"
