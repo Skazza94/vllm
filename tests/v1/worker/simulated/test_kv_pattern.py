@@ -1194,3 +1194,49 @@ def test_native_checks_release_an_ended_receives_posted_reads():
     (lost,) = checker.after_step(KVConnectorOutput(finished_recving={"c"}))
     assert lost["error"] == "receive failed"
     assert set(checker.posted) == {"rb"} and set(checker.pending) == {"b"}
+
+
+def test_real_transfers_take_a_dsa_group_of_its_latent_and_indexer_keys():
+    """A DSA model's group of two kinds: BF16 latents and uint8 indexer keys
+    and scales (132 bytes a token), MLA specs of one block size; another
+    role, dtype, width or block size is refused, as is the mixed group
+    outside DSA."""
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MLAAttentionSpec,
+        SparseCacheRole,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_groups
+
+    def latent(**changed):
+        return MLAAttentionSpec(**{"block_size": 64, "num_kv_heads": 1, "head_size": 576,
+                                   "dtype": torch.bfloat16, **changed})
+
+    def keys(**changed):
+        return MLAAttentionSpec(**{"block_size": 64, "num_kv_heads": 1, "head_size": 132,
+                                   "dtype": torch.uint8, "cache_role": SparseCacheRole.INDEXER,
+                                   **changed})
+
+    def config(*members):
+        specs = {f"layer{i}": spec for i, spec in enumerate(members)}
+        return KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(
+                list(specs), UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=specs))],
+        )
+
+    check_real_kv_groups(config(latent(), keys(), latent()), dsa=True)
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        check_real_kv_groups(config(latent(), keys()))
+    for members, message in (
+        ((latent(dtype=torch.float16), keys()), "not BF16"),
+        ((latent(), keys(dtype=torch.bfloat16)), "not uint8 x 132"),
+        ((latent(), keys(head_size=128)), "not uint8 x 132"),
+        ((keys(), keys()), "no latent"),
+        ((latent(), keys(block_size=32)), "block sizes"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            check_real_kv_groups(config(*members), dsa=True)
+

@@ -1700,6 +1700,7 @@ def main():
     worker = get_kv_transfer_group().connector_worker
     mine = {"bases": [int(b) for b in worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank]],
             "strides": [int(b) for b in worker.block_stride_per_layer],
+            "lens": [int(b) for b in worker.block_len_per_layer],
             "num_blocks": int(worker.num_blocks)}
     prompt = [{"prompt_token_ids": [5] * 200}]
     if producer:
@@ -1717,7 +1718,7 @@ def main():
     wrapper, checker = worker.nixl_wrapper, runner._kv_checker
     dlists, transfers, reads = {}, [], []
     prep, make = wrapper.prep_xfer_dlist, wrapper.make_prepped_xfer
-    expect = checker.expect if checker is not None else None
+    before = checker.before_step if checker is not None else None
 
     def prep_xfer_dlist(agent, blocks, *args, **kw):
         handle = prep(agent, blocks, *args, **kw)
@@ -1729,14 +1730,17 @@ def main():
                           [int(i) for i in remote_ids]])
         return make(op, local, local_ids, remote_handle, remote_ids, *args, **kw)
 
-    def record(req_id, remote_request_id, first, block_ids):
-        reads.append([[int(b) for b in ids] for ids in block_ids])
-        return expect(req_id, remote_request_id, first, block_ids)
+    def record(scheduler_output):
+        from vllm.v1.worker.simulated.kv_transfer import requested_reads
+        for read in requested_reads(scheduler_output.kv_connector_metadata):
+            if read.blocks:
+                reads.append([[int(b) for b in ids] for ids in read.block_ids])
+        return before(scheduler_output)
 
     wrapper.prep_xfer_dlist = prep_xfer_dlist
     wrapper.make_prepped_xfer = make_prepped_xfer
     if checker is not None:
-        checker.expect = record
+        checker.before_step = record
     params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
                             extra_args={"kv_transfer_params": remote["params"]})
     llm.generate(prompt, params, use_tqdm=False)
@@ -1752,11 +1756,21 @@ def main():
                                          descriptors(dlists[remote_handle], remote_ids))]
     # Ours: the selection of the consumer's blocks, each span paired with the
     # same region and offset in the producer's block at the same place.
-    s = checker.selection
     (block_ids,) = reads
     ours = []
+    s = getattr(checker, "selection", None)
     for group, (ids, remote_ids) in enumerate(zip(block_ids, remote["params"]["remote_block_ids"])):
         remote_ids = remote_ids[len(remote_ids) - len(ids):]
+        if s is None:
+            # Not a hybrid: each region (a layer) a whole page of each block,
+            # region by region.
+            for region, (base, stride, length) in enumerate(
+                    zip(mine["bases"], mine["strides"], mine["lens"])):
+                for place, block in enumerate(ids):
+                    ours.append([base + block * stride, length,
+                                 remote["bases"][region] + remote_ids[place] * remote["strides"][region],
+                                 remote["lens"][region]])
+            continue
         for row, block, place in s.select(group, ids):
             r = s.rows[row]
             ours.append([r.view[block].data_ptr(), r.view.shape[1],
@@ -1772,6 +1786,146 @@ def main():
 if __name__ == "__main__":
     main()
 """
+
+
+# A tiny DeepSeek-V3.2 (DSA): each layer a BF16 latent and an indexer key
+# cache, of two pages, in one group.
+DEEPSEEK_V32 = {
+    **DEEPSEEK_V3,
+    "architectures": ["DeepseekV32ForCausalLM"],
+    "model_type": "deepseek_v32",
+    "q_lora_rank": 64,
+    "index_topk": 16,
+    "index_head_dim": 128,
+    "index_n_heads": 4,
+}
+
+
+# A tiny GLM-5 (DSA): its published config scaled down, an indexer on
+# alternate layers ("full"), the others sharing the previous top-k.
+GLM_5 = {
+    "architectures": ["GlmMoeDsaForCausalLM"],
+    "model_type": "glm_moe_dsa",
+    "vocab_size": 128,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "moe_intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "kv_lora_rank": 512,
+    "q_lora_rank": 64,
+    "qk_nope_head_dim": 32,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 32,
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": True,
+    "routed_scaling_factor": 2.5,
+    "moe_router_dtype": "float32",
+    "index_topk": 16,
+    "index_head_dim": 128,
+    "index_n_heads": 4,
+    "index_topk_freq": 2,
+    "index_skip_topk_offset": 1,
+    "index_topk_pattern": None,
+    "indexer_rope_interleave": True,
+    "indexer_types": ["full", "shared", "full", "shared"],
+    "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+    "num_nextn_predict_layers": 0,
+    "max_position_embeddings": 256,
+    "rope_theta": 1000000,
+    "hidden_act": "silu",
+    "rms_norm_eps": 1e-05,
+    "tie_word_embeddings": False,
+    "torch_dtype": "float32",
+}
+
+
+def test_dsa_sparse_mla_builds_on_cpu_in_a_simulation_only(tmp_path, monkeypatch):
+    """DeepSeek-V3.2's and GLM-5's sparse MLA: in a simulation the CPU
+    platform keeps the GPU deployment's sparse backend for its caches (no
+    kernel runs); each attention layer a BF16 latent, each layer with an
+    indexer its FP8 keys and scales (132 bytes a token), GLM-5's on the
+    layers its config marks full. Outside a simulation, refused."""
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    for name, config, indexers in (("v32", DEEPSEEK_V32, 2), ("glm", GLM_5, 2)):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps(config))
+        llm = LLM(
+            model=str(directory), skip_tokenizer_init=True, dtype="bfloat16",
+            max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
+            max_num_batched_tokens=64, enable_prefix_caching=False,
+            enforce_eager=True, block_size=64,
+            simulation_config={"simulate_forward": True, "timing": "linear",
+                               "timing_args": {"fixed_us": 100}},
+        )
+        try:
+            (out,) = llm.generate(
+                [{"prompt_token_ids": [5] * 100}],
+                SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+                use_tqdm=False,
+            )
+            assert len(out.outputs[0].token_ids) == 2
+            engine = llm.llm_engine.engine_core.engine_core
+            runner = engine.model_executor.driver_worker.worker.model_runner
+            specs = runner.get_kv_cache_spec()
+            latents = {n: s for n, s in specs.items() if not n.endswith("indexer.k_cache")}
+            keys = {n: s for n, s in specs.items() if n.endswith("indexer.k_cache")}
+            assert len(latents) == config["num_hidden_layers"] and len(keys) == indexers
+            assert {(s.head_size, s.dtype, s.page_size_bytes) for s in latents.values()} == {
+                (576, torch.bfloat16, 64 * 576 * 2)
+            }
+            assert {(s.head_size, s.dtype, s.page_size_bytes) for s in keys.values()} == {
+                (132, torch.uint8, 64 * 132)
+            }
+            (backends,) = llm.apply_model(
+                lambda m: sorted({
+                    a.get_attn_backend().get_name()
+                    for a in m.modules()
+                    if hasattr(a, "get_attn_backend")
+                })
+            )
+            assert "CPU_SIMULATED_MLA_SPARSE" in backends, backends
+        finally:
+            del llm
+    with pytest.raises(Exception, match="Sparse Attention is not supported on CPU"):
+        LLM(model=str(tmp_path / "v32"), skip_tokenizer_init=True, dtype="bfloat16",
+            max_model_len=256, enforce_eager=True, block_size=64)
+
+
+def test_real_mode_takes_dsa_sparse_mla_with_a_bf16_latent(tmp_path_factory):
+    """DeepSeek-V3.2's and GLM-5's sparse MLA over either connector, its
+    latent BF16 as the deployment keeps it (`auto`); an FP8 latent
+    (`fp8_ds_mla`) is refused, as are DeepSeek-V4's and other sparse MLA."""
+    v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2", DEEPSEEK_V32)
+    glm = write_model_dir(tmp_path_factory, "tiny-glm-5", GLM_5)
+    kwargs = {"dtype": "bfloat16", "block_size": 64}
+    for model in (v32, glm):
+        for connector in ("NixlConnector", "MooncakeConnector"):
+            for dtype in ("auto", "bfloat16"):
+                engine_config(model, kv_transfer={"kv_connector": connector},
+                              kv_cache_dtype=dtype, **kwargs)
+        with pytest.raises(ValueError, match="BF16 sparse-MLA latent cache"):
+            engine_config(model, kv_cache_dtype="fp8", **kwargs)
+        # `auto` takes the model's dtype: a float16 model's latent is not BF16.
+        with pytest.raises(ValueError, match="BF16 sparse-MLA latent cache"):
+            engine_config(model, kv_cache_dtype="auto", dtype="float16", block_size=64)
+    other = write_model_dir(
+        tmp_path_factory, "tiny-sparse-v3",
+        {**DEEPSEEK_V32, "architectures": ["DeepseekV3ForCausalLM"], "model_type": "deepseek_v3"},
+    )
+    with pytest.raises(ValueError, match="no sparse MLA"):
+        engine_config(other, **kwargs)
 
 
 # Qwen3.5 with its one MTP layer, whose attention KV joins the target's.
@@ -1793,8 +1947,9 @@ def mtp(k):
         (QWEN3_5_MOE, {"language_model_only": True}),
         (QWEN3_5_MOE_MTP, mtp(1)),
         (QWEN3_5_MOE_MTP, mtp(3)),
+        (DEEPSEEK_V32, {"block_size": 64}),
     ],
-    ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3"],
+    ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,
@@ -1812,8 +1967,11 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     assert [d[1] for d in c["native"]] == [d[3] for d in c["native"]]
     (check,) = c["checks"]
     assert check["ok"], check
-    assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
-    assert sum(g["bytes"] for g in check["groups"]) == sum(d[1] for d in c["native"])
+    # A hybrid's check counts NIXL's selection; another model's, its layers'
+    # pages, a descriptor each.
+    if "descriptors" in check["groups"][0]:
+        assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
+    assert check["bytes"] == sum(d[1] for d in c["native"])
 
 
 @pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])
@@ -1868,15 +2026,16 @@ def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
             assert producer.poll() is None, "the producer exited"
             assert time.monotonic() < deadline, "no producer output"
             time.sleep(0.5)
-        consumer_log = subprocess.run(
+        consumer = subprocess.run(
             run("consumer", consumed, 12 * 1024**2, str(produced)),
             env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
-            check=True,
             timeout=600,
-            stdout=subprocess.PIPE if logs else None,
-            stderr=subprocess.STDOUT if logs else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-        ).stdout
+        )
+        assert consumer.returncode == 0, consumer.stdout[-4000:]
+        consumer_log = consumer.stdout
     finally:
         (tmp_path / "producer.json.done").touch()
         try:

@@ -94,6 +94,16 @@ MLA_FIELDS = (
     "qk_nope_head_dim",
     "v_head_dim",
 )
+# DSA sparse MLA (DeepSeek-V3.2, GLM-5): the latent's widths and its
+# lightning indexer's (heads, key width, top-k, which layers hold one).
+DSA_FIELDS = MLA_FIELDS + (
+    "index_n_heads",
+    "index_head_dim",
+    "index_topk",
+    "index_topk_freq",
+    "index_skip_topk_offset",
+    "index_topk_pattern",
+)
 MAMBA2_FIELDS = (
     "hybrid_override_pattern",
     "mamba_num_heads",
@@ -190,6 +200,7 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
         ATTENTION_FIELDS,
     ),
     "DeepseekV3ForCausalLM": MLA_FIELDS,
+    **dict.fromkeys(("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"), DSA_FIELDS),
     "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,
     **dict.fromkeys(
@@ -377,6 +388,19 @@ class AisimulateTimingProvider:
                 raise ValueError(f"Unknown quant_modes {sorted(unknown)}.")
             modes.update(quant_modes)
         kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4)
+        # GLM-5's deployment on Blackwell (SM100) resolves `auto` to an FP8
+        # sparse-MLA cache (`fp8_ds_mla`), which AISimulate does not time:
+        # only an explicit BF16 cache is that GPU's timed deployment.
+        if (
+            target_config.get("architectures") == ["GlmMoeDsaForCausalLM"]
+            and system == "b200_sxm"
+            and vllm_config.cache_config.cache_dtype == "auto"
+        ):
+            raise ValueError(
+                "GLM-5 on B200 resolves kv_cache_dtype auto to an FP8 sparse-MLA "
+                "cache, which the aisimulate timing provider does not time; pass "
+                "kv_cache_dtype bfloat16."
+            )
 
         nextn, speculation = self._speculation(vllm_config, target_config, topology)
 

@@ -403,7 +403,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a
   mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
-  sparse-MLA (but DeepSeek-V4's), chunked local or RSWA attention models.
+  other sparse-MLA (but DeepSeek-V4's, below), chunked local or RSWA
+  attention models.
+* DeepSeek-V3.2's and GLM-5's sparse MLA (DSA), over either connector, its
+  latent cache BF16 (`auto` or `bfloat16`; an FP8 `fp8_ds_mla` latent is
+  refused): each attention layer's latent (576 wide) and, on the layers
+  holding an indexer (GLM-5's every few, by its config), the indexer's FP8
+  keys and scales (132 bytes a token), pages of two sizes in one group, each
+  layer its own region; the pattern checks cover each layer's page.
 * DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
   with tensor parallelism or with data-parallel attention and expert
   parallelism (not both: the simulator's AISimulate timing provider does not
@@ -498,8 +505,10 @@ its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
 Layers still pick the CPU platform's attention backends and kernels, so a
-model needing one it lacks (sparse MLA, decode context parallelism, NVFP4 or
-MXFP4 weights, online FP8 quantization) fails to build there. The CPU build needs Python 3.11 or newer.
+model needing one it lacks (decode context parallelism, NVFP4 or MXFP4
+weights, online FP8 quantization) fails to build there; DSA sparse MLA
+(DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
+deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
 
 ## Limitations
 

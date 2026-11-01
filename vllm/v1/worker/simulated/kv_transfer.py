@@ -385,8 +385,57 @@ def refuse_foreign_state_geometry(worker) -> None:
     worker.add_remote_agent = add_remote_agent
 
 
+# DSA's indexer keys: 128 FP8 bytes and a 4-byte scale a token.
+DSA_INDEXER_HEAD_SIZE = 132
+
+
+def _dsa_group_problems(kv_cache_config: KVCacheConfig) -> set[str]:
+    """A DSA model's groups as built: each layer's BF16 latent (the sparse
+    role) and, with an indexer, its uint8 keys and scales, MLA specs of one
+    block size; a group of several kinds holds these two roles only."""
+    from vllm.v1.kv_cache_interface import SparseCacheRole
+
+    problems = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        members = (
+            spec.kv_cache_specs
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else dict.fromkeys(group.layer_names, spec)
+        )
+        roles = {}
+        for name, member in members.items():
+            role = getattr(member, "cache_role", None)
+            roles.setdefault(role, []).append(name)
+            if type(member) is not MLAAttentionSpec:
+                problems.add(f"DSA layer {name} of {type(member).__name__}")
+            elif role == SparseCacheRole.SPARSE and member.dtype != torch.bfloat16:
+                problems.add(f"DSA latent {name} of {member.dtype}, not BF16")
+            elif role == SparseCacheRole.INDEXER and (
+                member.dtype != torch.uint8
+                or member.head_size != DSA_INDEXER_HEAD_SIZE
+            ):
+                problems.add(
+                    f"DSA indexer {name} of {member.dtype} x {member.head_size}, "
+                    f"not uint8 x {DSA_INDEXER_HEAD_SIZE}"
+                )
+            elif role not in (SparseCacheRole.SPARSE, SparseCacheRole.INDEXER):
+                problems.add(f"DSA layer {name} of role {role}")
+        if SparseCacheRole.SPARSE not in roles:
+            problems.add(f"a DSA group of no latent (roles {sorted(map(str, roles))})")
+        if len({m.block_size for m in members.values()}) != 1:
+            problems.add(
+                "a DSA group of block sizes "
+                f"{sorted({m.block_size for m in members.values()})}"
+            )
+    return problems
+
+
 def check_real_kv_groups(
-    kv_cache_config: KVCacheConfig, v4: bool = False, speculative_blocks: int = 0
+    kv_cache_config: KVCacheConfig,
+    v4: bool = False,
+    speculative_blocks: int = 0,
+    dsa: bool = False,
 ) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
     RSWA attention, attention sinks), and of Mamba states other than a
@@ -397,7 +446,12 @@ def check_real_kv_groups(
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
     states = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.MAMBA2)
-    kinds = REAL_KV_SPECS + (V4_REAL_KV_SPECS if v4 else ())
+    kinds = (
+        REAL_KV_SPECS
+        + (V4_REAL_KV_SPECS if v4 else ())
+        # A DSA layer's latent and indexer keys: MLA specs of two pages.
+        + ((UniformTypeKVCacheSpecs,) if dsa else ())
+    )
     other = set()
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
@@ -418,6 +472,8 @@ def check_real_kv_groups(
                 f"{spec.mamba_cache_mode}, {spec.num_speculative_blocks} "
                 "speculative blocks)"
             )
+    if dsa:
+        other.update(_dsa_group_problems(kv_cache_config))
     if other:
         raise ValueError(
             "kv_transfer_mode real moves full and sliding-window attention KV, "
@@ -564,6 +620,37 @@ def kv_layout(
                 # A native MTP's scratch slots: NIXL moves the running slot
                 # (before them), whose clipped-read metadata index is k.
                 entry["speculative_blocks"] = spec.num_speculative_blocks
+            def kind_of(name: str) -> tuple:
+                spec_n, tensor_n = specs[name], kv_caches[name]
+                return (
+                    str(getattr(spec_n, "cache_role", None) or type(spec_n).__name__),
+                    str(tensor_n.dtype).removeprefix("torch."),
+                    spec_n.page_size_bytes,
+                    spec_n.real_page_size_bytes,
+                    tensor_n.stride(0) * tensor_n.element_size(),
+                )
+
+            kinds_of = {name: kind_of(name) for name in layers}
+            if len(set(kinds_of.values())) > 1 and not packed_members(
+                kv_caches, specs, layers
+            ):
+                # Layers of several pages, each in its own region (a DSA
+                # layer's latent and indexer keys): each kind's own geometry.
+                kinds: dict[tuple, dict[str, object]] = {}
+                for name, key in kinds_of.items():
+                    kind = kinds.setdefault(key, {
+                        "role": key[0].rsplit(".", 1)[-1].lower(),
+                        "dtype": key[1],
+                        "layers": 0,
+                        "page_bytes": key[2],
+                        "real_page_bytes": key[3],
+                        "block_stride": key[4],
+                    })
+                    kind["layers"] += 1
+                entry["kinds"] = list(kinds.values())
+                entry["checked_bytes_per_block"] = sum(
+                    k["page_bytes"] * k["layers"] for k in kinds.values()
+                )
             if packed := packed_members(kv_caches, specs, layers):
                 entry["members"] = packed
                 entry["checked_bytes_per_block"] = sum(

@@ -157,6 +157,20 @@ class CpuPlatform(Platform):
         num_heads: int | None = None,
     ) -> str:
         if attn_selector_config.use_sparse:
+            from vllm.config import get_current_vllm_config_or_none
+
+            # A simulation runs no attention kernel: DSA sparse MLA keeps the
+            # GPU deployment's backend for its KV cache (spec, layout, blocks).
+            config = get_current_vllm_config_or_none()
+            if (
+                config is not None
+                and config.simulation_config.simulate_forward
+                and attn_selector_config.use_mla
+            ):
+                return (
+                    "vllm.v1.attention.backends.mla.cpu_mla_sparse."
+                    "CPUSimulatedMLASparseBackend"
+                )
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
         kv_cache_dtype = attn_selector_config.kv_cache_dtype
         if attn_selector_config.use_mla:

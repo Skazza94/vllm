@@ -26,6 +26,8 @@ REAL_KV_MTP_DRAFTS = {
     "qwen3_5_moe": "Qwen3_5MoeMTP",
 }
 REAL_KV_MTP_MAX_DEPTH = 5
+# Sparse MLA with a lightning indexer (DSA): DeepSeek-V3.2, GLM-5.
+DSA_MODEL_TYPES = ("deepseek_v32", "glm_moe_dsa")
 
 
 @config
@@ -405,6 +407,21 @@ class SimulationConfig:
             and not v4
             and getattr(model.hf_text_config, "index_topk", None) is not None
         )
+        # DeepSeek-V3.2's sparse attention (DSA, GLM-5's too): a BF16 latent
+        # and an indexer key cache a layer, as the deployment keeps them.
+        dsa = sparse_mla and getattr(model.hf_config, "model_type", None) in (
+            DSA_MODEL_TYPES
+        )
+        if dsa:
+            sparse_mla = False
+            # `auto` takes the model's dtype: BF16 only when the model is.
+            resolved = model.dtype if cache.cache_dtype == "auto" else cache.cache_dtype
+            if str(resolved).removeprefix("torch.") != "bfloat16":
+                problems.append(
+                    "a BF16 sparse-MLA latent cache (kv_cache_dtype auto of a "
+                    f"BF16 model, or bfloat16), not {cache.cache_dtype} "
+                    f"({resolved})"
+                )
         if sparse_mla or model.is_attention_free:
             problems.append(
                 "an attention model, dense, MoE or dense MLA, its layers full "

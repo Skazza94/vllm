@@ -19,7 +19,7 @@ import torch.distributed as dist
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.simulation import NIXL_CONNECTORS
+from vllm.config.simulation import DSA_MODEL_TYPES, NIXL_CONNECTORS
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.logger import init_logger
@@ -205,6 +205,8 @@ class SimulatedModelRunner(GPUModelRunner):
                     self.vllm_config.speculative_config, "num_speculative_tokens", 0
                 )
                 or 0,
+                dsa=model is not None
+                and getattr(model.hf_config, "model_type", None) in DSA_MODEL_TYPES,
             )
             # The native path allocates the tensors, binds their layouts and
             # installs the connector that registers their memory for NIXL.

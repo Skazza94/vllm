@@ -1162,6 +1162,49 @@ def test_deepseek_v3_mtp_depths_match_the_pinned_estimator(k):
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, local",
+    [
+        ("deepseek-ai/DeepSeek-V3.2", "deepseek-ai/DeepSeek-V3.2"),
+        ("zai-org/GLM-5.2-FP8", "zai-org/GLM-5.2"),
+    ],
+)
+def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, local):
+    """DeepSeek-V3.2's and GLM-5's sparse MLA (DSA), timed as the published
+    FP8 deployment from a BF16 local copy: the latent's and the indexer's
+    geometry compared (GLM-5's indexer layers included), op-level estimates
+    over a BF16 cache."""
+    raw = {k: v for k, v in bundled_config(local).items() if k != "quantization_config"}
+    name = local.replace("/", "--")
+
+    def config(suffix, changed=raw, **kwargs):
+        return real_engine_config(
+            tmp_path, f"{name}-{suffix}", changed, derived=True,
+            tensor_parallel_size=8, **kwargs,
+        )
+
+    p = provider(config("bf16"), gpu="h200", target_model=target)
+    a = p.assumptions()["aisimulate"]
+    assert (a["resolved_config"]["estimation_mode"], a["config"]["kvcache_quant_mode"]) == (
+        "op_level", "bfloat16",
+    )
+    for field in ("index_n_heads", "index_head_dim", "index_topk", "index_topk_freq"):
+        assert a["compared_geometry"][field] == raw.get(field)
+    # Another indexer is not the target's.
+    with pytest.raises(ValueError, match="index_n_heads"):
+        provider(
+            config("indexer", {**raw, "index_n_heads": raw["index_n_heads"] * 2}),
+            gpu="h200", target_model=target,
+        )
+    if local == "zai-org/GLM-5.2":
+        # On B200 its `auto` cache is FP8 sparse MLA, not timed; BF16 is.
+        with pytest.raises(ValueError, match="kv_cache_dtype bfloat16"):
+            provider(config("b200"), gpu="b200", target_model=target)
+        provider(config("b200-bf16", kv_cache_dtype="bfloat16"), gpu="b200",
+                 target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 @pytest.mark.parametrize("k", [1, 3])
 def test_qwen3_5_mtp_depths_match_the_pinned_estimator(tmp_path, k):
     """Qwen3.5's one MTP layer (in its text config), served as its language
