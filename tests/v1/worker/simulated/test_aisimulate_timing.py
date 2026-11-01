@@ -137,10 +137,14 @@ def fake_aisimulate(tmp_path, monkeypatch):
     sdk.RustForwardPassPerfModel = FakeModel
     utils = types.ModuleType("aisimulate_core.sdk.utils")
     utils._infer_quantization_fields = infer_quantization
+    # Every bundled config here is one the package lists as pre-downloaded.
+    common = types.ModuleType("aisimulate_core.sdk.common")
+    common.DefaultHFModels = set(BUNDLED)
     for name, module in (
         ("aisimulate_core", core),
         ("aisimulate_core.sdk", sdk),
         ("aisimulate_core.sdk.utils", utils),
+        ("aisimulate_core.sdk.common", common),
     ):
         monkeypatch.setitem(sys.modules, name, module)
     FakeModel.instances = []
@@ -1202,6 +1206,117 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
             provider(config("b200"), gpu="b200", target_model=target)
         provider(config("b200-bf16", kv_cache_dtype="bfloat16"), gpu="b200",
                  target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_a_bundled_config_the_package_would_download_is_read_locally(tmp_path):
+    """Kimi-K2-Instruct's and Mixtral's configs ship with the package, which
+    lists them as not pre-downloaded and would fetch the published ones:
+    the provider hands it a directory of its own bundled config instead."""
+    import json as json_module
+    import os
+
+    from aisimulate_core.sdk.common import DefaultHFModels
+
+    for target, gpu, tp in (
+        ("moonshotai/Kimi-K2-Instruct", "b200", 8),
+        ("mistralai/Mixtral-8x7B-v0.1", "h100", 2),
+    ):
+        assert target not in DefaultHFModels
+        raw = {k: v for k, v in bundled_config(target).items() if k != "quantization_config"}
+        p = provider(
+            real_engine_config(tmp_path, target.replace("/", "--") + "-local", raw,
+                               derived=True, tensor_parallel_size=tp),
+            gpu=gpu, target_model=target,
+        )
+        a = p.assumptions()["aisimulate"]
+        directory = p.config["model"]
+        assert os.path.isdir(directory) and a["target_config_source"] == "bundled, local copy"
+        with open(os.path.join(directory, "config.json")) as f:
+            assert json_module.load(f) == bundled_config(target)
+        assert a["resolved_config"]["estimation_mode"] == "op_level"
+    # A listed target is named as before.
+    p = provider(engine_config(), gpu="h100")
+    assert p.config["model"] == "Qwen/Qwen3-30B-A3B"
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_each_caller_reads_its_own_bundled_snapshot(tmp_path):
+    """A bundled config the package would download is copied, with its
+    quantization sidecar or explicitly without one, into a snapshot private
+    to its caller, intact for as long as the caller keeps it: ranks starting
+    together never read another's half-written copy."""
+    import json as json_module
+    import os
+    import threading
+
+    from vllm.v1.worker.simulated.aisimulate_timing import _offline_model
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    config = {"architectures": ["MixtralForCausalLM"], "pad": "x" * 200_000}
+    with_sidecar = bundle / "org--with_config.json"
+    with_sidecar.write_text(json_module.dumps(config))
+    (bundle / "org--with_hf_quant_config.json").write_text('{"quantization": {}}')
+    without = bundle / "org--without_config.json"
+    without.write_text(json_module.dumps(config))
+
+    model, snapshot = _offline_model("org/with", str(with_sidecar))
+    assert sorted(os.listdir(model)) == ["config.json", "hf_quant_config.json"]
+    # No sidecar bundled: none in the snapshot, whatever another one held.
+    other, other_snapshot = _offline_model("org/without", str(without))
+    assert other != model and os.listdir(other) == ["config.json"]
+    # A listed model is named, not copied.
+    assert _offline_model("Qwen/Qwen3-30B-A3B", "unused") == ("Qwen/Qwen3-30B-A3B", None)
+
+    errors, held = [], []
+
+    def start():
+        try:
+            directory, keep = _offline_model("org/with", str(with_sidecar))
+            held.append(keep)
+            for _ in range(50):
+                with open(os.path.join(directory, "config.json")) as f:
+                    assert json_module.load(f) == config
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and len({keep.name for keep in held}) == 8
+    # The first snapshot is still whole while kept, gone once released.
+    with open(os.path.join(model, "config.json")) as f:
+        assert json_module.load(f) == config
+    snapshot.cleanup()
+    assert not os.path.exists(model)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_kimi_k2_5_is_timed_with_its_mixed_precision(tmp_path):
+    """Kimi-K2.5 (a vision-language wrapper served as its language model), a
+    BF16 local copy timed as the published checkpoint: AISimulate's own
+    reading of its compressed-tensors groups, BF16 GEMMs and int4 experts,
+    and the nested text config's MLA geometry compared."""
+    target = "moonshotai/Kimi-K2.5"
+    raw = bundled_config(target)
+    raw = {**raw, "text_config": {k: v for k, v in raw["text_config"].items()
+                                  if k != "quantization_config"}}
+    raw.pop("quantization_config", None)
+    p = provider(
+        real_engine_config(tmp_path, "moonshotai--Kimi-K2.5-bf16", raw, derived=True,
+                           tensor_parallel_size=8, language_model_only=True,
+                           trust_remote_code=True),
+        gpu="b200", target_model=target,
+    )
+    a = p.assumptions()["aisimulate"]
+    assert {k: a["config"][k] for k in ("gemm_quant_mode", "moe_quant_mode", "fmha_quant_mode")} == {
+        "gemm_quant_mode": "bfloat16", "moe_quant_mode": "int4_wo", "fmha_quant_mode": "bfloat16",
+    }
+    assert a["resolved_config"]["estimation_mode"] == "op_level"
+    assert a["compared_geometry"]["kv_lora_rank"] == raw["text_config"]["kv_lora_rank"]
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")

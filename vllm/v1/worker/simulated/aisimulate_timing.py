@@ -18,6 +18,8 @@ import importlib.metadata
 import json
 import math
 import os
+import shutil
+import tempfile
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -202,7 +204,7 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
         ),
         ATTENTION_FIELDS,
     ),
-    "DeepseekV3ForCausalLM": MLA_FIELDS,
+    **dict.fromkeys(("DeepseekV3ForCausalLM", "KimiK25ForConditionalGeneration"), MLA_FIELDS),
     **dict.fromkeys(("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"), DSA_FIELDS),
     "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,
@@ -218,6 +220,48 @@ APPROXIMATIONS = [
     ),
     "the op-level estimator reduces a rank's requests to aggregate and average lengths",
 ]
+
+
+def _offline_model(
+    target: str, bundled: str
+) -> tuple[str, tempfile.TemporaryDirectory | None]:
+    """The model AISimulate is given: its name when the package lists it as
+    pre-downloaded; else a private snapshot of the package's own bundled
+    config (with its quantization sidecar, or none when it bundles none),
+    which it reads locally where it would otherwise download the published
+    config. The snapshot is this caller's alone: keep the returned directory
+    alive while AISimulate may read it."""
+    from aisimulate_core.sdk.common import DefaultHFModels
+
+    if target in DefaultHFModels:
+        return target, None
+    snapshot = tempfile.TemporaryDirectory(prefix="aisimulate-")
+    shutil.copyfile(bundled, os.path.join(snapshot.name, "config.json"))
+    sidecar = bundled.removesuffix("_config.json") + "_hf_quant_config.json"
+    if os.path.isfile(sidecar):
+        shutil.copyfile(sidecar, os.path.join(snapshot.name, "hf_quant_config.json"))
+    return snapshot.name, snapshot
+
+
+def _compressed_tensors_modes(target: str) -> dict[str, str]:
+    """A compressed-tensors checkpoint's GEMM and expert modes as AISimulate
+    infers them from its full config (BF16 where a layer kind is ignored)."""
+    from aisimulate_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+    from aisimulate_core.sdk.utils import _load_model_config_from_model_path
+
+    inferred = _infer_quant_modes_from_raw_config(
+        _load_model_config_from_model_path(target)
+    )
+
+    def name(key: str) -> str:
+        value = inferred.get(key)
+        return getattr(value, "name", value) or "bfloat16"
+
+    return {
+        "gemm_quant_mode": name("gemm_quant_mode"),
+        "moe_quant_mode": name("moe_quant_mode"),
+        "fmha_quant_mode": "bfloat16",
+    }
 
 
 def _geometry(config: Any, fields: tuple[str, ...]) -> dict[str, Any]:
@@ -366,12 +410,20 @@ class AisimulateTimingProvider:
             target_config = json.load(f)
         geometry = self._check_geometry(vllm_config, target_config, target)
 
+        # One snapshot for the provider's lifetime: quant inference and the
+        # estimator read the same files.
+        model, self._snapshot = _offline_model(target, bundled)
         v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
         quant = _infer_quantization_fields(target_config).get("quant_algo")
         # V4's experts follow the raw config's `expert_dtype` (AISimulate's own
         # V4 override): FP4 experts with FP8 activations.
         expert_dtype = target_config.get("expert_dtype") if v4 else None
         modes = QUANT_MODES.get(quant) if not v4 else None
+        if quant == "compressed-tensors":
+            # Mixed per-layer precision (Kimi-K2.5's int4 experts beside BF16
+            # GEMMs): AISimulate's own reading of the checkpoint's groups and
+            # ignore list, sidecars included; attention BF16 as elsewhere.
+            modes = _compressed_tensors_modes(model)
         if v4 and (quant, expert_dtype) == ("fp8_block", "fp4"):
             modes = {
                 "gemm_quant_mode": "fp8_block",
@@ -413,7 +465,7 @@ class AisimulateTimingProvider:
         )
         self.num_ranks = topology["attention_dp"]
         self.config = {
-            "model": target,
+            "model": model,
             "system": system,
             "backend": "vllm",
             "worker_type": worker_type,
@@ -469,6 +521,10 @@ class AisimulateTimingProvider:
             "config": self.config,
             "resolved_config": resolved,
             "target_model": target,
+            # The estimator's own bundled config, read offline.
+            "target_config_source": (
+                "bundled" if self.config["model"] == target else "bundled, local copy"
+            ),
             "target_config_sha256": _file_sha256(bundled),
             "target_quantization": quant,
             "target_modified": modified,
