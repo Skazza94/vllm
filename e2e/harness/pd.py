@@ -742,6 +742,8 @@ def _packed_problems(group: dict) -> list[str]:
     the members count the group's layers, its checked bytes are their real
     pages and the bytes a block moves span the block. Empty for a group that
     is not packed."""
+    if "kinds" in group and "members" not in group:
+        return _kinds_problems(group)
     if not any(key in group for key in ("members", "checked_bytes_per_block", "transfer_bytes_per_block")):
         return []
 
@@ -786,6 +788,37 @@ def _packed_problems(group: dict) -> list[str]:
         problems.append(f"checks {checked} bytes a block, not its members' {real} real bytes")
     if moved < stride:
         problems.append(f"moves {moved} bytes a block, less than its {stride}-byte block")
+    return problems
+
+
+def _kinds_problems(group: dict) -> list[str]:
+    """How a group of layers of several pages, each layer in its own region
+    (a DSA layer's latent and indexer keys), is malformed: each kind names
+    its role, dtype, layer count, page and real bytes and block stride, its
+    real bytes within its page and its page within its block; the kinds
+    count the group's layers and its checked bytes a block are their pages
+    (not the group's first tensor's)."""
+    kinds = group.get("kinds")
+    checked = group.get("checked_bytes_per_block")
+    fields = ("role", "dtype", "layers", "page_bytes", "real_page_bytes", "block_stride")
+
+    def size(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    if not (isinstance(kinds, list) and len(kinds) > 1 and size(checked)
+            and all(isinstance(k, dict) and all(f in k for f in fields) for k in kinds)
+            and all(size(k["layers"]) and size(k["page_bytes"]) and size(k["real_page_bytes"])
+                    and size(k["block_stride"]) for k in kinds)):
+        return [f"has a malformed layout of several pages (kinds {kinds!r}, checked_bytes_per_block {checked!r})"]
+    problems = []
+    if sum(k["layers"] for k in kinds) != group.get("layers"):
+        problems.append(f"has kinds of {sum(k['layers'] for k in kinds)} layers, not its {group.get('layers')}")
+    if checked != sum(k["page_bytes"] * k["layers"] for k in kinds):
+        problems.append(f"checks {checked} bytes a block, not its kinds' pages")
+    problems.extend(f"kind {k['role']} has {k['real_page_bytes']} real bytes in a {k['page_bytes']}-byte page"
+                    for k in kinds if k["real_page_bytes"] > k["page_bytes"])
+    problems.extend(f"kind {k['role']}'s {k['page_bytes']}-byte page exceeds its {k['block_stride']}-byte block"
+                    for k in kinds if k["page_bytes"] > k["block_stride"])
     return problems
 
 

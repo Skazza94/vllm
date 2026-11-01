@@ -1193,5 +1193,48 @@ class NativeMtpStateTests(unittest.TestCase):
                                     for p in problems), problems)
 
 
+
+class SparseMlaLayoutTests(unittest.TestCase):
+    """A real decode record of a tiny DeepSeek-V3.2 over NIXL (two
+    processes): each layer's BF16 latent and indexer keys, pages of two
+    sizes in one group, each layer its own region; a check's bytes are its
+    blocks of every layer's page."""
+
+    PATH = Path(__file__).parent / "data" / "nixl-deepseek-v3.2-decode-steps.jsonl"
+
+    def problems(self, change=None) -> list[str]:
+        records = [json.loads(line) for line in self.PATH.read_text().splitlines()]
+        layout = next(r["kv_layout"] for r in records if "kv_layout" in r)
+        checks = [r["kv_check"] for r in records if "kv_check" in r]
+        if change:
+            change(layout["groups"][0], checks[0])
+        return pd._byte_check_problems(layout, checks, 200, pd._pull_plans(records),
+                                       {c["req_id"]: 200 for c in checks})
+
+    def test_a_sparse_mla_check_counts_each_layers_page(self) -> None:
+        self.assertEqual(self.problems(), [])
+
+    def test_its_failures_are_reported(self) -> None:
+        def kinds_short(group, check):
+            group["kinds"][0]["layers"] = 1
+
+        def checked_wrong(group, check):
+            group["checked_bytes_per_block"] += 1
+
+        def latent_pages_only(group, check):
+            # Every layer counted at the latent's page.
+            check["groups"][0]["bytes"] = check["groups"][0]["blocks"] * 4 * 73728
+
+        cases = {
+            "has kinds of 3 layers, not its 4": kinds_short,
+            "checks 164353 bytes a block, not its kinds' pages": checked_wrong,
+            "check disagrees with the layout": latent_pages_only,
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message):
+                problems = self.problems(change)
+                self.assertTrue(any(message in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
