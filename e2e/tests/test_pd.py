@@ -419,9 +419,10 @@ def hybrid_pull(request: str, state=(0, 1), attention=(0, 2), offset: int = 100)
         {"group": 1, "first": attention[0], "blocks": list(range(offset + 10, offset + 10 + attention[1]))}]}})
 
 
-def stepped(request: str, side: str, computed: int, scheduled: int, prompt: int) -> str:
+def stepped(request: str, side: str, computed: int, scheduled: int, prompt: int, drafts: int = 0) -> str:
     return line(step={"requests": [{"req_id": f"cmpl-{request}-0-{side}", "num_computed_tokens": computed,
-                                    "num_scheduled_tokens": scheduled, "num_prompt_tokens": prompt}]})
+                                    "num_scheduled_tokens": scheduled, "num_prompt_tokens": prompt,
+                                    "num_spec_tokens": drafts}]})
 
 
 class HybridCheckTests(unittest.TestCase):
@@ -446,6 +447,11 @@ class HybridCheckTests(unittest.TestCase):
         self.assertEqual(verdict["ranks"][0]["handoff"]["requests"], 2)
         self.assertEqual(verdict["ranks"][0]["handoff"]["prompt_tokens"], [33, 33])
 
+    def test_a_speculative_resume_verifies_its_drafts(self) -> None:
+        # Native MTP at depth 2: the last prompt token and two drafts.
+        steps = "".join(stepped(r, "d", 32, 3, 33, drafts=2) for r in ("a", "b"))
+        self.assertEqual(self.verdict(decode_steps=steps)["problems"], [])
+
     def test_hybrid_failures_are_reported(self) -> None:
         cases = {
             "state group 0 checked 2 blocks, not 1": {
@@ -460,6 +466,10 @@ class HybridCheckTests(unittest.TestCase):
             "prefill took a 33-token prompt to 33 tokens, not its 33 tokens but the last": {
                 "prefill_steps": stepped("a", "p", 0, 33, 33) + stepped("b", "p", 0, 32, 32)},
             "cmpl-b-0-d has no prefill steps": {"prefill_steps": stepped("a", "p", 0, 32, 32)},
+            # With speculative decoding the resume verifies its drafts too;
+            # scheduled tokens beside them are not the last prompt token's.
+            "resumed at 32 tokens with 3 scheduled, not at 32 with 2": {
+                "decode_steps": stepped("a", "d", 32, 3, 33, drafts=1) + stepped("b", "d", 32, 1, 33)},
         }
         for message, changes in cases.items():
             with self.subTest(message=message):
@@ -1137,6 +1147,50 @@ class PrefillDecodeRunTests(unittest.TestCase):
         self.assertEqual(verdict["kv_checks"], 40)
         # The other rail stayed idle.
         self.assertLess(verdict["router_bytes"]["data1"], 1 << 20)
+
+
+
+class NativeMtpStateTests(unittest.TestCase):
+    """Real decode records of Qwen3.5's native MTP over NIXL (two processes,
+    MTP depths 1 and 3): the clipped read's metadata gives a state's running
+    slot (physically before its trailing scratch slots) index k, the depth;
+    the checks agree with the layout there."""
+
+    DATA = Path(__file__).parent / "data"
+
+    def records(self, k: int) -> list[dict]:
+        path = self.DATA / f"nixl-qwen3.5-mtp-k{k}-decode-steps.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def problems(self, records: list[dict]) -> list[str]:
+        layout = next(r["kv_layout"] for r in records if "kv_layout" in r)
+        checks = [r["kv_check"] for r in records if "kv_check" in r]
+        return pd._byte_check_problems(layout, checks, 200, pd._pull_plans(records),
+                                       {c["req_id"]: 199 for c in checks})
+
+    def test_states_start_at_the_mtp_depth(self) -> None:
+        for k in (1, 3):
+            with self.subTest(k=k):
+                records = self.records(k)
+                layout = next(r["kv_layout"] for r in records if "kv_layout" in r)
+                self.assertEqual([g.get("speculative_blocks") for g in layout["groups"]], [k, k, None])
+                self.assertEqual(self.problems(records), [])
+
+    def test_other_starts_are_reported(self) -> None:
+        for k in (1, 3):
+            records = self.records(k)
+            check = next(r["kv_check"] for r in records if "kv_check" in r)
+            # A state's check placed at index 0, where the clipped read's
+            # metadata gives k.
+            check["groups"][0]["first_logical_block"] = 0
+            # Attention still starts at 0: not moved by the depth.
+            check["groups"][2]["first_logical_block"] = k
+            problems = self.problems(records)
+            with self.subTest(k=k):
+                self.assertTrue(any(f"group 0 (MambaSpec) was pulled from block 0, not {k}" in p
+                                    for p in problems), problems)
+                self.assertTrue(any(f"group 2 (FullAttentionSpec) was pulled from block {k}, not 0" in p
+                                    for p in problems), problems)
 
 
 if __name__ == "__main__":

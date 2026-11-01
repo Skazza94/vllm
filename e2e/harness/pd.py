@@ -907,9 +907,13 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             elif (g["layers"], g["bytes"]) != (spec["layers"], g["blocks"] * spec["layers"] * spec["block_bytes"]):
                 problems.append(f"{request}'s group {g['group']} check disagrees with the layout "
                                 f"({spec['layers']} layers of {spec['block_bytes']} bytes a block)")
-            if window is None and g["first_logical_block"] != 0:
+            # A state's running slot (before its native MTP's scratch
+            # slots, the one NIXL moves) has clipped-read metadata index k
+            # (`speculative_blocks`); any other group starts at 0.
+            start = (spec.get("speculative_blocks") or 0) if spec.get("kind") == "MambaSpec" else 0
+            if window is None and g["first_logical_block"] != start:
                 problems.append(f"{request}'s group {g['group']} ({spec.get('kind')}) was pulled from block "
-                                f"{g['first_logical_block']}, not 0")
+                                f"{g['first_logical_block']}, not {start}")
             if spec.get("kind") == "MambaSpec":
                 if g["blocks"] != 1:
                     problems.append(f"{request}'s state group {g['group']} checked {g['blocks']} blocks, not 1")
@@ -940,19 +944,21 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
     return _capped(problems)
 
 
-def _request_steps(records: list[dict]) -> dict[str, list[tuple[int, int, int]]]:
-    """Each request's steps in a step log: (computed, scheduled, prompt)
-    tokens, in order."""
-    steps: dict[str, list[tuple[int, int, int]]] = {}
+def _request_steps(records: list[dict]) -> dict[str, list[tuple[int, int, int, int]]]:
+    """Each request's steps in a step log: (computed, scheduled, prompt,
+    speculative) tokens, in order; speculative, the drafts the step
+    verifies among its scheduled tokens."""
+    steps: dict[str, list[tuple[int, int, int, int]]] = {}
     for record in records:
         for request in (record.get("step") or {}).get("requests", []):
             steps.setdefault(request["req_id"], []).append(
-                (request["num_computed_tokens"], request["num_scheduled_tokens"], request["num_prompt_tokens"]))
+                (request["num_computed_tokens"], request["num_scheduled_tokens"], request["num_prompt_tokens"],
+                 request.get("num_spec_tokens") or 0))
     return steps
 
 
-def _handoff_problems(prefill: dict[str, list[tuple[int, int, int]]],
-                      decode: dict[str, list[tuple[int, int, int]]],
+def _handoff_problems(prefill: dict[str, list[tuple[int, int, int, int]]],
+                      decode: dict[str, list[tuple[int, int, int, int]]],
                       consumed: set[str]) -> dict:
     """A hybrid model's handoff, from both sides' steps: prefill computes
     the prompt but its last token (Mooncake truncates its N tokens to
@@ -967,18 +973,20 @@ def _handoff_problems(prefill: dict[str, list[tuple[int, int, int]]],
         if steps is None:
             problems.append(f"{request} has no decode steps")
             continue
-        computed, scheduled, prompt = steps[0]
+        computed, scheduled, prompt, drafts = steps[0]
         if prompt <= 1:
             continue
         prompts.append(prompt)
-        if (computed, scheduled) != (prompt - 1, 1):
+        # The last prompt token, and with speculative decoding the drafts
+        # the same step verifies.
+        if (computed, scheduled) != (prompt - 1, 1 + drafts):
             problems.append(f"{request} resumed at {computed} tokens with {scheduled} scheduled, not at "
-                            f"{prompt - 1} with 1")
+                            f"{prompt - 1} with {1 + drafts}")
         steps = produced.get(_base_request_id(request))
         if steps is None:
             problems.append(f"{request} has no prefill steps")
             continue
-        computed, scheduled, prefilled = steps[-1]
+        computed, scheduled, prefilled, _ = steps[-1]
         if prefilled != prompt - 1 or computed + scheduled != prompt - 1:
             problems.append(f"{request}'s prefill took a {prefilled}-token prompt to {computed + scheduled} "
                             f"tokens, not its {prompt} tokens but the last")
