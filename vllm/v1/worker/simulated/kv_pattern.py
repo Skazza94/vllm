@@ -606,6 +606,25 @@ class NativeChecker:
     transfer_group_ids: Sequence[int] | None = None
     pending: dict[str, _Expected] = field(default_factory=dict)
     lost: set[str] = field(default_factory=set)
+    # The local descriptors of the READs NIXL posted, by producer request.
+    posted: dict[str, list[int]] = field(default_factory=dict)
+
+    def watch_reads(self) -> None:
+        """Record each READ's local descriptors as NIXL posts it (its
+        notification names the producer's request): the blocks it writes,
+        which must be the checked ones, never a state's scratch slot."""
+        wrapper = self.selection.worker.nixl_wrapper
+        make = wrapper.make_prepped_xfer
+
+        def make_prepped_xfer(op, local, local_ids, remote, remote_ids, *args, **kw):
+            notif = kw.get("notif_msg", args[0] if args else b"")
+            if isinstance(notif, bytes):
+                notif = notif.decode()
+            request = notif.rsplit(":", 1)[0]
+            self.posted.setdefault(request, []).extend(int(i) for i in local_ids)
+            return make(op, local, local_ids, remote, remote_ids, *args, **kw)
+
+        wrapper.make_prepped_xfer = make_prepped_xfer
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         for read in requested_reads(scheduler_output.kv_connector_metadata):
@@ -644,7 +663,21 @@ class NativeChecker:
             groups.append(_ExpectedGroup(group, first, list(ids)))
         self.pending[req_id] = _Expected(remote_request_id, groups)
 
-    after_step = PatternChecker.after_step
+    def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
+        """PatternChecker's, then each ended receive's posted descriptors
+        released (a failed or lost read's too, never compared), another
+        pending read's kept."""
+        ended = {}
+        if kv_output is not None:
+            for req_id in (kv_output.failed_recving or set()) | (
+                kv_output.finished_recving or set()
+            ):
+                if (expected := self.pending.get(req_id)) is not None:
+                    ended[req_id] = expected.remote_request_id
+        results = PatternChecker.after_step(self, kv_output)
+        for remote_request_id in ended.values():
+            self.posted.pop(remote_request_id, None)
+        return results
 
     def _check_geometry(self) -> None:
         """The selection is the local one: a remote read whole by the same
@@ -675,6 +708,15 @@ class NativeChecker:
         for group in expected.groups:
             held = [b for b in group.block_ids if b != NULL_BLOCK_ID]
             selected = s.select(group.group, held) if held else []
+            # A state group moves its running slot only: NIXL drops a native
+            # MTP's trailing scratch slots and keeps the one before them
+            # (`blocks[:-k][-1:]`, the first). Its place is that slot's, not
+            # the index the consumer's clipped-read metadata gives (k).
+            first = (
+                0
+                if selected and all(s.rows[row].state for row, _, _ in selected)
+                else group.first_logical_block
+            )
             payload = transfer_only = wrong_total = 0
             for row, block, place in selected:
                 r = s.rows[row]
@@ -682,7 +724,7 @@ class NativeChecker:
                 want = pattern(
                     expected.remote_request_id,
                     s.name(group.group, row),
-                    group.first_logical_block + place,
+                    first + place,
                     view.shape[1],
                     self.tp_rank,
                 )
@@ -695,7 +737,7 @@ class NativeChecker:
                     mismatched_blocks.append(
                         [
                             s.name(group.group, row),
-                            group.first_logical_block + place,
+                            first + place,
                             block,
                             wrong,
                         ]
@@ -711,7 +753,13 @@ class NativeChecker:
             groups.append(
                 {
                     "group": group.group,
+                    # Where the pull's metadata placed the blocks among the
+                    # request's (a state's clipped running slot: index k, its
+                    # slot physically before the scratch ones), and the
+                    # producer's place their pattern is of.
                     "first_logical_block": group.first_logical_block,
+                    "pattern_first_block": first,
+                    "block_ids": held,
                     "blocks": len(held),
                     "layers": len(s.groups[group.group]),
                     "regions": len(s.regions(selected)),
@@ -724,6 +772,18 @@ class NativeChecker:
                 }
             )
         mismatched_bytes = sum(g["mismatched_bytes"] for g in groups)
+        # The READs wrote these descriptors' blocks and no others (a
+        # state's scratch slots included), in the selection's order.
+        checked = [
+            int(s.starts[row]) + block
+            for group in expected.groups
+            for row, block, _ in s.select(
+                group.group, [b for b in group.block_ids if b != NULL_BLOCK_ID]
+            )
+            if any(b != NULL_BLOCK_ID for b in group.block_ids)
+        ]
+        posted = self.posted.pop(expected.remote_request_id, None)
+        posted_ok = posted == checked
         return {
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,
@@ -732,7 +792,9 @@ class NativeChecker:
             "layers": sum(g["layers"] for g in groups),
             "bytes": sum(g["bytes"] for g in groups),
             "groups": groups,
+            "posted_descriptors": None if posted is None else len(posted),
+            "posted_matches_checked": posted_ok,
             "mismatched_bytes": mismatched_bytes,
             "mismatched_blocks": mismatched_blocks[:16],
-            "ok": mismatched_bytes == 0,
+            "ok": mismatched_bytes == 0 and posted_ok,
         }

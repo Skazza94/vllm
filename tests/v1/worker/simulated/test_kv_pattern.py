@@ -915,12 +915,13 @@ def test_kv_layout_describes_a_padded_state_and_counts_storage_once():
         "kind": "MambaSpec", "sliding_window": None, "block_size": 4096, "layers": 2,
         "block_bytes": PAGE, "real_page_bytes": STATE_BYTES, "block_stride": PAGE,
         "mamba_type": "GDN_ATTN",
+        "speculative_blocks": 0,
     }
 
 
 def test_real_transfers_take_a_recurrent_layers_single_state_only():
     """A gated delta-net's or a Mamba2 mixer's state, one block a request
-    (mamba_cache_mode none), without speculative blocks."""
+    (mamba_cache_mode none), without speculative blocks but a native MTP's."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -960,6 +961,16 @@ def test_real_transfers_take_a_recurrent_layers_single_state_only():
     ):
         with pytest.raises(ValueError, match=message):
             check_real_kv_groups(config(**mamba))
+    # A native MTP of depth k: exactly k scratch slots a state (NIXL drops
+    # them), neither none nor another depth's.
+    for k in (1, 3):
+        check_real_kv_groups(config(num_speculative_blocks=k), speculative_blocks=k)
+        check_real_kv_groups(config(**mamba2, num_speculative_blocks=k), speculative_blocks=k)
+        for blocks in (0, k + 1):
+            with pytest.raises(ValueError, match=f"{blocks} speculative blocks"):
+                check_real_kv_groups(
+                    config(num_speculative_blocks=blocks), speculative_blocks=k
+                )
 
 
 def test_real_transfers_take_qwens_gated_delta_net_layers_only():
@@ -1147,3 +1158,39 @@ def test_packed_blocks_check_each_layers_real_page_at_its_offset():
     assert result["bytes"] == 2 * (6 + 10)  # the real pages only
     assert not received(corrupt=2 * stride + 8 + 3)["ok"]  # layer 1's real byte
     assert received(corrupt=2 * stride + 7)["ok"]  # padding is not checked
+
+
+def test_native_checks_release_an_ended_receives_posted_reads():
+    """The READs NIXL posted for a request are released when its receive
+    ends, failed (a setup failure included: recorded, then raised), or
+    finished after its blocks were reported invalid; another pending
+    request's are kept."""
+    from types import SimpleNamespace
+
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.worker.simulated.kv_pattern import (
+        NativeChecker,
+        _Expected,
+        _ExpectedGroup,
+    )
+
+    def failing(op, local, local_ids, remote, remote_ids, notif_msg=b""):
+        raise RuntimeError("transfer setup failed")
+
+    worker = SimpleNamespace(nixl_wrapper=SimpleNamespace(make_prepped_xfer=failing))
+    checker = NativeChecker(SimpleNamespace(worker=worker))
+    checker.watch_reads()
+    for req, remote, blocks in (("a", "ra", [1]), ("b", "rb", [2]), ("c", "rc", [3])):
+        checker.pending[req] = _Expected(remote, [_ExpectedGroup(0, 0, blocks)])
+        checker.posted[remote] = [blocks[0]]
+    # A setup failure: the descriptors are recorded before the call raises.
+    with pytest.raises(RuntimeError):
+        worker.nixl_wrapper.make_prepped_xfer("READ", 0, [7], 1, [7], notif_msg=b"ra:1")
+    assert checker.posted["ra"] == [1, 7]
+
+    (failed,) = checker.after_step(KVConnectorOutput(failed_recving={"a"}))
+    assert not failed["ok"] and set(checker.posted) == {"rb", "rc"}
+    assert checker.after_step(KVConnectorOutput(invalid_block_ids={3})) == []
+    (lost,) = checker.after_step(KVConnectorOutput(finished_recving={"c"}))
+    assert lost["error"] == "receive failed"
+    assert set(checker.posted) == {"rb"} and set(checker.pending) == {"b"}

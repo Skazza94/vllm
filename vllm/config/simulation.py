@@ -22,6 +22,8 @@ REAL_KV_CONNECTORS = (*NIXL_CONNECTORS, "MooncakeConnector")
 REAL_KV_MTP_DRAFTS = {
     "deepseek_v3": "DeepSeekMTPModel",
     "deepseek_v4": "DeepSeekV4MTPModel",
+    "qwen3_5": "Qwen3_5MTP",
+    "qwen3_5_moe": "Qwen3_5MoeMTP",
 }
 REAL_KV_MTP_MAX_DEPTH = 5
 
@@ -199,7 +201,10 @@ class SimulationConfig:
         architectures = list(
             getattr(spec.draft_model_config, "architectures", None) or []
         )
-        layers = getattr(model.hf_text_config, "num_nextn_predict_layers", None)
+        text = model.hf_text_config
+        layers = getattr(text, "num_nextn_predict_layers", None) or getattr(
+            text, "mtp_num_hidden_layers", None
+        )
         mismatches = []
         if spec.method != "mtp":
             mismatches.append(f"method {spec.method}")
@@ -232,8 +237,8 @@ class SimulationConfig:
         if not mismatches:
             return []
         return [
-            "speculative decoding only as DeepSeek-V3's or DeepSeek-V4's "
-            f"native single-module MTP (1 to {REAL_KV_MTP_MAX_DEPTH} tokens) "
+            "speculative decoding only as DeepSeek-V3's, DeepSeek-V4's or "
+            f"Qwen3.5's native single-module MTP (1 to {REAL_KV_MTP_MAX_DEPTH} tokens) "
             f"over NIXL, not {', '.join(mismatches)}"
         ]
 

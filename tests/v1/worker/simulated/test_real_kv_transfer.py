@@ -592,6 +592,47 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_or_nixl_without_prefix_cachin
     hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs)
 
 
+def test_real_mode_takes_qwen3_5_native_mtp_over_nixl_only(
+    tmp_path_factory, ds_conv_layout
+):
+    """Qwen3.5's one MTP layer (`mtp_num_hidden_layers`) moves with the
+    target's KV over NIXL in the DS layout, its states' speculative slots
+    left where they are: not over Mooncake, nor two MTP layers."""
+    text = QWEN3_5_MOE["text_config"]
+    one = write_model_dir(
+        tmp_path_factory, "tiny-qwen3.5-mtp",
+        {**QWEN3_5_MOE, "text_config": {**text, "mtp_num_hidden_layers": 1}},
+    )
+    two = write_model_dir(
+        tmp_path_factory, "tiny-qwen3.5-mtp-two",
+        {**QWEN3_5_MOE, "text_config": {**text, "mtp_num_hidden_layers": 2}},
+    )
+
+    def mtp(k=1):
+        return {"method": "mtp", "num_speculative_tokens": k}
+
+    for connector in ("NixlConnector", "NixlPullConnector"):
+        for k in (1, 5):
+            config = engine_config(
+                one, kv_transfer={"kv_connector": connector},
+                speculative_config=mtp(k), language_model_only=True,
+            )
+            assert config.speculative_config.draft_model_config.architectures == [
+                "Qwen3_5MoeMTP"
+            ]
+    for model, kwargs, problem in (
+        (one, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
+        (one, {"speculative_config": mtp(6)}, "6 speculative tokens"),
+        (two, {}, "2 MTP layers"),
+    ):
+        kwargs.setdefault("speculative_config", mtp())
+        with pytest.raises(ValueError, match=problem):
+            engine_config(model, language_model_only=True, **kwargs)
+    ds_conv_layout("SD")
+    with pytest.raises(ValueError, match="DS conv-state layout"):
+        engine_config(one, speculative_config=mtp(), language_model_only=True)
+
+
 @pytest.mark.parametrize("model", ["nemotron_h_model_dir", "nemotron_3_model_dir"])
 def test_real_mode_takes_mamba2_hybrids_over_mooncake_or_nixl_without_prefix_caching(
     model, request, ds_conv_layout
@@ -1449,10 +1490,19 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
 
         checker = NativeChecker(s)
 
-        def read(corrupt=None, whole_page=False, skip=None):
+        def post(blocks, extra=()):
+            """The local descriptors NIXL posts for a read into `blocks`
+            (`extra`: of other blocks besides, e.g. a state's scratch slot)."""
+            checker.posted["cmpl-a-0"] = [
+                int(d) for d in worker._compute_desc_ids(blocks, worker.num_blocks, None, 1)
+            ] + list(extra)
+
+        def read(corrupt=None, whole_page=False, skip=None, extra=(), swap=False):
             """The read NIXL would post: each selected span from the source
-            block to the target block, then a corruption; its check."""
+            block to the target block (`swap`: a state's from the source's
+            other slot), then a corruption; its check."""
             checker.expect("cmpl-b-0", "cmpl-a-0", [0] * len(groups), target)
+            post(target, extra)
             for index in range(len(groups)):
                 pairs = zip(
                     s.select(index, source[index]), s.select(index, target[index])
@@ -1461,6 +1511,8 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
                     assert (row, place) == (dst_row, dst_place)
                     if skip is not None and skip(index, row):
                         continue
+                    if swap and s.rows[row].state:
+                        src = source[index][1 - place]
                     s.rows[row].view[dst] = s.rows[row].view[src]
                 if whole_page:
                     for region in s.state_regions(s.select(index, source[index])):
@@ -1508,6 +1560,18 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             g["padding_mismatched_bytes"] for g in padding["groups"]
         ) == 1
         assert not read(whole_page=True)["ok"]  # the padding was copied
+        # A state's other slot copied (a scratch slot where the running one
+        # belongs), or a READ writing a block beside the checked ones.
+        assert not read(swap=True)["ok"]
+        spare = next(
+            int(d) for d in worker._compute_desc_ids(
+                [[worker.num_blocks - 1] if i == state else [] for i in range(len(groups))],
+                worker.num_blocks, None, 1,
+            )
+        )
+        stray = read(extra=[spare])
+        assert stray["mismatched_bytes"] == 0 and not stray["posted_matches_checked"]
+        assert not stray["ok"]
         if transfer_only:
             unmoved = read(
                 skip=lambda index, row: s.rows[row].region not in s.members[index]
@@ -1541,7 +1605,8 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
                 )
             ]
 
-        def complete(req_id):
+        def complete(req_id, blocks):
+            post(blocks)
             return checker._compare(req_id, checker.pending.pop(req_id))
 
         checker.expect("cmpl-d-0", "cmpl-a-0", [0] * len(groups), first)
@@ -1552,8 +1617,8 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
         assert {"cmpl-d-0", "cmpl-e-0"} <= set(checker.pending)
         assert all(torch.equal(a, b) for a, b in zip(before, snapshot(first)))
         land(second)
-        assert complete("cmpl-d-0")["ok"]
-        assert complete("cmpl-e-0")["ok"]
+        assert complete("cmpl-d-0", first)["ok"]
+        assert complete("cmpl-e-0", second)["ok"]
         # Completed and released, its blocks reused by another read take the
         # sentinel again, and that read is checked on its own.
         checker.expect("cmpl-g-0", "cmpl-a-0", [0] * len(groups), first)
@@ -1562,10 +1627,10 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             for index in range(len(groups))
             for row, block, _ in s.select(index, first[index])
         )
-        assert not complete("cmpl-g-0")["ok"]  # nothing landed this time
+        assert not complete("cmpl-g-0", first)["ok"]  # nothing landed this time
         checker.expect("cmpl-g-0", "cmpl-a-0", [0] * len(groups), first)
         land(first)
-        assert complete("cmpl-g-0")["ok"]
+        assert complete("cmpl-g-0", first)["ok"]
         assert not checker.pending
         assert read()["ok"]
         # A remote of another geometry is refused, not assumed equal.
@@ -1612,8 +1677,14 @@ def main():
     producer = role == "producer"
     simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
                   "timing": "linear", "timing_args": {"fixed_us": 100}}
+    kwargs = json.loads(kwargs)
+    check = kwargs.pop("check", True)
     simulation.update({"kv_pattern_fill": True} if producer
-                      else {"kv_pattern_check": True, "log_path": out + ".steps"})
+                      else {"kv_pattern_check": True, "log_path": out + ".steps"}
+                      if check else {})
+    speculative = kwargs.get("speculative_config")
+    if speculative:
+        simulation["spec_acceptance_rates"] = [0.7] * speculative["num_speculative_tokens"]
     llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
               max_model_len=256, kv_cache_memory_bytes=int(memory),
               max_num_batched_tokens=64, enable_prefix_caching=False,
@@ -1623,7 +1694,7 @@ def main():
                   "kv_role": "kv_producer" if producer else "kv_consumer",
                   "kv_buffer_device": "cpu",
                   "kv_connector_extra_config": {"backends": ["Mooncake"]}},
-              **json.loads(kwargs))
+              **kwargs)
     engine = llm.llm_engine.engine_core.engine_core
     runner = engine.model_executor.driver_worker.worker.model_runner
     worker = get_kv_transfer_group().connector_worker
@@ -1645,7 +1716,8 @@ def main():
         remote = json.load(f)
     wrapper, checker = worker.nixl_wrapper, runner._kv_checker
     dlists, transfers, reads = {}, [], []
-    prep, make, expect = wrapper.prep_xfer_dlist, wrapper.make_prepped_xfer, checker.expect
+    prep, make = wrapper.prep_xfer_dlist, wrapper.make_prepped_xfer
+    expect = checker.expect if checker is not None else None
 
     def prep_xfer_dlist(agent, blocks, *args, **kw):
         handle = prep(agent, blocks, *args, **kw)
@@ -1663,10 +1735,15 @@ def main():
 
     wrapper.prep_xfer_dlist = prep_xfer_dlist
     wrapper.make_prepped_xfer = make_prepped_xfer
-    checker.expect = record
+    if checker is not None:
+        checker.expect = record
     params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
                             extra_args={"kv_transfer_params": remote["params"]})
     llm.generate(prompt, params, use_tqdm=False)
+    if not transfers:  # the handshake refused the producer: no READ posted
+        with open(out, "w") as f:
+            json.dump({**mine, "transfers": 0, "reads": len(reads)}, f)
+        return
     local_handle = worker.src_xfer_handles_by_block_size[worker.block_size]
     native = []
     for op, local, local_ids, remote_handle, remote_ids in transfers:
@@ -1697,13 +1774,27 @@ if __name__ == "__main__":
 """
 
 
+# Qwen3.5 with its one MTP layer, whose attention KV joins the target's.
+QWEN3_5_MOE_MTP = {
+    **QWEN3_5_MOE,
+    "text_config": {**QWEN3_5_MOE["text_config"], "mtp_num_hidden_layers": 1},
+}
+
+
+def mtp(k):
+    return {"language_model_only": True,
+            "speculative_config": {"method": "mtp", "num_speculative_tokens": k}}
+
+
 @pytest.mark.parametrize(
     "config, kwargs",
     [
         (NEMOTRON_3_UNEQUAL, {}),
         (QWEN3_5_MOE, {"language_model_only": True}),
+        (QWEN3_5_MOE_MTP, mtp(1)),
+        (QWEN3_5_MOE_MTP, mtp(3)),
     ],
-    ids=["nemotron-3-unequal", "qwen3.5"],
+    ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,
@@ -1711,6 +1802,34 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     consumer's native READs pair, in order and with duplicates, each span of
     our selection of its blocks with the same region and offset of the
     producer's block at the same place, and its byte check passes."""
+    p, c = run_nixl_peers(config, kwargs, tmp_path)
+    # Distinct pools and backing storage.
+    assert p["num_blocks"] != c["num_blocks"]
+    assert not set(p["bases"]) & set(c["bases"])
+    assert c["transfers"] >= 1
+    # The native pairs, in order and with their multiplicity, are ours.
+    assert c["native"] and c["native"] == c["ours"]
+    assert [d[1] for d in c["native"]] == [d[3] for d in c["native"]]
+    (check,) = c["checks"]
+    assert check["ok"], check
+    assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
+    assert sum(g["bytes"] for g in check["groups"]) == sum(d[1] for d in c["native"])
+
+
+@pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])
+def test_nixl_peers_of_other_mtp_depths_are_refused_before_a_read(tmp_path, check):
+    """Qwen3.5 at MTP depths 2 and 3: the same attention blocks, conv states
+    of other widths. The consumer's handshake refuses the producer, so no
+    READ is posted, whether the consumer checks bytes or not."""
+    p, c = run_nixl_peers(QWEN3_5_MOE_MTP, mtp(2), tmp_path,
+                          consumer_kwargs={**mtp(3), "check": check}, logs=True)
+    assert c["transfers"] == 0 and c["reads"] == int(check)
+    assert "holds its states otherwise" in c["log"]
+
+
+def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
+    """Run NIXL_PEER's producer and consumer; their JSON records (the
+    consumer's with its output when `logs`)."""
     import socket
     import subprocess
     import sys
@@ -1735,8 +1854,9 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
 
     def run(role, out, memory, *extra):
+        own = consumer_kwargs if role == "consumer" and consumer_kwargs else kwargs
         return [sys.executable, str(script), role, str(tmp_path / "model"),
-                json.dumps(kwargs), str(out), str(memory), *extra]
+                json.dumps(own), str(out), str(memory), *extra]
 
     producer = subprocess.Popen(
         run("producer", produced, 8 * 1024**2),
@@ -1748,12 +1868,15 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
             assert producer.poll() is None, "the producer exited"
             assert time.monotonic() < deadline, "no producer output"
             time.sleep(0.5)
-        subprocess.run(
+        consumer_log = subprocess.run(
             run("consumer", consumed, 12 * 1024**2, str(produced)),
             env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
             check=True,
             timeout=600,
-        )
+            stdout=subprocess.PIPE if logs else None,
+            stderr=subprocess.STDOUT if logs else None,
+            text=True,
+        ).stdout
     finally:
         (tmp_path / "producer.json.done").touch()
         try:
@@ -1762,17 +1885,9 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
             producer.kill()
     p = json.loads(produced.read_text())
     c = json.loads(consumed.read_text())
-    # Distinct pools and backing storage.
-    assert p["num_blocks"] != c["num_blocks"]
-    assert not set(p["bases"]) & set(c["bases"])
-    assert c["transfers"] >= 1
-    # The native pairs, in order and with their multiplicity, are ours.
-    assert c["native"] and c["native"] == c["ours"]
-    assert [d[1] for d in c["native"]] == [d[3] for d in c["native"]]
-    (check,) = c["checks"]
-    assert check["ok"], check
-    assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
-    assert sum(g["bytes"] for g in check["groups"]) == sum(d[1] for d in c["native"])
+    if logs:
+        c["log"] = consumer_log
+    return p, c
 
 
 @pytest.mark.parametrize(

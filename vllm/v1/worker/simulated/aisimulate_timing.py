@@ -140,6 +140,15 @@ V4_APPROXIMATION = (
 MTP_TARGETS = {
     "DeepseekV3ForCausalLM": "DeepSeekMTPModel",
     "DeepseekV4ForCausalLM": "DeepSeekV4MTPModel",
+    "Qwen3_5ForConditionalGeneration": "Qwen3_5MTP",
+    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeMTP",
+}
+# Each draft's model type as the speculative config builds it.
+MTP_DRAFT_TYPES = {
+    "DeepSeekMTPModel": "deepseek_mtp",
+    "DeepSeekV4MTPModel": "deepseek_mtp",
+    "Qwen3_5MTP": "qwen3_5_mtp",
+    "Qwen3_5MoeMTP": "qwen3_5_mtp",
 }
 MTP_MAX_DEPTH = 5
 MTP_APPROXIMATIONS = [
@@ -160,6 +169,13 @@ MTP_APPROXIMATIONS = [
     "acceptance does not enter the cost",
     "graph-based kernel tables: an off-graph deployment is not modeled",
 ]
+# A hybrid target's MTP (Qwen3.5): its native drafter is one full-attention
+# layer, priced as k layers of the target's mix of attention and delta-nets.
+HYBRID_MTP_APPROXIMATION = (
+    "the MTP drafter, a full-attention layer, is priced as the hybrid target's "
+    "layers ((L + k) / L of its graph): its attention and delta-net mix, not "
+    "the drafter's own"
+)
 GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(
         (
@@ -451,7 +467,12 @@ class AisimulateTimingProvider:
             ),
             "approximations": APPROXIMATIONS
             + ([V4_APPROXIMATION] if v4 else [])
-            + (MTP_APPROXIMATIONS if nextn else []),
+            + (MTP_APPROXIMATIONS if nextn else [])
+            + (
+                [HYBRID_MTP_APPROXIMATION]
+                if nextn and getattr(vllm_config.model_config, "is_hybrid", False)
+                else []
+            ),
             "host_us": host_us,
         }
         logger.info("AISimulate timing: %s", self._assumptions["deployment"])
@@ -525,9 +546,10 @@ class AisimulateTimingProvider:
     def _speculation(
         vllm_config: "VllmConfig", target_config: dict[str, Any], topology: dict
     ) -> tuple[int, dict[str, Any] | None]:
-        """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's
-        or DeepSeek-V4's native single-module MTP (its own checkpoint's one MTP
-        layer, the target's parallelism and precision) only."""
+        """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's,
+        DeepSeek-V4's or Qwen3.5's native single-module MTP (its own
+        checkpoint's one MTP layer, the target's parallelism and precision)
+        only."""
         spec = vllm_config.speculative_config
         if spec is None:
             return 0, None
@@ -541,13 +563,25 @@ class AisimulateTimingProvider:
             problems.append(f"target {target_config.get('architectures')}")
         # One MTP layer, which every step reuses (a checkpoint with several
         # is refused even at k = 1).
+        # DeepSeek counts them as `num_nextn_predict_layers`, Qwen3.5 (in its
+        # text config) as `mtp_num_hidden_layers`.
+        text = target_config.get("text_config") or target_config
+
+        def mtp_layers(config) -> int | None:
+            return config.get("num_nextn_predict_layers") or config.get(
+                "mtp_num_hidden_layers"
+            )
+
+        to_dict = getattr(draft, "to_dict", None)
+        draft_config = to_dict() if to_dict else dict(vars(draft or object()))
         layers = {
-            target_config.get("num_nextn_predict_layers"),
-            getattr(draft, "num_nextn_predict_layers", None),
+            mtp_layers(text),
+            mtp_layers(draft_config.get("text_config") or draft_config),
         }
         if layers != {1}:
             problems.append(f"{sorted(layers, key=str)} MTP layers (one)")
-        if getattr(draft, "model_type", None) != "deepseek_mtp":
+        draft_type = MTP_DRAFT_TYPES.get(MTP_TARGETS.get(target))
+        if getattr(draft, "model_type", None) != draft_type:
             problems.append(f"draft {getattr(draft, 'model_type', None)}")
         architectures = list(
             getattr(spec.draft_model_config, "architectures", None) or []
@@ -576,8 +610,8 @@ class AisimulateTimingProvider:
             )
         if problems:
             raise ValueError(
-                "The aisimulate timing provider times DeepSeek-V3's or "
-                "DeepSeek-V4's native single-module MTP only, not "
+                "The aisimulate timing provider times DeepSeek-V3's, "
+                "DeepSeek-V4's or Qwen3.5's native single-module MTP only, not "
                 f"{', '.join(problems)}."
             )
         return k, {

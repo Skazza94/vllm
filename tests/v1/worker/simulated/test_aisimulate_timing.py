@@ -1162,6 +1162,63 @@ def test_deepseek_v3_mtp_depths_match_the_pinned_estimator(k):
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("k", [1, 3])
+def test_qwen3_5_mtp_depths_match_the_pinned_estimator(tmp_path, k):
+    """Qwen3.5's one MTP layer (in its text config), served as its language
+    model, is AISimulate's MTP depth k like DeepSeek's."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    target = "Qwen/Qwen3.5-35B-A3B"
+    p = provider(
+        real_engine_config(
+            tmp_path,
+            f"Qwen--Qwen3.5-35B-A3B-mtp{k}",
+            bundled_config(target),
+            derived=True,
+            language_model_only=True,
+            speculative_config={"method": "mtp", "num_speculative_tokens": k},
+        ),
+        gpu="h200",
+        target_model=target,
+    )
+    speculation = p.assumptions()["aisimulate"]["speculation"]
+    assert (p.config["nextn"], speculation["draft_architectures"]) == (
+        k,
+        ["Qwen3_5MoeMTP"],
+    )
+    # Its drafter priced as the hybrid target's layers: stated.
+    assert any(
+        "full-attention layer, is priced as the hybrid target's" in a
+        for a in p.assumptions()["aisimulate"]["approximations"]
+    )
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=target,
+            system="h200_sxm",
+            backend="vllm",
+            worker_type="aggregated",
+            tp=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            nextn=k,
+            kvcache_quant_mode="bfloat16",
+            estimation_mode="op_level",
+            fallback_policy="deny",
+        )
+    )
+    drafted = dataclasses.replace(sim_req("d", 1 + k, 1024, 512), num_spec_tokens=k)
+    step = sim_step(
+        0, *[dataclasses.replace(drafted, req_id=f"d{i}") for i in range(8)]
+    )
+    assert p.estimate(step).device_s * 1000 == pytest.approx(
+        direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+        rel=1e-9,
+    )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 def test_a_deepseek_v3_mtp_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
     """Native single-module MTP through the engine: drafts scheduled and
     accepted (sampled), every step priced at depth 1."""

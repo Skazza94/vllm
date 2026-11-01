@@ -52,6 +52,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     kv_layout,
     layer_specs,
     packed_pages,
+    refuse_foreign_state_geometry,
     registered_block_bytes,
     scheduled_kv_events,
     simulated_kv_connector,
@@ -200,6 +201,10 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.kv_cache_config,
                 v4=model is not None
                 and getattr(model.hf_config, "model_type", None) == "deepseek_v4",
+                speculative_blocks=getattr(
+                    self.vllm_config.speculative_config, "num_speculative_tokens", 0
+                )
+                or 0,
             )
             # The native path allocates the tensors, binds their layouts and
             # installs the connector that registers their memory for NIXL.
@@ -295,6 +300,7 @@ class SimulatedModelRunner(GPUModelRunner):
         connector = super()._make_kv_connector(kv_caches_dict)
         selection = None
         if native:
+            refuse_foreign_state_geometry(get_kv_transfer_group().connector_worker)
             selection = NativeSelection(
                 get_kv_transfer_group().connector_worker,
                 kv_caches_dict,
@@ -309,6 +315,7 @@ class SimulatedModelRunner(GPUModelRunner):
                     tp.rank_in_group,
                     self.kv_cache_config.transfer_group_ids,
                 )
+                self._kv_checker.watch_reads()
             logger.info(
                 "KV pattern %s over NIXL's selection: %d descriptor rows.",
                 "fill" if sim.kv_pattern_fill else "check",

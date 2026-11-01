@@ -362,12 +362,38 @@ def packed_pages(
     return pages
 
 
-def check_real_kv_groups(kv_cache_config: KVCacheConfig, v4: bool = False) -> None:
+def refuse_foreign_state_geometry(worker) -> None:
+    """A hybrid's peer over NIXL must hold its states as this instance does:
+    the same conv and SSM sizes (a native MTP's depth widens the conv state)
+    and region block lengths. NIXL checks neither between equal TP sizes
+    (its per-region check skips hybrids), and would read a state of another
+    geometry at this one's offsets; the handshake refuses it before any
+    READ, whether bytes are checked or not."""
+    add = worker.add_remote_agent
+
+    def add_remote_agent(metadata, *args, **kwargs):
+        local = (tuple(worker._mamba_ssm_size), list(worker.block_len_per_layer))
+        remote = (tuple(metadata.ssm_sizes), list(metadata.block_lens))
+        if remote != local:
+            raise ValueError(
+                "A hybrid model's NIXL peer holds its states otherwise: conv and "
+                f"SSM sizes {remote[0]} and block lengths {remote[1]}, not "
+                f"{local[0]} and {local[1]} (e.g. another MTP depth)."
+            )
+        return add(metadata, *args, **kwargs)
+
+    worker.add_remote_agent = add_remote_agent
+
+
+def check_real_kv_groups(
+    kv_cache_config: KVCacheConfig, v4: bool = False, speculative_blocks: int = 0
+) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
     RSWA attention, attention sinks), and of Mamba states other than a
     gated delta-net's or a Mamba2 mixer's in mamba_cache_mode none without
-    speculative blocks, whose blocks follow other rules; DeepSeek-V4's
-    (`v4`) groups too, of its own kinds."""
+    speculative blocks other than a native MTP's (`speculative_blocks`, its
+    depth: scratch slots NIXL does not move), whose blocks follow other
+    rules; DeepSeek-V4's (`v4`) groups too, of its own kinds."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
     states = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.MAMBA2)
@@ -385,7 +411,7 @@ def check_real_kv_groups(kv_cache_config: KVCacheConfig, v4: bool = False) -> No
         elif isinstance(spec, MambaSpec) and (
             spec.mamba_type not in states
             or spec.mamba_cache_mode != "none"
-            or spec.num_speculative_blocks
+            or spec.num_speculative_blocks != speculative_blocks
         ):
             other.add(
                 f"MambaSpec ({spec.mamba_type.name}, mamba_cache_mode "
@@ -535,6 +561,9 @@ def kv_layout(
             }
             if isinstance(spec, MambaSpec):
                 entry["mamba_type"] = spec.mamba_type.name
+                # A native MTP's scratch slots: NIXL moves the running slot
+                # (before them), whose clipped-read metadata index is k.
+                entry["speculative_blocks"] = spec.num_speculative_blocks
             if packed := packed_members(kv_caches, specs, layers):
                 entry["members"] = packed
                 entry["checked_bytes_per_block"] = sum(
