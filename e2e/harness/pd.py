@@ -98,6 +98,10 @@ class Server:
     language_model_only: bool = False
     """A multimodal model served as its language model (--language-model-only):
     no modality, the encoders not built."""
+    trust_remote_code: bool = False
+    """Run the model repository's own code (--trust-remote-code, for the
+    servers and the benchmark's tokenizer): Kimi's tokenizer is such code.
+    Off unless a spec asks."""
     hp_tcp_args: dict = field(default_factory=dict)
     env: dict = field(default_factory=dict)
     timing: str | None = None
@@ -172,6 +176,9 @@ def load(path: str | Path) -> Run:
     if run.server.timing is None:
         raise ValueError("run config needs server.timing (zero, linear, table, replay, aisimulate or a "
                          "module.Class)")
+    if not isinstance(run.server.trust_remote_code, bool):
+        # YAML's "false" is a string: a true value in a flag's test.
+        raise ValueError(f"server.trust_remote_code is true or false, not {run.server.trust_remote_code!r}")
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
     if run.server.speculative is not None:
@@ -216,6 +223,21 @@ def tent_config(address: str, hp_tcp_args: dict) -> dict:
     transports["hp_tcp"] = {"enable": True, "bind_address": address, "advertise_address": address,
                             "rail_addresses": [address], **hp_tcp_args}
     return {"rpc_server_hostname": address, "transports": transports}
+
+
+def bench_command(run: Run) -> list[str]:
+    """The client's benchmark: random prompts of the workload's lengths
+    through the proxy, tokenized with the model's tokenizer."""
+    w = run.workload
+    return [
+        VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
+        "--base-url", f"http://127.0.0.1:{PROXY_PORT}", "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
+        *(["--trust-remote-code"] if run.server.trust_remote_code else []),
+        "--dataset-name", "random", "--random-input-len", str(w.input_len),
+        "--random-output-len", str(w.output_len), "--num-prompts", str(w.num_prompts),
+        "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
+        "--save-result", "--save-detailed", "--result-dir", f"{WORK}/results", "--result-filename", "bench.json",
+    ]
 
 
 def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
@@ -277,6 +299,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
           if side.data_parallel_size > 1 else []),
         "--generation-config", "vllm", "--enforce-eager",
         *(["--language-model-only"] if s.language_model_only else []),
+        *(["--trust-remote-code"] if s.trust_remote_code else []),
         # The byte check's pattern is the request's: a block cached for
         # another request would not match it.
         *_prefix_caching_flags(run),
@@ -339,15 +362,7 @@ def execute(run: Run, output: Path | None = None) -> dict:
 
         tent_before = _tent_metrics(run, container)
         routers_before = router_bytes(state)
-        w = run.workload
-        bench = [
-            VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
-            "--base-url", f"http://127.0.0.1:{PROXY_PORT}", "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
-            "--dataset-name", "random", "--random-input-len", str(w.input_len),
-            "--random-output-len", str(w.output_len), "--num-prompts", str(w.num_prompts),
-            "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
-            "--save-result", "--save-detailed", "--result-dir", f"{WORK}/results", "--result-filename", "bench.json",
-        ]
+        bench = bench_command(run)
         (output / "bench.log").write_text(topology.exec_in(container[run.client], bench, timeout=3600))
         # The servers' step logs settle shortly after the last response.
         time.sleep(2)

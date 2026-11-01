@@ -8,6 +8,7 @@ from dataclasses import asdict
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -110,6 +111,27 @@ class CheckTests(unittest.TestCase):
         text = pd.Run(**{**RUN.__dict__, "server": pd.Server(language_model_only=True)})
         for role in ("prefill", "decode"):
             self.assertIn("--language-model-only", pd.server_command(text, role, ["10.100.0.1"]))
+
+    def test_a_repositorys_own_code_runs_only_when_asked(self) -> None:
+        self.assertNotIn("--trust-remote-code", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
+        self.assertNotIn("--trust-remote-code", pd.bench_command(RUN))
+        trusted = pd.Run(**{**RUN.__dict__, "server": pd.Server(trust_remote_code=True)})
+        for role in ("prefill", "decode"):
+            self.assertIn("--trust-remote-code", pd.server_command(trusted, role, ["10.100.0.1"]))
+        self.assertIn("--trust-remote-code", pd.bench_command(trusted))
+        # Only a boolean: the string "false" would turn the flags on.
+        base = Path(__file__).parents[1] / "runs" / "pd-smoke.yaml"
+        for value, ok in (("true", True), ("false", True), ('"false"', False), ("1", False), ("yes", True)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                spec = Path(directory) / "x.yaml"
+                text = re.sub(r"^(server:.*)$", rf"\1\n  trust_remote_code: {value}",
+                              base.read_text(), count=1, flags=re.M)
+                spec.write_text(text.replace("model: ", f"model: {base.parent}/", 1))
+                if ok:
+                    pd.load(spec)
+                else:
+                    with self.assertRaisesRegex(ValueError, "trust_remote_code is true or false"):
+                        pd.load(spec)
 
     def test_nixl_moves_the_kv_over_its_mooncake_backend_on_the_kv_address(self) -> None:
         nixl = pd.Run(**{**RUN.__dict__, "server": pd.Server(connector="nixl")})
