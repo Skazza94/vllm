@@ -152,6 +152,8 @@ MTP_TARGETS = {
     "DeepseekV4ForCausalLM": "DeepSeekV4MTPModel",
     "Qwen3_5ForConditionalGeneration": "Qwen3_5MTP",
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeMTP",
+    "DeepseekV32ForCausalLM": "DeepseekV32MTPModel",
+    "GlmMoeDsaForCausalLM": "DeepseekV32MTPModel",
 }
 # Each draft's model type as the speculative config builds it.
 MTP_DRAFT_TYPES = {
@@ -159,6 +161,7 @@ MTP_DRAFT_TYPES = {
     "DeepSeekV4MTPModel": "deepseek_mtp",
     "Qwen3_5MTP": "qwen3_5_mtp",
     "Qwen3_5MoeMTP": "qwen3_5_mtp",
+    "DeepseekV32MTPModel": "deepseek_mtp",
 }
 MTP_MAX_DEPTH = 5
 MTP_APPROXIMATIONS = [

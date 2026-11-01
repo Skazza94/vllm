@@ -1206,6 +1206,53 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 @pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize(
+    "target, local",
+    [
+        ("deepseek-ai/DeepSeek-V3.2", "deepseek-ai/DeepSeek-V3.2"),
+        ("zai-org/GLM-5.2-FP8", "zai-org/GLM-5.2"),
+    ],
+)
+def test_dsa_mtp_depths_match_the_pinned_estimator(tmp_path, target, local, k):
+    """DeepSeek-V3.2's and GLM-5's one MTP layer is AISimulate's MTP depth k,
+    its estimates the estimator's own (op-level, BF16 cache)."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    raw = {key: v for key, v in bundled_config(local).items() if key != "quantization_config"}
+    p = provider(
+        real_engine_config(
+            tmp_path, f"{local.replace('/', '--')}-mtp{k}", raw, derived=True,
+            tensor_parallel_size=8,
+            speculative_config={"method": "mtp", "num_speculative_tokens": k},
+        ),
+        gpu="h200",
+        target_model=target,
+    )
+    speculation = p.assumptions()["aisimulate"]["speculation"]
+    assert (p.config["nextn"], speculation["draft_architectures"]) == (
+        k, ["DeepseekV32MTPModel"],
+    )
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=target, system="h200_sxm", backend="vllm", worker_type="aggregated",
+            tp=8, moe_tp_size=8, moe_ep_size=1, nextn=k,
+            gemm_quant_mode="fp8_block", moe_quant_mode="fp8_block",
+            fmha_quant_mode="bfloat16", comm_quant_mode="half",
+            kvcache_quant_mode="bfloat16", estimation_mode="op_level",
+            fallback_policy="deny",
+        )
+    )
+    drafted = dataclasses.replace(sim_req("d", 1 + k, 1024, 512), num_spec_tokens=k)
+    step = sim_step(0, *[dataclasses.replace(drafted, req_id=f"d{i}") for i in range(8)])
+    assert p.estimate(step).device_s * 1000 == pytest.approx(
+        direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))), rel=1e-9,
+    )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("k", [1, 3])
 def test_qwen3_5_mtp_depths_match_the_pinned_estimator(tmp_path, k):
     """Qwen3.5's one MTP layer (in its text config), served as its language
     model, is AISimulate's MTP depth k like DeepSeek's."""

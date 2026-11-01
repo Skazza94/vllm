@@ -24,6 +24,8 @@ REAL_KV_MTP_DRAFTS = {
     "deepseek_v4": "DeepSeekV4MTPModel",
     "qwen3_5": "Qwen3_5MTP",
     "qwen3_5_moe": "Qwen3_5MoeMTP",
+    "deepseek_v32": "DeepseekV32MTPModel",
+    "glm_moe_dsa": "DeepseekV32MTPModel",
 }
 REAL_KV_MTP_MAX_DEPTH = 5
 # Sparse MLA with a lightning indexer (DSA): DeepSeek-V3.2, GLM-5.

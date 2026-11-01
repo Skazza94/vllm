@@ -1903,6 +1903,37 @@ def test_dsa_sparse_mla_builds_on_cpu_in_a_simulation_only(tmp_path, monkeypatch
             max_model_len=256, enforce_eager=True, block_size=64)
 
 
+def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
+    """DeepSeek-V3.2's and GLM-5's one MTP layer (its own latent and indexer
+    keys) moves with the target's over NIXL: not over Mooncake, nor two MTP
+    layers."""
+    kwargs = {"dtype": "bfloat16", "block_size": 64}
+
+    def mtp(k=1):
+        return {"method": "mtp", "num_speculative_tokens": k}
+
+    for name, config in (("v32", DEEPSEEK_V32), ("glm", GLM_5)):
+        one = write_model_dir(tmp_path_factory, f"tiny-{name}-mtp",
+                              {**config, "num_nextn_predict_layers": 1})
+        two = write_model_dir(tmp_path_factory, f"tiny-{name}-mtp-two",
+                              {**config, "num_nextn_predict_layers": 2})
+        for connector in ("NixlConnector", "NixlPullConnector"):
+            for k in (1, 5):
+                built = engine_config(one, kv_transfer={"kv_connector": connector},
+                                      speculative_config=mtp(k), **kwargs)
+                assert built.speculative_config.draft_model_config.architectures == [
+                    "DeepseekV32MTPModel"
+                ]
+        for model, changes, problem in (
+            (one, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
+            (one, {"speculative_config": mtp(6)}, "6 speculative tokens"),
+            (two, {}, "2 MTP layers"),
+        ):
+            changes.setdefault("speculative_config", mtp())
+            with pytest.raises(ValueError, match=problem):
+                engine_config(model, **changes, **kwargs)
+
+
 def test_real_mode_takes_dsa_sparse_mla_with_a_bf16_latent(tmp_path_factory):
     """DeepSeek-V3.2's and GLM-5's sparse MLA over either connector, its
     latent BF16 as the deployment keeps it (`auto`); an FP8 latent
@@ -1948,8 +1979,13 @@ def mtp(k):
         (QWEN3_5_MOE_MTP, mtp(1)),
         (QWEN3_5_MOE_MTP, mtp(3)),
         (DEEPSEEK_V32, {"block_size": 64}),
+        ({**DEEPSEEK_V32, "num_nextn_predict_layers": 1},
+         {"block_size": 64, "speculative_config": {"method": "mtp", "num_speculative_tokens": 1}}),
+        ({**DEEPSEEK_V32, "num_nextn_predict_layers": 1},
+         {"block_size": 64, "speculative_config": {"method": "mtp", "num_speculative_tokens": 3}}),
     ],
-    ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2"],
+    ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2",
+         "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,
