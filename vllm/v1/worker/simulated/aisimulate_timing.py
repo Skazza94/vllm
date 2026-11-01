@@ -20,6 +20,7 @@ import math
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -113,6 +114,34 @@ MAMBA2_FIELDS = (
     "n_groups",
     "ssm_state_size",
     "conv_kernel",
+)
+# Gemma4: sliding layers of head_dim x num_key_value_heads, global ones of
+# global_head_dim x num_global_key_value_heads (one K for V when
+# attention_k_eq_v), no layer sharing another's KV.
+GEMMA4_FIELDS = ATTENTION_FIELDS + (
+    "global_head_dim",
+    "num_global_key_value_heads",
+    "attention_k_eq_v",
+    "num_kv_shared_layers",
+    # Each layer's own (head_dim, num_key_value_heads), as a heterogeneous
+    # config resolves them (transformers keeps the global ones per layer).
+    "per_layer_kv",
+)
+# MiMo-V2-Flash: full and sliding layers of their own KV heads and K/V widths,
+# by its hybrid pattern, the sliding ones with sink biases.
+MIMO_V2_FIELDS = (
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "v_head_dim",
+    "hybrid_layer_pattern",
+    "sliding_window",
+    "swa_num_key_value_heads",
+    "swa_head_dim",
+    "swa_v_head_dim",
+    "add_swa_attention_sink_bias",
+    "add_full_attention_sink_bias",
 )
 # Qwen's gated delta-net: its state's widths (the convolution's and the
 # recurrent state's).
@@ -208,6 +237,9 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"), DSA_FIELDS),
     "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,
+    "Gemma4ForConditionalGeneration": GEMMA4_FIELDS,
+    "MiMoV2FlashForCausalLM": MIMO_V2_FIELDS,
+    "MuseGlimmerForConditionalGeneration": ATTENTION_FIELDS,
     **dict.fromkeys(
         ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"),
         ATTENTION_FIELDS + GDN_FIELDS,
@@ -222,21 +254,51 @@ APPROXIMATIONS = [
 ]
 
 
+def _mimo_v2_flash_timing_input(config: dict[str, Any]) -> dict[str, Any]:
+    """MiMo-V2-Flash's hybrid_layer_pattern marks its sliding layers 1 (as its
+    model reads it), AISimulate's hybrid graph its global ones: inverted, the
+    estimator prices 9 full and 39 sliding layers, the model's own."""
+    return {
+        **config,
+        "hybrid_layer_pattern": [1 - v for v in config["hybrid_layer_pattern"]],
+    }
+
+
+# A bundled config AISimulate would misread, by architecture: what it is
+# given instead (a timing input only; the served model and the geometry
+# compared are the published config's), and what was changed.
+TIMING_INPUTS: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], str]] = {
+    "MiMoV2FlashForCausalLM": (
+        _mimo_v2_flash_timing_input,
+        "hybrid_layer_pattern inverted (MiMo marks sliding layers 1, AISimulate "
+        "global ones)",
+    ),
+}
+
+
 def _offline_model(
-    target: str, bundled: str
+    target: str, bundled: str, timing_input: Callable | None = None
 ) -> tuple[str, tempfile.TemporaryDirectory | None]:
     """The model AISimulate is given: its name when the package lists it as
     pre-downloaded; else a private snapshot of the package's own bundled
     config (with its quantization sidecar, or none when it bundles none),
     which it reads locally where it would otherwise download the published
-    config. The snapshot is this caller's alone: keep the returned directory
-    alive while AISimulate may read it."""
+    config. A config it would misread (`timing_input`) is always given as a
+    snapshot of that function's copy. The snapshot is this caller's alone:
+    keep the returned directory alive while AISimulate may read it."""
     from aisimulate_core.sdk.common import DefaultHFModels
 
-    if target in DefaultHFModels:
+    if target in DefaultHFModels and timing_input is None:
         return target, None
     snapshot = tempfile.TemporaryDirectory(prefix="aisimulate-")
-    shutil.copyfile(bundled, os.path.join(snapshot.name, "config.json"))
+    config = os.path.join(snapshot.name, "config.json")
+    if timing_input is None:
+        shutil.copyfile(bundled, config)
+    else:
+        with open(bundled) as f:
+            normalized = timing_input(json.load(f))
+        with open(config, "w") as f:
+            json.dump(normalized, f, indent=2)
     sidecar = bundled.removesuffix("_config.json") + "_hf_quant_config.json"
     if os.path.isfile(sidecar):
         shutil.copyfile(sidecar, os.path.join(snapshot.name, "hf_quant_config.json"))
@@ -264,11 +326,36 @@ def _compressed_tensors_modes(target: str) -> dict[str, str]:
     }
 
 
+def _resolved(config: Any, name: str) -> Any:
+    """A config field as its class resolves it; a heterogeneous config's
+    per-layer field (Gemma4's KV heads), which it refuses to read globally or
+    keeps per layer only, as the config holds it (the published value)."""
+    try:
+        value = getattr(config, name, None)
+    except Exception as e:  # transformers' AmbiguousGlobalPerLayerAttributeError
+        if type(e).__name__ != "AmbiguousGlobalPerLayerAttributeError":
+            raise
+        value = None
+    if value is None and hasattr(config, "to_dict"):
+        value = config.to_dict().get(name)
+    return value
+
+
 def _geometry(config: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     """A config object's KV and state geometry, as its class resolves it. An
     attention head size its class leaves unset is the model's own fallback,
     hidden size over attention heads (Mixtral's, say)."""
-    geometry = {name: getattr(config, name, None) for name in fields}
+    geometry = {name: _resolved(config, name) for name in fields if name != "per_layer_kv"}
+    if "per_layer_kv" in fields:
+        layers = getattr(config, "per_layer_config", None)
+        geometry["per_layer_kv"] = (
+            [
+                (layer.head_dim, layer.num_key_value_heads)
+                for layer in (layers[i] for i in range(config.num_hidden_layers))
+            ]
+            if layers is not None
+            else None
+        )
     if fields is V4_FIELDS:
         # No fallback: each of V4's fields must be resolved.
         if missing := [name for name, value in geometry.items() if value is None]:
@@ -412,7 +499,10 @@ class AisimulateTimingProvider:
 
         # One snapshot for the provider's lifetime: quant inference and the
         # estimator read the same files.
-        model, self._snapshot = _offline_model(target, bundled)
+        timing_input, transformation = TIMING_INPUTS.get(
+            (target_config.get("architectures") or [None])[0], (None, None)
+        )
+        model, self._snapshot = _offline_model(target, bundled, timing_input)
         v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
         quant = _infer_quantization_fields(target_config).get("quant_algo")
         # V4's experts follow the raw config's `expert_dtype` (AISimulate's own
@@ -523,9 +613,25 @@ class AisimulateTimingProvider:
             "target_model": target,
             # The estimator's own bundled config, read offline.
             "target_config_source": (
-                "bundled" if self.config["model"] == target else "bundled, local copy"
+                "bundled"
+                if self.config["model"] == target
+                else "bundled, normalized local copy"
+                if transformation
+                else "bundled, local copy"
             ),
             "target_config_sha256": _file_sha256(bundled),
+            # What the estimator read instead of the bundled config, when it
+            # would misread that: the change and the file it read.
+            "timing_input": (
+                {
+                    "transformation": transformation,
+                    "config_sha256": _file_sha256(
+                        os.path.join(self.config["model"], "config.json")
+                    ),
+                }
+                if transformation
+                else None
+            ),
             "target_quantization": quant,
             "target_modified": modified,
             "local_config": local_config,

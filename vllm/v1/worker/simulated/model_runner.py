@@ -273,12 +273,13 @@ class SimulatedModelRunner(GPUModelRunner):
         tp = get_tp_group()
         groups = self.kv_cache_config.kv_cache_groups
         self._kv_allocations = group_allocations(self.kv_cache_config)
-        # A hybrid model over NIXL: what the native worker selects, read
-        # once it registered the caches (below).
+        # A model of several KV cache groups over NIXL (a hybrid's, or
+        # attention groups, whose unequal layers leave a slot holding none of
+        # a group's layers, moved with it): what the native worker selects,
+        # read once it registered the caches (below).
         native = (
-            self.model_config.is_hybrid
-            and self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
-        )
+            self.model_config.is_hybrid or len(groups) > 1
+        ) and self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
         if (sim.kv_pattern_fill or sim.kv_pattern_check) and not native:
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).

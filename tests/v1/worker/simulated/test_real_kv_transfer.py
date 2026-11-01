@@ -1759,24 +1759,34 @@ def main():
     (block_ids,) = reads
     ours = []
     s = getattr(checker, "selection", None)
-    for group, (ids, remote_ids) in enumerate(zip(block_ids, remote["params"]["remote_block_ids"])):
-        remote_ids = remote_ids[len(remote_ids) - len(ids):]
-        if s is None:
-            # Not a hybrid: each region (a layer) a whole page of each block,
-            # region by region.
-            for region, (base, stride, length) in enumerate(
-                    zip(mine["bases"], mine["strides"], mine["lens"])):
+    pairs = [(ids, remote_ids[len(remote_ids) - len(ids):])
+             for ids, remote_ids in zip(block_ids, remote["params"]["remote_block_ids"])]
+    if s is None:
+        # Not a hybrid: each region (a layer slot, which every group's
+        # blocks index) a whole page of each block, region by region and,
+        # within one, group by group.
+        for region, (base, stride, length) in enumerate(
+                zip(mine["bases"], mine["strides"], mine["lens"])):
+            for ids, remote_ids in pairs:
                 for place, block in enumerate(ids):
                     ours.append([base + block * stride, length,
                                  remote["bases"][region] + remote_ids[place] * remote["strides"][region],
                                  remote["lens"][region]])
-            continue
+    # A selection's: each group's spans paired by place, in the native order
+    # of every group's blocks together (region by region, then group).
+    spans = {}
+    for group, (ids, remote_ids) in enumerate(pairs):
+        if s is None:
+            break
         for row, block, place in s.select(group, ids):
             r = s.rows[row]
-            ours.append([r.view[block].data_ptr(), r.view.shape[1],
-                         remote["bases"][r.region] + r.offset
-                         + remote_ids[place] * remote["strides"][r.region],
-                         r.view.shape[1]])
+            spans[int(s.starts[row]) + block] = [
+                r.view[block].data_ptr(), r.view.shape[1],
+                remote["bases"][r.region] + r.offset
+                + remote_ids[place] * remote["strides"][r.region],
+                r.view.shape[1]]
+    if s is not None:
+        ours = [spans[d] for d in s.order(dict(enumerate(block_ids)))]
     with open(out + ".steps") as f:
         checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
     with open(out, "w") as f:
@@ -1959,6 +1969,173 @@ def test_real_mode_takes_dsa_sparse_mla_with_a_bf16_latent(tmp_path_factory):
         engine_config(other, **kwargs)
 
 
+# A tiny MiMo-V2-Flash: full layers of 1 KV head, sliding ones (window 32,
+# sink biases) of 2, K 48 / V 32 wide: equal pages, blocks of two sizes.
+MIMO_V2_FLASH = {
+    "architectures": ["MiMoV2FlashForCausalLM"],
+    "model_type": "mimo_v2_flash",
+    "vocab_size": 256,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 1,
+    "head_dim": 48,
+    "v_head_dim": 32,
+    "swa_num_attention_heads": 4,
+    "swa_num_key_value_heads": 2,
+    "swa_head_dim": 48,
+    "swa_v_head_dim": 32,
+    "hybrid_layer_pattern": [0, 1, 1, 0],
+    "moe_layer_freq": [0, 1, 1, 1],
+    "sliding_window": 32,
+    "sliding_window_size": 32,
+    "attention_chunk_size": 32,
+    "add_swa_attention_sink_bias": True,
+    "add_full_attention_sink_bias": False,
+    "attention_value_scale": 0.707,
+    "partial_rotary_factor": 0.334,
+    "rope_theta": 5000000,
+    "swa_rope_theta": 10000,
+    "n_routed_experts": 4,
+    "n_shared_experts": None,
+    "num_experts_per_tok": 2,
+    "norm_topk_prob": True,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "n_group": 1,
+    "topk_group": 1,
+    "hidden_act": "silu",
+    "layernorm_epsilon": 1e-05,
+    "max_position_embeddings": 512,
+    "tie_word_embeddings": False,
+    "torch_dtype": "float32",
+}
+
+
+# A tiny MiMo-V2-Flash whose attention groups differ (2 full, 3 sliding
+# layers in groups of two slots: 2, 2 and 1), so the last group holds no
+# layer in the second slot, which NIXL moves with it.
+MIMO_V2_FLASH_UNEQUAL = {
+    **MIMO_V2_FLASH,
+    "num_hidden_layers": 5,
+    "hybrid_layer_pattern": [0, 1, 1, 1, 0],
+    "moe_layer_freq": [0, 1, 1, 1, 1],
+}
+
+
+def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
+    """Attention groups of unequal layers over NIXL (MiMo-V2-Flash's 9 full
+    and 39 sliding layers in groups of 9, 8 and 7, say): each block of a
+    group moves in every layer slot, a slot holding none of a short group's
+    layers included (transfer-only). The filler fills and the checker
+    requires every selected span, a window's null head holding its places;
+    the transfer-only bytes are counted apart, and an unmoved transfer-only
+    span or a block of another place fails the check."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.v1.worker.simulated.kv_pattern import NativeChecker, NativeFiller, pattern
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    (tmp_path / "config.json").write_text(json.dumps(MIMO_V2_FLASH_UNEQUAL))
+    llm = LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    # The runtime path: a chunked prompt beyond the window.
+    llm.generate(
+        [{"prompt_token_ids": [5] * 200}],
+        SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+        use_tqdm=False,
+    )
+    engine = llm.llm_engine.engine_core.engine_core
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    groups = engine.scheduler.kv_cache_config.kv_cache_groups
+    worker = get_kv_transfer_group().connector_worker
+    filler = runner._kv_filler
+    assert isinstance(filler, NativeFiller)
+    s = filler.selection
+
+    # A region a slot; each group's block in every one, a whole page.
+    slots = max(len(group.layer_names) for group in groups)
+    assert sorted(len(group.layer_names) for group in groups) == [1, 2, 2]
+    assert worker.num_regions == slots
+    page = groups[0].kv_cache_spec.page_size_bytes
+    for index, group in enumerate(groups):
+        spans = [
+            (s.rows[row].region, s.rows[row].offset, s.rows[row].view.shape[1])
+            for row, _, _ in s.select(index, [1])
+        ]
+        assert spans == [(region, 0, page) for region in range(slots)]
+        assert len(s.members[index]) == len(group.layer_names)
+    short = next(i for i, group in enumerate(groups) if len(group.layer_names) < slots)
+    (spare,) = set(range(slots)) - s.members[short]
+
+    # A producer's blocks after a null head: each span's pattern is of its
+    # place among the request's blocks, nulls counted.
+    free = iter(range(2, worker.num_blocks))
+    source = [[0, 0, next(free), next(free)] for _ in groups]
+    target = [[0, 0, next(free), next(free)] for _ in groups]
+    filler._extend("cmpl-a-0", source, replace=True)
+    for index, blocks in enumerate(source):
+        for row, block, place in s.select(index, blocks[2:]):
+            view = s.rows[row].view
+            assert torch.equal(
+                view[block], pattern("cmpl-a-0", s.name(index, row), 2 + place, view.shape[1], 0)
+            )
+
+    checker = NativeChecker(s)
+
+    def read(skip=None, shift=False):
+        """The read NIXL would post into `target` (the null head unread),
+        `skip`ping spans or `shift`ing a block to the other place; its check."""
+        checker.expect("cmpl-b-0", "cmpl-a-0", [0] * len(groups), target)
+        checker.posted["cmpl-a-0"] = [
+            int(d) for d in worker._compute_desc_ids(
+                [blocks[2:] for blocks in target], worker.num_blocks, None, 1
+            )
+        ]
+        for index in range(len(groups)):
+            src = source[index][2:][::-1] if shift else source[index][2:]
+            pairs = zip(s.select(index, src), s.select(index, target[index][2:]))
+            for (row, a, _), (_, b, _) in pairs:
+                if skip is None or not skip(index, row):
+                    s.rows[row].view[b] = s.rows[row].view[a]
+        return checker._compare("cmpl-b-0", checker.pending.pop("cmpl-b-0"))
+
+    result = read()
+    assert result["ok"], result
+    for index, g in enumerate(result["groups"]):
+        assert (g["blocks"], g["descriptors"], g["bytes"]) == (2, 2 * slots, 2 * slots * page)
+        assert g["layers"] == len(groups[index].layer_names)
+        # The slot of none of its layers: moved and checked, counted apart.
+        assert g["transfer_only_bytes"] == (2 * page if index == short else 0)
+    unmoved = read(skip=lambda index, row: index == short and s.rows[row].region == spare)
+    assert not unmoved["ok"]
+    assert not read(shift=True)["ok"]
+
 # Qwen3.5 with its one MTP layer, whose attention KV joins the target's.
 QWEN3_5_MOE_MTP = {
     **QWEN3_5_MOE,
@@ -1983,9 +2160,11 @@ def mtp(k):
          {"block_size": 64, "speculative_config": {"method": "mtp", "num_speculative_tokens": 1}}),
         ({**DEEPSEEK_V32, "num_nextn_predict_layers": 1},
          {"block_size": 64, "speculative_config": {"method": "mtp", "num_speculative_tokens": 3}}),
+        (MIMO_V2_FLASH, {}),
+        (MIMO_V2_FLASH_UNEQUAL, {}),
     ],
     ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2",
-         "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3"],
+         "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3", "mimo-v2-flash", "mimo-v2-flash-unequal"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,
@@ -2008,6 +2187,10 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     if "descriptors" in check["groups"][0]:
         assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
     assert check["bytes"] == sum(d[1] for d in c["native"])
+    # Unequal attention groups: the slot holding none of the short group's
+    # layers is moved, checked and counted apart.
+    if config is MIMO_V2_FLASH_UNEQUAL:
+        assert sum(g["transfer_only_bytes"] for g in check["groups"]) > 0
 
 
 @pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])

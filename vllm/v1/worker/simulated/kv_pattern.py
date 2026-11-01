@@ -317,7 +317,8 @@ class PatternChecker:
         }
 
 
-# A hybrid model's KV over NIXL: what the native worker moves of a request's
+# A model of several KV cache groups over NIXL (a hybrid's, or attention groups,
+# whose layers may be unequal): what the native worker moves of a request's
 # blocks, not each layer's page. NIXL registers deduplicated regions (a
 # backing slot shared by one layer of each group), moves a state as its conv
 # sub-projections and SSM state (not the page's padding), and moves each of a
@@ -391,13 +392,13 @@ class NativeSelection:
             range(len(groups))
         ):
             raise ValueError(
-                "Pattern checks of a hybrid model over NIXL need every KV cache "
+                "Pattern checks of several KV cache groups over NIXL need every KV cache "
                 f"group transferred, not groups {list(transfer_group_ids)} of "
                 f"{len(groups)}."
             )
         if worker._physical_blocks_per_logical_kv_block != 1:
             raise ValueError(
-                "Pattern checks of a hybrid model over NIXL need one physical "
+                "Pattern checks of several KV cache groups over NIXL need one physical "
                 "block a logical one, not "
                 f"{worker._physical_blocks_per_logical_kv_block}."
             )
@@ -474,7 +475,7 @@ class NativeSelection:
         row, block id, the block's place among the request's), in the native
         order, duplicates included."""
         if NULL_BLOCK_ID in block_ids:
-            raise ValueError("A hybrid model's NIXL blocks hold no null block.")
+            raise ValueError("A selection of NIXL blocks holds no null block.")
         lists: list[list[int]] = [[] for _ in self.groups]
         lists[group] = list(block_ids)
         ids = self.worker._compute_desc_ids(lists, self.worker.num_blocks, None, 1)
@@ -490,6 +491,17 @@ class NativeSelection:
                 )
             selected.append((row, block, place))
         return selected
+
+    def order(self, block_ids: Mapping[int, Sequence[int]]) -> list[int]:
+        """The native descriptor ids of several groups' blocks moved
+        together, in the native order."""
+        lists = [list(block_ids.get(group, ())) for group in range(len(self.groups))]
+        if not any(lists):
+            return []
+        return [
+            int(d)
+            for d in self.worker._compute_desc_ids(lists, self.worker.num_blocks, None, 1)
+        ]
 
     def name(self, group: int, row: int) -> str:
         """A span's identity: its group and native region (and the
@@ -575,7 +587,10 @@ class NativeFiller:
         for group, (held, new_ids) in enumerate(zip(known, block_ids)):
             start = len(held)
             held.extend(new_ids)
-            new_ids = [b for b in new_ids if b != NULL_BLOCK_ID]
+            # Each block's place among the request's, null blocks (a window's
+            # head) holding theirs.
+            places = [i for i, b in enumerate(new_ids) if b != NULL_BLOCK_ID]
+            new_ids = [new_ids[i] for i in places]
             if not new_ids:
                 continue
             selected = s.select(group, new_ids)
@@ -585,7 +600,7 @@ class NativeFiller:
                     pattern(
                         req_id,
                         s.name(group, row),
-                        start + place,
+                        start + places[place],
                         view.shape[1],
                         self.tp_rank,
                     )
@@ -693,7 +708,7 @@ class NativeChecker:
         sizes = set(w.src_xfer_handles_by_block_size) - {w.block_size}
         if other or sizes or w.src_xfer_handles_by_tp_ratio:
             raise ValueError(
-                "Pattern checks of a hybrid model over NIXL need a remote of "
+                "Pattern checks of several KV cache groups over NIXL need a remote of "
                 "equal TP and block size, not "
                 f"source ranks {[p.all_source_ranks for p in other.values()]}, "
                 f"block sizes {sorted(sizes)}, "
@@ -706,7 +721,8 @@ class NativeChecker:
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
-            held = [b for b in group.block_ids if b != NULL_BLOCK_ID]
+            places = [i for i, b in enumerate(group.block_ids) if b != NULL_BLOCK_ID]
+            held = [group.block_ids[i] for i in places]
             selected = s.select(group.group, held) if held else []
             # A state group moves its running slot only: NIXL drops a native
             # MTP's trailing scratch slots and keeps the one before them
@@ -724,7 +740,7 @@ class NativeChecker:
                 want = pattern(
                     expected.remote_request_id,
                     s.name(group.group, row),
-                    first + place,
+                    first + places[place],
                     view.shape[1],
                     self.tp_rank,
                 )
@@ -737,7 +753,7 @@ class NativeChecker:
                     mismatched_blocks.append(
                         [
                             s.name(group.group, row),
-                            first + place,
+                            first + places[place],
                             block,
                             wrong,
                         ]
@@ -773,15 +789,14 @@ class NativeChecker:
             )
         mismatched_bytes = sum(g["mismatched_bytes"] for g in groups)
         # The READs wrote these descriptors' blocks and no others (a
-        # state's scratch slots included), in the selection's order.
-        checked = [
-            int(s.starts[row]) + block
-            for group in expected.groups
-            for row, block, _ in s.select(
-                group.group, [b for b in group.block_ids if b != NULL_BLOCK_ID]
-            )
-            if any(b != NULL_BLOCK_ID for b in group.block_ids)
-        ]
+        # state's scratch slots included), in the native order of every
+        # group's blocks together (region by region, then group by group).
+        checked = s.order(
+            {
+                group.group: [b for b in group.block_ids if b != NULL_BLOCK_ID]
+                for group in expected.groups
+            }
+        )
         posted = self.posted.pop(expected.remote_request_id, None)
         posted_ok = posted == checked
         return {

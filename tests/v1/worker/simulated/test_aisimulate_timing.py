@@ -8,6 +8,7 @@ import dataclasses
 import importlib.util
 import json
 import math
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -1238,6 +1239,100 @@ def test_a_bundled_config_the_package_would_download_is_read_locally(tmp_path):
     # A listed target is named as before.
     p = provider(engine_config(), gpu="h100")
     assert p.config["model"] == "Qwen/Qwen3-30B-A3B"
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, gpu, kwargs, field, changed",
+    [
+        # Gemma4: its global layers' KV heads (a per-layer field its
+        # heterogeneous config reads only as published).
+        ("google/gemma-4-26B-A4B", "h100", {"language_model_only": True},
+         "num_global_key_value_heads", 4),
+        ("XiaomiMiMo/MiMo-V2-Flash", "h200", {}, "swa_num_key_value_heads", 16),
+        ("meta-models/Muse-Glimmer-30B", "h200", {"language_model_only": True},
+         "sliding_window", 4096),
+    ],
+)
+def test_sliding_window_families_are_timed_with_their_layer_kinds(
+    tmp_path, target, gpu, kwargs, field, changed
+):
+    """Gemma4, MiMo-V2-Flash and Muse-Glimmer: sliding and full layers of
+    their own KV heads and widths, compared kind by kind (a changed one is not
+    the target's); op-level estimates over a BF16 cache."""
+    raw = {k: v for k, v in bundled_config(target).items() if k != "quantization_config"}
+    name = target.replace("/", "--")
+
+    def config(suffix, local):
+        return real_engine_config(tmp_path, f"{name}-{suffix}", local, derived=True, **kwargs)
+
+    p = provider(config("bf16", raw), gpu=gpu, target_model=target)
+    a = p.assumptions()["aisimulate"]
+    assert (a["resolved_config"]["estimation_mode"], a["config"]["kvcache_quant_mode"]) == (
+        "op_level", "bfloat16",
+    )
+    text = raw.get("text_config", raw)
+    if field == "num_global_key_value_heads":
+        # Held per layer: the global layers' own heads and width.
+        per_layer = a["compared_geometry"]["per_layer_kv"]
+        full = [i for i, kind in enumerate(text["layer_types"]) if kind == "full_attention"]
+        assert {per_layer[i] for i in full} == {(text["global_head_dim"], text[field])}
+        assert {per_layer[i] for i in range(len(per_layer)) if i not in full} == {
+            (text["head_dim"], text["num_key_value_heads"])
+        }
+        field = "per_layer_kv"
+    else:
+        assert a["compared_geometry"][field] == text[field]
+    changed_text = {**text, ("num_global_key_value_heads" if field == "per_layer_kv" else field): changed}
+    local = {**raw, "text_config": changed_text} if "text_config" in raw else changed_text
+    with pytest.raises(ValueError, match=field):
+        provider(config("changed", local), gpu=gpu, target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_mimo_v2_flash_is_priced_with_its_own_layer_kinds(tmp_path):
+    """MiMo-V2-Flash marks its sliding layers 1, AISimulate's hybrid graph its
+    global ones: the estimator reads a normalized copy (recorded), whose graph
+    prices the model's 9 full (one dense, eight MoE) and 39 sliding MoE
+    layers, while the geometry compared is the published config's."""
+    from aisimulate_core.sdk import config as sdk_config
+    from aisimulate_core.sdk.models import get_model
+
+    target = "XiaomiMiMo/MiMo-V2-Flash"
+    raw = {k: v for k, v in bundled_config(target).items() if k != "quantization_config"}
+    local = real_engine_config(tmp_path, "mimo-bf16", raw, derived=True)
+    p = provider(local, gpu="h200", target_model=target)
+    a = p.assumptions()["aisimulate"]
+    assert a["target_config_source"] == "bundled, normalized local copy"
+    assert a["timing_input"]["transformation"].startswith("hybrid_layer_pattern inverted")
+    assert a["compared_geometry"]["hybrid_layer_pattern"] == raw["hybrid_layer_pattern"]
+    with open(os.path.join(p.config["model"], "config.json")) as f:
+        read = json.load(f)
+    assert read["hybrid_layer_pattern"] == [1 - v for v in raw["hybrid_layer_pattern"]]
+    assert {k: v for k, v in read.items() if k != "hybrid_layer_pattern"} == {
+        k: v for k, v in bundled_config(target).items() if k != "hybrid_layer_pattern"
+    }
+    model = get_model(
+        p.config["model"],
+        sdk_config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        "vllm",
+    )
+    assert model._count_layer_types() == {
+        "global_dense": 1, "global_moe": 8, "swa_moe": 39, "swa_dense": 0,
+    }
+    # Each phase's attention: (layers, window, KV heads) of each kind.
+    window = raw["sliding_window_size"]
+    for ops in (model.context_ops, model.generation_ops):
+        attention = sorted(
+            (op._scale_factor, op._window_size, op._n_kv)
+            for op in ops
+            if type(op).__name__.endswith("Attention")
+        )
+        assert attention == [
+            (1.0, 0, raw["num_key_value_heads"]),
+            (8.0, 0, raw["num_key_value_heads"]),
+            (39.0, window, raw["swa_num_key_value_heads"]),
+        ]
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
