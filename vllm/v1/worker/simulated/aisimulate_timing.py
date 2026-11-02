@@ -97,6 +97,10 @@ MLA_FIELDS = (
     "qk_nope_head_dim",
     "v_head_dim",
 )
+# Kimi-K3 (Kimi-Linear): MLA layers' latent widths (without RoPE when
+# mla_use_nope) beside KDA layers, by its linear attention config (the KDA
+# layers, their heads, head width and short convolution).
+KIMI_K3_FIELDS = MLA_FIELDS + ("mla_use_nope", "linear_attn_config")
 # DSA sparse MLA (DeepSeek-V3.2, GLM-5): the latent's widths and its
 # lightning indexer's (heads, key width, top-k, which layers hold one).
 DSA_FIELDS = MLA_FIELDS + (
@@ -238,6 +242,7 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
         ATTENTION_FIELDS,
     ),
     **dict.fromkeys(("DeepseekV3ForCausalLM", "KimiK25ForConditionalGeneration"), MLA_FIELDS),
+    "KimiK3ForConditionalGeneration": KIMI_K3_FIELDS,
     **dict.fromkeys(("DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"), DSA_FIELDS),
     "DeepseekV4ForCausalLM": V4_FIELDS,
     "NemotronHForCausalLM": ATTENTION_FIELDS + MAMBA2_FIELDS,

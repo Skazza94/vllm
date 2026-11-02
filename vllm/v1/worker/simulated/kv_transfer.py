@@ -484,18 +484,22 @@ def check_real_kv_groups(
 
 def check_real_kv_layers(model: torch.nn.Module) -> None:
     """Refuse real KV transfers of a model whose recurrent layers are not
-    Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself) or Mamba2
-    (`MambaMixer2` itself, without ReplaySSM or speculative state): Kimi's
-    and OLMo's delta-nets share their KV cache groups but not their states'
-    rules. Each recurrent mixer must be the only one of its decoder layer
-    (an element of the one module list holding them all), without attention
-    beside it (Falcon-H1's parallel hybrid, Zamba2's shared transformer)."""
+    Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself), Kimi-K3's
+    delta attention (`KimiK3DeltaAttention`, packed like Qwen's: its q, k
+    and v convolutions in one conv state, without RecoverSSM or speculative
+    state) or Mamba2 (`MambaMixer2` itself, without ReplaySSM or speculative
+    state): Kimi-Linear's and OLMo's delta-nets share their KV cache groups
+    but not their states' rules. Each recurrent mixer must be the only one of
+    its decoder layer (an element of the one module list holding them all),
+    without attention beside it (Falcon-H1's parallel hybrid, Zamba2's shared
+    transformer)."""
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
     )
     from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+    from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 
     mixers = [m for m in model.modules() if isinstance(m, MambaBase)]
     if not mixers:
@@ -504,14 +508,24 @@ def check_real_kv_layers(model: torch.nn.Module) -> None:
         {
             type(m).__name__
             for m in mixers
-            if type(m) not in (QwenGatedDeltaNetAttention, MambaMixer2)
+            if type(m)
+            not in (QwenGatedDeltaNetAttention, KimiK3DeltaAttention, MambaMixer2)
         }
     )
     if other:
         raise ValueError(
             "kv_transfer_mode real moves Qwen's gated delta-net "
-            "(QwenGatedDeltaNetAttention) and Mamba2 (MambaMixer2) states only, "
+            "(QwenGatedDeltaNetAttention), Kimi-K3's delta attention "
+            "(KimiK3DeltaAttention) and Mamba2 (MambaMixer2) states only, "
             f"not {', '.join(other)}'s."
+        )
+    if any(
+        type(m) is KimiK3DeltaAttention and (m.use_recoverssm or m.num_spec)
+        for m in mixers
+    ):
+        raise ValueError(
+            "kv_transfer_mode real moves Kimi-K3's delta attention states "
+            "without RecoverSSM or speculative state only."
         )
     if any(
         type(m) is MambaMixer2 and (m.use_replayssm or m.num_spec) for m in mixers

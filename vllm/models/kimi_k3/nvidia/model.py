@@ -179,7 +179,9 @@ def maybe_init_gemm_rs_ar(vllm_config: VllmConfig, use_sequence_parallel: bool) 
     all_reduce = not use_sequence_parallel
     mode = "GEMM-AR" if all_reduce else "GEMM-RS"
     enabled = envs.VLLM_KIMI_K3_GEMM_AR if all_reduce else envs.VLLM_ENABLE_GEMM_RS
-    if not enabled:
+    # The fused kernels are CUDA's (cute_dsl); elsewhere (a CPU simulation)
+    # the plain GEMM and all-reduce run.
+    if not enabled or not current_platform.is_cuda():
         return False
 
     # The kernel module pulls in cute_dsl, so import it only once the flag
@@ -506,7 +508,11 @@ class KimiMoE(nn.Module):
             # down projection on decode-sized batches (gated by
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
             self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
-            self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
+            self._down_proj_events = (
+                (torch.cuda.Event(), torch.cuda.Event())
+                if self._down_proj_stream is not None
+                else (None, None)
+            )
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -983,7 +989,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         # Aux stream for overlapping the MLA g_proj output-gate GEMM with the
         # attention front-end (DeepseekV4 convention: created at the model
         # level and threaded into each attention layer).
-        aux_stream = torch.cuda.Stream()
+        aux_stream = torch.cuda.Stream() if current_platform.is_cuda_alike() else None
 
         def get_layer(prefix: str):
             return KimiDecoderLayer(

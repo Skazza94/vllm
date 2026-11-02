@@ -226,6 +226,61 @@ def gpt_oss_model_dir(tmp_path_factory):
     return str(directory)
 
 
+# A tiny Kimi-K3 language model (Kimi-Linear with its full-rank-gate KDA,
+# KimiK3DeltaAttention): three KDA layers, then MLA; SiTU latent experts
+# beside a shared one, attention residual blocks.
+KIMI_K3 = {
+    "architectures": ["KimiLinearForCausalLM"],
+    "model_type": "kimi_linear",
+    "vocab_size": 256,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 64,
+    "routed_expert_hidden_size": 64,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "q_lora_rank": 64,
+    "kv_lora_rank": 64,
+    "qk_nope_head_dim": 32,
+    "qk_rope_head_dim": 16,
+    "v_head_dim": 32,
+    "mla_use_nope": True,
+    "mla_use_output_gate": True,
+    "linear_attn_config": {
+        "kda_layers": [1, 2, 3],
+        "full_attn_layers": [4],
+        "num_heads": 4,
+        "head_dim": 32,
+        "short_conv_kernel_size": 4,
+        "gate_lower_bound": -5.0,
+        "use_full_rank_gate": True,
+    },
+    "num_experts": 4,
+    "num_experts_per_token": 2,
+    "num_shared_experts": 1,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "moe_renormalize": True,
+    "moe_router_activation_func": "sigmoid",
+    "num_expert_group": 1,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "use_grouped_topk": True,
+    "routed_scaling_factor": 1.0,
+    "latent_moe_use_norm": True,
+    "hidden_act": "situ",
+    "activation_situ_beta": 4.0,
+    "activation_situ_linear_beta": 25.0,
+    "attn_res_block_size": 2,
+    "num_nextn_predict_layers": 0,
+    "rms_norm_eps": 1e-05,
+    "max_position_embeddings": 512,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+}
+
+
 # A tiny Qwen3.5-MoE, a vision-language wrapper served as its language model
 # (language_model_only): three gated delta-net layers, then full attention.
 QWEN3_5_MOE = {
@@ -1354,8 +1409,9 @@ NEMOTRON_3_UNEQUAL = {
         (NEMOTRON_3_UNEQUAL, {}, True),
         (NEMOTRON_3, {}, False),
         (QWEN3_5_MOE, {"language_model_only": True}, False),
+        (KIMI_K3, {}, False),
     ],
-    ids=["nemotron-3-unequal", "nemotron-3", "qwen3.5"],
+    ids=["nemotron-3-unequal", "nemotron-3", "qwen3.5", "kimi-k3"],
 )
 def test_nixl_checks_cover_a_hybrids_native_selection(
     config, kwargs, transfer_only, tmp_path, monkeypatch, ds_conv_layout
@@ -2162,9 +2218,11 @@ def mtp(k):
          {"block_size": 64, "speculative_config": {"method": "mtp", "num_speculative_tokens": 3}}),
         (MIMO_V2_FLASH, {}),
         (MIMO_V2_FLASH_UNEQUAL, {}),
+        (KIMI_K3, {}),
     ],
     ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2",
-         "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3", "mimo-v2-flash", "mimo-v2-flash-unequal"],
+         "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3", "mimo-v2-flash", "mimo-v2-flash-unequal",
+         "kimi-k3"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,

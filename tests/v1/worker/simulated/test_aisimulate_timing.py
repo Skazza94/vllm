@@ -1422,6 +1422,66 @@ def test_full_attention_families_are_timed_as_published(
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_kimi_k3_is_timed_with_its_mla_modules(tmp_path, tp):
+    """Kimi-K3 (KDA and MLA layers, latent SiTU experts): a BF16 copy of its
+    MXFP4-expert checkpoint timed as published (BF16 GEMMs, w4a16_mxfp4
+    experts) over a BF16 cache, its MLA and linear attention geometry
+    compared (a changed KDA head width is not the target's). AISimulate
+    prices its MLA layers from MLA-module rows, falling back silently to a
+    GQA stack where a module row is missing: the rows answer, both phases."""
+    from aisimulate_core.sdk import config as sdk_config
+    from aisimulate_core.sdk.engine import _evaluate_single_op
+    from aisimulate_core.sdk.models import get_model
+    from aisimulate_core.sdk.operations.overlap import FallbackOp
+    from aisimulate_core.sdk.perf_database import get_database
+
+    target = "moonshotai/Kimi-K3"
+    raw = bundled_config(target)
+    text = {k: v for k, v in raw["text_config"].items() if k != "quantization_config"}
+    local = {**raw, "text_config": text}
+
+    def config(suffix, local):
+        return real_engine_config(
+            tmp_path, f"kimi-k3-{suffix}", local, derived=True,
+            language_model_only=True, tensor_parallel_size=tp,
+        )
+
+    p = provider(config("bf16", local), gpu="b200", target_model=target)
+    a = p.assumptions()["aisimulate"]
+    assert a["resolved_config"]["estimation_mode"] == "op_level"
+    c = a["config"]
+    assert (c["gemm_quant_mode"], c["moe_quant_mode"], c["kvcache_quant_mode"]) == (
+        "bfloat16", "w4a16_mxfp4", "bfloat16",
+    )
+    assert a["compared_geometry"]["linear_attn_config"] == text["linear_attn_config"]
+    assert a["compared_geometry"]["kv_lora_rank"] == text["kv_lora_rank"]
+
+    model = get_model(
+        p.config["model"],
+        sdk_config.ModelConfig(tp_size=tp, moe_tp_size=1, moe_ep_size=tp),
+        "vllm",
+    )
+    # The data the estimator resolved (backend_version None: its default).
+    database = get_database("b200_sxm", "vllm", a["resolved_config"]["backend_version"])
+    for context, ops, shape in (
+        (True, model.context_ops, {"batch_size": 1, "s": 1024, "prefix": 0}),
+        (False, model.generation_ops, {"batch_size": 4, "s": 1024, "prefix": 0}),
+    ):
+        (block,) = [op for op in ops if isinstance(op, FallbackOp)]
+        result = _evaluate_single_op(
+            database, block._primary, is_context=context, x=None,
+            imbalance_correction_scale=1.0, **shape,
+        )
+        assert float(getattr(result, "latency", result)) > 0
+
+    kda = {**text["linear_attn_config"], "head_dim": 64}
+    changed = {**raw, "text_config": {**text, "linear_attn_config": kda}}
+    with pytest.raises(ValueError, match="linear_attn_config"):
+        provider(config("changed", changed), gpu="b200", target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 def test_each_caller_reads_its_own_bundled_snapshot(tmp_path):
     """A bundled config the package would download is copied, with its
     quantization sidecar or explicitly without one, into a snapshot private

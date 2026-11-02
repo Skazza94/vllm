@@ -398,7 +398,9 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   slot NIXL selects for it, a slot holding none of a shorter group's layers
   moved and checked too (transfer-only, reported apart); and, without
   prefix caching, hybrid models of Qwen's gated delta-net (Qwen3.5, served
-  as its language model) or of Mamba2 (`MambaMixer2`: Nemotron-H,
+  as its language model), of Kimi-K3's delta attention (KDA beside MLA,
+  served as its language model; its SiTU experts the CPU platform builds
+  only for a simulation) or of Mamba2 (`MambaMixer2`: Nemotron-H,
   Nemotron-3, whose non-gated relu^2 experts the CPU platform builds only
   for a simulation): each request's state is one block of its recurrent
   groups (`mamba_cache_mode` none), padded to the attention page, and
@@ -410,8 +412,9 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   layers included (transfer-only), the page's padding not; the pattern
   checks follow that selection. Each
   decoder layer holds one recurrent mixer at most, without attention beside
-  it. Not other recurrent layers (Mamba, Kimi's or OLMo's delta-nets), a
-  mixer beside attention (Falcon-H1, Zamba2), ReplaySSM, attention-free,
+  it. Not other recurrent layers (Mamba, Kimi-Linear's or OLMo's
+  delta-nets), a mixer beside attention (Falcon-H1, Zamba2), ReplaySSM or
+  RecoverSSM, attention-free,
   other sparse-MLA (but DeepSeek-V4's, below), chunked local or RSWA
   attention models.
 * DeepSeek-V3.2's and GLM-5's sparse MLA (DSA), over either connector, its

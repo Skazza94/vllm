@@ -78,7 +78,11 @@ class LatentMoERunner(MoERunner):
             and current_platform.is_device_capability_family(100)
         )
         # Overlap the shared-expert all-reduce with the tier-1 up-projection.
-        self._shared_ar_events = (torch.cuda.Event(), torch.cuda.Event())
+        self._shared_ar_events = (
+            (torch.cuda.Event(), torch.cuda.Event())
+            if current_platform.is_cuda_alike()
+            else (None, None)
+        )
         use_fused_path = self._use_fused_path()
         if (
             self.enable_k3_latent_moe_tail_fusion

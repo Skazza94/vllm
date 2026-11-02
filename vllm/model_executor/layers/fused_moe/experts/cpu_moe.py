@@ -237,7 +237,12 @@ class CPUUnquantizedExperts(_CPUPaddedIntermediateMixin, mk.FusedMoEExpertsModul
             MoEActivation.SWIGLUOAI,
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
-        ) or (activation == MoEActivation.RELU2_NO_MUL and cpu_simulated_forward())
+        ) or (
+            # Nemotron-3's non-gated relu^2 and Kimi-K3's SiTU experts only in
+            # a simulation, which builds them and never runs them.
+            activation in (MoEActivation.RELU2_NO_MUL, MoEActivation.SITU)
+            and cpu_simulated_forward()
+        )
 
     @staticmethod
     def _supports_quant_scheme(
