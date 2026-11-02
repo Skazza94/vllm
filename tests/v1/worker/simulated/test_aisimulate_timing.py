@@ -537,6 +537,44 @@ def test_unresolved_v4_geometry_has_no_fallback(fake_aisimulate):
         _geometry(config, V4_FIELDS)
 
 
+def test_decilm_geometry_is_each_layers_attention(fake_aisimulate):
+    """Llama-3.3-Nemotron-Super (DeciLM): each layer's attention by its block
+    config, none, linear or of its own KV grouping (a window, sinks), so a
+    layer of another kind or grouping differs."""
+    from vllm.v1.worker.simulated.aisimulate_timing import DECILM_FIELDS, _geometry
+
+    def attention(no_op=False, linear=False, group=8, window=None, sinks=None):
+        return SimpleNamespace(
+            attention=SimpleNamespace(
+                no_op=no_op,
+                replace_with_linear=linear,
+                n_heads_in_group=None if no_op or linear else group,
+                window_length=window,
+                num_sink_tokens=sinks,
+            )
+        )
+
+    def config(blocks):
+        return SimpleNamespace(
+            num_hidden_layers=len(blocks),
+            num_attention_heads=64,
+            hidden_size=8192,
+            block_configs=blocks,
+        )
+
+    published = [attention(), attention(no_op=True), attention(), attention(linear=True)]
+    geometry = _geometry(config(published), DECILM_FIELDS)
+    assert geometry["block_attention"] == [
+        (False, False, 8, None, None),
+        (True, False, None, None, None),
+        (False, False, 8, None, None),
+        (False, True, None, None, None),
+    ]
+    for changed in (attention(group=4), attention(no_op=True), attention(window=1024)):
+        other = _geometry(config([changed] + published[1:]), DECILM_FIELDS)
+        assert other["block_attention"] != geometry["block_attention"]
+
+
 @pytest.mark.parametrize("ms", [None, math.nan, 0.0])
 def test_a_failing_startup_probe_is_refused(fake_aisimulate, monkeypatch, ms):
     monkeypatch.setattr(fake_aisimulate, "ms", ms)
@@ -1333,6 +1371,54 @@ def test_mimo_v2_flash_is_priced_with_its_own_layer_kinds(tmp_path):
             (8.0, 0, raw["num_key_value_heads"]),
             (39.0, window, raw["swa_num_key_value_heads"]),
         ]
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, gpu, tp, kwargs, derived, modes",
+    [
+        # MiniMax-M2.x: a BF16 copy of its FP8 checkpoint, timed as published
+        # (AISimulate has no TP8 for it).
+        ("MiniMaxAI/MiniMax-M2.5", "h200", 4, {}, True, ("fp8_block", "fp8_block")),
+        ("MiniMaxAI/MiniMax-M2.7", "h200", 4, {}, True, ("fp8_block", "fp8_block")),
+        # Qwen3-VL, dense and MoE, served as its language model.
+        ("Qwen/Qwen3-VL-8B-Instruct", "h100", 1, {"language_model_only": True}, False,
+         ("bfloat16", "bfloat16")),
+        ("Qwen/Qwen3-VL-30B-A3B-Instruct", "h100", 2, {"language_model_only": True}, False,
+         ("bfloat16", "bfloat16")),
+    ],
+)
+def test_full_attention_families_are_timed_as_published(
+    tmp_path, target, gpu, tp, kwargs, derived, modes
+):
+    """MiniMax-M2.x and Qwen3-VL: full attention of their own KV heads,
+    compared (a changed head count is not the target's); op-level estimates
+    of the published precision over a BF16 cache."""
+    raw = bundled_config(target)
+    local_raw = (
+        {k: v for k, v in raw.items() if k not in ("quantization_config", "auto_map")}
+        if derived
+        else raw
+    )
+    name = target.replace("/", "--")
+
+    def config(suffix, local):
+        return real_engine_config(
+            tmp_path, f"{name}-{suffix}", local, derived=derived,
+            tensor_parallel_size=tp, **kwargs,
+        )
+
+    p = provider(config("local", local_raw), gpu=gpu, target_model=target)
+    a = p.assumptions()["aisimulate"]
+    assert a["resolved_config"]["estimation_mode"] == "op_level"
+    assert (a["config"]["gemm_quant_mode"], a["config"]["moe_quant_mode"]) == modes
+    assert a["config"]["kvcache_quant_mode"] == "bfloat16"
+    text = local_raw.get("text_config", local_raw)
+    assert a["compared_geometry"]["num_key_value_heads"] == text["num_key_value_heads"]
+    changed_text = {**text, "num_key_value_heads": text["num_key_value_heads"] // 2}
+    changed = {**local_raw, "text_config": changed_text} if "text_config" in local_raw else changed_text
+    with pytest.raises(ValueError, match="num_key_value_heads"):
+        provider(config("changed", changed), gpu=gpu, target_model=target)
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")

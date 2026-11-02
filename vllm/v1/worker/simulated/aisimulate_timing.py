@@ -143,6 +143,10 @@ MIMO_V2_FIELDS = (
     "add_swa_attention_sink_bias",
     "add_full_attention_sink_bias",
 )
+# DeciLM (Llama-3.3-Nemotron-Super): each layer's attention its own, by its
+# block config: none (no_op), a linear map, or attention of
+# num_attention_heads / n_heads_in_group KV heads (a window, sinks).
+DECILM_FIELDS = ("num_hidden_layers", "num_attention_heads", "hidden_size", "block_attention")
 # Qwen's gated delta-net: its state's widths (the convolution's and the
 # recurrent state's).
 GDN_FIELDS = (
@@ -240,6 +244,12 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     "Gemma4ForConditionalGeneration": GEMMA4_FIELDS,
     "MiMoV2FlashForCausalLM": MIMO_V2_FIELDS,
     "MuseGlimmerForConditionalGeneration": ATTENTION_FIELDS,
+    "MiniMaxM2ForCausalLM": ATTENTION_FIELDS,
+    "DeciLMForCausalLM": DECILM_FIELDS,
+    **dict.fromkeys(
+        ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"),
+        ATTENTION_FIELDS,
+    ),
     **dict.fromkeys(
         ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"),
         ATTENTION_FIELDS + GDN_FIELDS,
@@ -345,7 +355,27 @@ def _geometry(config: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     """A config object's KV and state geometry, as its class resolves it. An
     attention head size its class leaves unset is the model's own fallback,
     hidden size over attention heads (Mixtral's, say)."""
-    geometry = {name: _resolved(config, name) for name in fields if name != "per_layer_kv"}
+    derived = ("per_layer_kv", "block_attention")
+    geometry = {name: _resolved(config, name) for name in fields if name not in derived}
+    if "block_attention" in fields:
+        blocks = getattr(config, "block_configs", None)
+        geometry["block_attention"] = (
+            [
+                tuple(
+                    _resolved(block.attention, name)
+                    for name in (
+                        "no_op",
+                        "replace_with_linear",
+                        "n_heads_in_group",
+                        "window_length",
+                        "num_sink_tokens",
+                    )
+                )
+                for block in blocks
+            ]
+            if blocks is not None
+            else None
+        )
     if "per_layer_kv" in fields:
         layers = getattr(config, "per_layer_config", None)
         geometry["per_layer_kv"] = (
