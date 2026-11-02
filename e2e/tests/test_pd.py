@@ -200,13 +200,38 @@ class CheckTests(unittest.TestCase):
         # A hybrid model's run without byte checks keeps it off.
         self.assertEqual(flags(False, False), ["--no-enable-prefix-caching"])
         self.assertEqual(flags(False, True), ["--enable-prefix-caching"])
+        # With the byte checks too: a block's pattern is then its content's.
+        self.assertEqual(flags(True, True), ["--enable-prefix-caching"])
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "run.yaml"
             spec.write_text((E2E / "runs" / "pd-smoke.yaml").read_text().replace(
-                "server:  # both servers", "server:  # both servers\n  enable_prefix_caching: true"))
-            with self.assertRaises(ValueError) as raised:
-                pd.load(spec)
-            self.assertIn("kv_check needs prefix caching off", str(raised.exception))
+                "server:  # both servers", "server:  # both servers\n  enable_prefix_caching: true").replace(
+                "model: ", f"model: {E2E / 'runs'}/", 1))
+            run = pd.load(spec)
+            self.assertTrue(run.kv_check and run.server.enable_prefix_caching)
+
+    def test_a_workload_may_share_prefixes(self) -> None:
+        repetition = {"prefix_len": 768, "suffix_len": 256, "num_prefixes": 4}
+        run = pd.Run(**{**RUN.__dict__, "workload": pd.Workload(input_len=1024, prefix_repetition=repetition)})
+        command = pd.bench_command(run)
+        self.assertEqual(command[command.index("--dataset-name") + 1], "prefix_repetition")
+        self.assertEqual([command[command.index(f"--prefix-repetition-{name}") + 1]
+                          for name in ("prefix-len", "suffix-len", "num-prefixes", "output-len")],
+                         ["768", "256", "4", "16"])
+        self.assertNotIn("--random-input-len", command)
+        self.assertIn("--random-input-len", pd.bench_command(RUN))
+        base = (E2E / "runs" / "pd-smoke.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
+        for workload, extra, error in (
+                ("prefix_repetition: {prefix_len: 700, suffix_len: 256, num_prefixes: 4}", "", "input_len is"),
+                ("prefix_repetition: {prefix_len: 768, suffix_len: 256}", "", "takes positive"),
+                ("input_len: 1024", "expect_fragmentation: 1\n", "true or false"),
+                ("input_len: 1024", "expect_fragmentation: true\nkv_check: false\n", "needs kv_check")):
+            with self.subTest(workload=workload, extra=extra), tempfile.TemporaryDirectory() as directory:
+                spec = Path(directory) / "run.yaml"
+                text = re.sub(r"^workload:.*$", f"workload:\n  {workload}", base, count=1, flags=re.M)
+                spec.write_text(re.sub(r"^kv_check:.*\n", "", text, flags=re.M) + extra)
+                with self.assertRaisesRegex(ValueError, error):
+                    pd.load(spec)
 
     def test_a_new_run_names_its_timing_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1260,3 +1285,227 @@ class SparseMlaLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Prefix caching: hits checked on both instances, pulls past decode's hit.
+PREFIX = pd.Run(**{**RUN.__dict__, "server": pd.Server(enable_prefix_caching=True)})
+FULL_LAYOUT = line(kv_layout={
+    "tp_rank": 0, "tp_size": 1, "block_bytes": 8, "bytes": 1600,
+    "groups": [{"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
+                "block_bytes": 4}]})
+
+
+def admit(request: str, side: str, computed: int, blocks: list[int]) -> str:
+    """A request admitted (new or resumed) with `computed` tokens and its
+    blocks then."""
+    rid = f"cmpl-{request}-0-{side}"
+    return line(kv_events={"allocated": {rid: [b for b in blocks if b]}, "admitted": {rid: computed},
+                           "allocated_groups": {rid: [{"group": 0, "first": 0, "blocks": blocks}]}})
+
+
+def post(request: str, first: int, blocks: list[int]) -> str:
+    """Decode's pull of a request's blocks from place `first`, posted."""
+    rid = f"cmpl-{request}-0-d"
+    return line(kv_events={"allocated": {rid: blocks}, "reads_posted": [rid],
+                           "allocated_groups": {rid: [{"group": 0, "first": first, "blocks": blocks}]}})
+
+
+def hit(request: str, side: str, blocks: int, ok: bool = True, first_block: int | None = None) -> dict:
+    """A hit check of a request's first `blocks` places: prefill's blocks
+    from 1, decode's from 101, unless `first_block`."""
+    first_block = (1 if side == "p" else 101) if first_block is None else first_block
+    return {"req_id": f"cmpl-{request}-0-{side}", "kind": "hit", "blocks": blocks, "bytes": blocks * 8,
+            "groups": [{"group": 0, "logical_blocks": list(range(blocks)),
+                        "block_ids": list(range(first_block, first_block + blocks)), "blocks": blocks,
+                        "bytes": blocks * 8, "mismatched_bytes": 0 if ok else 3, "written_this_step": []}],
+            "mismatched_bytes": 0 if ok else 3, "ok": ok}
+
+
+def blocks(first: int, count: int) -> list[int]:
+    return list(range(first, first + count))
+
+
+# b's 1024-token prompt shares a's first 48 blocks (of 64): prefill admits b
+# with them cached; decode too, and pulls b's last 16.
+PREFILL_ADMISSIONS = admit("a", "p", 0, blocks(1, 64)) + admit("b", "p", 768, blocks(1, 48) + blocks(201, 16))
+DECODE_ADMISSIONS = (post("a", 0, blocks(101, 64)) + post("b", 48, blocks(301, 16))
+                     + admit("a", "d", 1023, blocks(101, 64)) + admit("b", "d", 1023, blocks(101, 48) + blocks(301, 16)))
+A_CHECK = checked("a", blocks=64, layers=2, bytes=64 * 8, groups=[group_check(0, 0, 64)])
+B_CHECK = checked("b", blocks=16, layers=2, bytes=16 * 8, groups=[group_check(0, 48, 16)])
+
+
+class PrefixCachingCheckTests(unittest.TestCase):
+    def verdict(self, decode_checks=None, prefill_checks=None, prefill_events="", decode_events="",
+                run=PREFIX, moved=(64 + 16) * 8, prefill_admissions=PREFILL_ADMISSIONS,
+                decode_admissions=DECODE_ADMISSIONS, decode_steps=None) -> dict:
+        decode_checks = [A_CHECK, hit("b", "d", 48), B_CHECK] if decode_checks is None else decode_checks
+        prefill_checks = [hit("b", "p", 48)] if prefill_checks is None else prefill_checks
+        decode_steps = decode_steps or stepped("a", "d", 1023, 1, 1024) + stepped("b", "d", 1023, 1, 1024)
+        prefill = (FULL_LAYOUT + prefill_admissions + prefill_events
+                   + "".join(line(kv_check=c) for c in prefill_checks)
+                   + line(kv_transfers={"send": {"count": 2, "bytes": moved, "failed": 0}}))
+        decode = (FULL_LAYOUT + decode_steps + decode_admissions + decode_events
+                  + "".join(line(kv_check=c) for c in decode_checks))
+        return pd.check({"completed": run.workload.num_prompts, "errors": []}, [prefill], [decode],
+                        {"control": 50, "data0": moved + 100}, run)
+
+    def assertProblem(self, verdict: dict, *messages: str) -> None:
+        for message in messages:
+            self.assertTrue(any(message in problem for problem in verdict["problems"]), verdict["problems"])
+
+    def test_hits_are_checked_apart_from_transfers(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual((verdict["kv_checks"], verdict["kv_bytes_checked"]), (2, 80 * 8))
+        self.assertEqual(verdict["prefix_hits"], {
+            "prefill": {"kv_hit_checks": 1, "kv_hit_blocks": 48, "kv_bytes_hit_checked": 48 * 8},
+            "decode": {"kv_hit_checks": 1, "kv_hit_blocks": 48, "kv_bytes_hit_checked": 48 * 8}})
+        self.assertEqual(verdict["fragmentation"]["contiguous"], 2)
+        # Without prefix caching a pull starts at the prompt's first block.
+        off = self.verdict(run=pd.Run(**{**RUN.__dict__, "server": pd.Server(block_size=16)}))
+        self.assertProblem(off, "pulled from block 48, not 0")
+        self.assertIsNone(off["prefix_hits"])
+
+    def test_prefix_caching_failures_are_reported(self) -> None:
+        outside = {"req_id": "cmpl-b-0-p", "kind": "fill", "ok": False, "error": "outside the lifecycle"}
+        cases = {
+            "prefill: 1 prefix hit(s) held bytes unlike": {"prefill_checks": [hit("b", "p", 48, ok=False)]},
+            "decode: 1 prefix hit(s) held bytes unlike": {"decode_checks": [A_CHECK, hit("b", "d", 48, False),
+                                                                            B_CHECK]},
+            "outside the pattern lifecycle": {"prefill_checks": [hit("b", "p", 48), outside]},
+            "prefill showed no checked prefix hit": {"prefill_checks": []},
+            # The pull past the hit takes the rest of the prompt, not less.
+            "checked 15 blocks, not the cdiv(1024, 16) of its prompt past its 48-block prefix hit": {
+                "decode_checks": [A_CHECK, hit("b", "d", 48),
+                                  checked("b", blocks=15, layers=2, bytes=120, groups=[group_check(0, 48, 15)])],
+                "moved": 79 * 8},
+        }
+        for message, changes in cases.items():
+            with self.subTest(message=message):
+                self.assertProblem(self.verdict(**changes), message)
+
+    def test_hits_must_cover_each_admitted_prefix(self) -> None:
+        """Response 128: a hit check must be the request's own, of exactly
+        the places its admission left to the cache, its blocks there."""
+        cases = {
+            # b's 48-block hit missing, a's unrelated one-block hit instead.
+            "unrelated": ({"decode_checks": [A_CHECK, hit("a", "d", 1), B_CHECK]},
+                          ["decode: cmpl-a-0-d logged 1 prefix hit check(s), not the 0",
+                           "decode: cmpl-b-0-d logged 0 prefix hit check(s), not the 1",
+                           "decode showed no checked prefix hit"]),
+            "missing": ({"decode_checks": [A_CHECK, B_CHECK]},
+                        ["cmpl-b-0-d logged 0 prefix hit check(s), not the 1 its admissions imply ([48] block(s))"]),
+            "shortened": ({"decode_checks": [A_CHECK, hit("b", "d", 47), B_CHECK]},
+                          ["cmpl-b-0-d's hit check covers group 0: 47 block(s) 0:101..46:147, not its admitted "
+                           "hit group 0: 48 block(s) 0:101..47:148"]),
+            "other blocks": ({"prefill_checks": [hit("b", "p", 48, first_block=2)]},
+                             ["prefill: cmpl-b-0-p's hit check covers group 0: 48 block(s) 0:2..47:49"]),
+            "zero blocks and bytes": ({"decode_checks": [A_CHECK, hit("b", "d", 0), B_CHECK],
+                                       "prefill_checks": [hit("b", "p", 0)]},
+                                      ["prefill: cmpl-b-0-p's hit check covers no bytes",
+                                       "decode: cmpl-b-0-d's hit check covers no bytes",
+                                       "prefill showed no checked prefix hit", "decode showed no checked prefix hit"]),
+            "bytes unlike the layout": ({"prefill_checks": [{**hit("b", "p", 48), "bytes": 48 * 4, "groups": [
+                {**hit("b", "p", 48)["groups"][0], "bytes": 48 * 4}]}]},
+                ["cmpl-b-0-p's hit check of group 0 (48 block(s), 192 bytes) disagrees with the layout (8 bytes"]),
+            # The pull's own plan: its blocks are the request's at their
+            # places, and it starts within the tokens it was admitted with.
+            "plan unlike the table": ({"decode_admissions": DECODE_ADMISSIONS.replace(
+                json.dumps(blocks(301, 16)), json.dumps(blocks(302, 16)), 2)},
+                ["cmpl-b-0-d's pull of group 0 (16 block(s) from 48) is not its blocks there when admitted"]),
+            "plan past the admission": ({"decode_admissions": DECODE_ADMISSIONS.replace(
+                '"cmpl-b-0-d": 1023', '"cmpl-b-0-d": 700')},
+                ["cmpl-b-0-d's pull of group 0 starts at block 48, past the 700 tokens"]),
+        }
+        for name, (changes, messages) in cases.items():
+            with self.subTest(name):
+                self.assertProblem(self.verdict(**changes), *messages)
+        # Prefill admitted b with 48 blocks cached: a 47-block admission
+        # makes its 48-block check another's.
+        shorter = PREFILL_ADMISSIONS.replace('"cmpl-b-0-p": 768', '"cmpl-b-0-p": 752')
+        self.assertProblem(self.verdict(prefill_admissions=shorter), "not its admitted hit group 0: 47 block(s)")
+
+    def test_a_request_served_from_hits_alone_is_consumed_once(self) -> None:
+        """a pulled; b's prompt (1025 tokens) is a's and one more: decode
+        hits all 64 of its full blocks and pulls nothing; c hits 48 and
+        pulls 16."""
+        run = pd.Run(**{**PREFIX.__dict__, "workload": pd.Workload(num_prompts=3)})
+        prefill = (admit("a", "p", 0, blocks(1, 64)) + admit("b", "p", 1024, blocks(1, 64) + [217])
+                   + admit("c", "p", 768, blocks(1, 48) + blocks(201, 16)))
+        decode = (post("a", 0, blocks(101, 64)) + admit("a", "d", 1023, blocks(101, 64))
+                  + admit("b", "d", 1024, blocks(101, 64) + [400])
+                  + post("c", 48, blocks(301, 16)) + admit("c", "d", 1023, blocks(101, 48) + blocks(301, 16)))
+        steps = (stepped("a", "d", 1023, 1, 1024) + stepped("b", "d", 1024, 1, 1025)
+                 + stepped("c", "d", 1023, 1, 1024))
+        c_check = {**B_CHECK, "req_id": "cmpl-c-0-d"}
+        good = dict(run=run, prefill_admissions=prefill, decode_admissions=decode, decode_steps=steps,
+                    decode_checks=[A_CHECK, hit("b", "d", 64), hit("c", "d", 48), c_check],
+                    prefill_checks=[hit("b", "p", 64), hit("c", "p", 48)])
+        verdict = self.verdict(**good)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["kv_checks"], 2)
+        self.assertEqual(verdict["prefix_hits"]["decode"], {"kv_hit_checks": 2, "kv_hit_blocks": 112,
+                                                            "kv_bytes_hit_checked": 112 * 8})
+        self.assertEqual(verdict["ownership"], {"producers": {0: 3}, "consumers": {0: 3}})
+        # b's hit not checked: nothing shows decode consumed it.
+        self.assertProblem(self.verdict(**{**good, "decode_checks": [A_CHECK, hit("c", "d", 48), c_check]}),
+                           "decode admitted cmpl-b-0-d with neither a pull nor a checked prefix hit")
+        # c pulled: its byte check is still required.
+        self.assertProblem(self.verdict(**{**good, "decode_checks": [A_CHECK, hit("b", "d", 64),
+                                                                     hit("c", "d", 48)]}),
+                           "1 pulled request(s) without a successful byte check: cmpl-c-0-d",
+                           "decode logged 1 byte check(s) for 2 distinct request(s) that pulled")
+        # Response 129: b reuses 768 of its 1024 tokens and prefills the
+        # other 256 itself, with no pull: a missing transfer, not a full hit.
+        partial = dict(run=PREFIX, decode_checks=[A_CHECK, hit("b", "d", 48)], moved=512,
+                       decode_admissions=post("a", 0, blocks(101, 64)) + admit("a", "d", 1023, blocks(101, 64))
+                       + admit("b", "d", 768, blocks(101, 48) + blocks(301, 16)),
+                       decode_steps=stepped("a", "d", 1023, 1, 1024) + stepped("b", "d", 768, 256, 1024))
+        self.assertProblem(self.verdict(**partial),
+                           "decode admitted cmpl-b-0-d without a pull, 768 of its 1024 prompt tokens cached, its "
+                           "first step computing from 768: it prefilled 256 tokens itself, not only the last")
+        # Its admission alone claiming the whole prompt does not hide the step.
+        whole = hit("b", "d", 63)
+        whole["groups"][0]["block_ids"] = blocks(101, 48) + blocks(301, 15)
+        claimed = {**partial, "decode_checks": [A_CHECK, whole],
+                   "decode_admissions": partial["decode_admissions"].replace('"cmpl-b-0-d": 768', '"cmpl-b-0-d": 1023')}
+        self.assertEqual([p for p in self.verdict(**claimed)["problems"] if "hit" in p and "prefilled" not in p], [])
+        self.assertProblem(self.verdict(**claimed), "it prefilled 256 tokens itself")
+        # A request decode never admitted is not consumed.
+        self.assertProblem(self.verdict(**{**good, "decode_admissions": decode.replace(
+            admit("b", "d", 1024, blocks(101, 64) + [400]), "")}), "decode admitted 2 distinct request(s), not 3")
+
+    def test_fragmentation_counts_checked_matched_pulls_only(self) -> None:
+        def pull(request: str, places: list[int], first: int = 2) -> dict:
+            return {"kv_events": {"reads_posted": [f"cmpl-{request}-0-d"], "allocated_groups": {
+                f"cmpl-{request}-0-d": [{"group": 0, "first": first, "blocks": places}]}}}
+
+        # Prefill's tables (a chunk's allocations continue at their places).
+        prefill = [pd._records(allocated_groups("a", (0, 0, [1, 2, 3, 4])) + allocated_groups("b", (0, 0, [5, 6]))
+                               + allocated_groups("b", (0, 2, [9, 7]))
+                               + allocated_groups("c", (0, 0, [10, 11, 12, 13]))
+                               + allocated_groups("d", (0, 0, [14, 15, 17, 19])))]
+        decode = [pull("a", [20, 21]), pull("b", [30, 31]), pull("c", [40, 42]),
+                  pull("x", [50]),  # no producer allocation logged: unmatched
+                  pull("d", [60, 62]),  # fragmented on both, but not checked
+                  {"kv_events": {"reads_posted": ["cmpl-y-0-d"], "allocated": {"cmpl-y-0-d": [70, 72]}}}]
+        checked_ids = {f"cmpl-{r}-0-d" for r in "abcxy"}
+        self.assertEqual(pd._fragmentation(prefill, [decode], [checked_ids]), {
+            "pulls": 6, "contiguous": 1, "fragmented_prefill_only": 1, "fragmented_decode_only": 1,
+            "fragmented_both": 0, "unlogged": 1, "unchecked": 1, "unmatched": 1,
+            "jointly_contiguous_runs": 1 + 2 + 2, "unmatched_groups": 1})
+        # Checked, d is fragmented on both.
+        self.assertEqual(pd._fragmentation(prefill, [decode], [checked_ids | {"cmpl-d-0-d"}])["fragmented_both"], 1)
+        # A checked pull without the producer's allocation is not contiguous.
+        alone = pd._fragmentation([], [[pull("missing", [50])]], [{"cmpl-missing-0-d"}])
+        self.assertEqual((alone["contiguous"], alone["unmatched"], alone["unmatched_groups"]), (0, 1, 1))
+        # In a run: neither an unchecked pull nor an unmatched one meets
+        # expect_fragmentation (response 128's counterexamples).
+        expecting = pd.Run(**{**PREFIX.__dict__, "expect_fragmentation": True})
+        for prefill_events, decode_events in (
+                (allocated_groups("unverified", (0, 0, [14, 15, 17, 19])), line(**pull("unverified", [60, 62]))),
+                ("", line(**pull("missing", [50])))):
+            verdict = self.verdict(prefill_events=prefill_events, decode_events=decode_events, run=expecting)
+            self.assertProblem(verdict, "no byte-checked transfer was fragmented on both instances",
+                               "1 pull(s) posted for requests decode never admitted")
+            self.assertEqual((verdict["fragmentation"]["contiguous"], verdict["fragmentation"]["unchecked"]), (2, 1))

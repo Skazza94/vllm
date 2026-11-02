@@ -86,7 +86,8 @@ class Server:
     """Tokens per KV block; None: the platform's (a hybrid model's)."""
     enable_prefix_caching: bool | None = None
     """None: off with kv_check, else vLLM's default (on; a hybrid model's
-    real transfers need it off)."""
+    real transfers need it off). On with kv_check, a block's pattern is its
+    content's, and prefix hits are checked too."""
     kv_cache_memory_bytes: int = 2 * 1024 ** 3
     max_model_len: int = 4096
     max_num_batched_tokens: int = 2048
@@ -130,6 +131,14 @@ class Workload:
     num_prompts: int = 40
     concurrency: int = 4
     seed: int = 0
+    prefix_repetition: dict | None = None
+    """Prompts sharing prefixes (the benchmark's prefix_repetition dataset):
+    {prefix_len, suffix_len, num_prefixes}, input_len their sum. The text is
+    tokenized again by the server: the sharing the checks report is the
+    servers' own (their prefix hits), not this nominal split."""
+
+
+PREFIX_REPETITION_KEYS = ("prefix_len", "suffix_len", "num_prefixes")
 
 
 @dataclass
@@ -142,6 +151,9 @@ class Run:
     client: str
     control_network: str
     kv_check: bool = True
+    expect_fragmentation: bool = False
+    """Require byte-checked transfers whose blocks are scattered on both
+    instances (a tight KV budget's reuse); the counts are reported anyway."""
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     proxy: Path = DEFAULT_PROXY
@@ -154,7 +166,7 @@ def load(path: str | Path) -> Run:
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
-             "server", "workload", "proxy", "startup_timeout"}
+             "expect_fragmentation", "server", "workload", "proxy", "startup_timeout"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
     try:
@@ -164,6 +176,7 @@ def load(path: str | Path) -> Run:
             prefill=Side(**raw["prefill"]), decode=Side(**raw["decode"]),
             client=raw["client"], control_network=raw["control_network"],
             kv_check=bool(raw.get("kv_check", True)),
+            expect_fragmentation=raw.get("expect_fragmentation", False),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             proxy=(path.parent / raw["proxy"]).resolve() if "proxy" in raw else (
                 NIXL_PROXY if (raw.get("server") or {}).get("connector") == "nixl" else DEFAULT_PROXY),
@@ -183,8 +196,17 @@ def load(path: str | Path) -> Run:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
     if run.server.speculative is not None:
         _check_speculative(run.server)
-    if run.kv_check and run.server.enable_prefix_caching:
-        raise ValueError("kv_check needs prefix caching off (server.enable_prefix_caching)")
+    if not isinstance(run.expect_fragmentation, bool):
+        raise ValueError(f"expect_fragmentation is true or false, not {run.expect_fragmentation!r}")
+    if run.expect_fragmentation and not run.kv_check:
+        raise ValueError("expect_fragmentation needs kv_check (it counts byte-checked transfers)")
+    repetition = run.workload.prefix_repetition
+    if repetition is not None:
+        if not isinstance(repetition, dict) or set(repetition) != set(PREFIX_REPETITION_KEYS) or not all(
+                isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in repetition.values()):
+            raise ValueError("workload.prefix_repetition takes positive prefix_len, suffix_len and num_prefixes")
+        if repetition["prefix_len"] + repetition["suffix_len"] != run.workload.input_len:
+            raise ValueError("workload.input_len is prefix_repetition's prefix_len + suffix_len")
     ranks = run.server.tensor_parallel_size
     for side in (run.prefill, run.decode):
         if not isinstance(side.kv_network, str) and len(side.kv_network) != ranks:
@@ -229,12 +251,19 @@ def bench_command(run: Run) -> list[str]:
     """The client's benchmark: random prompts of the workload's lengths
     through the proxy, tokenized with the model's tokenizer."""
     w = run.workload
+    repetition = w.prefix_repetition
+    dataset = ["--dataset-name", "random", "--random-input-len", str(w.input_len),
+               "--random-output-len", str(w.output_len)] if repetition is None else [
+        "--dataset-name", "prefix_repetition",
+        "--prefix-repetition-prefix-len", str(repetition["prefix_len"]),
+        "--prefix-repetition-suffix-len", str(repetition["suffix_len"]),
+        "--prefix-repetition-num-prefixes", str(repetition["num_prefixes"]),
+        "--prefix-repetition-output-len", str(w.output_len)]
     return [
         VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
         "--base-url", f"http://127.0.0.1:{PROXY_PORT}", "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
         *(["--trust-remote-code"] if run.server.trust_remote_code else []),
-        "--dataset-name", "random", "--random-input-len", str(w.input_len),
-        "--random-output-len", str(w.output_len), "--num-prompts", str(w.num_prompts),
+        *dataset, "--num-prompts", str(w.num_prompts),
         "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
         "--save-result", "--save-detailed", "--result-dir", f"{WORK}/results", "--result-filename", "bench.json",
     ]
@@ -300,8 +329,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         "--generation-config", "vllm", "--enforce-eager",
         *(["--language-model-only"] if s.language_model_only else []),
         *(["--trust-remote-code"] if s.trust_remote_code else []),
-        # The byte check's pattern is the request's: a block cached for
-        # another request would not match it.
+        # Off for the byte checks unless asked (then a block's pattern is
+        # its content's).
         *_prefix_caching_flags(run),
         "--simulation-config", json.dumps(simulation),
         "--kv-transfer-config", json.dumps(kv_transfer),
@@ -424,6 +453,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     problems = []
     w = run.workload
     tp_size = run.server.tensor_parallel_size
+    # With prefix caching the checks also compare each request's prefix
+    # hits (`kind` hit), on both instances, apart from its transfer.
+    prefix = bool(run.server.enable_prefix_caching) and run.kv_check
     errors = [error for error in bench.get("errors", []) if error]
     if bench.get("completed") != w.num_prompts or errors:
         problems.append(f"{bench.get('completed')} of {w.num_prompts} request(s) completed; errors: {errors[:3]}")
@@ -467,22 +499,82 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                         sent[key] += int(transfers.get(key) or 0)
             if sent["failed"]:
                 problems.append(f"{at}{role}'s connector failed {sent['failed']} transfer(s)")
-            checks = [record["kv_check"] for record in records if "kv_check" in record]
-            if run.kv_check and role == "decode":
+            logged = [record["kv_check"] for record in records if "kv_check" in record]
+            # A transfer's check; a prefix hit's; a request the content
+            # patterns could not describe (fill, write).
+            checks = [c for c in logged if c.get("kind") in (None, "transfer")]
+            hits = [c for c in logged if c.get("kind") == "hit"]
+            outside = [c for c in logged if c.get("kind") not in (None, "transfer", "hit")]
+            if run.kv_check:
                 bad = [c for c in checks if not c.get("ok") or c.get("mismatched_bytes")]
                 if bad:
                     problems.append(f"{at}{len(bad)} request(s) received KV bytes unlike prefill's: {bad[0]}")
+                bad = [c for c in hits if not c.get("ok") or c.get("mismatched_bytes")]
+                if bad:
+                    problems.append(f"{at}{role}: {len(bad)} prefix hit(s) held bytes unlike their content's: "
+                                    f"{bad[0]}")
+                if outside:
+                    problems.append(f"{at}{role}: {len(outside)} request(s) outside the pattern lifecycle: "
+                                    f"{outside[0]}")
+            if run.kv_check and role == "decode":
                 if layout:
                     # Failed receives are reported above; every other check is validated.
                     problems.extend(f"{at}{problem}" for problem in _byte_check_problems(
                         layout, [c for c in checks if "error" not in c], w.input_len, _pull_plans(records),
-                        {req_id: steps[0][2] for req_id, steps in joint_steps[("decode", tp)].items()}))
+                        {req_id: steps[0][2] for req_id, steps in joint_steps[("decode", tp)].items()}, prefix))
+            admissions = _admissions(records)
+            # The hits each request's admissions imply, checked: only those
+            # reconciled count (`valid_hits`).
+            valid_hits = []
+            if prefix and layout:
+                found, valid_hits = _hit_problems(layout, hits, admissions)
+                problems.extend(f"{at}{role}: {problem}" for problem in found)
+            verified = {c["req_id"] for c in checks
+                        if "req_id" in c and "error" not in c and c.get("ok") and not c.get("mismatched_bytes")}
+            pulled = {request for request, adms in admissions.items() if any(
+                a["pull"] and any(block for _, blocks in a["pull"].values() for block in blocks) for a in adms)}
+            if prefix and role == "decode":
+                # A request admitted without a pull is consumed through its
+                # own hit, checked, of its whole prompt but the last token
+                # (the one decode computes: native caching hits at most N - 1,
+                # a hybrid's replay is that token too), as admitted and as its
+                # first step computes; one pulled, through its byte check.
+                hit_ids = {c["req_id"] for c in valid_hits}
+                first_steps = joint_steps[("decode", tp)]
+                for request in sorted(set(admissions) - pulled):
+                    if request not in hit_ids:
+                        problems.append(f"{at}decode admitted {request} with neither a pull nor a checked prefix hit")
+                        continue
+                    computed = admissions[request][0]["computed"]
+                    first = (first_steps.get(request) or [None])[0]
+                    if first is None:
+                        problems.append(f"{at}decode admitted {request} without a pull and logged no step of it")
+                    elif min(computed, first[0]) < first[2] - 1:
+                        problems.append(
+                            f"{at}decode admitted {request} without a pull, {computed} of its {first[2]} prompt "
+                            f"tokens cached, its first step computing from {first[0]}: it prefilled "
+                            f"{first[2] - min(computed, first[0])} tokens itself, not only the last (a transfer "
+                            "replaced by local prefill)")
+                if unverified := sorted(pulled - verified):
+                    problems.append(f"{at}{len(unverified)} pulled request(s) without a successful byte check: "
+                                    f"{unverified[0]}")
+                posted = {request for r in records for request in (r.get("kv_events") or {}).get("reads_posted") or []}
+                if unadmitted := sorted(posted - set(admissions)):
+                    problems.append(f"{at}{len(unadmitted)} pull(s) posted for requests decode never admitted: "
+                                    f"{unadmitted[0]}")
+                if unposted := sorted({c["req_id"] for c in checks if "req_id" in c} - pulled):
+                    problems.append(f"{at}{len(unposted)} byte check(s) of requests whose pull was not logged: "
+                                    f"{unposted[0]}")
             # The requests the rank owns: prefill's allocations; decode's
-            # byte checks, else its allocations.
-            owned = {_base_request_id(c["req_id"]) for c in checks if "req_id" in c} if (
-                role == "decode" and run.kv_check) else {
-                _base_request_id(req_id) for r in records
-                for req_id in ((r.get("kv_events") or {}).get("allocated") or {})}
+            # admissions (prefix caching), its byte checks, else its
+            # allocations.
+            if prefix and role == "decode":
+                owned = {_base_request_id(request) for request in admissions}
+            elif role == "decode" and run.kv_check:
+                owned = {_base_request_id(c["req_id"]) for c in checks if "req_id" in c}
+            else:
+                owned = {_base_request_id(req_id) for r in records
+                         for req_id in ((r.get("kv_events") or {}).get("allocated") or {})}
             counters = tents.get(role, {}).get((dp, tp)) if tents else None
             if tents:
                 # Mooncake's prefill writes the KV, NIXL's decode reads it.
@@ -502,8 +594,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                     problems.append(f"{at}TENT {'read' if mover == 'decode' else 'wrote'} {counted:.0f} bytes, "
                                     f"not the {sent['bytes']} its connector moved")
             ranks[role][(dp, tp)] = {
-                "transfers": sent, "kv_checks": len(checks),
+                "transfers": sent, "kv_checks": len(checks), "pulled": len(pulled),
                 "checked_ids": {c["req_id"] for c in checks if "req_id" in c and "error" not in c},
+                "verified_ids": verified,
                 "allocated_ids": {req_id for r in records
                                   for req_id in ((r.get("kv_events") or {}).get("allocated") or {})},
                 "hybrid": bool(layout and _prefill_backoff(layout)),
@@ -514,6 +607,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "kv_bytes_transfer_only": sum(int(g.get("transfer_only_bytes") or 0)
                                               for c in checks for g in c.get("groups") or []),
                 "kv_bytes_spanned": _spanned_bytes(layout, checks) if layout else 0,
+                # Prefix hits compared in place, reconciled with the
+                # requests' admissions: no transfer moved them.
+                "kv_hit_checks": len(valid_hits),
+                "kv_hit_blocks": sum(c["blocks"] for c in valid_hits),
+                "kv_bytes_hit_checked": sum(c["bytes"] for c in valid_hits),
                 "requests": owned, "tent": counters,
                 "kv_layout": layout and {key: layout.get(key) for key in (
                     "dp_rank", "dp_local_rank", "tp_rank", "tp_size", "shape", "block_bytes", "bytes",
@@ -545,12 +643,16 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         # (none without kv_check).
         consumed = len(set().union(*(summary["requests"] for summary in of["decode"].values())))
         byte_checks = sum(summary["kv_checks"] for summary in of["decode"].values())
+        # With prefix caching a request served from decode's own hits pulls
+        # nothing: one byte check for each request that pulled.
+        pulls = sum(summary["pulled"] for summary in of["decode"].values()) if prefix else consumed
         if run.kv_check:
             if consumed != w.num_prompts:
-                problems.append(f"{at}decode byte-checked {consumed} distinct request(s), not {w.num_prompts}")
-            if byte_checks != consumed:
-                problems.append(f"{at}decode logged {byte_checks} byte check(s) for {consumed} distinct "
-                                "request(s)")
+                problems.append(f"{at}decode {'admitted' if prefix else 'byte-checked'} {consumed} distinct "
+                                f"request(s), not {w.num_prompts}")
+            if byte_checks != pulls:
+                problems.append(f"{at}decode logged {byte_checks} byte check(s) for {pulls} distinct "
+                                f"request(s){' that pulled' if prefix else ''}")
         for role, label in (("prefill", "prefill DP ranks produced"), ("decode", "decode DP ranks consumed")):
             shared = sorted(request for request, dps in owners[role].items() if len(dps) > 1)
             if shared:
@@ -568,8 +670,22 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 joint_steps[("prefill", tp)], joint_steps[("decode", tp)],
                 set().union(*(summary[consumed_ids] for summary in of["decode"].values())))
             problems.extend(f"{at}{problem}" for problem in handoff["problems"])
+        hit = {role: {key: sum(summary[key] for summary in of[role].values())
+                      for key in ("kv_hit_checks", "kv_hit_blocks", "kv_bytes_hit_checked")} for role in sides}
+        if prefix:
+            for role in sides:
+                if not (hit[role]["kv_hit_blocks"] and hit[role]["kv_bytes_hit_checked"]):
+                    problems.append(f"{at}{role} showed no checked prefix hit: the run did not exercise prefix "
+                                    "caching")
+        fragmentation = _fragmentation(
+            [records for (dp, rank), records in logs["prefill"].items() if rank == tp],
+            [records for (dp, rank), records in logs["decode"].items() if rank == tp],
+            [ranks["decode"][(dp, rank)]["verified_ids"] for (dp, rank) in logs["decode"] if rank == tp])
+        if tp == 0 and run.expect_fragmentation and not fragmentation["fragmented_both"]:
+            problems.append(f"{at}no byte-checked transfer was fragmented on both instances: {fragmentation}")
         per_tp.append({
             "kv_checks": byte_checks, "consumed": consumed, "kv_bytes_checked": checked, "kv_bytes_spanned": spanned,
+            "prefix_hits": hit if prefix else None, "fragmentation": fragmentation,
             "kv_bytes_transfer_only": sum(summary["kv_bytes_transfer_only"] for summary in of["decode"].values()),
             "transfers_bytes": moved,
             "kv_layout": {role: (of[role].get(0) or {}).get("kv_layout") for role in sides},
@@ -621,13 +737,21 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "kv_checks": per_tp[0]["kv_checks"] if per_tp else 0,
         "kv_bytes_checked": sum(rank["kv_bytes_checked"] for rank in per_tp),
         "kv_bytes_transfer_only": sum(rank.get("kv_bytes_transfer_only", 0) for rank in per_tp),
+        # TP rank 0's hit checks (every TP rank checks the same requests),
+        # every rank's bytes.
+        "prefix_hits": {role: {"kv_hit_checks": per_tp[0]["prefix_hits"][role]["kv_hit_checks"],
+                               "kv_hit_blocks": per_tp[0]["prefix_hits"][role]["kv_hit_blocks"],
+                               "kv_bytes_hit_checked": sum(rank["prefix_hits"][role]["kv_bytes_hit_checked"]
+                                                           for rank in per_tp)}
+                        for role in sides} if prefix and per_tp else None,
+        "fragmentation": per_tp[0]["fragmentation"] if per_tp else None,
         "transfers": sums,
         "router_bytes": routers,
         "ranks": per_tp,
         "ownership": ownership,
         "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
                              **{key: value for key, value in summary.items()
-                                if key not in ("requests", "checked_ids", "allocated_ids")},
+                                if key not in ("requests", "checked_ids", "verified_ids", "allocated_ids")},
                              "requests": len(summary["requests"])}
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
         "speculation": speculation,
@@ -859,7 +983,7 @@ def _spanned_bytes(layout: dict, checks: list[dict]) -> int:
 
 def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                          plans: dict[str, dict[int, tuple[int, int]]],
-                         prompts: dict[str, int] | None = None) -> list[str]:
+                         prompts: dict[str, int] | None = None, prefix: bool = False) -> list[str]:
     """How a rank's successful byte checks disagree with its KV layout.
 
     An older simulator's layout (no ``groups``): each check's bytes are its
@@ -876,7 +1000,9 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
     ``prefill_backoff``); a gated delta-net's state
     is one block, at place 0. For several groups or a window, each group
     must also be the request's pull as posted (``_pull_plans``), and prompts
-    longer than a window must have had some pull clipped. A packed group
+    longer than a window must have had some pull clipped. With prefix
+    caching (`prefix`) a pull starts after decode's own prefix hit, any
+    block, and takes the rest of the prompt's. A packed group
     (each block all of its layers' pages, DeepSeek-V4's) checks its layers'
     real pages, ``checked_bytes_per_block`` a block. Missing fields are
     problems."""
@@ -913,8 +1039,9 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                             f"{len(groups)} once")
         if (check["blocks"], check["bytes"]) != (sum(g["blocks"] for g in nested), sum(g["bytes"] for g in nested)):
             problems.append(f"{request}'s byte check is not its groups' sum")
-        plan = plans.get(request) if grouped else None
-        if grouped and plan is None:
+        # With prefix caching a pull's plan is logged for one group too.
+        plan = plans.get(request) if grouped or prefix else None
+        if (grouped or prefix) and plan is None:
             problems.append(f"{request}'s pull plan was not logged (reads_posted with allocated_groups)")
         for g in nested:
             spec = groups[g["group"]] if 0 <= g["group"] < len(groups) else None
@@ -960,7 +1087,7 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             # slots, the one NIXL moves) has clipped-read metadata index k
             # (`speculative_blocks`); any other group starts at 0.
             start = (spec.get("speculative_blocks") or 0) if spec.get("kind") == "MambaSpec" else 0
-            if window is None and g["first_logical_block"] != start:
+            if window is None and g["first_logical_block"] != start and not prefix:
                 problems.append(f"{request}'s group {g['group']} ({spec.get('kind')}) was pulled from block "
                                 f"{g['first_logical_block']}, not {start}")
             if spec.get("kind") == "MambaSpec":
@@ -970,9 +1097,11 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                 problems.append(f"{request}'s group {g['group']} pages cannot be checked: decode logged no "
                                 "steps of it")
             elif window is None:
-                if g["blocks"] != -(-tokens // spec["block_size"]):
+                hit = g["first_logical_block"] if prefix else 0
+                if g["blocks"] != -(-tokens // spec["block_size"]) - hit:
                     problems.append(f"{request}'s group {g['group']} checked {g['blocks']} blocks, not the "
-                                    f"cdiv({tokens}, {spec['block_size']}) of its prompt")
+                                    f"cdiv({tokens}, {spec['block_size']}) of its prompt"
+                                    + (f" past its {hit}-block prefix hit" if hit else ""))
             if window is not None:
                 bound = -(-window // spec["block_size"]) + 1
                 if g["blocks"] > bound:
@@ -991,6 +1120,175 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             problems.append(f"no pull of window group {index} was clipped, with prompts of {input_len} tokens "
                             f"beyond its {window}")
     return _capped(problems)
+
+
+def _runs(blocks: list[int]) -> int:
+    """Physically consecutive runs of a block list."""
+    return len(blocks) and 1 + sum(b != a + 1 for a, b in zip(blocks, blocks[1:]))
+
+
+def _fragmentation(prefill: list[list[dict]], decode: list[list[dict]], verified: list[set[str]]) -> dict:
+    """How scattered one TP rank's pulled blocks were: for each pull decode
+    posted, its blocks of each group (``allocated_groups`` of that step) and
+    the producer's at the same places (its allocations, by base request id),
+    each side's physical runs. A pull is fragmented on a side when a group's
+    blocks there are not one run; jointly contiguous runs (consecutive on
+    both sides at once) are what a connector can merge into one transfer.
+    Only pulls with a successful byte check (`verified[i]`, decode's i-th
+    log's) whose every block has the producer's are classified; the others
+    are counted apart: unlogged (no allocations by group: one full-attention
+    group without prefix caching), unchecked, unmatched (a producer place
+    missing; `unmatched_groups`, their groups)."""
+    produced: dict[str, dict[int, dict[int, int]]] = {}
+    for records in prefill:
+        for record in records:
+            for request, entries in ((record.get("kv_events") or {}).get("allocated_groups") or {}).items():
+                table = produced.setdefault(_base_request_id(request), {})
+                for entry in entries:
+                    places = table.setdefault(entry["group"], {})
+                    for offset, block in enumerate(entry["blocks"]):
+                        places[entry["first"] + offset] = block
+    kinds = {(False, False): "contiguous", (True, False): "fragmented_prefill_only",
+             (False, True): "fragmented_decode_only", (True, True): "fragmented_both"}
+    counts = dict.fromkeys(kinds.values(), 0)
+    joint = unlogged = unchecked = unmatched = unmatched_groups = 0
+    for records, checked in zip(decode, verified):
+        for record in records:
+            events = record.get("kv_events") or {}
+            for request in events.get("reads_posted") or []:
+                table = produced.get(_base_request_id(request)) or {}
+                entries = (events.get("allocated_groups") or {}).get(request)
+                if not entries:
+                    unlogged += 1
+                    continue
+                if request not in checked:
+                    unchecked += 1
+                    continue
+                groups = [[(block, (table.get(entry["group"]) or {}).get(entry["first"] + offset))
+                           for offset, block in enumerate(entry["blocks"]) if block] for entry in entries]
+                missing = sum(any(p is None for _, p in pairs) for pairs in groups)
+                if missing:
+                    unmatched += 1
+                    unmatched_groups += missing
+                    continue
+                sides = [False, False]
+                for pairs in groups:
+                    ours, theirs = [d for d, _ in pairs], [p for _, p in pairs]
+                    sides[0] |= _runs(theirs) > 1
+                    sides[1] |= _runs(ours) > 1
+                    joint += len(pairs) and 1 + sum(
+                        not (d2 == d1 + 1 and p2 == p1 + 1) for (d1, p1), (d2, p2) in zip(pairs, pairs[1:]))
+                counts[kinds[tuple(sides)]] += 1
+    return {"pulls": sum(counts.values()) + unlogged + unchecked + unmatched, **counts, "unlogged": unlogged,
+            "unchecked": unchecked, "unmatched": unmatched, "jointly_contiguous_runs": joint,
+            "unmatched_groups": unmatched_groups}
+
+
+def _admissions(records: list[dict]) -> dict[str, list[dict]]:
+    """Each request's admissions in a rank's step log, in order: a new or
+    resumed request's tokens computed when admitted (``admitted``), its
+    blocks then by group (``allocated_groups`` from place 0; the null block,
+    0, holding a window's clipped places) and, when a pull was posted for it
+    before, that pull's (first place, blocks) by group."""
+    admissions: dict[str, list[dict]] = {}
+    posted: dict[str, dict[int, tuple[int, list[int]]]] = {}
+    for record in records:
+        events = record.get("kv_events") or {}
+        by_group = events.get("allocated_groups") or {}
+        for request in events.get("reads_posted") or []:
+            posted[request] = {entry["group"]: (entry["first"], list(entry["blocks"]))
+                               for entry in by_group.get(request, [])}
+        for request, computed in (events.get("admitted") or {}).items():
+            admissions.setdefault(request, []).append({
+                "computed": computed,
+                "table": {entry["group"]: list(entry["blocks"]) for entry in by_group.get(request, [])
+                          if entry["first"] == 0},
+                "pull": posted.pop(request, None)})
+    return admissions
+
+
+def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dict]]) -> tuple[list[str], list[dict]]:
+    """A rank's prefix hit checks against its requests' admissions, and the
+    checks that agree with them. Each admission implies a hit of each
+    group's places before its pull's first (decode, a pull posted), else
+    before its computed tokens' full blocks: its blocks there, null ones
+    (a window's clipped head) left out. Each admission with such blocks has
+    one hit check, in order, of exactly those places and blocks, its bytes
+    the layout's for them; no request has any other. A pull's blocks must be
+    the request's at their places when admitted, its first within the
+    admitted computed tokens."""
+    groups = layout.get("groups")
+    if not groups:
+        return ["the layout lists no KV cache groups to check prefix hits by"], []
+    problems: list[str] = []
+    expected: dict[str, list[dict[int, list[tuple[int, int]]]]] = {}
+    for request, adms in admissions.items():
+        for admission in adms:
+            pull, table = admission["pull"], admission["table"]
+            for group, (first, blocks) in (pull or {}).items():
+                size = groups[group]["block_size"] if 0 <= group < len(groups) else None
+                if table.get(group, [])[first:first + len(blocks)] != blocks:
+                    problems.append(f"{request}'s pull of group {group} ({len(blocks)} block(s) from {first}) is "
+                                    "not its blocks there when admitted")
+                elif size is None or first * size > admission["computed"]:
+                    problems.append(f"{request}'s pull of group {group} starts at block {first}, past the "
+                                    f"{admission['computed']} tokens it was admitted with")
+            want = {}
+            for group, spec in enumerate(groups):
+                count = (pull.get(group, (0, []))[0] if pull is not None
+                         else admission["computed"] // spec["block_size"])
+                row = table.get(group, [])
+                places = [(place, row[place]) for place in range(min(count, len(row))) if row[place]]
+                if places:
+                    want[group] = places
+            if want:
+                expected.setdefault(request, []).append(want)
+    logged: dict[str, list[dict]] = {}
+    for check in hits:
+        if "groups" in check:  # a hit outside the lifecycle has none, reported apart
+            logged.setdefault(check.get("req_id"), []).append(check)
+    valid = []
+    for request in sorted(set(expected) | set(logged), key=str):
+        want, got = expected.get(request, []), logged.get(request, [])
+        if len(want) != len(got):
+            problems.append(f"{request} logged {len(got)} prefix hit check(s), not the {len(want)} its "
+                            f"admissions imply ({[sum(map(len, w.values())) for w in want]} block(s))")
+        for places, check in zip(want, got):
+            found = []
+            seen = {}
+            for g in check["groups"]:
+                if any(key not in g for key in ("group", "logical_blocks", "block_ids", "blocks", "bytes")):
+                    found.append(f"{request}'s hit check of group {g.get('group')} lacks its places, blocks or "
+                                 "bytes")
+                    continue
+                spec = groups[g["group"]] if 0 <= g["group"] < len(groups) else None
+                seen[g["group"]] = list(zip(g["logical_blocks"], g["block_ids"]))
+                per_block = None if spec is None else (
+                    spec["transfer"]["bytes_per_block"] if "transfer" in spec
+                    else spec.get("checked_bytes_per_block") or spec["layers"] * spec["block_bytes"])
+                if (len(g["logical_blocks"]), len(g["block_ids"])) != (g["blocks"], g["blocks"]) or (
+                        per_block is None or g["bytes"] != g["blocks"] * per_block):
+                    found.append(f"{request}'s hit check of group {g['group']} ({g['blocks']} block(s), "
+                                 f"{g['bytes']} bytes) disagrees with the layout ({per_block} bytes a block)")
+            if seen != places:
+                found.append(f"{request}'s hit check covers {_places(seen)}, not its admitted hit "
+                             f"{_places(places)}")
+            if (check.get("blocks"), check.get("bytes")) != (sum(g.get("blocks", 0) for g in check["groups"]),
+                                                             sum(g.get("bytes", 0) for g in check["groups"])):
+                found.append(f"{request}'s hit check is not its groups' sum")
+            if not (check.get("blocks") and check.get("bytes")):
+                found.append(f"{request}'s hit check covers no bytes")
+            problems.extend(found)
+            if not found and check.get("ok") and not check.get("mismatched_bytes"):
+                valid.append(check)
+    return _capped(problems), valid
+
+
+def _places(places: dict[int, list[tuple[int, int]]]) -> str:
+    """Hit places by group, briefly: each group's count and first and last
+    (place: block)."""
+    return "; ".join(f"group {group}: {len(p)} block(s)" + (f" {p[0][0]}:{p[0][1]}..{p[-1][0]}:{p[-1][1]}" if p else "")
+                     for group, p in sorted(places.items())) or "nothing"
 
 
 def _request_steps(records: list[dict]) -> dict[str, list[tuple[int, int, int, int]]]:
@@ -1086,7 +1384,7 @@ def _group_evidence(layout: dict, checks: list[dict], records: list[dict]) -> li
 
 def _prefix_caching_flags(run: Run) -> list[str]:
     """The server's prefix caching: as set, else off for the byte checks
-    (the pattern is the request's), else vLLM's default."""
+    (their request patterns), else vLLM's default."""
     enabled = run.server.enable_prefix_caching
     if enabled is None:
         enabled = False if run.kv_check else None
