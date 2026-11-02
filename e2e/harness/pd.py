@@ -510,7 +510,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "groups": layout and layout.get("groups") and _group_evidence(layout, checks, records),
                 "kv_bytes_checked": sum(int(c.get("bytes") or 0) for c in checks),
                 # Of them, NIXL's moves of regions holding none of a group's
-                # layers (a hybrid's shorter state group).
+                # layers (a shorter group's: a hybrid's state or attention).
                 "kv_bytes_transfer_only": sum(int(g.get("transfer_only_bytes") or 0)
                                               for c in checks for g in c.get("groups") or []),
                 "kv_bytes_spanned": _spanned_bytes(layout, checks) if layout else 0,
@@ -936,8 +936,9 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             if g["group"] in invalid:
                 pass  # its malformed layout is reported above
             elif "transfer" in spec:
-                # A hybrid over NIXL: the native selection of each block, its
-                # transfer-only regions and its state pages' unmoved padding.
+                # Several groups over NIXL: the native selection of each
+                # block, its transfer-only regions and its state pages'
+                # unmoved padding.
                 transfer = spec["transfer"]
                 want = {key: g["blocks"] * transfer[per] for key, per in (
                     ("bytes", "bytes_per_block"), ("transfer_only_bytes", "transfer_only_bytes_per_block"),
