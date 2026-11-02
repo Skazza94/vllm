@@ -850,11 +850,19 @@ class GroupAllocations:
         return allocated
 
 
-def group_allocations(kv_cache_config: KVCacheConfig) -> GroupAllocations | None:
+def group_allocations(
+    kv_cache_config: KVCacheConfig, prefix_caching: bool = False
+) -> GroupAllocations | None:
     """A `GroupAllocations` for a model of several KV cache groups or of
-    sliding windows; None for one group of full attention."""
+    sliding windows, or with prefix caching (a pull starts past a prefix
+    hit, the blocks it fills logged where they are); None for one group of
+    full attention."""
     groups = kv_cache_config.kv_cache_groups
-    if len(groups) == 1 and not isinstance(groups[0].kv_cache_spec, SlidingWindowSpec):
+    if (
+        len(groups) == 1
+        and not isinstance(groups[0].kv_cache_spec, SlidingWindowSpec)
+        and not prefix_caching
+    ):
         return None
     return GroupAllocations(kv_cache_config.transfer_group_ids)
 
@@ -867,7 +875,9 @@ def scheduled_kv_events(
     `kv_events` record: blocks newly allocated to each request (every KV
     cache group's, but the null block; by group with `allocations`), the
     requests
-    resumed after a preemption (their blocks replaced), the remote reads this
+    resumed after a preemption (their blocks replaced), the tokens each new
+    or resumed request was admitted with as computed (its prefix hit, or
+    with a pull its hit and the pulled tokens), the remote reads this
     step posts, the producer requests told to free their blocks without a
     read (by their remote id), and the requests finished (completed or
     aborted) since the previous step."""
@@ -891,7 +901,13 @@ def scheduled_kv_events(
         else:
             # Aborted before decode allocated blocks: only frees prefill's.
             notified.append(read.remote_request_id)
-    events: dict[str, object] = {"allocated": allocated}
+    admitted = {new.req_id: new.num_computed_tokens for new in scheduler_output.scheduled_new_reqs}
+    admitted.update(
+        (req_id, computed)
+        for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens)
+        if req_id in cached.resumed_req_ids
+    )
+    events: dict[str, object] = {"allocated": allocated, "admitted": admitted}
     if allocations is not None:
         events["allocated_groups"] = allocations.events(scheduler_output, requested)
     return {

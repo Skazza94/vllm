@@ -535,6 +535,13 @@ class InputProcessor:
                     )
                 )
 
+        self.vllm_config.simulation_config.check_pattern_request(
+            self.cache_config.enable_prefix_caching,
+            lora_request=lora_request,
+            cache_salt=decoder_input.get("cache_salt"),
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+        )
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,

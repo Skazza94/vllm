@@ -524,12 +524,6 @@ def test_simulated_mode_is_the_default_and_unchanged(model_dir):
         ({}, {"kv_buffer_device": "cuda"}, {}, "CPU KV buffers"),
         ({"kv_transfer_timing": {"load_gbps": 1}}, {}, {}, "no kv_transfer_timing"),
         ({}, {}, {"kv_cache_memory_bytes": None}, "explicit kv_cache_memory_bytes"),
-        (
-            {"kv_pattern_check": True, "log_path": "/tmp/steps"},
-            {"kv_role": "kv_consumer"},
-            {"enable_prefix_caching": True},
-            "prefix caching disabled for kv_pattern_fill",
-        ),
         ({"clock": "virtual"}, {}, {}, "the real clock"),
     ],
 )
@@ -552,10 +546,33 @@ def test_pattern_options_need_real_mode_and_their_role(model_dir, simulation, kv
         engine_config(model_dir, simulation, kv_transfer)
 
 
-def test_real_mode_allows_prefix_caching(model_dir):
+def test_real_mode_allows_prefix_caching(model_dir, mla_model_dir):
     config = engine_config(model_dir, enable_prefix_caching=True)
     assert config.cache_config.enable_prefix_caching
     assert config.simulation_config.kv_transfer_mode == "real"
+    # With the pattern checks too: a block's pattern is then its content's.
+    check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
+    for model in (model_dir, mla_model_dir):
+        for connector in ("NixlConnector", "MooncakeConnector"):
+            config = engine_config(
+                model, check, {"kv_connector": connector}, enable_prefix_caching=True
+            )
+            assert config.simulation_config.kv_pattern_check
+
+
+def test_pattern_checks_with_prefix_caching_refuse_dsa_and_mtp(tmp_path_factory):
+    """Not validated with content patterns: DSA's indexer cache, speculative
+    drafts (hybrids and DeepSeek-V4 are refused prefix caching anyway)."""
+    check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
+    v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-pc", DEEPSEEK_V32)
+    with pytest.raises(ValueError, match=r"sparse MLA \(DSA\) without prefix caching"):
+        engine_config(v32, check, dtype="bfloat16", block_size=64, enable_prefix_caching=True)
+    engine_config(v32, check, dtype="bfloat16", block_size=64)
+    v3 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-pc", deepseek_v3(1))
+    mtp = {"method": "mtp", "num_speculative_tokens": 1}
+    with pytest.raises(ValueError, match="no speculative decoding with prefix caching"):
+        engine_config(v3, check, speculative_config=mtp, enable_prefix_caching=True)
+    engine_config(v3, check, speculative_config=mtp)
 
 
 def test_simulated_blocks_need_a_multiple_of_16(model_dir):
@@ -2260,6 +2277,135 @@ def test_nixl_peers_of_other_mtp_depths_are_refused_before_a_read(tmp_path, chec
                           consumer_kwargs={**mtp(3), "check": check}, logs=True)
     assert c["transfers"] == 0 and c["reads"] == int(check)
     assert "holds its states otherwise" in c["log"]
+
+
+# Prefix caching between NIXL peers: request A, then B sharing A's prompt
+# and A's generated tokens (the fallback token, 0) on decode.
+NIXL_PREFIX_PEER = r"""
+import json, os, sys, time
+
+def main():
+    role, model, kwargs, out, memory = sys.argv[1:6]
+    from vllm import LLM, SamplingParams
+    producer = role == "producer"
+    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+                  "timing": "linear", "timing_args": {"fixed_us": 100},
+                  "log_path": out + ".steps",
+                  ("kv_pattern_fill" if producer else "kv_pattern_check"): True}
+    llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
+              max_model_len=256, kv_cache_memory_bytes=int(memory), block_size=16,
+              max_num_batched_tokens=64, enable_prefix_caching=True,
+              enforce_eager=True, simulation_config=simulation,
+              kv_transfer_config={
+                  "kv_connector": "NixlConnector",
+                  "kv_role": "kv_producer" if producer else "kv_consumer",
+                  "kv_buffer_device": "cpu",
+                  "kv_connector_extra_config": {"backends": ["Mooncake"]}},
+              **json.loads(kwargs))
+    prompts = json.loads(sys.argv[6])
+    if producer:
+        params = []
+        for prompt in prompts:
+            (output,) = llm.generate(
+                [{"prompt_token_ids": prompt}],
+                SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False,
+                               extra_args={"kv_transfer_params": {"do_remote_decode": True}}),
+                use_tqdm=False)
+            params.append(output.kv_transfer_params)
+        with open(out + ".tmp", "w") as f:
+            json.dump({"params": params}, f)
+        os.rename(out + ".tmp", out)
+        while not os.path.exists(out + ".done"):
+            time.sleep(0.2)
+    else:
+        with open(sys.argv[7]) as f:
+            remote = json.load(f)
+        outputs = []
+        for prompt, params, max_tokens in zip(prompts, remote["params"], json.loads(sys.argv[8])):
+            (output,) = llm.generate(
+                [{"prompt_token_ids": prompt}],
+                SamplingParams(max_tokens=max_tokens, ignore_eos=True, detokenize=False,
+                               extra_args={"kv_transfer_params": params}),
+                use_tqdm=False)
+            outputs.append(list(output.outputs[0].token_ids))
+        with open(out, "w") as f:
+            json.dump({"outputs": outputs}, f)
+    with open(out + ".steps") as f:
+        checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
+    with open(out + ".checks", "w") as f:
+        json.dump(checks, f)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def test_nixl_peers_check_prefix_hits_and_pages_completed_by_generation(model_dir, tmp_path):
+    """Prefix caching on both instances. A (40 tokens, its last page partial)
+    is pulled, then decode generates 26 tokens, completing that page and a
+    wholly generated one. B's prompt is A's, 24 of its generated tokens and
+    10 more: prefill hits A's two full prompt pages, decode hits four pages
+    (two completed by generation) and pulls the rest. Every check passes."""
+    import socket
+    import subprocess
+    import sys
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    a = [(7 * i) % 120 + 1 for i in range(40)]
+    b = a + [0] * 24 + [3] * 10
+    prompts, max_tokens = json.dumps([a, b]), json.dumps([26, 2])
+    script = tmp_path / "peer.py"
+    script.write_text(NIXL_PREFIX_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+    producer = subprocess.Popen(
+        [sys.executable, str(script), "producer", model_dir, "{}", str(produced),
+         str(8 * 1024**2), prompts],
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, "the producer exited"
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        consumer = subprocess.run(
+            [sys.executable, str(script), "consumer", model_dir, "{}", str(consumed),
+             str(12 * 1024**2), prompts, str(produced), max_tokens],
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+            timeout=600, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        assert consumer.returncode == 0, consumer.stdout[-4000:]
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            producer.kill()
+    assert json.loads(consumed.read_text())["outputs"][0] == [0] * 26
+    p_checks = json.loads((tmp_path / "producer.json.checks").read_text())
+    c_checks = json.loads((tmp_path / "consumer.json.checks").read_text())
+    assert all(c["ok"] for c in p_checks + c_checks), p_checks + c_checks
+    # Prefill: B hits A's two full prompt pages.
+    (p_hit,) = p_checks
+    assert p_hit["kind"] == "hit" and p_hit["groups"][0]["logical_blocks"] == [0, 1]
+    # Decode: A's pull (3 pages), B's hit (4 pages, two completed by
+    # generation) and B's pull after it (its last page, logical 4).
+    pulls = [c for c in c_checks if "kind" not in c]
+    hits = [c for c in c_checks if c.get("kind") == "hit"]
+    assert [c["blocks"] for c in pulls] == [3, 1]
+    (hit,) = hits
+    assert hit["groups"][0]["logical_blocks"] == [0, 1, 2, 3]
 
 
 def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):

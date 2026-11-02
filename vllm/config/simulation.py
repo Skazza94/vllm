@@ -297,6 +297,38 @@ class SimulationConfig:
             )
         kv_transfer.kv_connector_module_path = kv_nixl.__name__
 
+    def check_pattern_request(
+        self,
+        enable_prefix_caching: bool,
+        *,
+        lora_request: object,
+        cache_salt: str | None,
+        prompt_embeds: object,
+        mm_features: object,
+    ) -> None:
+        """With prefix caching, the pattern checks seed a block by its tokens:
+        a request whose cache key adds more (a LoRA adapter, a salt, embedded
+        or multimodal input) is refused at intake, before it is scheduled."""
+        if not (self.kv_pattern_fill or self.kv_pattern_check) or not (
+            enable_prefix_caching
+        ):
+            return
+        extra = [
+            name
+            for name, present in (
+                ("a LoRA adapter", lora_request is not None),
+                ("a cache_salt", bool(cache_salt)),
+                ("prompt embeddings", prompt_embeds is not None),
+                ("multimodal inputs", bool(mm_features)),
+            )
+            if present
+        ]
+        if extra:
+            raise ValueError(
+                "KV pattern checks with prefix caching take token prompts only, "
+                f"not {', '.join(extra)}: a block's pattern is its tokens'."
+            )
+
     def _verify_real_kv_transfer(self, vllm_config: "VllmConfig") -> None:
         """Check what real transfers under simulated compute support so far:
         CPU KV buffers moved by a native connector (NIXL or Mooncake) between
@@ -350,10 +382,6 @@ class SimulationConfig:
         cache = vllm_config.cache_config
         if cache.kv_cache_memory_bytes is None:
             problems.append("an explicit kv_cache_memory_bytes")
-        if cache.enable_prefix_caching and (self.kv_pattern_fill or self.kv_pattern_check):
-            # The pattern is the request's: a block cached for another
-            # request holds another pattern.
-            problems.append("prefix caching disabled for kv_pattern_fill and kv_pattern_check")
         parallel = vllm_config.parallel_config
         sizes = {
             "TP": parallel.tensor_parallel_size,
@@ -423,6 +451,22 @@ class SimulationConfig:
                     "a BF16 sparse-MLA latent cache (kv_cache_dtype auto of a "
                     f"BF16 model, or bfloat16), not {cache.cache_dtype} "
                     f"({resolved})"
+                )
+        if cache.enable_prefix_caching and (self.kv_pattern_fill or self.kv_pattern_check):
+            # The pattern is then a block's content (its tokens and every
+            # earlier one, as prefix caching keys it): attention caches.
+            # A hybrid's states and DeepSeek-V4's caches are refused below
+            # and above; DSA's indexer cache and speculative drafts are not
+            # validated with it.
+            if dsa:
+                problems.append(
+                    "sparse MLA (DSA) without prefix caching for kv_pattern_fill "
+                    "and kv_pattern_check"
+                )
+            if vllm_config.speculative_config is not None:
+                problems.append(
+                    "no speculative decoding with prefix caching for "
+                    "kv_pattern_fill and kv_pattern_check"
                 )
         if sparse_mla or model.is_attention_free:
             problems.append(

@@ -39,6 +39,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     NativeSelection,
     PatternChecker,
     PatternFiller,
+    TokenChains,
     block_views,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
@@ -272,7 +273,9 @@ class SimulatedModelRunner(GPUModelRunner):
         sim = self.vllm_config.simulation_config
         tp = get_tp_group()
         groups = self.kv_cache_config.kv_cache_groups
-        self._kv_allocations = group_allocations(self.kv_cache_config)
+        self._kv_allocations = group_allocations(
+            self.kv_cache_config, self.cache_config.enable_prefix_caching
+        )
         # A model of several KV cache groups over NIXL (a hybrid's, or
         # attention groups, whose unequal layers leave a slot holding none of
         # a group's layers, moved with it): what the native worker selects,
@@ -280,6 +283,13 @@ class SimulatedModelRunner(GPUModelRunner):
         native = (
             self.model_config.is_hybrid or len(groups) > 1
         ) and self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
+        # With prefix caching, a block may hold another request's KV: its
+        # pattern is its content's (each group's block size keys it).
+        chains = (
+            TokenChains([group.kv_cache_spec.block_size for group in groups])
+            if self.cache_config.enable_prefix_caching
+            else None
+        )
         if (sim.kv_pattern_fill or sim.kv_pattern_check) and not native:
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).
@@ -287,13 +297,16 @@ class SimulatedModelRunner(GPUModelRunner):
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
             layers = [group.layer_names for group in groups]
             if sim.kv_pattern_fill:
-                self._kv_filler = PatternFiller(views, tp.rank_in_group, layers)
+                self._kv_filler = PatternFiller(
+                    views, tp.rank_in_group, layers, chains
+                )
             if sim.kv_pattern_check:
                 self._kv_checker = PatternChecker(
                     views,
                     tp.rank_in_group,
                     layers,
                     self.kv_cache_config.transfer_group_ids,
+                    chains,
                 )
             logger.info(
                 "KV pattern %s over %d layers.",
@@ -311,12 +324,13 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.kv_cache_config.transfer_group_ids,
             )
             if sim.kv_pattern_fill:
-                self._kv_filler = NativeFiller(selection, tp.rank_in_group)
+                self._kv_filler = NativeFiller(selection, tp.rank_in_group, chains)
             if sim.kv_pattern_check:
                 self._kv_checker = NativeChecker(
                     selection,
                     tp.rank_in_group,
                     self.kv_cache_config.transfer_group_ids,
+                    chains,
                 )
                 self._kv_checker.watch_reads()
             logger.info(
@@ -447,6 +461,12 @@ class SimulatedModelRunner(GPUModelRunner):
         if self._kv_filler is not None:
             # After the runner zeroed this step's new blocks.
             self._kv_filler.after_update(scheduler_output)
+            if self.step_log is not None and (checks := self._kv_filler.take_results()):
+                self.step_log.write_kv_checks(checks, self.clock.now())
+        if self._kv_checker is not None:
+            # The pages this step completes (prefix caching), after the
+            # zeroing too.
+            self._kv_checker.after_update(scheduler_output)
         if self._real_kv_transfer and self.step_log is not None:
             self._log_new_threads()
             self._kv_events = scheduled_kv_events(
@@ -587,6 +607,8 @@ class SimulatedModelRunner(GPUModelRunner):
                 for tokens, n in zip(sampled.tolist(), num_sampled_np.tolist())
             ],
         )
+        if self._kv_checker is not None:
+            self._kv_checker.sampled(output.req_ids, output.sampled_token_ids)
 
         if self.step_log is not None and self._logs_steps:
             self.step_log.write(

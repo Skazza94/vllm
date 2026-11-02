@@ -19,6 +19,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     SENTINEL,
     PatternChecker,
     PatternFiller,
+    TokenChains,
     block_views,
     pattern,
 )
@@ -41,9 +42,11 @@ def caches(num_blocks=8):
 
 def new_request_step(req_id, block_ids):
     return SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id=req_id, block_ids=(block_ids,))],
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id=req_id, block_ids=(block_ids,), num_computed_tokens=0)
+        ],
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+            req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
         ),
         finished_req_ids=set(),
     )
@@ -239,15 +242,20 @@ def test_kv_events_follow_a_request_lifecycle():
         tp_size=1,
         remote=step.kv_connector_metadata.reqs_to_recv[DECODE_ID].remote,
     )
-    step.scheduled_new_reqs = [SimpleNamespace(req_id=DECODE_ID, block_ids=([1, 2],))]
+    step.scheduled_new_reqs = [
+        SimpleNamespace(req_id=DECODE_ID, block_ids=([1, 2],), num_computed_tokens=7)
+    ]
     step.scheduled_cached_reqs = SimpleNamespace(
         req_ids=["cmpl-old-0-1", "cmpl-pre-0-1"],
         new_block_ids=[([7],), ([4, 6],)],
+        num_computed_tokens=[30, 4],
         resumed_req_ids={"cmpl-pre-0-1"},
     )
     step.finished_req_ids = {"cmpl-done-0-1"}
     assert scheduled_kv_events(step) == {
         "allocated": {DECODE_ID: [1, 2], "cmpl-old-0-1": [7], "cmpl-pre-0-1": [4, 6]},
+        # Computed at admission: a new request's, a resumed one's (its hit).
+        "admitted": {DECODE_ID: 7, "cmpl-pre-0-1": 4},
         "resumed": ["cmpl-pre-0-1"],
         "reads_posted": [DECODE_ID],
         # The aborted request only frees prefill's blocks, named by prefill's id.
@@ -357,7 +365,7 @@ def test_mooncake_requests_are_lifecycle_events():
     step = mooncake_step(DECODE_ID, [1, 2])
     step.scheduled_new_reqs = []
     step.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
     )
     step.finished_req_ids = set()
     events = scheduled_kv_events(step)
@@ -500,7 +508,10 @@ def groups_step(req_id, *block_ids, cached=False):
     if cached:
         step.scheduled_new_reqs = []
         step.scheduled_cached_reqs = SimpleNamespace(
-            req_ids=[req_id], new_block_ids=[tuple(block_ids)], resumed_req_ids=set()
+            req_ids=[req_id],
+            new_block_ids=[tuple(block_ids)],
+            num_computed_tokens=[0],
+            resumed_req_ids=set(),
         )
     else:
         step.scheduled_new_reqs[0].block_ids = tuple(block_ids)
@@ -530,7 +541,7 @@ def mooncake_pull(req_id, block_ids, first):
         kv_connector_metadata=metadata,
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+            req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
         ),
         finished_req_ids=set(),
     )
@@ -734,6 +745,8 @@ def test_allocations_by_group_are_kept_for_several_groups_or_a_window():
         )
 
     assert group_allocations(config(full)) is None
+    # With prefix caching a pull starts past a hit: logged by group too.
+    assert group_allocations(config(full), prefix_caching=True) is not None
     assert group_allocations(config(window)) is not None
     assert group_allocations(config(full, full)).transfer_group_ids == (0, 1)
 
@@ -1240,3 +1253,422 @@ def test_real_transfers_take_a_dsa_group_of_its_latent_and_indexer_keys():
         with pytest.raises(ValueError, match=message):
             check_real_kv_groups(config(*members), dsa=True)
 
+
+
+# Prefix caching: a block's pattern is its content's (TokenChains).
+
+BLOCK = 4  # tokens a block, as caches() holds them
+
+
+def step(new=(), cached=(), finished=(), metadata=None):
+    """A scheduler output: new requests (req_id, block ids, prompt, computed,
+    scheduled), running ones (req_id, new block ids, computed, scheduled,
+    resumed)."""
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id=r, block_ids=(ids,), prompt_token_ids=prompt, num_computed_tokens=c
+            )
+            for r, ids, prompt, c, _ in new
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[r for r, *_ in cached],
+            new_block_ids=[None if ids is None else (ids,) for _, ids, *_ in cached],
+            num_computed_tokens=[c for _, _, c, _, _ in cached],
+            resumed_req_ids={r for r, *_, resumed in cached if resumed},
+        ),
+        num_scheduled_tokens={r: n for r, *_, n in new}
+        | {r: n for r, _, _, n, _ in cached},
+        finished_req_ids=set(finished),
+        kv_connector_metadata=metadata,
+    )
+
+
+def pull(local, remote, computed=()):
+    """A step posting a pull (a full scheduler output)."""
+    return step(metadata=recv_step(local, remote, computed).kv_connector_metadata)
+
+
+def test_content_identity_follows_the_tokens():
+    chains = TokenChains([BLOCK, 2 * BLOCK])
+    chains.admit("a", list(range(16)))
+    chains.admit("b", list(range(12)) + [99, 98])
+    chains.admit("c", [7] + list(range(1, 16)))
+    # A shared prefix: the same full blocks, whichever request.
+    assert chains.identity("a", 0, 2, BLOCK) == chains.identity("b", 0, 2, BLOCK)
+    assert chains.identity("a", 1, 0, 8) == chains.identity("b", 1, 0, 8)
+    # One token earlier in the chain differs: every later block differs.
+    assert chains.identity("a", 0, 0, BLOCK) != chains.identity("c", 0, 0, BLOCK)
+    assert chains.identity("a", 0, 3, BLOCK) != chains.identity("c", 0, 3, BLOCK)
+    # Another place, fill or block size differs.
+    assert chains.identity("a", 0, 3, BLOCK) != chains.identity("b", 0, 3, 2)
+    assert chains.identity("a", 0, 3, 2) != chains.identity("a", 0, 3, 3)
+    assert chains.identity("a", 0, 1, BLOCK) != chains.identity("a", 1, 0, BLOCK)
+    # A prompt's partial last block: its tokens so far.
+    assert chains.prompt_content("b", 0, 3) == chains.identity("b", 0, 3, 2)
+    # Tokens not known yet are refused, not guessed.
+    with pytest.raises(ValueError, match="tokens up to 20 are unknown"):
+        chains.identity("a", 0, 4, BLOCK)
+    chains.admit("e", None)
+    with pytest.raises(ValueError, match="no prompt token ids"):
+        chains.prompt_content("e", 0, 0)
+    # The same identity seeds the same bytes on any layer it is given with.
+    a = pattern("x", LAYERS[0], 2, 64, identity=chains.identity("a", 0, 2, BLOCK))
+    b = pattern("y", LAYERS[0], 2, 64, identity=chains.identity("b", 0, 2, BLOCK))
+    assert torch.equal(a, b)
+    assert not torch.equal(a, pattern("x", LAYERS[1], 2, 64, identity=chains.identity("a", 0, 2, BLOCK)))
+    assert not torch.equal(a, pattern("x", LAYERS[0], 2, 64, 1, chains.identity("a", 0, 2, BLOCK)))
+
+
+def test_without_prefix_caching_the_pattern_is_still_the_requests():
+    import hashlib
+
+    import numpy as np
+
+    seed = hashlib.blake2b(f"cmpl-abc-0|tp1|{LAYERS[0]}|3".encode(), digest_size=16).digest()
+    want = np.random.Generator(np.random.PCG64(int.from_bytes(seed, "little"))).integers(
+        1, 256, 128, dtype=np.uint8
+    )
+    assert pattern(PREFILL_ID, LAYERS[0], 3, 128, 1).numpy().tolist() == want.tolist()
+
+
+PROMPT_A = list(range(100, 110))  # 10 tokens: two full blocks and a partial one
+
+
+def content_sides():
+    chains_p, chains_d = TokenChains([BLOCK]), TokenChains([BLOCK])
+    prefill, decode = block_views(caches(12), 12), block_views(caches(12), 12)
+    filler = PatternFiller(prefill, chains=chains_p)
+    checker = PatternChecker(decode, chains=chains_d)
+    return prefill, decode, filler, checker
+
+
+def holds(views, block, chains, req_id, logical, n):
+    return all(
+        torch.equal(
+            view[block],
+            pattern(req_id, layer, logical, view.shape[1], identity=chains.identity(req_id, 0, logical, n)),
+        )
+        for layer, view in views.items()
+    )
+
+
+def test_prefill_prefix_hits_are_compared_and_never_rewritten():
+    prefill, _, filler, _ = content_sides()
+    filler.after_update(step(new=[("a", [1, 2, 3], PROMPT_A, 0, 10)]))
+    assert holds(prefill, 3, filler.chains, "a", 2, 2)
+    assert filler.take_results() == []
+    # B shares A's two full blocks (a prefix hit of 8 tokens).
+    prompt_b = PROMPT_A[:8] + [7, 7, 7]
+    before = {layer: view[[1, 2]].clone() for layer, view in prefill.items()}
+    filler.after_update(step(new=[("b", [1, 2, 5], prompt_b, 8, 3)]))
+    (hit,) = filler.take_results()
+    assert hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["blocks"] == 2 and hit["groups"][0]["logical_blocks"] == [0, 1]
+    assert all(torch.equal(view[[1, 2]], before[layer]) for layer, view in prefill.items())
+    assert holds(prefill, 5, filler.chains, "b", 2, 3)
+    # A corrupted cached page fails the next request's hit, unrepaired.
+    prefill[LAYERS[1]][2][5] ^= 0xFF
+    filler.after_update(step(new=[("c", [1, 2, 6], PROMPT_A[:8] + [1], 8, 1)]))
+    (hit,) = filler.take_results()
+    assert not hit["ok"] and hit["mismatched_bytes"] == 1
+    assert hit["mismatched_blocks"] == [[LAYERS[1], 1, 2, 1]]
+
+
+def test_a_pull_is_compared_when_its_request_runs():
+    prefill, decode, filler, checker = content_sides()
+    filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A, 0, 10)]))
+    checker.before_step(pull([1, 2, 4], [3, 5, 6]))
+    transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+    # Finished, but the prompt arrives with the request's first step.
+    assert checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID})) == []
+    checker.before_step(step(new=[(DECODE_ID, [1, 2, 4], PROMPT_A, 9, 1)]))
+    (result,) = checker.after_step(None)
+    assert result["ok"], result
+    assert result["blocks"] == 3 and "kind" not in result
+
+
+def test_a_pull_of_another_prompt_fails():
+    prefill, decode, filler, checker = content_sides()
+    filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A, 0, 10)]))
+    checker.before_step(pull([1, 2, 4], [3, 5, 6]))
+    transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+    checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    checker.before_step(step(new=[(DECODE_ID, [1, 2, 4], PROMPT_A[:9] + [0], 9, 1)]))
+    (result,) = checker.after_step(None)
+    assert not result["ok"]
+    # Only the last block holds the differing token.
+    assert {block[1] for block in result["mismatched_blocks"]} == {2}
+
+
+def test_a_page_completed_by_generation_is_reused_by_a_later_request():
+    """Response 126's case: A's last pulled page is partial; decode's own
+    steps complete it with a generated token, and B, whose prompt is A's
+    prompt and that token and more, hits it. A page wholly generated is
+    reused the same way."""
+    prefill, decode, filler, checker = content_sides()
+    filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A, 0, 10)]))
+    checker.before_step(pull([1, 2, 4], [3, 5, 6]))
+    transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+    checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    # Decode recomputes the last prompt token (N - 1), then generates.
+    first = step(new=[(DECODE_ID, [1, 2, 4], PROMPT_A, 9, 1)])
+    checker.before_step(first)
+    checker.after_update(first)
+    (pulled,) = checker.after_step(None)
+    assert pulled["ok"]
+    assert holds(decode, 4, checker.chains, DECODE_ID, 2, 2)  # not complete yet
+    generated = [50, 51, 52, 53, 54, 55]
+    computed = 10
+    for token in generated:
+        checker.sampled([DECODE_ID], [[token]])
+        new_ids = [8] if computed == 12 else None
+        s = step(cached=[(DECODE_ID, new_ids, computed, 1, False)])
+        checker.before_step(s)
+        checker.after_update(s)
+        assert checker.after_step(None) == []
+        computed += 1
+    chain = PROMPT_A + generated
+    # Page 2 (tokens 8-11, two generated) and page 3 (12-15, all generated).
+    assert holds(decode, 4, checker.chains, DECODE_ID, 2, BLOCK)
+    assert holds(decode, 8, checker.chains, DECODE_ID, 3, BLOCK)
+    # B hits all four pages, generated ones included, without a pull.
+    b = "cmpl-b-0-11111111"
+    hit_step = step(new=[(b, [1, 2, 4, 8, 9], chain[:16] + [1, 2], 16, 2)])
+    checker.before_step(hit_step)
+    checker.after_update(hit_step)
+    (hit,) = checker.after_step(None)
+    assert hit["kind"] == "hit" and hit["ok"] and hit["blocks"] == 4, hit
+    # The same page corrupted fails C's hit.
+    decode[LAYERS[0]][8][0] ^= 0xFF
+    c = "cmpl-c-0-22222222"
+    c_step = step(new=[(c, [1, 2, 4, 8, 10], chain[:16] + [3], 16, 1)])
+    checker.before_step(c_step)
+    checker.after_update(c_step)
+    (hit,) = checker.after_step(None)
+    assert not hit["ok"] and hit["mismatched_blocks"][0][2] == 8
+
+
+def test_a_decode_hit_before_a_pull_is_checked_at_its_place():
+    prefill, decode, filler, checker = content_sides()
+    filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A, 0, 10)]))
+    # Decode holds logical block 0 from an earlier request of that prefix.
+    checker.chains.admit("earlier", PROMPT_A[:4] + [0])
+    checker._write_block("earlier", 0, 0, 7, checker.chains.identity("earlier", 0, 0, BLOCK))
+    checker.before_step(pull([2, 4], [5, 6], computed=(1,)))
+    transfer(prefill, decode, [(2, 5), (4, 6)])
+    checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    first = step(new=[(DECODE_ID, [7, 2, 4], PROMPT_A, 9, 1)])
+    checker.before_step(first)
+    checker.after_update(first)
+    pulled, hit = checker.after_step(None)
+    assert hit["kind"] == "hit" and hit["ok"] and hit["groups"][0]["block_ids"] == [7]
+    assert pulled["ok"] and pulled["blocks"] == 2
+
+
+def test_a_prefill_hit_on_a_page_filled_in_the_same_step_is_compared_after_it():
+    """Native prefix caching shares a block as soon as it schedules the
+    tokens filling it: B, listed first, hits A's pages of this very step."""
+    prefill, _, filler, _ = content_sides()
+    prompt_b = PROMPT_A[:8] + [7, 7]
+    filler.after_update(step(new=[("b", [1, 2, 5], prompt_b, 8, 2), ("a", [1, 2, 3], PROMPT_A, 0, 10)]))
+    (hit,) = filler.take_results()
+    assert hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["groups"][0]["written_this_step"] == [[1, "a"], [2, "a"]]
+    assert holds(prefill, 5, filler.chains, "b", 2, 2)
+
+
+def test_a_decode_page_completed_and_adopted_in_the_same_step():
+    """A's step completes its page 2 (the received partial page and a
+    generated token) while B, scheduled in that step, adopts it."""
+    prefill, decode, filler, checker = content_sides()
+    filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A, 0, 10)]))
+    checker.before_step(pull([1, 2, 4], [3, 5, 6]))
+    transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+    checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    first = step(new=[(DECODE_ID, [1, 2, 4], PROMPT_A, 9, 1)])
+    checker.before_step(first)
+    checker.after_update(first)
+    assert checker.after_step(None)[0]["ok"]
+    checker.sampled([DECODE_ID], [[50]])
+    checker.sampled([DECODE_ID], [[51]])  # page 2's last token, sampled, not computed
+    s = step(cached=[(DECODE_ID, None, 10, 1, False)])
+    checker.before_step(s)
+    checker.after_update(s)
+    # Token 11 (sampled 51) completes page 2 as B adopts it.
+    b = "cmpl-b-0-11111111"
+    together = step(cached=[(DECODE_ID, [8], 11, 1, False)],
+                    new=[(b, [1, 2, 4, 9], PROMPT_A + [50, 51, 9, 9], 12, 2)])
+    checker.before_step(together)
+    checker.after_update(together)
+    (hit,) = checker.after_step(None)
+    assert hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["groups"][0]["logical_blocks"] == [0, 1, 2]
+    assert hit["groups"][0]["written_this_step"] == [[4, DECODE_ID]]
+
+
+def test_a_corrupted_ready_hit_fails_though_the_step_writes_others():
+    """Comparing after the step's writes cannot mask a page that was ready
+    before it: only its writer of the step writes a page, never a reader."""
+    prefill, _, filler, _ = content_sides()
+    filler.after_update(step(new=[("a", [1, 2, 3], PROMPT_A, 0, 10)]))
+    prefill[LAYERS[0]][1][0] ^= 0xFF
+    filler.after_update(step(new=[("b", [1, 2, 5], PROMPT_A[:8] + [7], 8, 1),
+                                  ("c", [6, 7], [1, 2, 3, 4, 5], 0, 5)]))
+    (hit,) = filler.take_results()
+    assert not hit["ok"] and hit["mismatched_blocks"][0][2] == 1
+    assert hit["groups"][0]["written_this_step"] == []
+
+
+def test_a_partial_prefix_hit_fails_closed():
+    """A hit ending inside a block (copy on write) needs an aligned Mamba
+    group, which prefix caching here excludes: refused, not checked."""
+    _, _, filler, _ = content_sides()
+    filler.after_update(step(new=[("a", [1, 2, 3], PROMPT_A, 0, 10)]))
+    filler.after_update(step(new=[("b", [1, 4, 5], PROMPT_A[:6] + [0] * 4, 6, 4)]))
+    failure, hit = filler.take_results()
+    assert not failure["ok"] and "ends inside a block" in failure["error"]
+    assert hit["ok"] and hit["blocks"] == 1
+
+
+def test_a_page_is_never_written_while_its_pull_waits():
+    _, _, _, checker = content_sides()
+    checker.before_step(pull([1, 2], [3, 5]))
+    checker.chains.admit("other", PROMPT_A)
+    checker.tables["other"] = [[2, 6, 7]]
+    with pytest.raises(RuntimeError, match="not compared yet"):
+        checker.after_update(step(cached=[("other", None, 3, 2, False)]))
+
+
+def test_requests_outside_the_lifecycle_fail_closed():
+    _, _, filler, _ = content_sides()
+    filler.after_update(step(new=[("embeds", [1, 2], None, 0, 8)]))
+    (result,) = filler.take_results()
+    assert not result["ok"] and result["kind"] == "fill"
+    assert "outside the prefix-caching pattern lifecycle" in result["error"]
+
+
+@pytest.mark.parametrize(
+    "request_kwargs, refused",
+    [
+        ({"lora_request": object()}, "a LoRA adapter"),
+        ({"cache_salt": "s"}, "a cache_salt"),
+        ({"prompt_embeds": torch.zeros(1)}, "prompt embeddings"),
+        ({"mm_features": [object()]}, "multimodal inputs"),
+    ],
+)
+def test_pattern_checks_with_prefix_caching_take_token_prompts_only(request_kwargs, refused):
+    from vllm.config.simulation import SimulationConfig
+
+    sim = SimulationConfig(kv_transfer_mode="real", kv_pattern_check=True)
+    plain = {"lora_request": None, "cache_salt": None, "prompt_embeds": None, "mm_features": None}
+    sim.check_pattern_request(True, **plain)
+    sim.check_pattern_request(False, **(plain | request_kwargs))
+    with pytest.raises(ValueError, match=refused):
+        sim.check_pattern_request(True, **(plain | request_kwargs))
+
+
+# The same lifecycle fed by a native scheduler with prefix caching.
+
+
+def native_requests(prompts, max_tokens=8):
+    from tests.v1.core.utils import create_requests
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+    from vllm.v1.request import Request
+
+    # Initializes the block hashes' seed; its sampling parameters are reused.
+    (template,) = create_requests(1, block_size=BLOCK, max_tokens=max_tokens)
+    hasher = get_request_block_hasher(BLOCK, sha256)
+    return [
+        Request(
+            request_id=req_id,
+            prompt_token_ids=prompt,
+            sampling_params=template.sampling_params,
+            pooling_params=None,
+            block_hasher=hasher,
+        )
+        for req_id, prompt in prompts.items()
+    ]
+
+
+def native_output(scheduler_output, tokens):
+    """A runner's output sampling `tokens[req_id]` for each scheduled request."""
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    return ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[tokens[req_id]] for req_id in req_ids],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_a_native_same_step_prefill_dedup_is_compared_after_its_writer():
+    """The native scheduler shares A's pages with B in the step that computes
+    them (`test_prefix_caching_for_prefill_dedup`): B's hit is compared after
+    A's writes, read-only, A named as their writer."""
+    from tests.v1.core.utils import create_scheduler
+
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK, num_blocks=32)
+    a, b = native_requests({"a": PROMPT_A, "b": PROMPT_A[:8] + [7, 7]})
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    out = scheduler.schedule()
+    new = {r.req_id: r for r in out.scheduled_new_reqs}
+    assert out.num_scheduled_tokens == {"a": 10, "b": 2}
+    assert new["b"].num_computed_tokens == 8
+    shared = new["a"].block_ids[0][:2]
+    assert new["b"].block_ids[0][:2] == shared
+    prefill = block_views(caches(32), 32)
+    filler = PatternFiller(prefill, chains=TokenChains([BLOCK]))
+    filler.after_update(out)
+    (hit,) = filler.take_results()
+    assert hit["req_id"] == "b" and hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["groups"][0]["block_ids"] == shared
+    assert hit["groups"][0]["written_this_step"] == [[shared[0], "a"], [shared[1], "a"]]
+    # B's own page holds its content, A's pages A's.
+    assert holds(prefill, new["b"].block_ids[0][2], filler.chains, "b", 2, 2)
+    assert holds(prefill, shared[1], filler.chains, "a", 1, BLOCK)
+
+
+def test_a_native_same_step_decode_adoption_is_compared_after_its_writer():
+    """A's decode step computes the last token of its page 2 (two of its
+    tokens generated); the native scheduler caches that page as it schedules
+    the token, and B, admitted in the same step, hits it. The checker writes
+    the page, then compares B's hit."""
+    from tests.v1.core.utils import create_scheduler
+
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK, num_blocks=32)
+    (a,) = native_requests({"a": PROMPT_A})
+    scheduler.add_request(a)
+    decode = block_views(caches(32), 32)
+    checker = PatternChecker(decode, chains=TokenChains([BLOCK]))
+
+    def run(out, tokens):
+        checker.before_step(out)
+        checker.after_update(out)
+        results = checker.after_step(None)
+        req_ids = list(out.num_scheduled_tokens)
+        checker.sampled(req_ids, [[tokens[r]] for r in req_ids])
+        scheduler.update_from_output(out, native_output(out, tokens))
+        return results
+
+    first = scheduler.schedule()
+    a_blocks = first.scheduled_new_reqs[0].block_ids[0]
+    assert run(first, {"a": 50}) == []
+    assert run(scheduler.schedule(), {"a": 51}) == []
+    (b,) = native_requests({"b": PROMPT_A + [50, 51, 1, 2]})
+    scheduler.add_request(b)
+    third = scheduler.schedule()
+    (new_b,) = third.scheduled_new_reqs
+    # A computes token 11, completing page 2; B hits it in that step.
+    assert third.scheduled_cached_reqs.num_computed_tokens == [11]
+    assert new_b.num_computed_tokens == 12 and new_b.block_ids[0][:3] == a_blocks[:3]
+    (hit,) = run(third, {"a": 52, "b": 60})
+    assert hit["req_id"] == "b" and hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["groups"][0]["written_this_step"] == [[a_blocks[2], "a"]]
+    assert holds(decode, a_blocks[2], checker.chains, "a", 2, BLOCK)

@@ -24,6 +24,19 @@ group's at a time. A block's bytes are its group's layers', its logical
 block its place among the request's blocks of that group, where null blocks
 (a sliding window's head, no longer attended) hold their places. The null
 block itself holds no request's KV and is neither filled nor checked.
+
+With prefix caching on, a block may hold KV computed for another request, so
+its pattern is seeded by its content instead (`TokenChains`): the request's
+tokens up to the block's end, which is what native prefix caching keys a full
+block by. Pages are written as their tokens land: the producer's prompt
+pages as they are allocated, the consumer's pages as its own steps complete
+them (generation included), so a page reused later holds what a request with
+that prefix expects. Prefix hits are compared read-only on both instances
+(`kind` hit), apart from the transferred blocks, after the step's own writes:
+the scheduler shares a block as soon as it schedules the tokens that fill it,
+so a hit may be a page another request writes in the same step (each write
+is recorded with its writer). A received page is compared before any later
+write.
 """
 
 import hashlib
@@ -93,21 +106,245 @@ def block_views(
 
 
 def pattern(
-    request_id: str, layer: str, logical_block: int, size: int, tp_rank: int = 0
+    request_id: str,
+    layer: str,
+    logical_block: int,
+    size: int,
+    tp_rank: int = 0,
+    identity: str | None = None,
 ) -> torch.Tensor:
     """The expected bytes of a request's logical block in one layer of a
     tensor-parallel rank (its KV heads): never zero, and another rank's
-    differ, so a block delivered to the wrong rank fails.
+    differ, so a block delivered to the wrong rank fails. `identity` (a
+    block's content, with prefix caching) stands for the request.
 
     PCG64 (numpy's portable generator) seeded by the identity's 128-bit
     BLAKE2b hash; both instances run the same numpy, so they agree."""
-    base = get_base_request_id(request_id)
+    base = identity if identity is not None else get_base_request_id(request_id)
     identity = f"{base}|tp{tp_rank}|{layer}|{logical_block}".encode()
     seed = int.from_bytes(hashlib.blake2b(identity, digest_size=16).digest(), "little")
     stream = np.random.Generator(np.random.PCG64(seed)).integers(
         1, 256, size, dtype=np.uint8
     )
     return torch.from_numpy(stream)
+
+
+class OutsideLifecycle(ValueError):
+    """A block whose content the token chains cannot name."""
+
+
+def _digest(previous: bytes, tokens: Sequence[int]) -> bytes:
+    data = previous + np.asarray(tokens, dtype=np.int64).tobytes()
+    return hashlib.blake2b(data, digest_size=16).digest()
+
+
+class TokenChains:
+    """With prefix caching: each request's token chain (its prompt, then the
+    tokens this worker sampled for it) and its blocks' content identities.
+    A full block's is that of its tokens and every earlier one, as native
+    prefix caching keys it, so requests sharing a prefix expect the same bytes
+    in its blocks, whichever request computed them; a partial block's names
+    its tokens so far."""
+
+    def __init__(self, block_sizes: Sequence[int]) -> None:
+        self.block_sizes = list(block_sizes)
+        """Each KV cache group's."""
+        self.tokens: dict[str, list[int] | None] = {}
+        self.prompt_lens: dict[str, int] = {}
+        # Each request's full blocks' chained digests, by block size.
+        self._full: dict[tuple[str, int], list[bytes]] = {}
+
+    def admit(self, req_id: str, prompt_token_ids: Sequence[int] | None) -> None:
+        """A request's first scheduling (a resumed one keeps its chain)."""
+        if req_id in self.tokens:
+            return
+        self.tokens[req_id] = (
+            None if prompt_token_ids is None else list(prompt_token_ids)
+        )
+        self.prompt_lens[req_id] = len(prompt_token_ids or ())
+
+    def extend(self, req_id: str, tokens: Sequence[int]) -> None:
+        if (chain := self.tokens.get(req_id)) is not None:
+            chain.extend(tokens)
+
+    def drop(self, req_id: str) -> None:
+        self.tokens.pop(req_id, None)
+        self.prompt_lens.pop(req_id, None)
+        for size in set(self.block_sizes):
+            self._full.pop((req_id, size), None)
+
+    def identity(self, req_id: str, group: int, logical: int, n: int) -> str:
+        """The content of a group's logical block holding its first `n`
+        tokens."""
+        tokens = self.tokens.get(req_id)
+        size = self.block_sizes[group]
+        end = logical * size + n
+        if tokens is None or end > len(tokens):
+            known = "no prompt token ids" if tokens is None else f"{len(tokens)} known"
+            raise OutsideLifecycle(
+                f"request {req_id}'s tokens up to {end} are unknown ({known})"
+            )
+        if n == 0:
+            return f"content|B{size}|n0|i{logical}"
+        full = self._full.setdefault((req_id, size), [])
+        while len(full) < logical + (n == size):
+            k = len(full)
+            full.append(_digest(full[-1] if full else b"", tokens[k * size : (k + 1) * size]))
+        if n == size:
+            digest = full[logical]
+        else:
+            digest = _digest(full[logical - 1] if logical else b"", tokens[logical * size : end])
+        return f"content|B{size}|n{n}|{digest.hex()}"
+
+    def prompt_content(self, req_id: str, group: int, logical: int) -> str:
+        """A block as the producer computes it: its prompt tokens."""
+        size = self.block_sizes[group]
+        n = min(size, max(0, self.prompt_lens.get(req_id, 0) - logical * size))
+        return self.identity(req_id, group, logical, n)
+
+
+def _lifecycle_failure(req_id: str, kind: str, error: Exception) -> dict:
+    return {
+        "req_id": req_id,
+        "kind": kind,
+        "ok": False,
+        "error": f"outside the prefix-caching pattern lifecycle: {error}",
+    }
+
+
+class _ContentPages:
+    """The lifecycle a filler and a checker share with prefix caching on
+    (`chains` set): each request's block table, its prefix hits compared
+    read-only, and (consumer) the pages its own steps complete written. A
+    subclass writes and compares a block (`_write_block`, `_compare_block`)."""
+
+    chains: "TokenChains | None"
+    tables: dict[str, list[list[int]]]
+    results: list[dict]
+    # This step's writes (block: writing request) and the prefix hits to
+    # compare once they are done.
+    step_writes: dict[int, str]
+    hits_due: list[tuple[str, list[int]]]
+
+    def _write_block(
+        self, req_id: str, group: int, logical: int, block: int, identity: str
+    ) -> None:
+        raise NotImplementedError
+
+    def _compare_block(
+        self, req_id: str, group: int, logical: int, block: int, identity: str
+    ) -> tuple[int, int, list]:
+        """(bytes compared, bytes wrong, mismatched entries)."""
+        raise NotImplementedError
+
+    def take_results(self) -> list[dict]:
+        results, self.results = self.results, []
+        for result in results:
+            if not result["ok"]:
+                logger.error("KV pattern check failed: %s", result)
+        return results
+
+    def _track(
+        self, req_id: str, block_ids: Sequence[Sequence[int]], replace: bool
+    ) -> None:
+        known = None if replace else self.tables.get(req_id)
+        if known is None:
+            known = [[] for _ in block_ids]
+        for held, new_ids in zip(known, block_ids):
+            held.extend(new_ids)
+        self.tables[req_id] = known
+
+    def _prefix_hits(self, req_id: str, num_computed_tokens: int) -> list[int]:
+        """The full blocks of a request's prefix hit, by group; queued for
+        comparison after the step's writes. A hit ending inside a block (a
+        partial hit, copied on write) is outside this lifecycle: native
+        caching shares one only for an aligned Mamba group, which prefix
+        caching here excludes."""
+        assert self.chains is not None
+        sizes = self.chains.block_sizes
+        if any(num_computed_tokens % size for size in sizes):
+            self.results.append(
+                _lifecycle_failure(
+                    req_id,
+                    "hit",
+                    OutsideLifecycle(
+                        f"a prefix hit of {num_computed_tokens} tokens ends inside a "
+                        f"block of {sizes} tokens (a partial hit)"
+                    ),
+                )
+            )
+        hits = [num_computed_tokens // size for size in sizes]
+        self.hits_due.append((req_id, hits))
+        return hits
+
+    def _record_writes(self, req_id: str, blocks: Sequence[int]) -> None:
+        if self.chains is not None:
+            for block in blocks:
+                self.step_writes[block] = req_id
+
+    def _verify_due(self) -> None:
+        """Compare the prefix hits found in this step, its writes done."""
+        due, self.hits_due = self.hits_due, []
+        for req_id, hits in due:
+            if req_id in self.tables:
+                self._verify_hits(req_id, hits)
+        self.step_writes = {}
+
+    def _verify_hits(self, req_id: str, hits: Sequence[int]) -> None:
+        """Compare a request's leading `hits[g]` blocks of each group (prefix
+        hits, never written by it): full blocks of its prompt's content,
+        noting those another request wrote in this step."""
+        assert self.chains is not None
+        table = self.tables[req_id]
+        groups, mismatched = [], []
+        for group, count in enumerate(hits):
+            ids, logicals, compared, wrong, written = [], [], 0, 0, []
+            for logical in range(min(count, len(table[group]))):
+                block = table[group][logical]
+                if block == NULL_BLOCK_ID:
+                    continue
+                size = self.chains.block_sizes[group]
+                try:
+                    identity = self.chains.identity(req_id, group, logical, size)
+                except OutsideLifecycle as e:
+                    self.results.append(_lifecycle_failure(req_id, "hit", e))
+                    return
+                b, w, entries = self._compare_block(req_id, group, logical, block, identity)
+                if (writer := self.step_writes.get(block)) is not None:
+                    written.append([block, writer])
+                ids.append(block)
+                logicals.append(logical)
+                compared += b
+                wrong += w
+                mismatched.extend(entries)
+            if ids:
+                groups.append(
+                    {
+                        "group": group,
+                        "logical_blocks": logicals,
+                        "block_ids": ids,
+                        "blocks": len(ids),
+                        "bytes": compared,
+                        "mismatched_bytes": wrong,
+                        # Hits on pages written in this step, and by whom.
+                        "written_this_step": written,
+                    }
+                )
+        if groups:
+            wrong = sum(g["mismatched_bytes"] for g in groups)
+            self.results.append(
+                {
+                    "req_id": req_id,
+                    "kind": "hit",
+                    "blocks": sum(g["blocks"] for g in groups),
+                    "bytes": sum(g["bytes"] for g in groups),
+                    "groups": groups,
+                    "mismatched_bytes": wrong,
+                    "mismatched_blocks": mismatched[:16],
+                    "ok": wrong == 0,
+                }
+            )
+
 
 
 def group_views(
@@ -120,8 +357,50 @@ def group_views(
     return [{name: views[name] for name in names if name in views} for names in groups]
 
 
+def _after_update(filler, scheduler_output: "SchedulerOutput") -> None:
+    """A filler's step: each new or resumed request's blocks, a running
+    one's new blocks; with prefix caching, a request's prefix hits are not
+    written but compared, after every write of the step (a hit may be a page
+    another request of the step fills)."""
+    chains = filler.chains
+    for new in scheduler_output.scheduled_new_reqs:
+        hits = None
+        if chains is not None:
+            chains.admit(new.req_id, new.prompt_token_ids)
+            filler._track(new.req_id, new.block_ids, replace=True)
+            hits = filler._prefix_hits(new.req_id, new.num_computed_tokens)
+        filler._extend(new.req_id, new.block_ids, replace=True, hits=hits)
+    cached = scheduler_output.scheduled_cached_reqs
+    for index, (req_id, new_ids) in enumerate(
+        zip(cached.req_ids, cached.new_block_ids)
+    ):
+        if new_ids is not None:
+            resumed = req_id in cached.resumed_req_ids
+            hits = None
+            if chains is not None:
+                filler._track(req_id, new_ids, replace=resumed)
+                if resumed:
+                    hits = filler._prefix_hits(req_id, cached.num_computed_tokens[index])
+            filler._extend(req_id, new_ids, replace=resumed, hits=hits)
+    if chains is not None:
+        filler._verify_due()
+    for req_id in scheduler_output.finished_req_ids:
+        filler.blocks.pop(req_id, None)
+        filler.tables.pop(req_id, None)
+        if chains is not None:
+            chains.drop(req_id)
+
+
+def _fill_identity(filler, req_id: str, group: int, logical: int) -> str | None:
+    """A new block's identity: the request's (prefix caching off) or its
+    prompt content's; raises OutsideLifecycle."""
+    if filler.chains is None:
+        return None
+    return filler.chains.prompt_content(req_id, group, logical)
+
+
 @dataclass
-class PatternFiller:
+class PatternFiller(_ContentPages):
     """Prefill side: fills each request's blocks with its pattern as the
     scheduler allocates them (after the runner zeroed new blocks)."""
 
@@ -129,42 +408,75 @@ class PatternFiller:
     tp_rank: int = 0
     groups: Sequence[Sequence[str]] | None = None
     """Each KV cache group's layers; None: one group of every layer."""
+    chains: TokenChains | None = None
+    """With prefix caching: blocks seeded by their content."""
     blocks: dict[str, list[list[int]]] = field(default_factory=dict)
     """Each request's blocks by group, null ones included."""
+    tables: dict[str, list[list[int]]] = field(default_factory=dict)
+    results: list[dict] = field(default_factory=list)
+    step_writes: dict[int, str] = field(default_factory=dict)
+    hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._groups = group_views(self.views, self.groups)
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
-        for new in scheduler_output.scheduled_new_reqs:
-            self._extend(new.req_id, new.block_ids, replace=True)
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
-            if new_ids is not None:
-                resumed = req_id in cached.resumed_req_ids
-                self._extend(req_id, new_ids, replace=resumed)
-        for req_id in scheduler_output.finished_req_ids:
-            self.blocks.pop(req_id, None)
+        _after_update(self, scheduler_output)
+
+    def _write_block(self, req_id, group, logical, block, identity) -> None:
+        for layer, view in self._groups[group].items():
+            view[block].copy_(
+                pattern(req_id, layer, logical, view.shape[1], self.tp_rank, identity)
+            )
+
+    def _compare_block(self, req_id, group, logical, block, identity):
+        return _compare_views(self._groups[group], req_id, logical, block, self.tp_rank, identity)
 
     def _extend(
-        self, req_id: str, block_ids: Sequence[Sequence[int]], replace: bool
+        self,
+        req_id: str,
+        block_ids: Sequence[Sequence[int]],
+        replace: bool,
+        hits: Sequence[int] | None = None,
     ) -> None:
         known = None if replace else self.blocks.get(req_id)
         if known is None:
             known = [[] for _ in self._groups]
-        for views, held, new_ids in zip(self._groups, known, block_ids):
+        for group, (held, new_ids) in enumerate(zip(known, block_ids)):
             start = len(held)
             held.extend(new_ids)
             for offset, block_id in enumerate(new_ids):
-                if block_id == NULL_BLOCK_ID:
+                logical = start + offset
+                if block_id == NULL_BLOCK_ID or (hits and logical < hits[group]):
                     continue
-                for layer, view in views.items():
-                    view[block_id].copy_(
-                        pattern(
-                            req_id, layer, start + offset, view.shape[1], self.tp_rank
-                        )
-                    )
+                try:
+                    identity = _fill_identity(self, req_id, group, logical)
+                except OutsideLifecycle as e:
+                    self.results.append(_lifecycle_failure(req_id, "fill", e))
+                    break
+                self._write_block(req_id, group, logical, block_id, identity)
+                self._record_writes(req_id, [block_id])
         self.blocks[req_id] = known
+
+
+def _compare_views(
+    views: dict[str, torch.Tensor],
+    req_id: str,
+    logical: int,
+    block: int,
+    tp_rank: int,
+    identity: str | None,
+) -> tuple[int, int, list]:
+    compared = wrong = 0
+    entries = []
+    for layer, view in views.items():
+        want = pattern(req_id, layer, logical, view.shape[1], tp_rank, identity)
+        bad = int((view[block] != want).sum())
+        compared += view.shape[1]
+        if bad:
+            wrong += bad
+            entries.append([layer, logical, block, bad])
+    return compared, wrong, entries
 
 
 @dataclass
@@ -191,8 +503,146 @@ class _Expected:
         ]
 
 
+class _ConsumerPages(_ContentPages):
+    """A checker's part of the lifecycle with prefix caching: a pull's
+    blocks are compared once the request runs (its prompt tokens arrive with
+    its first scheduling, after the pull), before any write of that step;
+    the pages its steps complete are written, never a block a check still
+    waits for; then its prefix hits are compared."""
+
+    pending: dict[str, "_Expected"]
+    awaiting: dict[str, "_Expected"]
+    pull_starts: dict[str, dict[int, int]]
+
+    def _record_pull_start(self, req_id: str, groups: Sequence["_ExpectedGroup"]) -> None:
+        if self.chains is not None:
+            # Where each group's pulled blocks start among the request's:
+            # the blocks before them are its local prefix hit (or a window's
+            # clipped head, null).
+            self.pull_starts[req_id] = {g.group: g.first_logical_block for g in groups}
+
+    def _admit_scheduled(self, scheduler_output: "SchedulerOutput") -> None:
+        chains = self.chains
+        if chains is None:
+            return
+        for new in scheduler_output.scheduled_new_reqs:
+            chains.admit(new.req_id, new.prompt_token_ids)
+            self._track(new.req_id, new.block_ids, replace=True)
+            starts = self.pull_starts.pop(new.req_id, None)
+            if starts is None:
+                self._prefix_hits(new.req_id, new.num_computed_tokens)
+            else:
+                # Before the pull: decode's own hit (or a window's null head).
+                self.hits_due.append(
+                    (new.req_id, [starts.get(g, 0) for g in range(len(chains.block_sizes))])
+                )
+            if (expected := self.awaiting.pop(new.req_id, None)) is not None:
+                self.results.append(self._compare_pull(new.req_id, expected))
+        cached = scheduler_output.scheduled_cached_reqs
+        for index, (req_id, new_ids) in enumerate(
+            zip(cached.req_ids, cached.new_block_ids)
+        ):
+            if new_ids is None:
+                continue
+            resumed = req_id in cached.resumed_req_ids
+            self._track(req_id, new_ids, replace=resumed)
+            if resumed:
+                self._prefix_hits(req_id, cached.num_computed_tokens[index])
+        for req_id in scheduler_output.finished_req_ids:
+            if (expected := self.awaiting.pop(req_id, None)) is not None:
+                self.results.append(
+                    {
+                        "req_id": req_id,
+                        "remote_request_id": expected.remote_request_id,
+                        "ok": False,
+                        "error": "finished before its pulled blocks were compared",
+                    }
+                )
+            self.tables.pop(req_id, None)
+            self.pull_starts.pop(req_id, None)
+            chains.drop(req_id)
+
+    def _compare_pull(self, req_id: str, expected: "_Expected") -> dict:
+        """A finished pull, against its blocks' prompt content."""
+        chains = self.chains
+        assert chains is not None
+        try:
+            for group in expected.groups:
+                for offset, block in enumerate(group.block_ids):
+                    if block != NULL_BLOCK_ID:
+                        chains.prompt_content(
+                            req_id, group.group, group.first_logical_block + offset
+                        )
+        except OutsideLifecycle as e:
+            return {
+                **_lifecycle_failure(req_id, "transfer", e),
+                "remote_request_id": expected.remote_request_id,
+            }
+        result = self._compare(
+            req_id,
+            expected,
+            lambda group, logical: chains.prompt_content(req_id, group, logical),
+        )
+        return result
+
+    def after_update(self, scheduler_output: "SchedulerOutput") -> None:
+        """Write the pages this step's computed tokens complete (after the
+        runner zeroed the step's new blocks): each group's blocks whose last
+        token the step computes, full blocks of the request's content (its
+        computed tokens: a sampled token is computed by a later step). Then
+        compare the step's prefix hits."""
+        chains = self.chains
+        if chains is None:
+            return
+        computed = {new.req_id: new.num_computed_tokens for new in scheduler_output.scheduled_new_reqs}
+        cached = scheduler_output.scheduled_cached_reqs
+        computed.update(zip(cached.req_ids, cached.num_computed_tokens))
+        waiting = {
+            block
+            for expected in (*self.pending.values(), *self.awaiting.values())
+            for block in expected.block_ids
+        }
+        for req_id, start in computed.items():
+            end = start + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            table = self.tables.get(req_id)
+            if table is None:
+                continue
+            for group, size in enumerate(chains.block_sizes):
+                for logical in range(start // size, min(end // size, len(table[group]))):
+                    block = table[group][logical]
+                    if block == NULL_BLOCK_ID:
+                        continue
+                    if block in waiting:
+                        raise RuntimeError(
+                            f"Request {req_id} would write block {block}, whose "
+                            "pulled bytes are not compared yet."
+                        )
+                    try:
+                        identity = chains.identity(req_id, group, logical, size)
+                    except OutsideLifecycle as e:
+                        self.results.append(_lifecycle_failure(req_id, "write", e))
+                        break
+                    self._write_block(req_id, group, logical, block, identity)
+                    self._record_writes(req_id, [block])
+        self._verify_due()
+
+    def sampled(self, req_ids: Sequence[str], tokens: Sequence[Sequence[int]]) -> None:
+        """The tokens this step sampled, each request's chain's next."""
+        if self.chains is not None:
+            for req_id, new in zip(req_ids, tokens):
+                self.chains.extend(req_id, new)
+
+    def _finish(self, req_id: str, expected: "_Expected") -> dict | None:
+        """A finished pull: compared now, or (prefix caching) once its
+        request runs."""
+        if self.chains is None:
+            return self._compare(req_id, expected)
+        self.awaiting[req_id] = expected
+        return None
+
+
 @dataclass
-class PatternChecker:
+class PatternChecker(_ConsumerPages):
     """Decode side: sentinel before each remote read, comparison after it."""
 
     views: dict[str, torch.Tensor]
@@ -202,16 +652,35 @@ class PatternChecker:
     transfer_group_ids: Sequence[int] | None = None
     """The KV cache groups a read's blocks are listed by (those that
     transfer KV); None: every group, in order."""
+    chains: TokenChains | None = None
+    """With prefix caching: blocks seeded by their content."""
     pending: dict[str, _Expected] = field(default_factory=dict)
     # Pending reads whose blocks the connector reported invalid.
     lost: set[str] = field(default_factory=set)
+    awaiting: dict[str, _Expected] = field(default_factory=dict)
+    pull_starts: dict[str, dict[int, int]] = field(default_factory=dict)
+    tables: dict[str, list[list[int]]] = field(default_factory=dict)
+    results: list[dict] = field(default_factory=list)
+    step_writes: dict[int, str] = field(default_factory=dict)
+    hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._groups = group_views(self.views, self.groups)
 
+    def _write_block(self, req_id, group, logical, block, identity) -> None:
+        for layer, view in self._groups[group].items():
+            view[block].copy_(
+                pattern(req_id, layer, logical, view.shape[1], self.tp_rank, identity)
+            )
+
+    def _compare_block(self, req_id, group, logical, block, identity):
+        return _compare_views(self._groups[group], req_id, logical, block, self.tp_rank, identity)
+
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         """Fill the blocks of the reads this step will post (call before the
-        connector sees the step's metadata)."""
+        connector sees the step's metadata); with prefix caching, compare the
+        requests that run for the first time (prefix hits, finished pulls)."""
+        self._admit_scheduled(scheduler_output)
         for read in requested_reads(scheduler_output.kv_connector_metadata):
             if not read.blocks:
                 continue
@@ -229,13 +698,15 @@ class PatternChecker:
                     view[held] = SENTINEL
                 groups.append(_ExpectedGroup(group, first, list(block_ids)))
             self.pending[read.req_id] = _Expected(read.remote_request_id, groups)
+            self._record_pull_start(read.req_id, groups)
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
         """Compare the reads the connector reported finished or failed. A read
         reported finished whose blocks were reported invalid, in this poll or
         an earlier one, failed (Mooncake reports failed loads that way)."""
+        ready = self.take_results()
         if kv_output is None:
-            return []
+            return ready
         if invalid := kv_output.invalid_block_ids:
             self.lost.update(
                 req_id
@@ -257,16 +728,17 @@ class PatternChecker:
             if req_id in self.lost:
                 self.lost.discard(req_id)
                 results.append({"req_id": req_id, "ok": False, "error": "receive failed"})
-            else:
-                results.append(self._compare(req_id, expected))
+            elif (result := self._finish(req_id, expected)) is not None:
+                results.append(result)
         for result in results:
             if not result["ok"]:
                 logger.error("KV pattern check failed: %s", result)
-        return results
+        return ready + results
 
-    def _compare(self, req_id: str, expected: _Expected) -> dict:
+    def _compare(self, req_id: str, expected: _Expected, identity_of=None) -> dict:
         """One request's result, its groups' nested: each group's blocks are
-        compared over the group's layers, each (layer, block) once."""
+        compared over the group's layers, each (layer, block) once.
+        `identity_of(group, logical)`: a block's content (prefix caching)."""
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
@@ -278,6 +750,7 @@ class PatternChecker:
                     continue
                 blocks += 1
                 logical = group.first_logical_block + offset
+                identity = identity_of(group.group, logical) if identity_of else None
                 for layer, view in views.items():
                     want = pattern(
                         expected.remote_request_id,
@@ -285,6 +758,7 @@ class PatternChecker:
                         logical,
                         view.shape[1],
                         self.tp_rank,
+                        identity,
                     )
                     wrong = int((view[block_id] != want).sum())
                     if wrong:
@@ -559,27 +1033,57 @@ class NativeSelection:
         return groups
 
 
+def _write_selected(selection, req_id, group, logical, block, tp_rank, identity):
+    s = selection
+    for row, b, _ in s.select(group, [block]):
+        view = s.rows[row].view
+        view[b].copy_(
+            pattern(req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity)
+        )
+
+
+def _compare_selected(selection, req_id, group, logical, block, tp_rank, identity):
+    s = selection
+    compared = wrong = 0
+    entries = []
+    for row, b, _ in s.select(group, [block]):
+        view = s.rows[row].view
+        want = pattern(req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity)
+        bad = int((view[b] != want).sum())
+        compared += view.shape[1]
+        if bad:
+            wrong += bad
+            entries.append([s.name(group, row), logical, b, bad])
+    return compared, wrong, entries
+
+
 @dataclass
-class NativeFiller:
+class NativeFiller(_ContentPages):
     """Prefill side over NIXL: fills each selected span of a request's new
     blocks with its pattern and its state pages' padding with POISON."""
 
     selection: NativeSelection
     tp_rank: int = 0
+    chains: TokenChains | None = None
+    """With prefix caching: blocks seeded by their content."""
     blocks: dict[str, list[list[int]]] = field(default_factory=dict)
+    tables: dict[str, list[list[int]]] = field(default_factory=dict)
+    results: list[dict] = field(default_factory=list)
+    step_writes: dict[int, str] = field(default_factory=dict)
+    hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
-        for new in scheduler_output.scheduled_new_reqs:
-            self._extend(new.req_id, new.block_ids, replace=True)
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
-            if new_ids is not None:
-                resumed = req_id in cached.resumed_req_ids
-                self._extend(req_id, new_ids, replace=resumed)
-        for req_id in scheduler_output.finished_req_ids:
-            self.blocks.pop(req_id, None)
+        _after_update(self, scheduler_output)
 
-    def _extend(self, req_id, block_ids, replace: bool) -> None:
+    def _write_block(self, req_id, group, logical, block, identity) -> None:
+        _write_selected(self.selection, req_id, group, logical, block, self.tp_rank, identity)
+
+    def _compare_block(self, req_id, group, logical, block, identity):
+        return _compare_selected(
+            self.selection, req_id, group, logical, block, self.tp_rank, identity
+        )
+
+    def _extend(self, req_id, block_ids, replace: bool, hits=None) -> None:
         s = self.selection
         known = None if replace else self.blocks.get(req_id)
         if known is None:
@@ -588,12 +1092,23 @@ class NativeFiller:
             start = len(held)
             held.extend(new_ids)
             # Each block's place among the request's, null blocks (a window's
-            # head) holding theirs.
-            places = [i for i, b in enumerate(new_ids) if b != NULL_BLOCK_ID]
+            # head) and prefix hits holding theirs.
+            places = [
+                i
+                for i, b in enumerate(new_ids)
+                if b != NULL_BLOCK_ID and not (hits and start + i < hits[group])
+            ]
             new_ids = [new_ids[i] for i in places]
             if not new_ids:
                 continue
             selected = s.select(group, new_ids)
+            try:
+                identities = [
+                    _fill_identity(self, req_id, group, start + i) for i in places
+                ]
+            except OutsideLifecycle as e:
+                self.results.append(_lifecycle_failure(req_id, "fill", e))
+                continue
             for row, block, place in selected:
                 view = s.rows[row].view
                 view[block].copy_(
@@ -603,15 +1118,17 @@ class NativeFiller:
                         start + places[place],
                         view.shape[1],
                         self.tp_rank,
+                        identities[place],
                     )
                 )
             for region in s.state_regions(selected) & set(s.padding):
                 s.padding[region].view[new_ids] = POISON
+            self._record_writes(req_id, new_ids)
         self.blocks[req_id] = known
 
 
 @dataclass
-class NativeChecker:
+class NativeChecker(_ConsumerPages):
     """Decode side over NIXL: sentinel over each selected span and padding
     of a read's blocks before it is posted; after it, the spans must hold
     the pattern and the padding its sentinel."""
@@ -619,10 +1136,26 @@ class NativeChecker:
     selection: NativeSelection
     tp_rank: int = 0
     transfer_group_ids: Sequence[int] | None = None
+    chains: TokenChains | None = None
+    """With prefix caching: blocks seeded by their content."""
     pending: dict[str, _Expected] = field(default_factory=dict)
     lost: set[str] = field(default_factory=set)
     # The local descriptors of the READs NIXL posted, by producer request.
     posted: dict[str, list[int]] = field(default_factory=dict)
+    awaiting: dict[str, _Expected] = field(default_factory=dict)
+    pull_starts: dict[str, dict[int, int]] = field(default_factory=dict)
+    tables: dict[str, list[list[int]]] = field(default_factory=dict)
+    results: list[dict] = field(default_factory=list)
+    step_writes: dict[int, str] = field(default_factory=dict)
+    hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+
+    def _write_block(self, req_id, group, logical, block, identity) -> None:
+        _write_selected(self.selection, req_id, group, logical, block, self.tp_rank, identity)
+
+    def _compare_block(self, req_id, group, logical, block, identity):
+        return _compare_selected(
+            self.selection, req_id, group, logical, block, self.tp_rank, identity
+        )
 
     def watch_reads(self) -> None:
         """Record each READ's local descriptors as NIXL posts it (its
@@ -642,6 +1175,7 @@ class NativeChecker:
         wrapper.make_prepped_xfer = make_prepped_xfer
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
+        self._admit_scheduled(scheduler_output)
         for read in requested_reads(scheduler_output.kv_connector_metadata):
             if read.blocks:
                 self.expect(
@@ -677,11 +1211,13 @@ class NativeChecker:
                     s.padding[region].view[held] = SENTINEL
             groups.append(_ExpectedGroup(group, first, list(ids)))
         self.pending[req_id] = _Expected(remote_request_id, groups)
+        self._record_pull_start(req_id, groups)
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
         """PatternChecker's, then each ended receive's posted descriptors
         released (a failed or lost read's too, never compared), another
-        pending read's kept."""
+        pending read's kept, and a read awaiting its comparison's
+        (prefix caching) kept until it is compared."""
         ended = {}
         if kv_output is not None:
             for req_id in (kv_output.failed_recving or set()) | (
@@ -690,8 +1226,9 @@ class NativeChecker:
                 if (expected := self.pending.get(req_id)) is not None:
                     ended[req_id] = expected.remote_request_id
         results = PatternChecker.after_step(self, kv_output)
-        for remote_request_id in ended.values():
-            self.posted.pop(remote_request_id, None)
+        for req_id, remote_request_id in ended.items():
+            if req_id not in self.awaiting:
+                self.posted.pop(remote_request_id, None)
         return results
 
     def _check_geometry(self) -> None:
@@ -715,7 +1252,7 @@ class NativeChecker:
                 f"split reads {sorted(w.src_xfer_handles_by_tp_ratio)}."
             )
 
-    def _compare(self, req_id: str, expected: _Expected) -> dict:
+    def _compare(self, req_id: str, expected: _Expected, identity_of=None) -> dict:
         s = self.selection
         self._check_geometry()
         groups = []
@@ -737,12 +1274,14 @@ class NativeChecker:
             for row, block, place in selected:
                 r = s.rows[row]
                 view = r.view
+                logical = first + places[place]
                 want = pattern(
                     expected.remote_request_id,
                     s.name(group.group, row),
-                    first + places[place],
+                    logical,
                     view.shape[1],
                     self.tp_rank,
+                    identity_of(group.group, logical) if identity_of else None,
                 )
                 wrong = int((view[block] != want).sum())
                 payload += view.shape[1]
