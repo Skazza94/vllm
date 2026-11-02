@@ -90,8 +90,12 @@ must match the target's bundled config, and the local KV cache precision is
 the one timed. `quant_modes` overrides the published precision, which
 records the target as modified. DeepSeek-V4 is timed with its packed FP8
 cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
-and its FP4 experts. Startup also times one prefill and one decode step:
-a target AISimulate lacks data for at those shapes fails before serving,
+and its FP4 experts. A bundled config AISimulate would misread is given to
+it as a private normalized copy, the change and both configs' hashes in the
+`timing` record: MiMo-V2-Flash's `hybrid_layer_pattern`, which marks its
+sliding layers 1 where AISimulate reads global ones, is inverted. Startup
+also times one prefill and one decode step: a target AISimulate lacks data
+for at those shapes fails before serving,
 but a later batch of another shape can still lack data and fail then.
 
 Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
@@ -385,9 +389,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 * Full-attention models, dense or MoE (experts hold no KV), and dense MLA
   models (one latent per token and layer); sliding-window attention too,
   alone or beside full attention (each layer kind a KV cache group, groups
-  sharing memory, a block being one group's at a time): either connector
-  moves each window's last blocks only, and says where they start among
-  the request's blocks (NIXL: `local_first_block_indices`); and, without
+  sharing memory, a block being one group's at a time, of different block
+  sizes when their pages are equal: Gemma4's and MiMo-V2-Flash's full and
+  sliding layers at most TP sizes): either connector moves each window's
+  last blocks only, and says where they start among the request's blocks
+  (NIXL: `local_first_block_indices`). Over NIXL a model of several groups
+  is checked through NIXL's own selection: a group's block in each layer
+  slot NIXL selects for it, a slot holding none of a shorter group's layers
+  moved and checked too (transfer-only, reported apart); and, without
   prefix caching, hybrid models of Qwen's gated delta-net (Qwen3.5, served
   as its language model) or of Mamba2 (`MambaMixer2`: Nemotron-H,
   Nemotron-3, whose non-gated relu^2 experts the CPU platform builds only
