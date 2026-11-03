@@ -1295,17 +1295,23 @@ def _fragmentation(prefill: list[list[dict]], decode: list[list[dict]], verified
 
 
 NIXL_MAX_DESCRIPTORS = 1024
-"""Descriptors a NIXL READ may carry (its Mooncake backend's batch)."""
+"""A conservative benchmark guard on the descriptors vLLM selects for one
+NIXL READ (before NIXL merges them): not a proven native limit, since NIXL's
+Mooncake backend receives the merged list."""
 
 
 def kv_heads_of(model: Path) -> int | None:
-    """The model's KV heads, from its own config (a multimodal model's text
-    config)."""
+    """The model's KV heads as its KV cache holds them, from its own config
+    (a multimodal model's text config): an MLA model's (`kv_lora_rank`) one
+    latent, the same on every rank, whatever attention heads it computes."""
     try:
         config = json.loads((Path(model) / "config.json").read_text())
     except (OSError, ValueError):
         return None
-    for source in (config, config.get("text_config") or {}, config.get("llm_config") or {}):
+    sources = (config, config.get("text_config") or {}, config.get("llm_config") or {})
+    if any(source.get("kv_lora_rank") for source in sources):
+        return 1
+    for source in sources:
         if isinstance(source.get("num_key_value_heads"), int):
             return source["num_key_value_heads"]
     return None
@@ -1412,6 +1418,7 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
     # Producer ranks with an answer the pairing or its plan refutes.
     misanswered: set[int] = set()
     descriptors: list[int] = []
+    merged: list[int] = []
     unknown = 0
     for role, mover in (("prefill", not nixl), ("decode", nixl)):
         if not mover:
@@ -1428,8 +1435,10 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                         continue
                     pair = (peer, rank) if nixl else (rank, peer)
                     logged[pair] = logged.get(pair, 0) + int(entry[0])
+                    if nixl and isinstance(plan, list) and len(plan) > 1 and isinstance(plan[1], int):
+                        descriptors.append(plan[1])
                     if nixl and isinstance(entry[3], int):
-                        descriptors.append(entry[3])
+                        merged.append(entry[3])
                     problems.extend(_plan_problems(pair, entry, plan, nixl, heads, sender, sources, slab))
                 for answer in transfer.get("zero_payload") or []:
                     peer, requests, plan = (list(answer) + [None, None, None])[:3]
@@ -1486,7 +1495,8 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
     evidence["idle_replicas"] = sorted(idle)
     evidence["unwritten_accepted"] = sorted(unwritten & idle)
     if nixl and descriptors and max(descriptors) > NIXL_MAX_DESCRIPTORS:
-        problems.append(f"a NIXL READ carried {max(descriptors)} descriptors, more than {NIXL_MAX_DESCRIPTORS}")
+        problems.append(f"a NIXL READ selected {max(descriptors)} descriptors, more than the "
+                        f"{NIXL_MAX_DESCRIPTORS} guard")
 
     received = {d: sum(n for (p, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
     sent = {p: sum(n for (pp, d), n in logged.items() if pp == p) for p in range(prefill_tp)}
@@ -1526,7 +1536,8 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                   if (p, d) in expected or (p, d) in logged or (p, d) in answers],
         "unique_kv_bytes": unique, "payload_bytes": payload,
         "replication_factor": round(payload / unique, 6) if unique else None,
-        "max_descriptors": max(descriptors, default=None), "ports": port_evidence or None,
+        "max_descriptors": max(descriptors, default=None), "max_merged_descriptors": max(merged, default=None),
+        "ports": port_evidence or None,
         "received": received, "problems": problems,
     })
     return evidence
@@ -1536,9 +1547,12 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
                    sender: dict, sources: dict, slab: int | None) -> list[str]:
     """A transfer's logged plan against the heads its pair carries, in
     slabs (a head's bytes in a block of a layer, from the layouts). NIXL's
-    [local slot, descriptors]: the slot the source's order gives, as many
-    descriptors as NIXL measured (`entry[3]`), within its limit, each one
-    layer's block of the carried heads. Each of Mooncake's regions [sends,
+    [local slot, selected, predicted]: the slot the source's order gives;
+    the descriptors vLLM selected (each one layer's block of the carried
+    heads, so they give the bytes; within the guard) and the hook's
+    prediction of the descriptors NIXL merges them into, which must be what
+    NIXL measured (`entry[3]`), never more than selected; a READ without
+    that prediction fails. Each of Mooncake's regions [sends,
     source offset, destination offset, length]: the first carried head's
     places in the producer's and decode's pages, the carried heads' length."""
     p, d = pair
@@ -1553,15 +1567,34 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
         slot = sources[d].index(p) if p in sources[d] and len(sources[d]) > 1 else 0
         if plan[0] != slot:
             problems.append(f"{at}a READ into slot {plan[0]}, not {slot}")
-        measured, seen = entry[3], plan[1] if len(plan) > 1 else None
-        if not isinstance(measured, int):
-            problems.append(f"{at}a READ without NIXL's measured descriptors (its hook saw {seen})")
-        elif measured != seen:
-            problems.append(f"{at}a READ NIXL measured at {measured} descriptors, its hook at {seen}")
-        elif measured > NIXL_MAX_DESCRIPTORS:
-            problems.append(f"{at}a READ of {measured} descriptors, more than NIXL's {NIXL_MAX_DESCRIPTORS}")
-        elif slab is not None and int(entry[0]) != measured * len(carried) * slab:
-            problems.append(f"{at}a READ of {entry[0]} bytes in {measured} descriptors, not "
+        measured = entry[3]
+        selected, predicted = (list(plan) + [None, None, None])[1:3]
+
+        def count(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+        if not count(selected):
+            problems.append(f"{at}a READ without its selected descriptors ({selected})")
+            return problems
+        if not count(measured):
+            problems.append(f"{at}a READ without NIXL's measured descriptors ({measured}; {selected} selected)")
+        if not count(predicted):
+            problems.append(f"{at}a READ without the hook's predicted merged descriptors ({predicted}; "
+                            f"{selected} selected, NIXL measured {measured})")
+        elif predicted > selected:
+            problems.append(f"{at}a READ predicted at {predicted} merged descriptors, more than its {selected} "
+                            "selected")
+        if count(measured) and count(predicted) and measured != predicted:
+            problems.append(f"{at}a READ NIXL measured at {measured} descriptors, predicted at {predicted} "
+                            f"({selected} selected)")
+        if count(measured) and measured > selected:
+            problems.append(f"{at}a READ NIXL measured at {measured} descriptors, more than its {selected} "
+                            "selected")
+        if selected > NIXL_MAX_DESCRIPTORS:
+            problems.append(f"{at}a READ of {selected} selected descriptors, more than the "
+                            f"{NIXL_MAX_DESCRIPTORS} guard")
+        if slab is not None and int(entry[0]) != selected * len(carried) * slab:
+            problems.append(f"{at}a READ of {entry[0]} bytes in {selected} selected descriptors, not "
                             f"{len(carried)} head(s) of {slab} bytes each")
         return problems
     if slab is None:

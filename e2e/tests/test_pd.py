@@ -1656,7 +1656,7 @@ def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requ
                 entry = [PER_HEAD * len(carried), 0.01, 0.0, 10, 10.0]
                 if nixl:
                     slot = sources.index(p) if len(sources) > 1 else 0
-                    loads[d].append(entry + [p, [slot, 10]])
+                    loads[d].append(entry + [p, [slot, 10, 10]])
                 else:
                     sends[p].append(entry + [d, plan])
 
@@ -1713,7 +1713,11 @@ class HeterogeneousTpTests(unittest.TestCase):
         self.directory.cleanup()
 
     def run_for(self, prefill_tp, decode_tp, kv_heads, nixl):
-        (self.model / "config.json").write_text(json.dumps({"num_key_value_heads": kv_heads}))
+        # kv_heads 1: an MLA model's latent (DeepSeek-V3's config: 128
+        # attention KV heads, one latent cached).
+        config = {"num_key_value_heads": 128, "kv_lora_rank": 512} if kv_heads == 1 else {
+            "num_key_value_heads": kv_heads}
+        (self.model / "config.json").write_text(json.dumps(config))
         return pd.Run(**{**RUN.__dict__, "model": self.model,
                          "prefill": pd.Side("p", "kv", tensor_parallel_size=prefill_tp),
                          "decode": pd.Side("d", "kv", tensor_parallel_size=decode_tp),
@@ -1789,11 +1793,11 @@ class HeterogeneousTpTests(unittest.TestCase):
             "plan [True, 0, 0, 20], not [True, 20, 0, 20]": (2, 4, 8, False, edit(
                 "prefill", 0, "[[true, 20, 0, 20]]", "[[true, 0, 0, 20]]")),
             "a READ into slot 0, not 1": (4, 2, 8, True, edit(
-                "decode", 0, "10.0, 1, [1, 10]], [200", "10.0, 1, [0, 10]], [200")),
+                "decode", 0, "10.0, 1, [1, 10, 10]], [200", "10.0, 1, [0, 10, 10]], [200")),
             "transfer(s) logged without their peer rank": (2, 4, 8, True, edit(
-                "decode", 0, "10.0, 0, [0, 10]]", "10.0]")),
-            "a READ of 2000 descriptors, more than NIXL's 1024": (2, 4, 8, True, edit(
-                "decode", 0, "0.0, 10, 10.0, 0, [0, 10]", "0.0, 2000, 10.0, 0, [0, 2000]")),
+                "decode", 0, "10.0, 0, [0, 10, 10]]", "10.0]")),
+            "a READ of 2000 selected descriptors, more than the 1024 guard": (2, 4, 8, True, edit(
+                "decode", 0, "0.0, 10, 10.0, 0, [0, 10, 10]", "0.0, 2000, 10.0, 0, [0, 2000, 2000]")),
             "prefill rank 0's router port RX 10 bytes": (2, 4, 8, False, short_port),
             "no router port counters": (2, 4, 8, False, no_ports),
         }
@@ -1836,6 +1840,35 @@ class HeterogeneousTpTests(unittest.TestCase):
                 send["zero_payload"] = change(send["zero_payload"])
             return record
         return apply
+
+    def test_an_mla_latent_reaches_every_decode_rank_whole(self) -> None:
+        """MLA: one latent, the same on every rank. Each decode rank receives
+        it whole from one producer (decode rank d's first paired one), so the
+        payload is decode TP times the unique KV: 8 at 4 -> 8, 4 at 8 -> 4.
+        Mooncake's other paired producers (8 -> 4: 1, 3, 5, 7) answer without
+        a payload; NIXL reads only from the first."""
+        for sizes, factor in (((4, 8), 8.0), ((8, 4), 4.0)):
+            for nixl in (False, True):
+                with self.subTest(sizes=sizes, nixl=nixl):
+                    verdict = self.verdict(*sizes, 1, nixl)
+                    self.assertEqual(verdict["problems"], [])
+                    hetero = verdict["hetero_tp"]
+                    self.assertEqual(hetero["kv_heads"], 1)
+                    self.assertEqual(hetero["replication_factor"], factor)
+                    self.assertEqual(hetero["payload_bytes"], factor * hetero["unique_kv_bytes"])
+                    p, d = sizes
+                    if nixl or p < d:
+                        self.assertEqual(hetero["sources"], {r: [r * p // d] for r in range(d)})
+                    else:
+                        self.assertEqual(hetero["sources"], {r: [2 * r, 2 * r + 1] for r in range(d)})
+                    self.assertEqual(hetero["idle_replicas"], [1, 3, 5, 7] if (p, d) == (8, 4) and not nixl
+                                     else [])
+                    self.assertTrue(all(pair["bytes"] == pair["expected"] for pair in hetero["pairs"]))
+        # A Mooncake replica's missing answer, as with attention heads.
+        problems = self.verdict(8, 4, 1, False, self.rewrite("prefill", 3, self.answers(lambda answers: [])))[
+            "problems"]
+        self.assertTrue(any("prefill rank 3 never answered decode rank 1" in problem for problem in problems),
+                        problems)
 
     def test_idle_replicas_are_accepted_only_on_their_answers(self) -> None:
         """Mooncake 8 -> 2, 4 KV heads: ranks 1, 3, 5, 7 never write, so their
@@ -1918,9 +1951,11 @@ class HeterogeneousTpTests(unittest.TestCase):
     def test_plans_and_descriptors_are_measured_against_the_layouts(self) -> None:
         """A head's bytes in a block of a layer (10 here) come from both sides'
         layouts: each Mooncake region's plan must be its heads' places and
-        length in them; each NIXL READ must carry NIXL's measured descriptors,
-        the hook's count, within NIXL's limit, each one block of a layer of its
-        heads."""
+        length in them. Each NIXL READ carries three counts: the descriptors
+        vLLM selected (each one block of a layer of its heads, within the
+        guard), the hook's prediction of what NIXL merges them into, and what
+        NIXL measured; measured = predicted <= selected, and a READ without a
+        prediction fails."""
         def problems(sizes, nixl, change):
             return self.verdict(*sizes, 8, nixl, change)["problems"]
 
@@ -1942,15 +1977,30 @@ class HeterogeneousTpTests(unittest.TestCase):
             # A second region of another geometry.
             "plan [True, 0, 0, 10], not [True, 0, 0, 20]": ((2, 4), False, plans(
                 lambda plan: plan + [[True, 0, 0, 10]])),
-            "a READ without NIXL's measured descriptors (its hook saw 2000)": ((2, 4), True, reads(
-                lambda entry: entry[:3] + [None] + entry[4:6] + [[entry[6][0], 2000]])),
-            "a READ NIXL measured at 10 descriptors, its hook at 9": ((2, 4), True, reads(
-                lambda entry: entry[:6] + [[entry[6][0], 9]])),
+            "a READ without NIXL's measured descriptors (None; 10 selected)": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [None] + entry[4:])),
+            # The hook's count alone, as before the prediction: not accepted.
+            "a READ without the hook's predicted merged descriptors (None; 10 selected, NIXL measured 10)": (
+                (2, 4), True, reads(lambda entry: entry[:6] + [entry[6][:2]])),
+            "a READ without its selected descriptors (None)": ((2, 4), True, reads(
+                lambda entry: entry[:6] + [entry[6][:1]])),
+            "a READ without the hook's predicted merged descriptors (0;": ((2, 4), True, reads(
+                lambda entry: entry[:6] + [[entry[6][0], 10, 0]])),
+            # A wrong prediction, and a merge predicted that NIXL did not make.
+            "a READ NIXL measured at 10 descriptors, predicted at 9 (10 selected)": ((2, 4), True, reads(
+                lambda entry: entry[:6] + [[entry[6][0], 10, 9]])),
+            "a READ NIXL measured at 10 descriptors, predicted at 2 (10 selected)": ((2, 4), True, reads(
+                lambda entry: entry[:6] + [[entry[6][0], 10, 2]])),
+            # More descriptors than vLLM selected, measured and predicted alike.
+            "a READ NIXL measured at 12 descriptors, more than its 10 selected": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [12] + entry[4:6] + [[entry[6][0], 10, 12]])),
+            "a READ predicted at 12 merged descriptors, more than its 10 selected": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [12] + entry[4:6] + [[entry[6][0], 10, 12]])),
             "prefill rank 0 -> decode rank 0: a transfer of 200 bytes without its plan (None)": (
                 (4, 2), True, reads(lambda entry: entry[:6] + [None])),
             # Bytes that are not its descriptors' blocks of its heads.
-            "a READ of 200 bytes in 5 descriptors, not 2 head(s) of 10 bytes each": ((2, 4), True, reads(
-                lambda entry: entry[:3] + [5] + entry[4:6] + [[entry[6][0], 5]])),
+            "a READ of 200 bytes in 5 selected descriptors, not 2 head(s) of 10 bytes each": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [5] + entry[4:6] + [[entry[6][0], 5, 5]])),
             # A layout whose heads' bytes disagree with the other side's.
             "the ranks' layouts give no single head size": ((2, 4), False, self.rewrite(
                 "decode", 1, lambda record: {"kv_layout": {**record["kv_layout"], "groups": [
@@ -1969,6 +2019,17 @@ class HeterogeneousTpTests(unittest.TestCase):
                 verdict = self.verdict(*sizes, kv_heads, nixl)
                 self.assertEqual(verdict["problems"], [])
                 self.assertEqual(verdict["hetero_tp"]["slab_bytes"], SLAB)
+                if nixl:
+                    self.assertEqual((verdict["hetero_tp"]["max_descriptors"],
+                                      verdict["hetero_tp"]["max_merged_descriptors"]), (10, 10))
+        # Decode rank 0's whole-page READs, whose 10 selected descriptors NIXL
+        # merged into 2, as predicted: their bytes are still the selected ones'.
+        for sizes in ((2, 4), (4, 2)):
+            with self.subTest(sizes=sizes, merged=True):
+                verdict = self.verdict(*sizes, 8, True, reads(
+                    lambda entry: entry[:3] + [2] + entry[4:6] + [[entry[6][0], 10, 2]]))
+                self.assertEqual(verdict["problems"], [])
+                self.assertEqual(verdict["hetero_tp"]["max_descriptors"], 10)
 
     def test_unequal_sizes_need_one_switched_network(self) -> None:
         base = (E2E / "runs" / "pd-smoke.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
