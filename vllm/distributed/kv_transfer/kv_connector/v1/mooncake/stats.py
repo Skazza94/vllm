@@ -90,12 +90,21 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             # (time.monotonic()).
             "wait_duration": [],
             "transfer_end": [],
+            # Per transfer, when known: the consumer TP rank written, and
+            # each region's plan [sends, source offset, destination offset,
+            # length] (heterogeneous TP slices a page).
+            "peer": [],
+            "plan": [],
             "num_failed_transfers": [],
             # Per failed transfer, when known: its bytes, descriptors and
             # start (time.monotonic()).
             "failed_bytes": [],
             "failed_descriptors": [],
             "failed_start": [],
+            "failed_peer": [],
+            # Consumer ranks answered without a write (a replicated
+            # producer's other ranks): [peer, its request ids, plan].
+            "zero_payload": [],
             "num_failed_recvs": [],
             "num_kv_expired_reqs": [],
         }
@@ -107,6 +116,8 @@ class MooncakeKVConnectorStats(KVConnectorStats):
         num_descs: int,
         wait_s: float | None = None,
         end: float | None = None,
+        peer: int | None = None,
+        plan: list | None = None,
     ):
         with self._lock:
             self.data["transfer_duration"].append(duration_s)
@@ -114,6 +125,8 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             self.data["num_descriptors"].append(num_descs)
             self.data["wait_duration"].append(wait_s)
             self.data["transfer_end"].append(end)
+            self.data["peer"].append(peer)
+            self.data["plan"].append(plan)
 
     # Each failure appends a single unit, which MooncakePromMetrics sums into
     # one counter increment.
@@ -122,12 +135,20 @@ class MooncakeKVConnectorStats(KVConnectorStats):
         total_bytes: int | None = None,
         num_descs: int | None = None,
         start: float | None = None,
+        peer: int | None = None,
     ):
         with self._lock:
             self.data["num_failed_transfers"].append(1)
             self.data["failed_bytes"].append(total_bytes)
             self.data["failed_descriptors"].append(num_descs)
             self.data["failed_start"].append(start)
+            self.data["failed_peer"].append(peer)
+
+    def record_zero_payload(self, peer: int, requests: list[str], plan: list):
+        """A consumer rank answered for its `requests` (its own request ids)
+        with nothing to write."""
+        with self._lock:
+            self.data["zero_payload"].append([peer, list(requests), plan])
 
     def record_failed_recv(self):
         with self._lock:
@@ -153,12 +174,13 @@ class MooncakeKVConnectorStats(KVConnectorStats):
             and len(self.data["num_failed_transfers"]) == 0
             and len(self.data["num_failed_recvs"]) == 0
             and len(self.data["num_kv_expired_reqs"]) == 0
+            and len(self.data.get("zero_payload", ())) == 0
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
             for k, v in other.data.items():
-                accumulator = self.data[k]
+                accumulator = self.data.setdefault(k, [])
                 assert isinstance(accumulator, list)
                 accumulator.extend(v)
         return self

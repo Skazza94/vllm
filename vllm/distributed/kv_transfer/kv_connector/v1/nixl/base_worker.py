@@ -1150,7 +1150,7 @@ class NixlBaseConnectorWorker:
         # Before any remote agent is added: a failed handshake fails the
         # requests waiting on it.
         if mismatch := simulated_tp_mismatch(
-            self.vllm_config, self.world_size, remote_tp_size
+            self.vllm_config, self.world_size, remote_tp_size, nixl_consumer=True
         ):
             raise RuntimeError(mismatch)
         if self._is_csa_linear:

@@ -392,9 +392,10 @@ class SimulationConfig:
         }
         model = vllm_config.model_config
         # Tensor parallelism: each rank moves its own KV heads, to the
-        # matching rank of an instance of the same TP size (either connector
-        # refuses a peer of another, `simulated_tp_mismatch`: their patterns
-        # differ). Data-parallel attention (an MoE model's DP
+        # ranks of the other instance that hold them; an instance of another
+        # TP size pairs for plain attention only, the connector re-sharding
+        # heads (`simulated_tp_mismatch`; each head's pattern is its own).
+        # Data-parallel attention (an MoE model's DP
         # ranks, with expert parallelism): each DP rank holds its own
         # requests' KV, paired with whichever DP rank serves the request on
         # the other instance.

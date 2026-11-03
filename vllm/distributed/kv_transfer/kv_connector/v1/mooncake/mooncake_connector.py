@@ -1784,6 +1784,7 @@ class MooncakeConnectorWorker:
                 local_regions,
                 remote_regions,
             )
+            plan = self._sender_plan
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
                 (d_req_id, send_meta)
@@ -1791,6 +1792,11 @@ class MooncakeConnectorWorker:
                 if d_req_id not in err_req_set
             ]
 
+            if not src_ptrs and ok_ready_reqs:
+                # A replica of a replicated producer: answered, nothing written.
+                self.xfer_stats.record_zero_payload(
+                    meta.remote_tp_rank, sorted(d for d, _ in ok_ready_reqs), plan
+                )
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
                 # The write can start once its last request is ready.
@@ -1804,7 +1810,9 @@ class MooncakeConnectorWorker:
                 )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
-                    self._send_blocks,
+                    self._send_blocks_to,
+                    meta.remote_tp_rank,
+                    plan,
                     remote_session,
                     src_ptrs,
                     dst_ptrs,
@@ -1903,6 +1911,8 @@ class MooncakeConnectorWorker:
         src_ptrs = []
         dst_ptrs = []
         lengths = []
+        # Each region's plan (sends, source and destination offsets, length).
+        plans: set[tuple[bool, int, int, int]] = set()
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
@@ -2036,6 +2046,9 @@ class MooncakeConnectorWorker:
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
                 )
+                plans.add(
+                    (should_transfer, src_region_offset, dst_region_offset, transfer_len)
+                )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
                     # needs to send the actual bytes for this paired decoder rank.
@@ -2098,6 +2111,9 @@ class MooncakeConnectorWorker:
                 remote_session,
             )
 
+        # Read by the caller right after this returns (one event loop: no
+        # other response's coroutine runs in between).
+        self._sender_plan = [list(p) for p in sorted(plans)]
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
     def _bind_sender_thread_device(self) -> None:
@@ -2105,6 +2121,17 @@ class MooncakeConnectorWorker:
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
+
+    def _send_blocks_to(self, peer: int, plan: list, *args) -> int:
+        """`_send_blocks` on this executor thread, its consumer TP rank and
+        each region's plan recorded with the write."""
+        if getattr(self, "_send_peer", None) is None:
+            self._send_peer = threading.local()
+        self._send_peer.value = (peer, plan)
+        try:
+            return self._send_blocks(*args)
+        finally:
+            self._send_peer.value = None
 
     def _send_blocks(
         self,
@@ -2115,7 +2142,13 @@ class MooncakeConnectorWorker:
         ready_at: float | None = None,
     ) -> int:
         """Write the blocks; ``ready_at`` (time.monotonic()), when its
-        requests' blocks were all ready, times the wait before the write."""
+        requests' blocks were all ready, times the wait before the write.
+        Its consumer rank and plan, set by `_send_blocks_to`, are recorded
+        with it."""
+        peer, plan = getattr(getattr(self, "_send_peer", None), "value", None) or (
+            None,
+            None,
+        )
         started = time.monotonic()
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
@@ -2129,11 +2162,13 @@ class MooncakeConnectorWorker:
                 num_descs=len(src_ptrs),
                 wait_s=None if ready_at is None else max(0.0, started - ready_at),
                 end=time.monotonic(),
+                peer=peer,
+                plan=plan,
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
             self.xfer_stats.record_failed_transfer(
-                total_bytes=sum(lengths), num_descs=len(src_ptrs), start=started
+                total_bytes=sum(lengths), num_descs=len(src_ptrs), start=started, peer=peer
             )
             logger.warning(
                 "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",

@@ -248,6 +248,50 @@ def transfer_rates_from_log(path: str) -> tuple[TransferRate, TransferRate | Non
     return rates[0], rates[1]
 
 
+class NixlReadPeers:
+    """Each NIXL READ's producer TP rank, local slot and descriptors, beside
+    its telemetry in the worker's stats (`peer`, `plan`): the hooks wrap the
+    wrapper's `make_prepped_xfer` (the handle's remote side names the rank,
+    its local side the slot a heterogeneous-TP split writes) and
+    `get_xfer_telemetry` (read just before the stats record that READ)."""
+
+    def __init__(self, worker) -> None:
+        self.worker = worker
+        self.handles: dict[object, tuple[int | None, list[int]]] = {}
+        wrapper = worker.nixl_wrapper
+        make, telemetry = wrapper.make_prepped_xfer, wrapper.get_xfer_telemetry
+
+        def make_prepped_xfer(op, local, local_ids, remote, remote_ids, *args, **kw):
+            handle = make(op, local, local_ids, remote, remote_ids, *args, **kw)
+            self.handles[handle] = (self._rank(remote), [self._slot(local), len(local_ids)])
+            return handle
+
+        def get_xfer_telemetry(handle):
+            result = telemetry(handle)
+            peer, plan = self.handles.pop(handle, (None, None))
+            if result is not None:
+                data = self.worker.xfer_stats.data
+                data.setdefault("peer", []).append(peer)
+                data.setdefault("plan", []).append(plan)
+            return result
+
+        wrapper.make_prepped_xfer = make_prepped_xfer
+        wrapper.get_xfer_telemetry = get_xfer_telemetry
+
+    def _rank(self, remote) -> int | None:
+        for ranks in self.worker.dst_xfer_side_handles.values():
+            for rank, handle in ranks.items():
+                if handle == remote:
+                    return int(rank)
+        return None
+
+    def _slot(self, local) -> int:
+        for handles in getattr(self.worker, "src_xfer_handles_by_tp_ratio", {}).values():
+            if local in handles:
+                return handles.index(local)
+        return 0
+
+
 def completed_transfers(
     kv_output: KVConnectorOutput | None,
 ) -> dict[str, dict[str, float]] | None:
@@ -282,6 +326,11 @@ def completed_transfers(
             unknown = [None] * stats.num_successful_transfers
             before = data["post_duration"] if nixl else data.get("wait_duration", unknown)
             ends = unknown if nixl else data.get("transfer_end", unknown)
+            # The peer rank and its plan (Mooncake: the consumer written,
+            # each region's plan; NIXL: the producer read and its READ, as
+            # `NixlReadPeers` saw them).
+            peers = data.get("peer") or unknown
+            plans = data.get("plan") or unknown
             transfers["load" if nixl else "send"] = {
                 "count": stats.num_successful_transfers,
                 "bytes": sum(data["bytes_transferred"]),
@@ -294,19 +343,30 @@ def completed_transfers(
                         before,
                         data["num_descriptors"],
                         ends,
+                        peers,
+                        plans,
                     )
                 ],
                 **({"failed": failed} if failed else {}),
             }
-            failed_each = list(
-                zip(
-                    data.get("failed_bytes", []),
-                    data.get("failed_descriptors", []),
-                    data.get("failed_start", []),
+            failed_each = [
+                list(entry) + [peer]
+                for entry, peer in zip(
+                    zip(
+                        data.get("failed_bytes", []),
+                        data.get("failed_descriptors", []),
+                        data.get("failed_start", []),
+                    ),
+                    data.get("failed_peer") or [None] * failed,
                 )
-            )
+            ]
             if not nixl and failed_each:
                 transfers["send"]["failed_each"] = [list(f) for f in failed_each]
+        if not nixl and data.get("zero_payload"):
+            # Consumer ranks a replicated producer answered without writing.
+            transfers.setdefault(
+                "send", {"count": 0, "bytes": 0, "seconds": 0.0, "each": []}
+            )["zero_payload"] = [list(z) for z in data["zero_payload"]]
         # Mooncake's consumer counts the transfers it waited for in vain.
         failed_recvs = 0 if nixl else len(data["num_failed_recvs"])
         if failed_recvs:

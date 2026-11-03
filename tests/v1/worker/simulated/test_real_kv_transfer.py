@@ -939,11 +939,13 @@ def test_real_mode_allows_tensor_parallelism_and_dp_attention(
         )
 
 
-@pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (2, 2)])
-def test_real_transfers_pair_equal_tp_sizes_only(model_dir, local_tp, remote_tp):
-    """What NIXL's handshake (and Mooncake's) checks first: real transfers
-    pair equal TP sizes (each rank's pattern is its own); ordinary execution
-    keeps heterogeneous TP."""
+@pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (2, 2), (1, 4), (2, 3)])
+def test_real_transfers_pair_tp_sizes_one_dividing_the_other(model_dir, local_tp, remote_tp):
+    """What NIXL's handshake (and Mooncake's) checks first: real transfers of
+    plain attention (the tiny Llama: 2 KV heads) pair TP sizes one dividing
+    the other, heads re-sharded; NIXL's decode refuses a larger producer
+    whose heads are replicated (TP 4 on 2 heads), as NIXL does. Ordinary
+    execution keeps heterogeneous TP."""
     from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
         simulated_tp_mismatch,
@@ -951,12 +953,16 @@ def test_real_transfers_pair_equal_tp_sizes_only(model_dir, local_tp, remote_tp)
 
     simulated = engine_config(model_dir, tensor_parallel_size=local_tp)
     mismatch = simulated_tp_mismatch(simulated, local_tp, remote_tp)
-    if local_tp == remote_tp:
-        assert mismatch is None
+    nixl = simulated_tp_mismatch(simulated, local_tp, remote_tp, nixl_consumer=True)
+    if (local_tp, remote_tp) == (2, 3):
+        assert f"one dividing the other, not local TP {local_tp} and remote TP {remote_tp}" in mismatch
     else:
-        assert f"local TP {local_tp} and remote TP {remote_tp}" in mismatch
+        assert mismatch is None
+        if (local_tp, remote_tp) == (1, 4):
+            assert "replicated" in nixl
+        else:
+            assert nixl is None
     assert simulated_tp_mismatch(VllmConfig(), local_tp, remote_tp) is None
-
 
 def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
     monkeypatch, model_dir
@@ -1151,12 +1157,35 @@ class RecordingConnector:
         return Connector
 
 
+def expected_pages(llm):
+    """The pattern a single-rank engine's layer page holds: each attention
+    layer's KV heads, as the model runner maps them (head_map), else the
+    rank's."""
+    from vllm.v1.worker.simulated.kv_pattern import head_map, layer_pattern
+    from vllm.v1.worker.simulated.kv_transfer import layer_specs
+
+    engine = llm.llm_engine
+    config = engine.engine_core.engine_core.scheduler.kv_cache_config
+    heads = head_map(
+        layer_specs(config.kv_cache_groups),
+        engine.model_config.get_total_num_kv_heads(),
+        0,
+        1,
+    )
+    assert heads, "no layer keeps its heads' pattern"
+
+    def page(req_id, layer, logical, size):
+        return layer_pattern(req_id, layer, logical, size, 0, None, heads)
+
+    return page
+
+
 def test_producer_writes_the_pattern_into_its_kv_tensors(any_model_dir, monkeypatch):
     """With kv_pattern_fill, a prefill engine's real KV tensors hold each
     request's pattern in the blocks the request was given."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+    from vllm.v1.worker.simulated.kv_pattern import block_views
 
     connector = RecordingConnector.make()
     RecordingConnector.registered.clear()
@@ -1195,10 +1224,11 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(any_model_dir, monkeypa
         caches = RecordingConnector.registered[0]
         num_blocks = next(iter(caches.values())).shape[0]
         views = block_views(caches, num_blocks)
+        page = expected_pages(llm)
         # 70 tokens span logical blocks 0..2; each holds its pattern somewhere.
         for layer, view in views.items():
             for logical in range(3):
-                want = pattern(output.request_id, layer, logical, view.shape[1])
+                want = page(output.request_id, layer, logical, view.shape[1])
                 assert any(torch.equal(view[b], want) for b in range(num_blocks)), (
                     layer,
                     logical,
@@ -1217,7 +1247,7 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
     allocations by group rebuild its blocks, reuse included."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+    from vllm.v1.worker.simulated.kv_pattern import block_views
 
     connector = RecordingConnector.make(hma=True)
     RecordingConnector.registered.clear()
@@ -1264,6 +1294,7 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
         ((req_id, block_ids),) = RecordingConnector.finished
         caches = RecordingConnector.registered[0]
         views = block_views(caches, config.num_blocks)
+        page = expected_pages(llm)
         for group, held in zip(config.kv_cache_groups, block_ids):
             # 200 tokens: 13 blocks, the window's first ones null.
             assert len(held) == 13
@@ -1278,7 +1309,7 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
                     continue
                 for layer in group.layer_names:
                     view = views[layer]
-                    want = pattern(req_id, layer, logical, view.shape[1])
+                    want = page(req_id, layer, logical, view.shape[1])
                     assert torch.equal(view[block], want), (layer, logical, block)
         # Each group's blocks by place, as the step log gave them.
         places: list[dict[int, int]] = [{} for _ in block_ids]
@@ -1321,7 +1352,7 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
     included; the layout record describes the padding."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-    from vllm.v1.worker.simulated.kv_pattern import block_views, pattern
+    from vllm.v1.worker.simulated.kv_pattern import block_views
 
     connector = RecordingConnector.make(hma=True)
     RecordingConnector.registered.clear()
@@ -1369,6 +1400,7 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
             name: g.kv_cache_spec.page_size_bytes for g in groups for name in g.layer_names
         }
         views = block_views(RecordingConnector.registered[0], config.num_blocks, pages)
+        page = expected_pages(llm)
         ((req_id, block_ids),) = RecordingConnector.finished
         for group, held in zip(groups, block_ids):
             spec = group.kv_cache_spec
@@ -1377,7 +1409,7 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
                 assert len(held) == 1 and spec.real_page_size_bytes < spec.page_size_bytes
             for logical, block in enumerate(held):
                 for layer in group.layer_names:
-                    want = pattern(req_id, layer, logical, spec.page_size_bytes)
+                    want = page(req_id, layer, logical, spec.page_size_bytes)
                     assert torch.equal(views[layer][block], want), (layer, logical)
         (layout,) = [r["kv_layout"] for r in log_records(log) if "kv_layout" in r]
         storages = {

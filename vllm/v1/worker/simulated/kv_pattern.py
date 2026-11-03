@@ -121,12 +121,124 @@ def pattern(
     PCG64 (numpy's portable generator) seeded by the identity's 128-bit
     BLAKE2b hash; both instances run the same numpy, so they agree."""
     base = identity if identity is not None else get_base_request_id(request_id)
-    identity = f"{base}|tp{tp_rank}|{layer}|{logical_block}".encode()
-    seed = int.from_bytes(hashlib.blake2b(identity, digest_size=16).digest(), "little")
+    return _stream(f"{base}|tp{tp_rank}|{layer}|{logical_block}", size)
+
+
+def _stream(name: str, size: int) -> torch.Tensor:
+    seed = int.from_bytes(
+        hashlib.blake2b(name.encode(), digest_size=16).digest(), "little"
+    )
     stream = np.random.Generator(np.random.PCG64(seed)).integers(
         1, 256, size, dtype=np.uint8
     )
     return torch.from_numpy(stream)
+
+
+HEAD_PATTERN = "head-v1"
+"""A layer's page as its KV heads' slabs, each its global head's pattern."""
+RANK_PATTERN = "rank-v0"
+"""A layer's page as one pattern of its tensor-parallel rank (`pattern`)."""
+
+HeadMap = Mapping[str, tuple[tuple[int, ...], int]]
+"""Each layer's global KV heads, in their order in its page, and one head's
+bytes (its slab: every token's K and V in the block); a layer absent keeps
+its rank's pattern."""
+
+
+def head_pattern(
+    request_id: str,
+    layer: str,
+    logical_block: int,
+    size: int,
+    heads: tuple[tuple[int, ...], int],
+    tp_rank: int = 0,
+    identity: str | None = None,
+) -> torch.Tensor:
+    """A layer's page of `size` bytes holding global KV heads `heads[0]`,
+    `heads[1]` bytes each: each slab its head's pattern, whichever rank holds
+    it and however the connector re-shards it (a head held by several ranks,
+    the same bytes on each); bytes past them (a page's padding), the rank's."""
+    global_heads, slab = heads
+    base = identity if identity is not None else get_base_request_id(request_id)
+    parts = [_stream(f"{base}|h{head}|{layer}|{logical_block}", slab) for head in global_heads]
+    rest = size - slab * len(global_heads)
+    if rest < 0:
+        raise ValueError(
+            f"{layer}: {len(global_heads)} heads of {slab} bytes exceed its {size}-byte page"
+        )
+    if rest:
+        parts.append(_stream(f"{base}|tp{tp_rank}|pad|{layer}|{logical_block}", rest))
+    return torch.cat(parts)
+
+
+def layer_pattern(
+    request_id: str,
+    layer: str,
+    logical_block: int,
+    size: int,
+    tp_rank: int,
+    identity: str | None,
+    heads: "HeadMap | None",
+) -> torch.Tensor:
+    """A layer's expected page: its heads' (`heads`), else its rank's."""
+    if heads is not None and layer in heads:
+        return head_pattern(
+            request_id, layer, logical_block, size, heads[layer], tp_rank, identity
+        )
+    return pattern(request_id, layer, logical_block, size, tp_rank, identity)
+
+
+def group_pattern(views: Mapping[str, object], heads: "HeadMap | None") -> dict:
+    """A group's pattern scheme and the global KV heads its layers hold: one
+    scheme for all its layers, or "mixed"."""
+    schemes = {HEAD_PATTERN if heads and layer in heads else RANK_PATTERN for layer in views}
+    covered = {heads[layer][0] for layer in views if heads and layer in heads}
+    return {
+        "pattern": schemes.pop() if len(schemes) == 1 else "mixed",
+        "global_heads": list(covered.pop()) if len(covered) == 1 else None,
+    }
+
+
+def head_map(
+    specs: Mapping[str, "KVCacheSpec"],
+    total_num_kv_heads: int,
+    tp_rank: int,
+    tp_size: int,
+) -> dict[str, tuple[tuple[int, ...], int]]:
+    """Each attention layer's global KV heads and slab, from its own spec:
+    one slot per KV head of plain states (`num_kv_heads`, `head_size`), the
+    heads vLLM gives this rank (rank r of tp <= K heads: K/tp from r*K/tp;
+    of tp > K: head r*K/tp, replicated); an MLA layer one latent, global
+    head 0, on every rank. A layer whose page packs otherwise (head slots,
+    packed content, compressed states), a state or a layer whose heads do
+    not match that sharding keeps its rank's pattern (absent)."""
+    from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+
+    heads = {}
+    for layer, spec in specs.items():
+        if (
+            not isinstance(spec, AttentionSpec)
+            or spec.num_head_slots is not None
+            or spec.state_content_bytes is not None
+            or spec.tokens_per_state != 1
+        ):
+            continue
+        if isinstance(spec, MLAAttentionSpec):
+            if spec.num_kv_heads == 1:
+                heads[layer] = ((0,), spec.unpadded_page_size_bytes)
+            continue
+        local = spec.num_kv_heads
+        if tp_size <= total_num_kv_heads:
+            first = tp_rank * total_num_kv_heads // tp_size
+            expected = total_num_kv_heads // tp_size
+            global_heads = tuple(range(first, first + local))
+        else:
+            expected = 1
+            global_heads = (tp_rank * total_num_kv_heads // tp_size,)
+        if local != expected:
+            continue
+        heads[layer] = (global_heads, spec.unpadded_page_size_bytes // local)
+    return heads
 
 
 class OutsideLifecycle(ValueError):
@@ -410,6 +522,9 @@ class PatternFiller(_ContentPages):
     """Each KV cache group's layers; None: one group of every layer."""
     chains: TokenChains | None = None
     """With prefix caching: blocks seeded by their content."""
+    heads: HeadMap | None = None
+    """Each attention layer's global KV heads (`head_map`): its page their
+    pattern; other layers their rank's."""
     blocks: dict[str, list[list[int]]] = field(default_factory=dict)
     """Each request's blocks by group, null ones included."""
     tables: dict[str, list[list[int]]] = field(default_factory=dict)
@@ -426,11 +541,15 @@ class PatternFiller(_ContentPages):
     def _write_block(self, req_id, group, logical, block, identity) -> None:
         for layer, view in self._groups[group].items():
             view[block].copy_(
-                pattern(req_id, layer, logical, view.shape[1], self.tp_rank, identity)
+                layer_pattern(
+                    req_id, layer, logical, view.shape[1], self.tp_rank, identity, self.heads
+                )
             )
 
     def _compare_block(self, req_id, group, logical, block, identity):
-        return _compare_views(self._groups[group], req_id, logical, block, self.tp_rank, identity)
+        return _compare_views(
+            self._groups[group], req_id, logical, block, self.tp_rank, identity, self.heads
+        )
 
     def _extend(
         self,
@@ -466,11 +585,12 @@ def _compare_views(
     block: int,
     tp_rank: int,
     identity: str | None,
+    heads: HeadMap | None = None,
 ) -> tuple[int, int, list]:
     compared = wrong = 0
     entries = []
     for layer, view in views.items():
-        want = pattern(req_id, layer, logical, view.shape[1], tp_rank, identity)
+        want = layer_pattern(req_id, layer, logical, view.shape[1], tp_rank, identity, heads)
         bad = int((view[block] != want).sum())
         compared += view.shape[1]
         if bad:
@@ -654,6 +774,9 @@ class PatternChecker(_ConsumerPages):
     transfer KV); None: every group, in order."""
     chains: TokenChains | None = None
     """With prefix caching: blocks seeded by their content."""
+    heads: HeadMap | None = None
+    """Each attention layer's global KV heads (`head_map`): its page their
+    pattern, whichever producer ranks wrote it; other layers their rank's."""
     pending: dict[str, _Expected] = field(default_factory=dict)
     # Pending reads whose blocks the connector reported invalid.
     lost: set[str] = field(default_factory=set)
@@ -670,11 +793,15 @@ class PatternChecker(_ConsumerPages):
     def _write_block(self, req_id, group, logical, block, identity) -> None:
         for layer, view in self._groups[group].items():
             view[block].copy_(
-                pattern(req_id, layer, logical, view.shape[1], self.tp_rank, identity)
+                layer_pattern(
+                    req_id, layer, logical, view.shape[1], self.tp_rank, identity, self.heads
+                )
             )
 
     def _compare_block(self, req_id, group, logical, block, identity):
-        return _compare_views(self._groups[group], req_id, logical, block, self.tp_rank, identity)
+        return _compare_views(
+            self._groups[group], req_id, logical, block, self.tp_rank, identity, self.heads
+        )
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         """Fill the blocks of the reads this step will post (call before the
@@ -752,13 +879,14 @@ class PatternChecker(_ConsumerPages):
                 logical = group.first_logical_block + offset
                 identity = identity_of(group.group, logical) if identity_of else None
                 for layer, view in views.items():
-                    want = pattern(
+                    want = layer_pattern(
                         expected.remote_request_id,
                         layer,
                         logical,
                         view.shape[1],
                         self.tp_rank,
                         identity,
+                        self.heads,
                     )
                     wrong = int((view[block_id] != want).sum())
                     if wrong:
@@ -773,6 +901,7 @@ class PatternChecker(_ConsumerPages):
                     "block_bytes": sum(view.shape[1] for view in views.values()),
                     "bytes": blocks * sum(view.shape[1] for view in views.values()),
                     "mismatched_bytes": group_mismatched,
+                    **group_pattern(views, self.heads),
                 }
             )
         mismatched_bytes = sum(group["mismatched_bytes"] for group in groups)

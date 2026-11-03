@@ -41,8 +41,11 @@ from vllm.v1.worker.simulated.kv_pattern import (
     PatternFiller,
     TokenChains,
     block_views,
+    group_pattern,
+    head_map,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
+    NixlReadPeers,
     ReadsInFlight,
     SimulatedTransfers,
     GroupAllocations,
@@ -290,15 +293,25 @@ class SimulatedModelRunner(GPUModelRunner):
             if self.cache_config.enable_prefix_caching
             else None
         )
+        # Each attention layer's page is its global KV heads' patterns, so a
+        # connector may re-shard heads between unequal TP sizes; NIXL's
+        # selection of several groups keeps its rank's.
+        heads = None
         if (sim.kv_pattern_fill or sim.kv_pattern_check) and not native:
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).
             pages = packed_pages(kv_caches_dict, layer_specs(groups))
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
             layers = [group.layer_names for group in groups]
+            heads = head_map(
+                layer_specs(groups),
+                self.model_config.get_total_num_kv_heads(),
+                tp.rank_in_group,
+                tp.world_size,
+            )
             if sim.kv_pattern_fill:
                 self._kv_filler = PatternFiller(
-                    views, tp.rank_in_group, layers, chains
+                    views, tp.rank_in_group, layers, chains, heads
                 )
             if sim.kv_pattern_check:
                 self._kv_checker = PatternChecker(
@@ -307,6 +320,7 @@ class SimulatedModelRunner(GPUModelRunner):
                     layers,
                     self.kv_cache_config.transfer_group_ids,
                     chains,
+                    heads,
                 )
             logger.info(
                 "KV pattern %s over %d layers.",
@@ -314,6 +328,13 @@ class SimulatedModelRunner(GPUModelRunner):
                 len(views),
             )
         connector = super()._make_kv_connector(kv_caches_dict)
+        nixl_worker = getattr(get_kv_transfer_group(), "connector_worker", None)
+        if (
+            self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
+            and getattr(nixl_worker, "nixl_wrapper", None) is not None
+        ):
+            # Each READ's producer rank and slot, beside its telemetry.
+            self._nixl_read_peers = NixlReadPeers(nixl_worker)
         selection = None
         if native:
             refuse_foreign_state_geometry(get_kv_transfer_group().connector_worker)
@@ -351,6 +372,9 @@ class SimulatedModelRunner(GPUModelRunner):
                 # What NIXL moves of each group's block, beside its layers.
                 for entry, transfer in zip(layout["groups"], selection.describe()):
                     entry["transfer"] = transfer
+            # Each group's pattern scheme, and the global KV heads it holds.
+            for entry, group in zip(layout["groups"], groups):
+                entry.update(group_pattern(dict.fromkeys(group.layer_names), heads))
             # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
                 {

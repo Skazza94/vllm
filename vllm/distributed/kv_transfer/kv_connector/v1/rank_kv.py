@@ -104,18 +104,49 @@ def bind_hp_tcp(address: str) -> None:
 
 
 def simulated_tp_mismatch(
-    vllm_config: VllmConfig, local_tp_size: int, remote_tp_size: int
+    vllm_config: VllmConfig,
+    local_tp_size: int,
+    remote_tp_size: int,
+    *,
+    nixl_consumer: bool = False,
 ) -> str | None:
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
-    real KV transfers under simulated compute pair ranks of equal sizes only."""
+    real KV transfers under simulated compute pair equal sizes, or unequal
+    ones (one dividing the other) for a model of plain attention only (no
+    MLA, sliding window, recurrent state or draft), whose pattern is each KV
+    head's (``kv_pattern.head_pattern``) wherever the connector re-shards it.
+    NIXL's decode (`nixl_consumer`, the local side) refuses, as NIXL itself
+    does, a larger producer whose KV heads are replicated."""
     sim = vllm_config.simulation_config
+    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+        return None
+    if local_tp_size == remote_tp_size:
+        return None
+    sizes = f"local TP {local_tp_size} and remote TP {remote_tp_size}"
+    larger, smaller = max(local_tp_size, remote_tp_size), min(local_tp_size, remote_tp_size)
+    if larger % smaller:
+        return f"Simulated real KV transfers pair TP sizes one dividing the other, not {sizes}."
+    model = vllm_config.model_config
+    layer_types = getattr(model.hf_text_config, "layer_types", None) or ()
     if (
-        sim.simulate_forward
-        and sim.kv_transfer_mode == "real"
-        and local_tp_size != remote_tp_size
+        model.use_mla
+        or model.is_hybrid
+        or model.get_sliding_window() is not None
+        or any("sliding" in str(kind) for kind in layer_types)
+        or vllm_config.speculative_config is not None
     ):
         return (
-            "Simulated real KV transfers pair equal tensor-parallel sizes, not "
-            f"local TP {local_tp_size} and remote TP {remote_tp_size}."
+            "Simulated real KV transfers pair unequal TP sizes for plain attention "
+            f"only (no MLA, sliding window, recurrent state or draft), not {sizes}."
+        )
+    if (
+        nixl_consumer
+        and remote_tp_size > local_tp_size
+        and remote_tp_size > model.get_total_num_kv_heads()
+    ):
+        # NIXL asserts the same (nixl/base_worker.py, before reading).
+        return (
+            f"NIXL does not read from a larger producer whose KV heads are "
+            f"replicated ({sizes}, {model.get_total_num_kv_heads()} KV heads)."
         )
     return None

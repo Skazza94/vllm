@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import dataclasses
 import inspect
 import os
 import queue
@@ -5079,6 +5080,170 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
                 f"got {notif!r} (expected {expected_notif!r}, "
                 f"buggy form would be {bad_notif!r})"
             )
+
+
+def _gathered_read(monkeypatch, narrow=None):
+    """Decode rank 0 of TP 2 reading one request from a prefill of TP 4
+    through NIXL's own read path: `_read_blocks_for_req` posts a READ per
+    source the native mapping gives (`compute_tp_mapping`, or `narrow` of it)
+    into that source's slot, and the request finishes when `get_finished`
+    polls all of them DONE. Each source's READ stays in progress until the
+    source is released, its head landing in the decode page when it first
+    reads DONE, its telemetry counting its descriptors. Returns the byte
+    checker's results before any source and after each, the sources read
+    and the worker's stats (with `NixlReadPeers` installed)."""
+    from tests.v1.worker.simulated.test_kv_pattern import (
+        DECODE_ID,
+        SLAB,
+        checker_for,
+        copy_slice,
+        recv_step,
+        tp_sides,
+    )
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.worker.simulated.kv_transfer import NixlReadPeers
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+    block_size = maybe_update_block_size(16)
+    vllm_config = create_vllm_config(block_size=block_size)
+    kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=1)
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config,
+        connector.engine_id,
+        hand_shake_latency=0,
+        kv_cache_config=kv_cache_config,
+    )
+    worker = connector.connector_worker
+    # The minimal single-block registration of the TP handshake tests above.
+    worker.slot_size_per_layer = [4096]
+    worker.block_len_per_layer = [4096 * worker.block_size]
+    worker.num_blocks = 1
+    worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
+    block_len = worker.block_len_per_layer[0]
+    worker.src_blocks_data = np.array(
+        [(0, block_len, worker.tp_rank, block_len, worker.num_blocks)],
+        dtype=np.uint64,
+    )
+    worker.num_descs = int(worker.src_blocks_data[:, 4].sum())
+    engine = worker.REMOTE_ENGINE_ID
+    remote_agents, _ = worker._nixl_handshake(
+        host="localhost", port=1234, remote_tp_size=4, expected_engine_id=engine
+    )
+    worker._remote_agents[engine] = remote_agents
+    mapping = worker.tp_mappings[engine]
+    if narrow is not None:
+        ranks = narrow(mapping.all_source_ranks)
+        mapping = worker.tp_mappings[engine] = dataclasses.replace(
+            mapping,
+            all_source_ranks=ranks,
+            source_ranks_per_group=tuple(ranks for _ in mapping.source_ranks_per_group),
+        )
+
+    # Toy pages of 4 KV heads: producer rank r holds head r, decode rank 0
+    # heads 0 and 1, in the slots the native mapping gives their sources.
+    prefill, decode = tp_sides(4, 2)
+    checker = checker_for(decode, 0)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+
+    fake = worker.nixl_wrapper
+    handles: dict[int, tuple[int, int]] = {}
+    released: set[int] = set()
+    landed: set[int] = set()
+    make = fake.make_prepped_xfer
+
+    def make_prepped_xfer(op, local, local_ids, remote, remote_ids, notif_msg=None):
+        handle = make(op, local, local_ids, remote, remote_ids, notif_msg=notif_msg)
+        sides = worker.dst_xfer_side_handles[engine].items()
+        handles[handle] = (next(r for r, h in sides if h == remote), len(local_ids))
+        return handle
+
+    def check_xfer_state(handle):
+        rank, _ = handles[handle]
+        if rank not in released:
+            return "PROC"
+        if handle not in landed:
+            landed.add(handle)
+            slot = mapping.rank_to_attention_slot[rank]
+            copy_slice(prefill[rank][0], decode[0][0], 0, slot * SLAB, SLAB)
+        return "DONE"
+
+    fake.make_prepped_xfer = make_prepped_xfer
+    fake.check_xfer_state = check_xfer_state
+    fake.get_xfer_telemetry = lambda handle: get_default_xfer_telemetry(
+        descCount=handles[handle][1]
+    )
+    NixlReadPeers(worker)
+
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id=DECODE_ID,
+        local_block_ids=([0],),
+        kv_transfer_params={
+            "remote_block_ids": ([0],),
+            "remote_engine_id": engine,
+            "remote_request_id": "prefill-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "remote_tp_size": 4,
+        },
+    )
+    worker.start_load_kv(metadata)
+    sources = sorted({rank for rank, _ in handles.values()})
+    results = []
+    for rank in [None, *sources]:
+        if rank is not None:
+            released.add(rank)
+        _, done = worker.get_finished()
+        results.append(checker.after_step(KVConnectorOutput(finished_recving=done)))
+    return results, sources, worker.xfer_stats.data
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_a_nixl_page_gathered_from_two_producers_finishes_after_the_last(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """P TP4 -> D TP2: decode rank 0 reads its heads from producer ranks 0
+    and 1 (the native mapping), each into its slot. With the last READ in
+    progress the native poll reports nothing and nothing is compared; once it
+    is done the request finishes and the gathered page passes. The READ hook
+    records each producer rank and slot, with NIXL's descriptor count."""
+    results, sources, data = _gathered_read(monkeypatch)
+    assert sources == [0, 1]
+    before, first, last = results
+    assert before == [] and first == []
+    (result,) = last
+    assert result["ok"], result
+    assert result["groups"][0]["global_heads"] == [0, 1]
+    assert data["peer"] == [0, 1]
+    assert [plan[0] for plan in data["plan"]] == [0, 1]
+    assert [plan[1] for plan in data["plan"]] == data["num_descriptors"]
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_a_nixl_read_taking_its_first_source_for_the_request_fails(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """The mutation the test above guards against: a mapping that takes the
+    first source for the whole request finishes it after that READ, and the
+    byte check fails on the head that never came."""
+    from tests.v1.worker.simulated.test_kv_pattern import LAYERS, SLAB
+
+    results, sources, _ = _gathered_read(monkeypatch, narrow=lambda ranks: ranks[:1])
+    assert sources == [0]
+    before, (result,) = results
+    assert before == []
+    assert not result["ok"]
+    assert result["mismatched_bytes"] == 2 * len(LAYERS) * SLAB
 
 
 @patch(

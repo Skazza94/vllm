@@ -37,6 +37,10 @@ class NixlKVConnectorStats(KVConnectorStats):
             "post_duration": [],
             "bytes_transferred": [],
             "num_descriptors": [],
+            # Per transfer, when a simulated run records it: the producer TP
+            # rank read and the READ ([local slot, descriptors]).
+            "peer": [],
+            "plan": [],
             "num_failed_transfers": [],
             "num_failed_notifications": [],
             "num_failed_handshakes": [],
@@ -92,7 +96,7 @@ class NixlKVConnectorStats(KVConnectorStats):
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
             for k, v in other.data.items():
-                accumulator = self.data[k]
+                accumulator = self.data.setdefault(k, [])
                 assert isinstance(accumulator, list)
                 accumulator.extend(v)
         return self

@@ -326,7 +326,12 @@ def test_nixl_reads_are_logged_one_by_one():
             "count": 2,
             "bytes": 655360,
             "seconds": 0.0035,
-            "each": [[393216, 0.002, 0.00015, 2, None], [262144, 0.0015, 0.0001, 2, None]],
+            # Bytes, seconds, posting, descriptors, end, peer, plan (the
+            # last three unknown here).
+            "each": [
+                [393216, 0.002, 0.00015, 2, None, None, None],
+                [262144, 0.0015, 0.0001, 2, None, None, None],
+            ],
         }
     }
 
@@ -392,7 +397,7 @@ def test_mooncake_sends_and_failed_receives_are_logged():
             "count": 1,
             "bytes": 393216,
             "seconds": 0.002,
-            "each": [[393216, 0.002, 0.0005, 3, 12.5]],
+            "each": [[393216, 0.002, 0.0005, 3, 12.5, None, None]],
         }
     }
     # Stats from before the wait and end were recorded.
@@ -401,7 +406,7 @@ def test_mooncake_sends_and_failed_receives_are_logged():
               "num_failed_transfers": [], "num_failed_recvs": [], "num_kv_expired_reqs": []}
     )
     assert completed_transfers(KVConnectorOutput(kv_connector_stats=old))["send"]["each"] == [
-        [1, 0.002, None, 1, None]
+        [1, 0.002, None, 1, None, None, None]
     ]
     # A failed write: its bytes and descriptors, to compare with the
     # transport's limits.
@@ -414,7 +419,8 @@ def test_mooncake_sends_and_failed_receives_are_logged():
             "seconds": 0,
             "each": [],
             "failed": 1,
-            "failed_each": [[176160768, 2688, 7.5]],
+            # Bytes, descriptors, start, the consumer rank (unknown here).
+            "failed_each": [[176160768, 2688, 7.5, None]],
         }
     }
     receiver = MooncakeKVConnectorStats()
@@ -583,8 +589,9 @@ def test_a_pull_of_groups_sharing_memory_is_checked_group_by_group():
     (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
     assert result["ok"], result
     # Each group's blocks over its own layers: each (layer, block) once.
+    # Without a head map (here), each page its rank's pattern.
     group = {"first_logical_block": 0, "blocks": 2, "layers": 2, "block_bytes": 512,
-             "bytes": 1024, "mismatched_bytes": 0}
+             "bytes": 1024, "mismatched_bytes": 0, "pattern": "rank-v0", "global_heads": None}
     assert result["groups"] == [{"group": 0, **group}, {"group": 1, **group}]
     assert (result["blocks"], result["layers"], result["bytes"]) == (4, 4, 2048)
     assert result["block_ids"] == [7, 8, 9, 10]
@@ -1672,3 +1679,227 @@ def test_a_native_same_step_decode_adoption_is_compared_after_its_writer():
     assert hit["req_id"] == "b" and hit["kind"] == "hit" and hit["ok"], hit
     assert hit["groups"][0]["written_this_step"] == [[a_blocks[2], "a"]]
     assert holds(decode, a_blocks[2], checker.chains, "a", 2, BLOCK)
+
+
+# Unequal TP: each attention layer's page is its global KV heads' patterns.
+
+
+def attention_specs(kv_heads_per_rank, layers=LAYERS, padded=None):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    # 4 tokens a block, head size 4 in uint8: a head's slab is 4 x 8 = 32 bytes.
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=kv_heads_per_rank,
+        head_size=4,
+        dtype=torch.uint8,
+        page_size_padded=padded,
+    )
+    return dict.fromkeys(layers, spec)
+
+
+SLAB = 32
+
+
+def test_global_heads_follow_vllm_sharding_layer_by_layer():
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.worker.simulated.kv_pattern import head_map
+
+    # K = 4 KV heads: TP2 ranks hold heads 0-1 and 2-3, TP4 one each, TP8
+    # one each, replicated on ranks 2h and 2h + 1.
+    assert head_map(attention_specs(2), 4, 1, 2)[LAYERS[0]] == ((2, 3), SLAB)
+    assert head_map(attention_specs(1), 4, 3, 4)[LAYERS[0]] == ((3,), SLAB)
+    assert [head_map(attention_specs(1), 4, r, 8)[LAYERS[0]][0] for r in range(8)] == [
+        (h,) for h in (0, 0, 1, 1, 2, 2, 3, 3)
+    ]
+    # A layer whose local heads do not match that sharding keeps its rank's.
+    assert head_map(attention_specs(1), 4, 0, 2) == {}
+    # MLA: one latent, the same on every rank.
+    mla = {"mla": MLAAttentionSpec(block_size=4, num_kv_heads=1, head_size=16, dtype=torch.uint8)}
+    assert head_map(mla, 1, 3, 4) == {"mla": ((0,), 64)}
+    # A recurrent state keeps its rank's pattern.
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = {"ssm": MambaSpec(block_size=4, shapes=((4,),), dtypes=(torch.uint8,))}
+    assert head_map(state, 4, 0, 2) == {}
+
+
+def test_a_heads_bytes_do_not_depend_on_tp_size_page_or_rank():
+    from vllm.v1.worker.simulated.kv_pattern import head_map, head_pattern
+
+    def page(tp, rank, padded=None):
+        specs = attention_specs(max(1, 4 // tp), padded=padded)
+        heads = head_map(specs, 4, rank, tp)[LAYERS[0]]
+        size = padded or len(heads[0]) * SLAB
+        return heads, head_pattern(PREFILL_ID, LAYERS[0], 3, size, heads, rank)
+
+    (_, tp2_rank0), (_, tp2_rank1) = page(2, 0), page(2, 1)
+    # TP4 rank 1 holds head 1: the second slab of TP2 rank 0's page.
+    assert torch.equal(page(4, 1)[1], tp2_rank0[SLAB : 2 * SLAB])
+    assert torch.equal(page(4, 2)[1], tp2_rank1[:SLAB])
+    # TP8 ranks 2 and 3 replicate head 1: the same bytes.
+    assert torch.equal(page(8, 2)[1], page(8, 3)[1])
+    assert torch.equal(page(8, 2)[1], tp2_rank0[SLAB : 2 * SLAB])
+    # Another request, layer or block differs.
+    heads = page(4, 1)[0]
+    assert not torch.equal(head_pattern("cmpl-other-0-1", LAYERS[0], 3, SLAB, heads), page(4, 1)[1])
+    assert not torch.equal(head_pattern(PREFILL_ID, LAYERS[1], 3, SLAB, heads), page(4, 1)[1])
+    assert not torch.equal(head_pattern(PREFILL_ID, LAYERS[0], 4, SLAB, heads), page(4, 1)[1])
+    # A padded page: its heads' slabs, then its rank's padding.
+    padded_heads, padded = page(2, 0, padded=80)
+    assert torch.equal(padded[: 2 * SLAB], tp2_rank0)
+    assert not torch.equal(padded[2 * SLAB :], page(2, 1, padded=80)[1][2 * SLAB :])
+    with pytest.raises(ValueError, match="exceed"):
+        head_pattern(PREFILL_ID, LAYERS[0], 3, SLAB, padded_heads)
+
+
+def tp_sides(prefill_tp, decode_tp, kv_heads=4, num_blocks=8):
+    """Each prefill rank's filled pages (blocks 3, 5 of a 2-block request)
+    and each decode rank's empty pages, under head patterns."""
+    from vllm.v1.worker.simulated.kv_pattern import head_map
+
+    def side(tp):
+        ranks = []
+        for rank in range(tp):
+            heads = head_map(attention_specs(max(1, kv_heads // tp)), kv_heads, rank, tp)
+            page = len(next(iter(heads.values()))[0]) * SLAB
+            views = {layer: torch.zeros(num_blocks, page, dtype=torch.uint8) for layer in LAYERS}
+            ranks.append((views, heads))
+        return ranks
+
+    prefill = side(prefill_tp)
+    for rank, (views, heads) in enumerate(prefill):
+        PatternFiller(views, rank, heads=heads).after_update(
+            new_request_step(PREFILL_ID, [3, 5])
+        )
+    return prefill, side(decode_tp)
+
+
+def checker_for(decode, rank):
+    views, heads = decode[rank]
+    return PatternChecker(views, rank, heads=heads)
+
+
+def copy_slice(prefill_views, decode_views, src_offset, dst_offset, length, pairs=((1, 3), (2, 5))):
+    for layer in LAYERS:
+        for d_block, p_block in pairs:
+            decode_views[layer][d_block][dst_offset : dst_offset + length] = prefill_views[layer][
+                p_block
+            ][src_offset : src_offset + length]
+
+
+def test_decode_ranks_check_head_slices_of_a_larger_producer_page():
+    """P TP2 -> D TP4: decode rank d holds head d, bytes (d % 2) x slab of
+    prefill rank d // 2's page; the wrong slice fails."""
+    prefill, decode = tp_sides(2, 4)
+    for rank in range(4):
+        checker = checker_for(decode, rank)
+        checker.before_step(recv_step([1, 2], [3, 5]))
+        copy_slice(prefill[rank // 2][0], decode[rank][0], (rank % 2) * SLAB, 0, SLAB)
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"], result
+        assert result["groups"][0]["global_heads"] == [rank]
+        assert result["groups"][0]["pattern"] == "head-v1"
+    checker = checker_for(decode, 1)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+    copy_slice(prefill[0][0], decode[1][0], 0, 0, SLAB)  # head 0, not 1
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+
+
+def test_a_decode_page_assembled_from_producers_is_compared_when_all_arrived():
+    """P TP4 -> D TP2: decode rank d's page is prefill ranks 2d and 2d + 1's
+    pages side by side. Compared only once the connector reports the request
+    finished (after its last source); reported finished early, the missing
+    part (still the sentinel) fails it."""
+    prefill, decode = tp_sides(4, 2)
+    checker = checker_for(decode, 1)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+    copy_slice(prefill[2][0], decode[1][0], 0, 0, SLAB)
+    # The last source is delayed: nothing is compared.
+    assert checker.after_step(KVConnectorOutput()) == []
+    copy_slice(prefill[3][0], decode[1][0], 0, SLAB, SLAB)
+    (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert result["ok"] and result["groups"][0]["global_heads"] == [2, 3], result
+    early = checker_for(decode, 0)
+    early.before_step(recv_step([1, 2], [3, 5]))
+    copy_slice(prefill[0][0], decode[0][0], 0, 0, SLAB)
+    (result,) = early.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+    assert not result["ok"]
+    assert result["mismatched_bytes"] == 2 * len(LAYERS) * SLAB
+
+
+def test_replicated_heads_carry_the_same_bytes_on_either_side():
+    """K = 4. P TP2 -> D TP8: decode ranks 2 and 3 both hold head 1, the
+    second slab of prefill rank 0's page. P TP8 -> D TP2: decode rank 0's
+    heads 0 and 1 come from producer ranks 0 and 2 (their replicas 1 and 3
+    write nothing), or equally from 1 and 3."""
+    prefill, decode = tp_sides(2, 8)
+    for rank in (2, 3):
+        checker = checker_for(decode, rank)
+        checker.before_step(recv_step([1, 2], [3, 5]))
+        copy_slice(prefill[0][0], decode[rank][0], SLAB, 0, SLAB)
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"] and result["groups"][0]["global_heads"] == [1], result
+    prefill, decode = tp_sides(8, 2)
+    for sources in ((0, 2), (1, 3)):
+        checker = checker_for(decode, 0)
+        checker.before_step(recv_step([1, 2], [3, 5]))
+        for slot, source in enumerate(sources):
+            copy_slice(prefill[source][0], decode[0][0], 0, slot * SLAB, SLAB)
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"], (sources, result)
+
+
+def test_a_delayed_decode_worker_holds_the_request():
+    """vLLM's aggregation across decode workers: a request finishes receiving
+    only when every worker reported it."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    def output(finished):
+        return ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_connector_output=KVConnectorOutput(finished_recving=finished),
+        )
+
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+    first = aggregator.aggregate([output({DECODE_ID}), output(set())])
+    assert not first.kv_connector_output.finished_recving
+    second = aggregator.aggregate([output(set()), output({DECODE_ID})])
+    assert second.kv_connector_output.finished_recving == {DECODE_ID}
+
+
+def test_nixl_reads_record_their_producer_rank_and_slot():
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
+        NixlKVConnectorStats,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import NixlReadPeers, completed_transfers
+
+    telemetry = {
+        101: SimpleNamespace(xferDuration=1000, postDuration=10, totalBytes=64, descCount=2),
+        102: SimpleNamespace(xferDuration=1000, postDuration=10, totalBytes=64, descCount=2),
+    }
+    handles = iter((101, 102))
+    wrapper = SimpleNamespace(
+        make_prepped_xfer=lambda *args, **kw: next(handles),
+        get_xfer_telemetry=lambda handle: telemetry[handle],
+    )
+    worker = SimpleNamespace(
+        nixl_wrapper=wrapper,
+        xfer_stats=NixlKVConnectorStats(),
+        dst_xfer_side_handles={"prefill": {2: 7002, 3: 7003}},
+        src_xfer_handles_by_tp_ratio={(-2, 16): [9000, 9001]},
+    )
+    NixlReadPeers(worker)
+    # Decode rank 1 of TP2 reads producer ranks 2 and 3 into slots 0 and 1.
+    first = wrapper.make_prepped_xfer("READ", 9000, [0, 1], 7002, [4, 5], b"req:1")
+    second = wrapper.make_prepped_xfer("READ", 9001, [0, 1], 7003, [4, 5], b"req:1")
+    # Completed in the other order: each keeps its own.
+    for handle in (second, first):
+        worker.xfer_stats.record_transfer(wrapper.get_xfer_telemetry(handle))
+    each = completed_transfers(KVConnectorOutput(kv_connector_stats=worker.xfer_stats))["load"][
+        "each"
+    ]
+    assert [entry[5:] for entry in each] == [[3, [1, 2]], [2, [0, 2]]]
