@@ -50,6 +50,25 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(parsed.networks["data0"].rate, "100gbit")
         self.assertEqual(parsed.nodes["a"].image, spec.DEFAULT_IMAGE)
 
+    def test_a_node_may_join_a_network_with_several_links(self) -> None:
+        parsed = spec.parse(with_changes(nodes={"a": {"networks": ["control", {"data0": 3}]},
+                                                "b": {"networks": ["control", {"data0": 2}]},
+                                                "client": {"networks": ["control"]}}))
+        plan = [(link.node, link.slot, link.interface, str(link.node_address), link.router_interface)
+                for link in parsed.links if link.network == "data0"]
+        self.assertEqual(plan, [
+            ("a", 0, "data0r0", "10.100.0.1", "p0"), ("a", 1, "data0r1", "10.100.0.3", "p1"),
+            ("a", 2, "data0r2", "10.100.0.5", "p2"), ("b", 0, "data0r0", "10.100.0.7", "p3"),
+            ("b", 1, "data0r1", "10.100.0.9", "p4")])
+        self.assertEqual(parsed.address("b", "data0", 1), ipaddress.IPv4Address("10.100.0.9"))
+        self.assertTrue(parsed.nodes["a"].multi_link)
+        self.assertFalse(parsed.nodes["client"].multi_link)
+        # One link keeps the network's name, as before.
+        self.assertEqual([link.interface for link in parsed.links if link.network == "control"],
+                         ["control"] * 3)
+        self.assertEqual(spec.parse(with_changes(nodes={"a": {"networks": [{"data0": 1}]}})).links[0].interface,
+                         "data0")
+
     def test_invalid_specs_are_rejected(self) -> None:
         cases = [
             (with_changes(name="Bad_Name"), "name must be"),
@@ -73,6 +92,16 @@ class SpecTests(unittest.TestCase):
             (with_changes(nodes={"router-x": {"networks": ["data0"]}}), "router-"),
             (with_changes(nodes={"a": {"networks": ["data0"], "gpu": 1}}), "unknown key"),
             (with_changes(routers={"memory": "1g"}), "routers takes only cpus"),
+            (with_changes(nodes={"a": {"networks": [{"data0": 0}]}}), "positive number of links"),
+            (with_changes(nodes={"a": {"networks": [{"data0": True}]}}), "positive number of links"),
+            (with_changes(nodes={"a": {"networks": [{"data0": 2, "control": 2}]}}), "one {network: links}"),
+            (with_changes(nodes={"a": {"networks": ["data0", {"data0": 2}]}}), "listed twice"),
+            # data0r10 fits 15 characters; a 13-character network's link 10 does not.
+            (with_changes(networks={"averylongnet1": {"subnet": "10.1.0.0/24"}},
+                          nodes={"a": {"networks": [{"averylongnet1": 11}]}}), "longer than 15"),
+            (with_changes(networks={"data0": {"subnet": "10.100.0.0/29"}},
+                          nodes={"a": {"networks": [{"data0": 4}]}, "b": {"networks": ["data0"]}}),
+             "too small for 5 link"),
         ]
         for raw, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):

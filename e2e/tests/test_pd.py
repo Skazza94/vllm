@@ -1609,3 +1609,395 @@ class HpTcpEvidenceTests(unittest.TestCase):
         # NIXL: TENT's counters, no connector writes.
         self.assertIsNone(self.verdict(sends((2000, 100, 10.0, 10.1)))["dp_ranks"]["decode"][0]["hp_tcp"].get(
             "max_connector_descriptors_per_write"))
+
+
+# Unequal TP: heads re-sharded, reconciled with the native pairing.
+SLAB = 10  # a head's bytes in a block of a layer
+PER_HEAD = 100  # a request's bytes of one head (5 blocks x 2 layers x SLAB)
+
+
+def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requests=("a", "b")):
+    """Consistent step logs, transfers, ports and TENT scrapes of a run whose
+    instances have unequal TP sizes: each request's heads moved as the
+    native pairing gives them, a READ's descriptors one per block and layer,
+    a replica's answers naming their requests, and each rank's TENT series
+    as a scrape serves them (one never incremented absent)."""
+    heads = {role: [pd.global_heads(r, n, kv_heads) for r in range(n)]
+             for role, n in (("prefill", prefill_tp), ("decode", decode_tp))}
+    ratio = max(prefill_tp, decode_tp) // min(prefill_tp, decode_tp)
+    paired = {d: [d * prefill_tp // decode_tp] if decode_tp >= prefill_tp else
+              [d * ratio + i for i in range(ratio)] for d in range(decode_tp)}
+    sender = {(h, d): min(p for p in paired[d] if h in heads["prefill"][p])
+              for d in range(decode_tp) for h in heads["decode"][d]}
+
+    def layout(rank, tp, mine):
+        return line(kv_layout={"tp_rank": rank, "tp_size": tp, "block_bytes": 20, "bytes": 1600, "groups": [
+            {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
+             "block_bytes": SLAB * len(mine), "real_page_bytes": SLAB * len(mine), "pattern": "head-v1",
+             "global_heads": mine}]})
+
+    def group(mine):
+        return {"group": 0, "first_logical_block": 0, "blocks": 5, "layers": 2, "block_bytes": SLAB * len(mine),
+                "bytes": PER_HEAD * len(mine), "mismatched_bytes": 0, "pattern": "head-v1", "global_heads": mine}
+
+    sends = {p: [] for p in range(prefill_tp)}
+    loads = {d: [] for d in range(decode_tp)}
+    zero = {p: [] for p in range(prefill_tp)}
+    for d in range(decode_tp):
+        sources = sorted({sender[(h, d)] for h in heads["decode"][d]})
+        for p in paired[d]:
+            carried = [h for h in heads["decode"][d] if sender[(h, d)] == p]
+            if not carried:
+                zero[p] += [[d, [f"cmpl-{r}-0-d"], [[False, 0, 0, SLAB]]] for r in requests]
+                continue
+            plan = [[True, heads["prefill"][p].index(carried[0]) * SLAB,
+                     heads["decode"][d].index(carried[0]) * SLAB, SLAB * len(carried)]]
+            for _ in requests:
+                entry = [PER_HEAD * len(carried), 0.01, 0.0, 10, 10.0]
+                if nixl:
+                    slot = sources.index(p) if len(sources) > 1 else 0
+                    loads[d].append(entry + [p, [slot, 10]])
+                else:
+                    sends[p].append(entry + [d, plan])
+
+    def transfers(direction, each, zero_payload=()):
+        record = {"count": len(each), "bytes": sum(e[0] for e in each), "each": each}
+        if zero_payload:
+            record["zero_payload"] = list(zero_payload)
+        return line(kv_transfers={direction: record})
+
+    prefill = [layout(p, prefill_tp, heads["prefill"][p]) + allocated(*requests)
+               + transfers("send", sends[p], zero[p]) for p in range(prefill_tp)]
+    decode = [layout(d, decode_tp, heads["decode"][d])
+              + "".join(stepped(r, "d", 80, 1, 80) for r in requests)
+              + transfers("load", loads[d])
+              + "".join(line(kv_check=checked(r, blocks=5, layers=2, bytes=PER_HEAD * len(heads["decode"][d]),
+                                              groups=[group(heads["decode"][d])])) for r in requests)
+              for d in range(decode_tp)]
+    sent = {p: sum(e[0] for e in sends[p]) + sum(e[0] for d in loads for e in loads[d] if e[5] == p)
+            for p in range(prefill_tp)}
+    received = {d: sum(e[0] for e in loads[d]) + sum(e[0] for p in sends for e in sends[p] if e[5] == d)
+                for d in range(decode_tp)}
+    ports = {"kv": {**{f"p{p}": {"node": "p", "slot": p, "rx": sent[p] + 100, "tx": 40} for p in range(prefill_tp)},
+                    **{f"p{prefill_tp + d}": {"node": "d", "slot": d, "rx": 40, "tx": received[d] + 100}
+                       for d in range(decode_tp)}}}
+
+    def scrape(moved=None, kind="write", transfers=0):
+        """A rank's TENT series before and after the workload: an engine
+        that never moved a byte serves no series for it."""
+        def served(moved_bytes, count):
+            lines = ["tent_registered_buffer_bytes 1600"]
+            if moved is not None:
+                lines += [f'tent_{kind}_bytes_total{{transport="tcp"}} {moved_bytes}',
+                          f"tent_{kind}_requests_total {count}", f"tent_transport_attempts_total {count}"]
+            return "\n".join(lines)
+
+        return pd._tent_delta(served(0, 0), served(moved, transfers))
+
+    if nixl:
+        tents = {"prefill": [scrape() for _ in range(prefill_tp)],
+                 "decode": [scrape(received[d], "read", len(loads[d])) for d in range(decode_tp)]}
+    else:
+        tents = {"prefill": [scrape(sent[p], "write", len(sends[p])) if sends[p] else scrape()
+                             for p in range(prefill_tp)],
+                 "decode": [scrape() for _ in range(decode_tp)]}
+    return prefill, decode, ports, sum(sent.values()), tents
+
+
+class HeterogeneousTpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def run_for(self, prefill_tp, decode_tp, kv_heads, nixl):
+        (self.model / "config.json").write_text(json.dumps({"num_key_value_heads": kv_heads}))
+        return pd.Run(**{**RUN.__dict__, "model": self.model,
+                         "prefill": pd.Side("p", "kv", tensor_parallel_size=prefill_tp),
+                         "decode": pd.Side("d", "kv", tensor_parallel_size=decode_tp),
+                         "server": pd.Server(connector="nixl" if nixl else "mooncake")})
+
+    def verdict(self, prefill_tp, decode_tp, kv_heads, nixl, change=None, tent_change=None) -> dict:
+        prefill, decode, ports, moved, tents = hetero_logs(prefill_tp, decode_tp, kv_heads, nixl)
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        if tent_change:
+            tent_change(tents)
+        return pd.check({"completed": 2, "errors": []}, prefill, decode, {"control": 50, "kv": moved + 500},
+                        self.run_for(prefill_tp, decode_tp, kv_heads, nixl), tents, ports)
+
+    def test_heads_resharded_either_way_over_both_connectors(self) -> None:
+        for sizes, kv_heads in (((2, 4), 8), ((4, 2), 8), ((2, 8), 4)):
+            for nixl in (False, True):
+                with self.subTest(sizes=sizes, nixl=nixl):
+                    verdict = self.verdict(*sizes, kv_heads, nixl)
+                    self.assertEqual(verdict["problems"], [])
+                    hetero = verdict["hetero_tp"]
+                    self.assertEqual(hetero["sizes"], {"prefill": sizes[0], "decode": sizes[1]})
+                    # Decode replicating heads (TP 8 > K 4) carries each twice.
+                    self.assertEqual(hetero["replication_factor"], 2.0 if sizes == (2, 8) else 1.0)
+        # Each decode rank reads half a producer's heads (2 -> 4), or
+        # gathers two producers' (4 -> 2).
+        self.assertEqual(self.verdict(2, 4, 8, True)["hetero_tp"]["sources"], {0: [0], 1: [0], 2: [1], 3: [1]})
+        self.assertEqual(self.verdict(4, 2, 8, True)["hetero_tp"]["sources"], {0: [0, 1], 1: [2, 3]})
+
+    def test_a_replicated_producer_answers_without_a_payload(self) -> None:
+        """Mooncake 8 -> 2 with 4 KV heads: ranks 0, 2, 4, 6 send; 1, 3, 5, 7
+        answer with no payload, which must be recorded."""
+        verdict = self.verdict(8, 2, 4, False)
+        self.assertEqual(verdict["problems"], [])
+        pairs = {(pair["prefill"], pair["decode"]): pair for pair in verdict["hetero_tp"]["pairs"]}
+        self.assertEqual(pairs[(1, 0)], {"prefill": 1, "decode": 0, "bytes": 0, "expected": 0,
+                                         "zero_payload_answers": 2})
+        self.assertEqual(pairs[(2, 0)]["bytes"], 2 * PER_HEAD)
+
+        def silent(prefill, decode, ports):
+            records = [json.loads(text) for text in prefill[1].splitlines()]
+            for record in records:
+                record.get("kv_transfers", {}).get("send", {}).pop("zero_payload", None)
+            return [prefill[0], "".join(json.dumps(r) + "\n" for r in records), *prefill[2:]], decode, ports
+
+        problems = self.verdict(8, 2, 4, False, silent)["problems"]
+        self.assertIn("prefill rank 1 never answered decode rank 0 (no payload and no zero-payload answer) for 2 "
+                      "request(s), cmpl-a-0", problems)
+
+    def test_failures_are_reported(self) -> None:
+        def edit(role, rank, old, new):
+            def change(prefill, decode, ports):
+                logs = {"prefill": list(prefill), "decode": list(decode)}
+                self.assertIn(old, logs[role][rank])
+                logs[role][rank] = logs[role][rank].replace(old, new)
+                return logs["prefill"], logs["decode"], ports
+            return change
+
+        def no_ports(prefill, decode, ports):
+            return prefill, decode, None
+
+        def short_port(prefill, decode, ports):
+            ports["kv"]["p0"]["rx"] = 10
+            return prefill, decode, ports
+
+        cases = {
+            # Decode rank 1 holding head 0's bytes, not its own.
+            "decode rank 1 checked cmpl-a-0-d's heads [0]": (2, 4, 8, False, edit(
+                "decode", 1, '"global_heads": [2, 3]}]}', '"global_heads": [0]}]}')),
+            "decode rank 1's group 0 holds head-v1 heads [0, 1], not head-v1 heads [2, 3]": (2, 4, 8, False, edit(
+                "decode", 1, '"global_heads": [2, 3]}]}}', '"global_heads": [0, 1]}]}}')),
+            "prefill rank 0 -> decode rank 1 moved 400 bytes, not the 400": None,
+            "plan [True, 0, 0, 20], not [True, 20, 0, 20]": (2, 4, 8, False, edit(
+                "prefill", 0, "[[true, 20, 0, 20]]", "[[true, 0, 0, 20]]")),
+            "a READ into slot 0, not 1": (4, 2, 8, True, edit(
+                "decode", 0, "10.0, 1, [1, 10]], [200", "10.0, 1, [0, 10]], [200")),
+            "transfer(s) logged without their peer rank": (2, 4, 8, True, edit(
+                "decode", 0, "10.0, 0, [0, 10]]", "10.0]")),
+            "a READ of 2000 descriptors, more than NIXL's 1024": (2, 4, 8, True, edit(
+                "decode", 0, "0.0, 10, 10.0, 0, [0, 10]", "0.0, 2000, 10.0, 0, [0, 2000]")),
+            "prefill rank 0's router port RX 10 bytes": (2, 4, 8, False, short_port),
+            "no router port counters": (2, 4, 8, False, no_ports),
+        }
+        cases.pop("prefill rank 0 -> decode rank 1 moved 400 bytes, not the 400")
+        for message, (p, d, k, nixl, change) in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(p, d, k, nixl, change)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+        # A pair moving other bytes than the heads it holds.
+        problems = self.verdict(2, 4, 8, False, edit("prefill", 0, "[200, 0.01", "[150, 0.01"))["problems"]
+        self.assertTrue(any("prefill rank 0 -> decode rank 0 moved" in p and "not the 400" in p
+                            for p in problems), problems)
+
+    @staticmethod
+    def rewrite(role, rank, change):
+        """A change of one rank's step log, record by record."""
+        def apply(prefill, decode, ports):
+            logs = {"prefill": list(prefill), "decode": list(decode)}
+            records = [json.loads(text) for text in logs[role][rank].splitlines()]
+            logs[role][rank] = "".join(json.dumps(record) + "\n" for record in map(change, records))
+            return logs["prefill"], logs["decode"], ports
+        return apply
+
+    @staticmethod
+    def each_transfer(direction, change):
+        """`change(entry)` of each transfer a record logs (its new entry)."""
+        def apply(record):
+            transfer = (record.get("kv_transfers") or {}).get(direction)
+            if transfer:
+                transfer["each"] = [change(list(entry)) for entry in transfer["each"]]
+            return record
+        return apply
+
+    @staticmethod
+    def answers(change):
+        """`change(answers)` of a prefill rank's zero-payload answers."""
+        def apply(record):
+            send = (record.get("kv_transfers") or {}).get("send")
+            if send and "zero_payload" in send:
+                send["zero_payload"] = change(send["zero_payload"])
+            return record
+        return apply
+
+    def test_idle_replicas_are_accepted_only_on_their_answers(self) -> None:
+        """Mooncake 8 -> 2, 4 KV heads: ranks 1, 3, 5, 7 never write, so their
+        TENT scrapes serve no write series (as `_tent_delta` reads them). That
+        is accepted only for a replica answering each of its decode ranks'
+        requests once, with a healthy endpoint and registration."""
+        verdict = self.verdict(8, 2, 4, False)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["hetero_tp"]["idle_replicas"], [1, 3, 5, 7])
+        self.assertEqual(verdict["hetero_tp"]["unwritten_accepted"], [1, 3, 5, 7])
+        for rank in (1, 3, 5, 7):
+            self.assertNotIn("tent_write_bytes_total", verdict["dp_ranks"]["prefill"][rank]["tent"])
+            self.assertIn("tent_write_bytes_total", verdict["dp_ranks"]["prefill"][rank - 1]["tent"])
+        lack = "prefill rank 1's TENT metrics lack tent_write_bytes_total, and it is not a replica"
+
+        def problems(change=None, tent_change=None):
+            return self.verdict(8, 2, 4, False, change, tent_change)["problems"]
+
+        cases = {
+            # Both answers replaced by one counting none (the old record).
+            "answered decode rank 0 without a payload for unnamed requests (0)": self.rewrite(
+                "prefill", 1, self.answers(lambda answers: [[0, 0, answers[0][2]]])),
+            "never answered decode rank 0 (no payload and no zero-payload answer) for 1 request(s), cmpl-b-0":
+                self.rewrite("prefill", 1, self.answers(lambda answers: answers[:1])),
+            "answered decode rank 0 without a payload twice for 1 request(s), cmpl-a-0": self.rewrite(
+                "prefill", 1, self.answers(lambda answers: answers + answers[:1])),
+            "prefill rank 1 answered decode rank 99, not one it pairs with": self.rewrite(
+                "prefill", 1, self.answers(lambda answers: answers + [[99, ["cmpl-a-0-d"], answers[0][2]]])),
+            # Rank 1 pairs with decode rank 0 only.
+            "prefill rank 1 answered decode rank 1, not one it pairs with": self.rewrite(
+                "prefill", 1, self.answers(lambda answers: answers + [[1, ["cmpl-a-0-d"], answers[0][2]]])),
+            "answered decode rank 0 without a payload for requests it never pulled: 1 request(s), cmpl-z-0":
+                self.rewrite("prefill", 1, self.answers(
+                    lambda answers: answers + [[0, ["cmpl-z-0-d"], answers[0][2]]])),
+            "answered decode rank 0 without a payload under a plan that sends": self.rewrite(
+                "prefill", 1, self.answers(lambda answers: [[0, a[1], [[True, 0, 0, 10]]] for a in answers])),
+            # A sending rank that also answers without a payload.
+            "prefill rank 0 answered decode rank 0 without a payload for 1 request(s), though it holds heads":
+                self.rewrite("prefill", 0, lambda record: {**record, "kv_transfers": {"send": {
+                    **record["kv_transfers"]["send"], "zero_payload": [[0, ["cmpl-a-0-d"], [[False, 0, 0, 10]]]]}}}
+                    if "kv_transfers" in record else record),
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message):
+                found = problems(change)
+                self.assertTrue(any(message in problem for problem in found), found)
+                # Rank 1's absent write series is no longer accepted.
+                if "prefill rank 0" not in message:
+                    self.assertTrue(any(lack in problem for problem in found), found)
+
+        def drop(rank, *names):
+            def change(tents):
+                for name in names:
+                    tents["prefill"][rank].pop(name)
+            return change
+
+        def silent(rank):
+            def change(tents):
+                tents["prefill"][rank] = None
+            return change
+
+        for message, tent_change in {
+                # An active producer without its write series.
+                "prefill rank 0's TENT metrics lack tent_write_bytes_total": drop(0, "tent_write_bytes_total"),
+                "rank 1: prefill's TENT metrics did not answer": silent(1),
+                "rank 1: prefill's TENT metrics lack tent_registered_buffer_bytes": drop(
+                    1, "tent_registered_buffer_bytes")}.items():
+            with self.subTest(message=message):
+                found = problems(tent_change=tent_change)
+                self.assertTrue(any(message in problem for problem in found), found)
+        # A missing answer fails the rank's absent write series too; with the
+        # series served (as zero), only the answer.
+        def zero_write(tents):
+            tents["prefill"][1]["tent_write_bytes_total"] = 0.0
+
+        found = problems(self.rewrite("prefill", 1, self.answers(lambda answers: answers[:1])), zero_write)
+        self.assertFalse(any(lack in problem for problem in found), found)
+        self.assertTrue(any("never answered decode rank 0" in problem for problem in found), found)
+
+    def test_plans_and_descriptors_are_measured_against_the_layouts(self) -> None:
+        """A head's bytes in a block of a layer (10 here) come from both sides'
+        layouts: each Mooncake region's plan must be its heads' places and
+        length in them; each NIXL READ must carry NIXL's measured descriptors,
+        the hook's count, within NIXL's limit, each one block of a layer of its
+        heads."""
+        def problems(sizes, nixl, change):
+            return self.verdict(*sizes, 8, nixl, change)["problems"]
+
+        def plans(change):
+            return self.rewrite("prefill", 0, self.each_transfer(
+                "send", lambda entry: entry[:6] + [change(entry[6])]))
+
+        def reads(change):
+            return self.rewrite("decode", 0, self.each_transfer("load", change))
+
+        cases = {
+            "a transfer of 200 bytes without its plan ([])": ((2, 4), False, plans(lambda plan: [])),
+            "a transfer of 200 bytes without its plan (None)": ((2, 4), False, plans(lambda plan: None)),
+            # A zero length while bytes moved.
+            "plan [True, 0, 0, 0], not [True, 0, 0, 20]": ((2, 4), False, plans(lambda plan: [[True, 0, 0, 0]])),
+            # Every length and offset scaled alike (a 64-byte head).
+            "plan [True, 0, 0, 128], not [True, 0, 0, 20]": ((2, 4), False, plans(
+                lambda plan: [[s, o // 10 * 64, d // 10 * 64, n // 10 * 64] for s, o, d, n in plan])),
+            # A second region of another geometry.
+            "plan [True, 0, 0, 10], not [True, 0, 0, 20]": ((2, 4), False, plans(
+                lambda plan: plan + [[True, 0, 0, 10]])),
+            "a READ without NIXL's measured descriptors (its hook saw 2000)": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [None] + entry[4:6] + [[entry[6][0], 2000]])),
+            "a READ NIXL measured at 10 descriptors, its hook at 9": ((2, 4), True, reads(
+                lambda entry: entry[:6] + [[entry[6][0], 9]])),
+            "prefill rank 0 -> decode rank 0: a transfer of 200 bytes without its plan (None)": (
+                (4, 2), True, reads(lambda entry: entry[:6] + [None])),
+            # Bytes that are not its descriptors' blocks of its heads.
+            "a READ of 200 bytes in 5 descriptors, not 2 head(s) of 10 bytes each": ((2, 4), True, reads(
+                lambda entry: entry[:3] + [5] + entry[4:6] + [[entry[6][0], 5]])),
+            # A layout whose heads' bytes disagree with the other side's.
+            "the ranks' layouts give no single head size": ((2, 4), False, self.rewrite(
+                "decode", 1, lambda record: {"kv_layout": {**record["kv_layout"], "groups": [
+                    {**record["kv_layout"]["groups"][0], "real_page_bytes": 64}]}}
+                if "kv_layout" in record else record)),
+        }
+        for message, (sizes, nixl, change) in cases.items():
+            with self.subTest(message=message):
+                found = problems(sizes, nixl, change)
+                self.assertTrue(any(message in problem for problem in found), found)
+        # Split, gather and replicated heads, both connectors, pass as logged.
+        for sizes, kv_heads, nixl in (((2, 4), 8, False), ((2, 4), 8, True), ((4, 2), 8, False),
+                                      ((4, 2), 8, True), ((2, 8), 4, False), ((2, 8), 4, True),
+                                      ((8, 2), 4, False)):
+            with self.subTest(sizes=sizes, nixl=nixl):
+                verdict = self.verdict(*sizes, kv_heads, nixl)
+                self.assertEqual(verdict["problems"], [])
+                self.assertEqual(verdict["hetero_tp"]["slab_bytes"], SLAB)
+
+    def test_unequal_sizes_need_one_switched_network(self) -> None:
+        base = (E2E / "runs" / "pd-smoke.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
+        for prefill, decode, error in (
+                ("{node: prefill0, kv_network: data0, tensor_parallel_size: 2}",
+                 "{node: decode0, kv_network: data0, tensor_parallel_size: 3}", "divide one another"),
+                ("{node: prefill0, kv_network: [data0, data1], tensor_parallel_size: 2}",
+                 "{node: decode0, kv_network: data0, tensor_parallel_size: 4}", "one switched network"),
+                ("{node: prefill0, kv_network: data0, tensor_parallel_size: 2, data_parallel_size: 2}",
+                 "{node: decode0, kv_network: data0, tensor_parallel_size: 4}", "without data parallelism"),
+                ("{node: prefill0, kv_network: data0, tensor_parallel_size: 0}",
+                 "{node: decode0, kv_network: data0}", "positive integer")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                spec = Path(directory) / "run.yaml"
+                text = re.sub(r"^prefill:.*$", f"prefill: {prefill}", base, count=1, flags=re.M)
+                spec.write_text(re.sub(r"^decode:.*$", f"decode: {decode}", text, count=1, flags=re.M))
+                with self.assertRaisesRegex(ValueError, error):
+                    pd.load(spec)
+
+    def test_rank_r_takes_link_r_of_a_switched_network(self) -> None:
+        interfaces = {"control": {"address": "10.250.0.1", "network": "control", "slot": 0},
+                      **{f"kvr{k}": {"address": f"10.102.0.{2 * k + 1}", "network": "kv", "slot": k}
+                         for k in range(4)}}
+        self.assertEqual(pd._kv_addresses(interfaces, pd.Side("p", "kv"), 4),
+                         ["10.102.0.1", "10.102.0.3", "10.102.0.5", "10.102.0.7"])
+        with self.assertRaisesRegex(ValueError, "4 links on kv, not one per rank"):
+            pd._kv_addresses(interfaces, pd.Side("p", "kv"), 8)
+        # A single link (or an older topology's state) serves every rank.
+        self.assertEqual(pd._kv_addresses({"data0": {"address": "10.100.0.1"}}, pd.Side("p", "data0"), 2),
+                         ["10.100.0.1", "10.100.0.1"])
+        self.assertEqual(pd.global_heads(3, 8, 4), [1])
+        self.assertEqual(pd.global_heads(1, 2, 8), [4, 5, 6, 7])

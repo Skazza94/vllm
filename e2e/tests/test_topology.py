@@ -211,3 +211,68 @@ class ShapingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@NEEDS_DOCKER
+class MultiLinkTopologyTests(unittest.TestCase):
+    """A switch with a link per rank: a node's sockets bound to link k's
+    address leave and return on link k."""
+
+    SPEC = spec.parse({
+        "name": "e2e-multilink",
+        "image": SMALL_IMAGE,
+        "networks": {"control": {"subnet": "10.251.0.0/24"},
+                     "kv": {"subnet": "10.102.0.0/24", "mtu": 9000}},
+        "nodes": {"prefill0": {"networks": ["control", {"kv": 3}]},
+                  "decode0": {"networks": ["control", {"kv": 2}]},
+                  "client": {"networks": ["control"]}},
+    })
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        topology.down(cls.SPEC.name)
+        cls.state = topology.up(cls.SPEC)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        topology.down(cls.SPEC.name)
+
+    def test_links_were_checked_both_ways_before_use(self) -> None:
+        checks = self.state["link_check"]
+        # 3 x 2 one way, 2 x 3 the other.
+        self.assertEqual(len(checks), 12)
+        self.assertEqual({tuple(c["from"][:2]) for c in checks},
+                         {("prefill0", 0), ("prefill0", 1), ("prefill0", 2), ("decode0", 0), ("decode0", 1)})
+        for check in checks:
+            self.assertGreaterEqual(min(check["router_rx"], check["router_tx"]), topology.CHECK_BYTES)
+            # Every router port is recorded; only the exchange's two carry it.
+            self.assertEqual(set(check["ports"]), {f"p{index}" for index in range(5)})
+            self.assertEqual(check["ports"][check["from"][3]]["rx"], check["router_rx"])
+            self.assertEqual(check["ports"][check["to"][3]]["tx"], check["router_tx"])
+            others = [value for name, value in check["ports"].items() if name not in (check["from"][3], check["to"][3])]
+            self.assertTrue(all(max(value.values()) < topology.CHECK_BYTES for value in others), check)
+        self.assertEqual(json.loads((topology.STATE_DIRECTORY / "e2e-multilink.json").read_text())["link_check"],
+                         checks)
+
+    def test_each_link_has_its_interface_table_and_rule(self) -> None:
+        node = pid(self.SPEC.container("prefill0"))
+        names = set(interfaces(self.SPEC.container("prefill0")))
+        self.assertTrue({"control", "kvr0", "kvr1", "kvr2"} <= names)
+        rules = json.loads(shell.in_netns(node, "ip", "-j", "rule", "show"))
+        for link in [l for l in self.SPEC.links_of("prefill0") if l.network == "kv"]:
+            table = topology.policy_table(self.SPEC, link)
+            self.assertTrue(any(r.get("src") == str(link.node_address) and str(r.get("table")) == str(table)
+                                for r in rules), rules)
+            for peer in [l for l in self.SPEC.links_of("decode0") if l.network == "kv"]:
+                route = json.loads(shell.in_netns(node, "ip", "-j", "route", "get", str(peer.node_address),
+                                                  "from", str(link.node_address)))
+                self.assertEqual(route[0]["dev"], link.interface)
+        # Unbound sockets keep the subnet's main route on link 0, and the
+        # control network its own.
+        self.assertIn("10.102.0.0/24 via 10.102.0.0 dev kvr0", routes(self.SPEC.container("prefill0")))
+        self.assertIn("10.251.0.0/24 via 10.251.0.0 dev control", routes(self.SPEC.container("prefill0")))
+        self.assertEqual(topology.exec_in(self.SPEC.container("client"), [
+            "python3", "-c", REACH, str(self.SPEC.address("decode0", "control"))]).strip(), "refused")
+        hosts = topology.exec_in(self.SPEC.container("decode0"), ["cat", "/etc/hosts"])
+        self.assertIn("10.102.0.3 prefill0-r1.kv", hosts)
+        self.assertIn("prefill0.control", hosts)

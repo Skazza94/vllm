@@ -36,7 +36,7 @@ networks:
     subnet: 10.250.0.0/24  # required; subnets must not overlap
   data0:
     subnet: 10.100.0.0/24
-    mtu: 9000  # default 1500
+    mtu: 9000  # default 1500; a benchmark parameter: it sets the TCP segment size
     # Optional egress shaping of each link, both ways (tc netem): a path
     # between two nodes crosses two links, so it sees the rate once and the
     # delay twice.
@@ -51,6 +51,9 @@ nodes:
   # Names: lowercase letters, digits and dashes, not starting with router-.
   prefill0:
     networks: [control, data0, data1]  # required, each at most once
+    # A network joined with several links, {kv: 8}: a link (interface
+    # <network>r<k>, its own /31) per rank, a socket bound to link k's
+    # address leaving on link k; `up` checks every such link both ways.
     cpus: "0-6"     # docker --cpuset-cpus (default: no limit)
     memory: 24g     # docker --memory (default: no limit)
     # image: vllm-sim:cpu  # this node's image (default: the spec's)

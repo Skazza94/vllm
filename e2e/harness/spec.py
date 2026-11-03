@@ -2,9 +2,13 @@
 
 Every network is a star: one router container in the middle and one veth
 pair from each of the network's nodes to it. Link ``k`` of a network (its
-``k``-th node, in spec order) is a /31 taken from the network's subnet: the
+``k``-th link, in spec order) is a /31 taken from the network's subnet: the
 router holds the even address, the node the odd one. A node routes the whole
 subnet through its router, and nothing else: no default route.
+
+A node may join a network with several links (``{kv: 8}``: a NIC per rank on
+one switch), each its own /31 and interface ``<network>r<k>``; a socket bound
+to link k's address leaves through link k (source-policy routing).
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ NAME = re.compile(r"^[a-z][a-z0-9-]*$")
 # Linux interface names: at most 15 characters. A node's interface is
 # named after its network.
 INTERFACE = re.compile(r"^[a-z][a-z0-9]{0,14}$")
+# Linux's limit on an interface name's length.
+MAX_INTERFACE = 15
 RATE = re.compile(r"^\d+(\.\d+)?(bit|kbit|mbit|gbit|tbit)$")
 DELAY = re.compile(r"^\d+(\.\d+)?(us|ms|s)$")
 DEFAULT_IMAGE = "vllm-sim:cpu"
@@ -47,6 +53,15 @@ class Node:
     cpus: str | None = None
     memory: str | None = None
     docker_args: tuple[str, ...] = ()
+    link_counts: tuple[tuple[str, int], ...] = ()
+    """Networks the node joins with several links, and how many."""
+
+    def links_on(self, network: str) -> int:
+        return dict(self.link_counts).get(network, 1)
+
+    @property
+    def multi_link(self) -> bool:
+        return any(count > 1 for _, count in self.link_counts)
 
 
 @dataclass(frozen=True)
@@ -55,13 +70,21 @@ class Link:
 
     network: str
     node: str
-    index: int  # the node's position among the network's nodes
+    index: int  # the link's position among the network's links
     node_address: ipaddress.IPv4Address
     router_address: ipaddress.IPv4Address
+    slot: int = 0  # among the node's links on the network
+    links: int = 1  # the node's links on the network
 
     @property
     def router_interface(self) -> str:
         return f"p{self.index}"
+
+    @property
+    def interface(self) -> str:
+        """The node's interface: the network's name, or with several links
+        ``<network>r<slot>``."""
+        return self.network if self.links == 1 else f"{self.network}r{self.slot}"
 
 
 @dataclass(frozen=True)
@@ -82,11 +105,11 @@ class Spec:
     def links_of(self, node: str) -> list[Link]:
         return [link for link in self.links if link.node == node]
 
-    def address(self, node: str, network: str) -> ipaddress.IPv4Address:
+    def address(self, node: str, network: str, slot: int = 0) -> ipaddress.IPv4Address:
         for link in self.links:
-            if (link.node, link.network) == (node, network):
+            if (link.node, link.network, link.slot) == (node, network, slot):
                 return link.node_address
-        raise KeyError(f"node {node} is not on network {network}")
+        raise KeyError(f"node {node} has no link {slot} on network {network}")
 
 
 def load(path: str | Path) -> Spec:
@@ -132,12 +155,17 @@ def parse(raw: dict) -> Spec:
 
     links = []
     for network in networks.values():
-        members = [node for node in nodes.values() if network.name in node.networks]
+        members = [(node, slot, node.links_on(network.name)) for node in nodes.values()
+                   if network.name in node.networks for slot in range(node.links_on(network.name))]
         if 2 * len(members) > network.subnet.num_addresses:
-            raise ValueError(f"network {network.name}: {network.subnet} is too small for {len(members)} node(s)")
-        for index, node in enumerate(members):
+            raise ValueError(f"network {network.name}: {network.subnet} is too small for {len(members)} link(s)")
+        for index, (node, slot, count) in enumerate(members):
             base = network.subnet.network_address + 2 * index
-            links.append(Link(network.name, node.name, index, base + 1, base))
+            link = Link(network.name, node.name, index, base + 1, base, slot, count)
+            if len(link.interface) > MAX_INTERFACE:
+                raise ValueError(f"node {node.name}: interface {link.interface} is longer than {MAX_INTERFACE} "
+                                 "characters (shorten the network's name)")
+            links.append(link)
     return Spec(name=name, networks=networks, nodes=nodes,
                 router_image=raw.get("router_image", DEFAULT_ROUTER_IMAGE),
                 router_cpus=routers.get("cpus"), links=tuple(links))
@@ -175,9 +203,23 @@ def _node(name: str, options: dict, networks: dict[str, Network], image: str) ->
     unknown = set(options) - {"networks", "image", "cpus", "memory", "docker_args"}
     if unknown:
         raise ValueError(f"node {name}: unknown key(s) {', '.join(sorted(unknown))}")
-    on = options.get("networks") or []
-    if not on or not isinstance(on, list):
+    listed = options.get("networks") or []
+    if not listed or not isinstance(listed, list):
         raise ValueError(f"node {name} needs a list of networks")
+    # A network's name, or {name: links}.
+    on, counts = [], []
+    for entry in listed:
+        if isinstance(entry, dict):
+            if len(entry) != 1:
+                raise ValueError(f"node {name}: a network with links is one {{network: links}} mapping")
+            (net, count), = entry.items()
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                raise ValueError(f"node {name}: network {net} takes a positive number of links")
+            if count > 1:
+                counts.append((net, count))
+            on.append(net)
+        else:
+            on.append(entry)
     missing = [net for net in on if net not in networks]
     if missing:
         raise ValueError(f"node {name}: unknown network(s) {', '.join(missing)}")
@@ -187,4 +229,4 @@ def _node(name: str, options: dict, networks: dict[str, Network], image: str) ->
     if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
         raise ValueError(f"node {name}: docker_args is a list of strings")
     return Node(name, tuple(on), options.get("image", image), options.get("cpus"),
-                options.get("memory"), tuple(args))
+                options.get("memory"), tuple(args), tuple(counts))
