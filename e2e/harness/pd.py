@@ -104,6 +104,20 @@ class Server:
     servers and the benchmark's tokenizer): Kimi's tokenizer is such code.
     Off unless a spec asks."""
     hp_tcp_args: dict = field(default_factory=dict)
+    """TENT's hp_tcp transport settings (MC_TENT_CONF's transports.hp_tcp),
+    e.g. {max_outstanding_tasks: 16384}. Admission, in the pinned TENT with
+    hp_tcp alone and its runtime queue off: a submitted transfer's requests,
+    after TENT merges those contiguous at both ends in the same
+    registrations, are one task each, reserved together or not at all,
+    without waiting, against the tasks still outstanding on that rank's
+    transport (all its transfers in flight; each task frees its slot as it
+    completes). Mooncake's Python binding retries a refused transfer once,
+    at once. A transfer of more tasks than max_outstanding_tasks (4096 by
+    default) is always refused; a smaller one may be, while others' tasks are
+    outstanding. A connector's descriptors are not those tasks (TENT may
+    merge them), and staying under the task limit leaves the byte limits
+    (max_outstanding_bytes, max_transfer_bytes) and the transport's health
+    to pass too."""
     env: dict = field(default_factory=dict)
     timing: str | None = None
     """The simulator's timing provider (zero, linear, table, replay,
@@ -235,6 +249,31 @@ def _check_speculative(server: Server) -> None:
         raise ValueError("server.speculative.seed is an integer")
     if server.connector != "nixl":
         raise ValueError("server.speculative needs the nixl connector (its handshake checks the draft)")
+
+
+TENT_DEFAULT_MAX_OUTSTANDING_TASKS = 4096
+"""hp_tcp's default max_outstanding_tasks in the TENT the image pins."""
+
+
+def hp_tcp_task_limit(server: Server) -> int | None:
+    """The hp_tcp task limit the servers ran with: hp_tcp_args', or a
+    server.env MC_TENT_CONF's that replaces the harness's; None if unknown
+    (that config unreadable, or TENT not selected)."""
+
+    def limit(hp_tcp: object) -> int | None:
+        value = hp_tcp.get("max_outstanding_tasks", TENT_DEFAULT_MAX_OUTSTANDING_TASKS) if isinstance(
+            hp_tcp, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    env = {name: str(value) for name, value in server.env.items()}
+    if env.get("MC_USE_TENT", "1") != "1":
+        return None
+    if "MC_TENT_CONF" in env:
+        try:
+            return limit(json.loads(env["MC_TENT_CONF"])["transports"]["hp_tcp"])
+        except (ValueError, KeyError, TypeError):
+            return None
+    return limit(server.hp_tcp_args)
 
 
 def tent_config(address: str, hp_tcp_args: dict) -> dict:
@@ -593,6 +632,25 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 if role == mover and counted is not None and counted != sent["bytes"]:
                     problems.append(f"{at}TENT {'read' if mover == 'decode' else 'wrote'} {counted:.0f} bytes, "
                                     f"not the {sent['bytes']} its connector moved")
+                if counters is not None:
+                    # A healthy scrape omits a failure series never incremented.
+                    failures = {key: int(counters.get(f"tent_{key}_total") or 0)
+                                for key in ("task_failures", "transport_attempt_failures")}
+                    if any(failures.values()):
+                        problems.append(
+                            f"{at}{role}'s TENT recorded {failures['task_failures']} failed task(s) and "
+                            f"{failures['transport_attempt_failures']} failed transport attempt(s): not a clean "
+                            f"transfer, whether or not a retry recovered it ({sent['failed']} connector transfer(s) "
+                            "failed)")
+            hp_tcp = None
+            if tents and run.server.connector != "nixl" and role == "prefill":
+                hp_tcp = _hp_tcp_writes(records, hp_tcp_task_limit(run.server))
+            if tents and counters is not None:
+                hp_tcp = {**(hp_tcp or {}), **{
+                    key: int(counters.get(f"tent_{key}_total") or 0) if "failures" in key else (
+                        None if counters.get(f"tent_{key}_total") is None else int(counters[f"tent_{key}_total"]))
+                    for key in ("transport_attempts", "write_requests", "read_requests", "task_failures",
+                                "transport_attempt_failures")}}
             ranks[role][(dp, tp)] = {
                 "transfers": sent, "kv_checks": len(checks), "pulled": len(pulled),
                 "checked_ids": {c["req_id"] for c in checks if "req_id" in c and "error" not in c},
@@ -612,7 +670,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "kv_hit_checks": len(valid_hits),
                 "kv_hit_blocks": sum(c["blocks"] for c in valid_hits),
                 "kv_bytes_hit_checked": sum(c["bytes"] for c in valid_hits),
-                "requests": owned, "tent": counters,
+                "requests": owned, "tent": counters, "hp_tcp": hp_tcp,
                 "kv_layout": layout and {key: layout.get(key) for key in (
                     "dp_rank", "dp_local_rank", "tp_rank", "tp_size", "shape", "block_bytes", "bytes",
                     "tent_metrics_port")},
@@ -755,6 +813,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                              "requests": len(summary["requests"])}
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
         "speculation": speculation,
+        "hp_tcp_task_limit": hp_tcp_task_limit(run.server),
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
     }
@@ -1182,6 +1241,71 @@ def _fragmentation(prefill: list[list[dict]], decode: list[list[dict]], verified
     return {"pulls": sum(counts.values()) + unlogged + unchecked + unmatched, **counts, "unlogged": unlogged,
             "unchecked": unchecked, "unmatched": unmatched, "jointly_contiguous_runs": joint,
             "unmatched_groups": unmatched_groups}
+
+
+def _hp_tcp_writes(records: list[dict], limit: int | None) -> dict:
+    """A Mooncake prefill rank's connector writes (``send``) against hp_tcp's
+    task limit, reported, never judged: TENT may merge a write's descriptors
+    into fewer tasks, and how many of another write's tasks are still
+    outstanding when one is submitted is not logged. Each write spans
+    [end - seconds, end]; a failed one [start, its record's time] (its end is
+    not logged; the record reporting it is written after it). The
+    overlapping-call bound is the most descriptors whose spans overlap: an
+    upper bound on what was in flight, complete only if every write's span
+    is known."""
+    spans: list[tuple[float, float, int]] = []
+    largest: list[int] = []
+    complete = True
+    written = failed = 0
+    for record in records:
+        send = (record.get("kv_transfers") or {}).get("send") or {}
+        each = send.get("each") or []
+        written += int(send.get("count") or 0)
+        complete &= len(each) == int(send.get("count") or 0)
+        for entry in each:
+            descriptors = entry[3] if len(entry) > 4 else None
+            if descriptors is None:
+                complete = False
+                continue
+            largest.append(descriptors)
+            if entry[1] is None or entry[4] is None:
+                complete = False
+                continue
+            spans.append((entry[4] - entry[1], entry[4], descriptors))
+        for entry in send.get("failed_each") or []:
+            failed += 1
+            descriptors, start = (entry[1], entry[2]) if len(entry) > 2 else (None, None)
+            if descriptors is None:
+                complete = False
+                continue
+            largest.append(descriptors)
+            end = record.get("t")
+            if start is None or end is None or end < start:
+                complete = False
+                continue
+            spans.append((start, end, descriptors))
+        # Failures counted but not each listed have no span.
+        complete &= len(send.get("failed_each") or []) >= int(send.get("failed") or 0)
+        failed += max(0, int(send.get("failed") or 0) - len(send.get("failed_each") or []))
+    in_flight = peak = 0
+    for _, change in sorted([(a, n) for a, _, n in spans] + [(b, -n) for _, b, n in spans],
+                            key=lambda event: (event[0], event[1])):
+        in_flight += change
+        peak = max(peak, in_flight)
+    notes = []
+    biggest = max(largest, default=None)
+    if limit is None:
+        notes.append("hp_tcp's task limit is unknown (server.env replaces TENT's configuration)")
+    else:
+        if biggest is not None and biggest > limit:
+            notes.append(f"a write of {biggest} connector descriptors exceeds the task limit {limit} (TENT may "
+                         "merge them: its tasks are not logged)")
+        if peak > limit:
+            notes.append(f"writes of {peak} connector descriptors overlapped, above the task limit {limit} (an "
+                         "upper bound: their tasks complete before their calls return)")
+    return {"task_limit": limit, "connector_writes": written, "failed_connector_writes": failed,
+            "connector_descriptors": sum(largest), "max_connector_descriptors_per_write": biggest,
+            "overlapping_call_descriptor_bound": peak, "bound_complete": complete, "notes": notes}
 
 
 def _admissions(records: list[dict]) -> dict[str, list[dict]]:

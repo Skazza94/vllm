@@ -1509,3 +1509,103 @@ class PrefixCachingCheckTests(unittest.TestCase):
             self.assertProblem(verdict, "no byte-checked transfer was fragmented on both instances",
                                "1 pull(s) posted for requests decode never admitted")
             self.assertEqual((verdict["fragmentation"]["contiguous"], verdict["fragmentation"]["unchecked"]), (2, 1))
+
+
+# hp_tcp's task limit: connector writes reported, TENT's failures checked.
+def sends(*writes, failed=(), t=20.0) -> str:
+    """A Mooncake prefill step's writes: (bytes, descriptors, start, end)
+    each, and failed ones (bytes, descriptors, start), reported at `t`."""
+    send = {"count": len(writes), "bytes": sum(w[0] for w in writes),
+            "each": [[b, end - start, 0.0, n, end] for b, n, start, end in writes]}
+    if failed:
+        send |= {"failed": len(failed), "failed_each": [list(f) for f in failed]}
+    return line(kv_transfers={"send": send}, t=t)
+
+
+class HpTcpEvidenceTests(unittest.TestCase):
+    def verdict(self, writes: str, prefill_tent=None, run=RUN) -> dict:
+        prefill = ONE_RANK + allocated("a", "b") + writes
+        tents = {"prefill": [{**tent(), **(prefill_tent or {})}], "decode": [tent(0)]}
+        return pd.check({"completed": 2, "errors": []}, [prefill], [GOOD["decode"]],
+                        {"control": 50, "data0": 2100}, run, tents)
+
+    def hp_tcp(self, verdict: dict) -> dict:
+        return verdict["dp_ranks"]["prefill"][0]["hp_tcp"]
+
+    def test_a_mergeable_write_above_the_limit_is_reported_not_rejected(self) -> None:
+        # 5,000 descriptors TENT merged into 3,000 tasks, admitted.
+        verdict = self.verdict(sends((2000, 5000, 10.0, 10.2)), {"tent_transport_attempts_total": 3000})
+        self.assertEqual(verdict["problems"], [])
+        evidence = self.hp_tcp(verdict)
+        self.assertEqual((evidence["max_connector_descriptors_per_write"], evidence["transport_attempts"],
+                          evidence["task_failures"], evidence["task_limit"]), (5000, 3000, 0, 4096))
+        self.assertIn("exceeds the task limit 4096 (TENT may merge them", evidence["notes"][0])
+        self.assertEqual(verdict["hp_tcp_task_limit"], 4096)
+
+    def test_a_recovered_attempt_still_fails_the_clean_transfer_check(self) -> None:
+        # Refused once, then admitted: the connector saw success.
+        verdict = self.verdict(sends((1000, 2288, 10.0, 10.5), (1000, 2548, 9.95, 10.1)),
+                               {"tent_task_failures_total": 2288, "tent_transport_attempt_failures_total": 2288})
+        self.assertEqual(verdict["problems"], [
+            "prefill's TENT recorded 2288 failed task(s) and 2288 failed transport attempt(s): not a clean "
+            "transfer, whether or not a retry recovered it (0 connector transfer(s) failed)"])
+        self.assertEqual(self.hp_tcp(verdict)["failed_connector_writes"], 0)
+
+    def test_an_overlap_above_the_limit_without_failures_passes(self) -> None:
+        verdict = self.verdict(sends((1000, 3000, 10.0, 10.1), (1000, 2500, 10.05, 10.12)))
+        self.assertEqual(verdict["problems"], [])
+        evidence = self.hp_tcp(verdict)
+        self.assertEqual((evidence["overlapping_call_descriptor_bound"], evidence["bound_complete"]), (5500, True))
+        self.assertIn("writes of 5500 connector descriptors overlapped, above the task limit 4096 (an upper bound",
+                      evidence["notes"][0])
+
+    def test_failed_writes_count_and_unknown_spans_leave_the_bound_incomplete(self) -> None:
+        # A failed write ends no later than the record reporting it.
+        evidence = pd._hp_tcp_writes(pd._records(sends((1000, 100, 10.0, 10.1), failed=[(500, 3000, 10.05)])), 4096)
+        self.assertEqual((evidence["overlapping_call_descriptor_bound"], evidence["bound_complete"],
+                          evidence["failed_connector_writes"], evidence["max_connector_descriptors_per_write"]),
+                         (3100, True, 1, 3000))
+        for name, records in (
+                ("no start", sends((1000, 100, 10.0, 10.1), failed=[(500, 3000, None)])),
+                ("reported before its start", sends((1000, 100, 10.0, 10.1), failed=[(500, 3000, 30.0)])),
+                ("counted, not listed", line(kv_transfers={"send": {"count": 0, "bytes": 0, "failed": 1}})),
+                ("a write without its end", line(kv_transfers={"send": {"count": 1, "bytes": 1000,
+                                                                        "each": [[1000, 0.1, 0.0, 100, None]]}}))):
+            with self.subTest(name):
+                evidence = pd._hp_tcp_writes(pd._records(records), 4096)
+                self.assertFalse(evidence["bound_complete"])
+
+    def test_the_c6_shape(self) -> None:
+        # 2,288 refused while 2,548 were in flight, then admitted; a write of
+        # two requests' 4,264 refused twice, failed.
+        writes = sends((1000, 2548, 11.0, 11.2), (1000, 2288, 11.02, 11.52), failed=[(1000, 4264, 12.0)], t=14.1)
+        verdict = self.verdict(writes, {"tent_task_failures_total": 10816,
+                                        "tent_transport_attempt_failures_total": 10816})
+        self.assertIn("prefill's connector failed 1 transfer(s)", verdict["problems"])
+        self.assertTrue(any("TENT recorded 10816 failed task(s) and 10816 failed transport attempt(s)" in p
+                            and "(1 connector transfer(s) failed)" in p for p in verdict["problems"]),
+                        verdict["problems"])
+        evidence = self.hp_tcp(verdict)
+        self.assertEqual((evidence["max_connector_descriptors_per_write"], evidence["overlapping_call_descriptor_bound"],
+                          evidence["failed_connector_writes"], evidence["bound_complete"]), (4264, 4836, 1, True))
+
+    def test_the_effective_limit(self) -> None:
+        conf = lambda hp_tcp: {"MC_TENT_CONF": json.dumps({"transports": {"hp_tcp": hp_tcp}})}
+        for server, limit in (
+                (pd.Server(), 4096),
+                (pd.Server(hp_tcp_args={"max_outstanding_tasks": 16384}), 16384),
+                # A spec's own TENT configuration replaces the harness's.
+                (pd.Server(hp_tcp_args={"max_outstanding_tasks": 16384},
+                           env=conf({"enable": True, "max_outstanding_tasks": 8192})), 8192),
+                (pd.Server(env=conf({"enable": True})), 4096),
+                (pd.Server(env={"MC_TENT_CONF": "{not json"}), None),
+                (pd.Server(env={"MC_TENT_CONF": json.dumps({"transports": {}})}), None),
+                (pd.Server(env={"MC_USE_TENT": 0}), None)):
+            with self.subTest(server=server):
+                self.assertEqual(pd.hp_tcp_task_limit(server), limit)
+        unknown = pd.Run(**{**RUN.__dict__, "server": pd.Server(env={"MC_TENT_CONF": "{not json"})})
+        verdict = self.verdict(sends((2000, 100, 10.0, 10.1)), run=unknown)
+        self.assertIn("task limit is unknown", self.hp_tcp(verdict)["notes"][0])
+        # NIXL: TENT's counters, no connector writes.
+        self.assertIsNone(self.verdict(sends((2000, 100, 10.0, 10.1)))["dp_ranks"]["decode"][0]["hp_tcp"].get(
+            "max_connector_descriptors_per_write"))
