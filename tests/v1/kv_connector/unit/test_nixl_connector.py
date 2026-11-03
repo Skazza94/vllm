@@ -5082,6 +5082,137 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
             )
 
 
+def _mla_worker(monkeypatch, tp_size):
+    """A NIXL worker of an MLA model, rank 0 of `tp_size` (the test model's
+    attention, its MLA flags set), without a handshake."""
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    block_size = maybe_update_block_size(16)
+    vllm_config = create_vllm_config(block_size=block_size)
+    kv_cache_config = make_kv_cache_config(block_size=block_size, num_blocks=1)
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    connector.connector_worker = FakeNixlConnectorWorker(
+        vllm_config, connector.engine_id, hand_shake_latency=0, kv_cache_config=kv_cache_config
+    )
+    worker = connector.connector_worker
+    worker.use_mla = True
+    worker.transfer_topo = dataclasses.replace(worker.transfer_topo, is_mla=True)
+    return worker
+
+
+def _mla_read(monkeypatch, decode_tp, prefill_tp):
+    """Decode rank 0 of an MLA model at `decode_tp` reading one request from
+    a prefill at `prefill_tp` through `_read_blocks_for_req`: its sources and
+    consumer count from NIXL's own mapping (`compute_tp_mapping`), its
+    remote agents those the handshake targets. Returns each READ posted
+    (`_read_blocks`' arguments), the notifications sent and the mapping."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+        compute_tp_mapping,
+    )
+
+    worker = _mla_worker(monkeypatch, decode_tp)
+    engine = worker.REMOTE_ENGINE_ID
+    worker.transfer_topo.register_remote_engine(
+        engine,
+        EngineTransferInfo(
+            remote_tp_size=prefill_tp,
+            remote_block_len=4096 * worker.block_size,
+            remote_block_size=worker.block_size,
+            remote_physical_blocks_per_logical=1,
+        ),
+    )
+    mapping = worker.tp_mappings[engine] = compute_tp_mapping(
+        worker.transfer_topo, prefill_tp, worker._group_spec_types
+    )
+    targets = worker.transfer_topo.handshake_target_ranks(prefill_tp)
+    worker._remote_agents[engine] = {(0, r): f"agent_p{r}" for r in targets}
+    worker.dst_xfer_side_handles = {engine: {r: 100 + r for r in targets}}
+    worker.region_group_ids = worker.dst_region_group_ids[engine] = [0]
+    notifications: list[tuple[str, bytes]] = []
+    worker.nixl_wrapper.send_notif = lambda agent, notif_msg: notifications.append(
+        (agent, notif_msg)
+    )
+    worker._read_blocks = MagicMock(return_value=True)
+    metadata = NixlConnectorMetadata()
+    metadata.add_new_req_to_recv(
+        request_id="decode-req",
+        local_block_ids=([0],),
+        kv_transfer_params={
+            "remote_block_ids": ([0],),
+            "remote_engine_id": engine,
+            "remote_request_id": "prefill-req",
+            "remote_host": "localhost",
+            "remote_port": 1234,
+            "remote_tp_size": prefill_tp,
+        },
+    )
+    worker._read_blocks_for_req("decode-req", metadata.reqs_to_recv["decode-req"])
+    reads = [call.kwargs for call in worker._read_blocks.call_args_list]
+    return reads, notifications, mapping
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+@pytest.mark.parametrize("decode_tp, prefill_tp", [(2, 4), (2, 1)])
+def test_an_mla_decode_reads_one_producer_and_notifies_the_others(
+    default_vllm_config, dist_init, monkeypatch, decode_tp, prefill_tp
+):
+    """MLA, NIXL's own mapping, decode rank 0. A larger prefill (TP4 to TP2):
+    one READ of the latent from producer 0, which counts one consumer; the
+    other producer it pairs with (1) is only notified, under the prefill's
+    request id, so it releases its copy. A smaller prefill (TP1 to TP2): one
+    READ from producer 0, which counts two consumers (both decode ranks read
+    it), and no notification."""
+    reads, notifications, mapping = _mla_read(monkeypatch, decode_tp, prefill_tp)
+    assert mapping.all_source_ranks == (0,)
+    (read,) = reads
+    assert read["read_spec"].remote_rank == 0
+    assert read["remote_request_id"] == "prefill-req"
+    consumers = 1 if prefill_tp > decode_tp else decode_tp // prefill_tp
+    assert read["expected_consumers"] == mapping.local_consumers == consumers
+    if prefill_tp > decode_tp:
+        assert notifications == [("agent_p1", f"prefill-req:{consumers}".encode())]
+    else:
+        assert notifications == []
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+    FakeNixlWrapper,
+)
+def test_an_mla_producer_releases_after_every_consumer_it_serves(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """MLA, NIXL's producer side (`get_finished`): a producer serving two
+    decode ranks (P TP1 -> D TP2: each READ notifies "<its request>:2") holds
+    the request after the first notification and releases it after the
+    second; a notification under the decode's own request id is not its
+    request's and releases nothing."""
+    worker = _mla_worker(monkeypatch, 1)
+    queued: list[bytes] = []
+    worker.nixl_wrapper.get_new_notifs = lambda: (
+        {"agent_d": [queued.pop(0)]} if queued else {}
+    )
+
+    def finished_after(notif):
+        queued.append(notif)
+        done_sending, _ = worker.get_finished()
+        return done_sending
+
+    worker._reqs_to_send["prefill-req"] = time.perf_counter() + 600
+    worker._reqs_to_process.add("prefill-req")
+    assert finished_after(b"decode-req:2") == set()
+    assert finished_after(b"prefill-req:2") == set()
+    assert "prefill-req" in worker._reqs_to_send
+    assert finished_after(b"prefill-req:2") == {"prefill-req"}
+    assert "prefill-req" not in worker._reqs_to_send
+
+
 def _gathered_read(monkeypatch, narrow=None):
     """Decode rank 0 of TP 2 reading one request from a prefill of TP 4
     through NIXL's own read path: `_read_blocks_for_req` posts a READ per
@@ -5091,7 +5222,8 @@ def _gathered_read(monkeypatch, narrow=None):
     source is released, its head landing in the decode page when it first
     reads DONE, its telemetry counting its descriptors. Returns the byte
     checker's results before any source and after each, the sources read
-    and the worker's stats (with `NixlReadPeers` installed)."""
+    and the worker's stats (with `NixlReadPeers` installed before the
+    handshake)."""
     from tests.v1.worker.simulated.test_kv_pattern import (
         DECODE_ID,
         SLAB,
@@ -5129,26 +5261,6 @@ def _gathered_read(monkeypatch, narrow=None):
         dtype=np.uint64,
     )
     worker.num_descs = int(worker.src_blocks_data[:, 4].sum())
-    engine = worker.REMOTE_ENGINE_ID
-    remote_agents, _ = worker._nixl_handshake(
-        host="localhost", port=1234, remote_tp_size=4, expected_engine_id=engine
-    )
-    worker._remote_agents[engine] = remote_agents
-    mapping = worker.tp_mappings[engine]
-    if narrow is not None:
-        ranks = narrow(mapping.all_source_ranks)
-        mapping = worker.tp_mappings[engine] = dataclasses.replace(
-            mapping,
-            all_source_ranks=ranks,
-            source_ranks_per_group=tuple(ranks for _ in mapping.source_ranks_per_group),
-        )
-
-    # Toy pages of 4 KV heads: producer rank r holds head r, decode rank 0
-    # heads 0 and 1, in the slots the native mapping gives their sources.
-    prefill, decode = tp_sides(4, 2)
-    checker = checker_for(decode, 0)
-    checker.before_step(recv_step([1, 2], [3, 5]))
-
     fake = worker.nixl_wrapper
     handles: dict[int, tuple[int, int]] = {}
     released: set[int] = set()
@@ -5176,7 +5288,29 @@ def _gathered_read(monkeypatch, narrow=None):
     fake.get_xfer_telemetry = lambda handle: get_default_xfer_telemetry(
         descCount=handles[handle][1]
     )
+    # Installed before the handshake, as the simulated runner does: it sees
+    # each prepared list's runs.
     NixlReadPeers(worker)
+    engine = worker.REMOTE_ENGINE_ID
+    remote_agents, _ = worker._nixl_handshake(
+        host="localhost", port=1234, remote_tp_size=4, expected_engine_id=engine
+    )
+    worker._remote_agents[engine] = remote_agents
+    mapping = worker.tp_mappings[engine]
+    if narrow is not None:
+        ranks = narrow(mapping.all_source_ranks)
+        mapping = worker.tp_mappings[engine] = dataclasses.replace(
+            mapping,
+            all_source_ranks=ranks,
+            source_ranks_per_group=tuple(ranks for _ in mapping.source_ranks_per_group),
+        )
+
+    # Toy pages of 4 KV heads: producer rank r holds head r, decode rank 0
+    # heads 0 and 1, in the slots the native mapping gives their sources.
+    prefill, decode = tp_sides(4, 2)
+    checker = checker_for(decode, 0)
+    checker.before_step(recv_step([1, 2], [3, 5]))
+
 
     metadata = NixlConnectorMetadata()
     metadata.add_new_req_to_recv(
@@ -5213,7 +5347,8 @@ def test_a_nixl_page_gathered_from_two_producers_finishes_after_the_last(
     and 1 (the native mapping), each into its slot. With the last READ in
     progress the native poll reports nothing and nothing is compared; once it
     is done the request finishes and the gathered page passes. The READ hook
-    records each producer rank and slot, with NIXL's descriptor count."""
+    records each producer rank and slot, with its selected descriptors and the
+    merge it predicts from the prepared runs (none for head slices)."""
     results, sources, data = _gathered_read(monkeypatch)
     assert sources == [0, 1]
     before, first, last = results
@@ -5224,6 +5359,9 @@ def test_a_nixl_page_gathered_from_two_producers_finishes_after_the_last(
     assert data["peer"] == [0, 1]
     assert [plan[0] for plan in data["plan"]] == [0, 1]
     assert [plan[1] for plan in data["plan"]] == data["num_descriptors"]
+    # Head slices (a slot's length below the page stride) never merge: the
+    # hook predicts each selected descriptor, as NIXL measures them here.
+    assert [plan[2] for plan in data["plan"]] == [plan[1] for plan in data["plan"]]
 
 
 @patch(

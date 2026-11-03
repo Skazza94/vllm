@@ -103,6 +103,23 @@ def bind_hp_tcp(address: str) -> None:
     tent_config.save(conf)
 
 
+def plain_mla(model) -> bool:
+    """MLA with one latent cache a layer, as DeepSeek-V3 and Kimi-K2 keep it:
+    not DeepSeek-V3.2's or GLM-5's sparse attention (an indexer's cache
+    beside the latent, which DeepSeek's code selects by the config having
+    `index_topk`, set or not), not DeepSeek-V4's compressed caches, not a
+    hybrid's (Kimi-K3's) recurrent states."""
+    configs = (model.hf_config, model.hf_text_config)
+    return (
+        model.use_mla
+        and not model.is_hybrid
+        and not any(hasattr(config, "index_topk") for config in configs)
+        and not any(
+            getattr(config, "model_type", None) == "deepseek_v4" for config in configs
+        )
+    )
+
+
 def simulated_tp_mismatch(
     vllm_config: VllmConfig,
     local_tp_size: int,
@@ -112,11 +129,12 @@ def simulated_tp_mismatch(
 ) -> str | None:
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
     real KV transfers under simulated compute pair equal sizes, or unequal
-    ones (one dividing the other) for a model of plain attention only (no
-    MLA, sliding window, recurrent state or draft), whose pattern is each KV
-    head's (``kv_pattern.head_pattern``) wherever the connector re-shards it.
-    NIXL's decode (`nixl_consumer`, the local side) refuses, as NIXL itself
-    does, a larger producer whose KV heads are replicated."""
+    ones (one dividing the other) for a model of plain attention (no sliding
+    window, recurrent state or draft), whose pattern is each KV head's
+    (``kv_pattern.head_pattern``) wherever the connector re-shards it, or of
+    plain MLA (`plain_mla`: one latent, the same on every rank). NIXL's
+    decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
+    larger producer whose KV heads are replicated; MLA's latent is exempt."""
     sim = vllm_config.simulation_config
     if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
         return None
@@ -129,7 +147,7 @@ def simulated_tp_mismatch(
     model = vllm_config.model_config
     layer_types = getattr(model.hf_text_config, "layer_types", None) or ()
     if (
-        model.use_mla
+        (model.use_mla and not plain_mla(model))
         or model.is_hybrid
         or model.get_sliding_window() is not None
         or any("sliding" in str(kind) for kind in layer_types)
@@ -137,10 +155,12 @@ def simulated_tp_mismatch(
     ):
         return (
             "Simulated real KV transfers pair unequal TP sizes for plain attention "
-            f"only (no MLA, sliding window, recurrent state or draft), not {sizes}."
+            "or plain MLA only (no sparse or compressed MLA, sliding window, "
+            f"recurrent state or draft), not {sizes}."
         )
     if (
         nixl_consumer
+        and not model.use_mla
         and remote_tp_size > local_tp_size
         and remote_tp_size > model.get_total_num_kv_heads()
     ):

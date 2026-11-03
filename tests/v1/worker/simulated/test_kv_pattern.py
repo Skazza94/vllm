@@ -1775,6 +1775,46 @@ def tp_sides(prefill_tp, decode_tp, kv_heads=4, num_blocks=8):
     return prefill, side(decode_tp)
 
 
+def mla_sides(prefill_tp, decode_tp, num_blocks=8):
+    """`tp_sides` for MLA: one latent of SLAB bytes a block, the same on
+    every rank (global head 0), filled on every prefill rank."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.worker.simulated.kv_pattern import head_map
+
+    spec = MLAAttentionSpec(block_size=4, num_kv_heads=1, head_size=8, dtype=torch.uint8)
+    specs = dict.fromkeys(LAYERS, spec)
+
+    def side(tp):
+        return [
+            (
+                {layer: torch.zeros(num_blocks, SLAB, dtype=torch.uint8) for layer in LAYERS},
+                head_map(specs, 1, rank, tp),
+            )
+            for rank in range(tp)
+        ]
+
+    prefill = side(prefill_tp)
+    for rank, (views, heads) in enumerate(prefill):
+        PatternFiller(views, rank, heads=heads).after_update(new_request_step(PREFILL_ID, [3, 5]))
+    return prefill, side(decode_tp)
+
+
+def test_an_mla_latent_is_the_same_page_at_any_tp_size():
+    """MLA: every rank of any TP size holds the same latent (global head 0),
+    so a decode rank of TP8 checks a TP4 producer's page byte for byte, and
+    any producer's would do."""
+    prefill, decode = mla_sides(4, 8)
+    assert all(torch.equal(prefill[0][0][l], prefill[r][0][l]) for r in range(4) for l in LAYERS)
+    for rank in (0, 5):
+        checker = checker_for(decode, rank)
+        checker.before_step(recv_step([1, 2], [3, 5]))
+        copy_slice(prefill[rank * 4 // 8][0], decode[rank][0], 0, 0, SLAB)
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        assert result["ok"], result
+        assert result["groups"][0]["global_heads"] == [0]
+        assert result["groups"][0]["pattern"] == "head-v1"
+
+
 def checker_for(decode, rank):
     views, heads = decode[rank]
     return PatternChecker(views, rank, heads=heads)
@@ -1902,4 +1942,5 @@ def test_nixl_reads_record_their_producer_rank_and_slot():
     each = completed_transfers(KVConnectorOutput(kv_connector_stats=worker.xfer_stats))["load"][
         "each"
     ]
-    assert [entry[5:] for entry in each] == [[3, [1, 2]], [2, [0, 2]]]
+    # No prepared runs known for these stand-in lists: no prediction.
+    assert [entry[5:] for entry in each] == [[3, [1, 2, None]], [2, [0, 2, None]]]

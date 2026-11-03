@@ -1403,10 +1403,11 @@ async def test_heterogeneous_pp_waits_for_consumer_without_shared_layers():
             worker.is_kv_consumer = True
 
 
-async def _heterogeneous_producer(tp_rank, tp_size, kv_heads, consumers):
+async def _heterogeneous_producer(tp_rank, tp_size, kv_heads, consumers, mla=False):
     """Serve `consumers` (consumer TP size, rank) pulls of one request from
     producer rank `tp_rank` of `tp_size` (`kv_heads` KV heads, 128 bytes a
-    head): each response, the producer's release state and its writes."""
+    head; with `mla`, one 128-byte latent on every rank): each response, the
+    producer's release state and its writes."""
     config = _make_worker_vllm_config("kv_producer")
     with (
         set_current_vllm_config(config),
@@ -1423,9 +1424,10 @@ async def _heterogeneous_producer(tp_rank, tp_size, kv_heads, consumers):
                 tp_rank=tp_rank,
                 tp_size=tp_size,
                 total_num_kv_heads=kv_heads,
-                is_mla=False,
+                is_mla=mla,
             )
-            local = 128 * max(1, kv_heads // tp_size)
+            worker.use_mla = mla
+            local = 128 if mla else 128 * max(1, kv_heads // tp_size)
             worker.kv_caches_base_addr = [0x1000]
             worker.block_len_per_layer = [local]
             worker.kv_block_len_per_layer = [local]
@@ -1446,7 +1448,7 @@ async def _heterogeneous_producer(tp_rank, tp_size, kv_heads, consumers):
                 patch.object(worker, "_send_blocks_to", return_value=0) as send,
             ):
                 for consumer_tp, consumer_rank in consumers:
-                    remote = 128 * max(1, kv_heads // consumer_tp)
+                    remote = 128 if mla else 128 * max(1, kv_heads // consumer_tp)
                     metadata = _xfer_meta(
                         [_region(0x2000, block_len=remote, row_offset=-1,
                                  layer_name="model.layers.0.self_attn")],
@@ -3112,6 +3114,35 @@ def test_sleep_unregisters_and_restores_kv_caches():
         reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])
 
 
+@pytest.mark.asyncio
+async def test_an_mla_producer_writes_its_whole_latent_to_each_consumer():
+    """MLA, P TP4 -> D TP8: producer rank 1 serves consumer ranks 2 and 3 (its
+    paired ones) the whole latent each, at offset 0, and keeps the request
+    until both pulled."""
+    steps, writes, data = await _heterogeneous_producer(1, 4, 128, [(8, 2), (8, 3)], mla=True)
+    assert steps == [
+        (MooncakeXferResponseStatus.FINISH, ["d-req"], True, set()),
+        (MooncakeXferResponseStatus.FINISH, ["d-req"], False, {"p-req"}),
+    ]
+    assert [call.args[:2] for call in writes] == [(2, [[True, 0, 0, 128]]), (3, [[True, 0, 0, 128]])]
+    assert all(call.args[5] == [128] for call in writes)
+    assert data["zero_payload"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_mla_producer_replica_answers_without_a_payload():
+    """MLA, P TP8 -> D TP4: consumer rank 1 pulls producer ranks 2 and 3; rank
+    2 writes the latent, rank 3 holds the same one and answers with no
+    payload, its consumer's request id recorded."""
+    steps, writes, data = await _heterogeneous_producer(3, 8, 128, [(4, 1)], mla=True)
+    assert steps == [(MooncakeXferResponseStatus.FINISH, ["d-req"], False, {"p-req"})]
+    assert writes == []
+    assert data["zero_payload"] == [[1, ["d-req"], [[False, 0, 0, 128]]]]
+    steps, writes, data = await _heterogeneous_producer(2, 8, 128, [(4, 1)], mla=True)
+    assert [call.args[:2] for call in writes] == [(1, [[True, 0, 0, 128]])]
+    assert data["zero_payload"] == []
+
+
 def _simulation_config(
     simulate_forward=True,
     kv_transfer_mode="real",
@@ -3122,12 +3153,22 @@ def _simulation_config(
     layer_types=None,
     kv_heads=8,
     speculative=None,
+    model_type=None,
+    text_model_type=None,
+    dsa=False,
 ):
+    """A model config for the TP gate: `dsa` gives the text config an
+    `index_topk` (sparse MLA's indexer; its presence counts, set or not);
+    `text_model_type` nests a text config of its own (Kimi-K2.5's)."""
+    text = SimpleNamespace(layer_types=layer_types, model_type=text_model_type or model_type)
+    if dsa:
+        text.index_topk = None
     model = SimpleNamespace(
         use_mla=mla,
         is_hybrid=hybrid,
         get_sliding_window=lambda: sliding_window,
-        hf_text_config=SimpleNamespace(layer_types=layer_types),
+        hf_config=SimpleNamespace(model_type=model_type) if text_model_type else text,
+        hf_text_config=text,
         get_total_num_kv_heads=lambda: kv_heads,
     )
     return SimpleNamespace(
@@ -3147,13 +3188,20 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     assert simulated_tp_mismatch(_simulation_config(), 4, 2) is None
     assert "one dividing the other" in simulated_tp_mismatch(_simulation_config(), 2, 3)
     for config in (
-        _simulation_config(mla=True),
+        # Sparse MLA (DeepSeek-V3.2, GLM-5): an indexer's cache beside the
+        # latent, `index_topk` present whatever its value, here or nested.
+        _simulation_config(mla=True, model_type="deepseek_v32", dsa=True),
+        _simulation_config(mla=True, model_type="kimi_k25", text_model_type="glm_moe_dsa", dsa=True),
+        # DeepSeek-V4's compressed caches; a hybrid's (Kimi-K3's) states.
+        _simulation_config(mla=True, model_type="deepseek_v4", kv_heads=1),
+        _simulation_config(mla=True, hybrid=True, model_type="kimi_linear"),
+        _simulation_config(mla=True, model_type="deepseek_v3", speculative=SimpleNamespace(method="mtp")),
         _simulation_config(hybrid=True),
         _simulation_config(sliding_window=1024),
         _simulation_config(layer_types=["sliding_attention", "full_attention"]),
         _simulation_config(speculative=SimpleNamespace(method="mtp")),
     ):
-        assert "plain attention only" in simulated_tp_mismatch(config, 2, 4)
+        assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, 2, 4)
         # Equal sizes pair as before.
         assert simulated_tp_mismatch(config, 2, 2) is None
     # NIXL's decode refuses a larger producer whose heads are replicated (K
@@ -3165,23 +3213,40 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     assert simulated_tp_mismatch(replicated, 2, 4, nixl_consumer=True) is None
     # Simulated transfers move no KV; real deployments keep Mooncake's
     # heterogeneous TP.
-    assert simulated_tp_mismatch(_simulation_config(kv_transfer_mode="simulated", mla=True), 2, 1) is None
-    assert (
-        simulated_tp_mismatch(_simulation_config(False, "simulated", mla=True), 2, 1) is None
-    )
+    sparse = {"mla": True, "model_type": "deepseek_v32", "dsa": True}
+    assert simulated_tp_mismatch(_simulation_config(kv_transfer_mode="simulated", **sparse), 2, 1) is None
+    assert simulated_tp_mismatch(_simulation_config(False, "simulated", **sparse), 2, 1) is None
 
 
-@pytest.mark.parametrize("kv_heads", [4, 8])
-def test_the_nixl_gate_refuses_what_nixls_handshake_asserts(kv_heads):
+def test_simulated_real_transfers_pair_unequal_tp_for_plain_mla():
+    """Plain MLA (DeepSeek-V3, Kimi-K2, and Kimi-K2.5's nested text config):
+    one latent, the same on every rank, pairs unequal sizes either way over
+    either connector; NIXL's replicated-producer refusal exempts it, as NIXL's
+    handshake does, whatever the KV head count the config reports."""
+    for config in (
+        _simulation_config(mla=True, model_type="deepseek_v3", kv_heads=128),
+        _simulation_config(mla=True, model_type="kimi_k2", kv_heads=64),
+        _simulation_config(mla=True, model_type="kimi_k25", text_model_type="kimi_k2", kv_heads=64),
+        _simulation_config(mla=True, model_type="deepseek_v3", kv_heads=1),
+    ):
+        for local, remote in ((4, 8), (8, 4), (2, 8), (8, 2)):
+            assert simulated_tp_mismatch(config, local, remote) is None
+            assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None
+        assert "one dividing the other" in simulated_tp_mismatch(config, 4, 6)
+
+
+@pytest.mark.parametrize("kv_heads, mla", [(4, False), (8, False), (1, True), (128, True)])
+def test_the_nixl_gate_refuses_what_nixls_handshake_asserts(kv_heads, mla):
     """The simulated gate refuses, before the handshake, exactly the pairs
-    NIXL's handshake asserts on for plain attention (a larger producer whose
-    heads are replicated, nixl/base_worker.py), from NIXL's own topology."""
+    NIXL's handshake asserts on (a larger producer whose heads are
+    replicated, plain attention only: nixl/base_worker.py exempts MLA), from
+    NIXL's own topology."""
     from vllm.distributed.kv_transfer.kv_connector.utils import (
         EngineTransferInfo,
         TransferTopology,
     )
 
-    config = _simulation_config(kv_heads=kv_heads)
+    config = _simulation_config(kv_heads=kv_heads, mla=mla, model_type="deepseek_v3" if mla else None)
     sizes = (1, 2, 4, 8)
     for local in sizes:
         for remote in sizes:
@@ -3192,7 +3257,7 @@ def test_the_nixl_gate_refuses_what_nixls_handshake_asserts(kv_heads):
                 tp_size=local,
                 block_size=16,
                 engine_id="decode",
-                is_mla=False,
+                is_mla=mla,
                 is_mamba=False,
                 total_num_kv_heads=kv_heads,
                 attn_backends=[],
@@ -3206,48 +3271,58 @@ def test_the_nixl_gate_refuses_what_nixls_handshake_asserts(kv_heads):
                     remote_physical_blocks_per_logical=1,
                 ),
             )
-            native = topo.tp_ratio(remote) < 0 and topo.is_kv_replicated("prefill")
+            # The handshake's assert, under its own `not use_mla` guard.
+            native = not mla and topo.tp_ratio(remote) < 0 and topo.is_kv_replicated("prefill")
             gate = simulated_tp_mismatch(config, local, remote, nixl_consumer=True)
             assert (gate is not None) == native, (local, remote, gate)
             if native:
                 assert "replicated" in gate
 
-async def _assembled_receive(narrow=None):
+async def _assembled_receive(narrow=None, mla=False):
     """A decode rank of TP 2 (rank 1, 4 KV heads) pulling one request from a
     prefill of TP 4 through Mooncake's own receive path: `receive_kv` takes
     its sources from the native pairing (`handshake_target_ranks`, or
     `narrow` of it), each source's pull runs the native receive loop over a
     stand-in socket whose answer is held until released, and each answer
     settles the request's shared pull count. A source's head lands in the
-    decode page just before its answer. Returns the byte checker's results
-    after each source, in order, and the sources pulled."""
+    decode page just before its answer. With `mla`, one latent on every rank:
+    producer 2 sends it whole, producer 3 (its replica) answers with no
+    payload. Returns the byte checker's results after each source, in order,
+    and the sources pulled (and, with `mla`, whether the decode page held
+    the latent after each source)."""
     from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
     from vllm.v1.outputs import KVConnectorOutput
 
     from tests.v1.worker.simulated.test_kv_pattern import (
         DECODE_ID,
+        LAYERS,
         SLAB,
         checker_for,
         copy_slice,
+        mla_sides,
         recv_step,
         tp_sides,
     )
 
-    prefill, decode = tp_sides(4, 2)
+    prefill, decode = mla_sides(4, 2) if mla else tp_sides(4, 2)
     checker = checker_for(decode, 1)
     checker.before_step(recv_step([1, 2], [3, 5]))
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
-    worker.vllm_config = _simulation_config(kv_heads=4)
+    worker.vllm_config = (
+        _simulation_config(mla=True, model_type="deepseek_v3", kv_heads=128)
+        if mla
+        else _simulation_config(kv_heads=4)
+    )
     worker.tp_size, worker.pp_size, worker.pp_rank = 2, 1, 0
     worker.transfer_topo = TransferTopology(
         tp_rank=1,
         tp_size=2,
         block_size=16,
         engine_id="decode",
-        is_mla=False,
+        is_mla=mla,
         is_mamba=False,
-        total_num_kv_heads=4,
+        total_num_kv_heads=128 if mla else 4,
         attn_backends=[],
     )
     if narrow is not None:
@@ -3272,9 +3347,13 @@ async def _assembled_receive(narrow=None):
 
         async def recv():
             await answer[path].wait()
-            # Producer rank r holds head r: decode rank 1's head r - 2.
             rank = int(path.removeprefix("tcp://p"))
-            copy_slice(prefill[rank][0], decode[1][0], 0, (rank - 2) * SLAB, SLAB)
+            if not mla:
+                # Producer rank r holds head r: decode rank 1's head r - 2.
+                copy_slice(prefill[rank][0], decode[1][0], 0, (rank - 2) * SLAB, SLAB)
+            elif rank == 2:
+                # The latent, whole; rank 3's replica answers without it.
+                copy_slice(prefill[rank][0], decode[1][0], 0, 0, SLAB)
             return worker._encoder.encode(
                 MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.FINISH, ok_reqs=[DECODE_ID]
@@ -3292,7 +3371,7 @@ async def _assembled_receive(narrow=None):
         remote_engine_id="prefill",
         remote_bootstrap_addr="http://bootstrap",
     )
-    results = []
+    results, landed = [], []
     with patch.object(mooncake_connector, "make_zmq_socket", socket_to):
         worker.receive_kv("prefill", {DECODE_ID: meta})
         for _ in range(3):
@@ -3301,8 +3380,17 @@ async def _assembled_receive(narrow=None):
             answer[path].set()
             for _ in range(3):
                 await asyncio.sleep(0)
+            landed.append(
+                all(
+                    torch.equal(decode[1][0][layer][block], prefill[2][0][layer][source])
+                    for layer in LAYERS
+                    for block, source in ((1, 3), (2, 5))
+                )
+            )
             finished = await worker.fetch_finished_recving_reqs()
             results.append(checker.after_step(KVConnectorOutput(finished_recving=finished)))
+    if mla:
+        return results, sorted(pulled), landed
     return results, sorted(pulled)
 
 
@@ -3334,11 +3422,45 @@ async def test_a_receive_taking_its_first_source_for_the_request_fails():
     assert not result["ok"]
     assert result["mismatched_bytes"] == 2 * len(LAYERS) * SLAB
 
+def _finished_after(results):
+    """How many sources had answered when the request first finished."""
+    return next((n for n, result in enumerate(results, 1) if result), None)
+
+
+@pytest.mark.asyncio
+async def test_an_mla_receive_waits_for_the_replicas_answer():
+    """MLA, P TP4 -> D TP2: decode rank 1 pulls producer ranks 2 and 3 (the
+    native pairing). Rank 2's latent lands whole, so every byte is already
+    right, but with rank 3's zero-payload answer held the request does not
+    finish; it finishes, and passes, once rank 3 answers."""
+    native = 2
+    results, pulled, landed = await _assembled_receive(mla=True)
+    assert pulled == ["tcp://p2", "tcp://p3"]
+    assert landed == [True, True]
+    assert results[0] == []
+    assert _finished_after(results) == native
+    (result,) = results[-1]
+    assert result["ok"] and result["groups"][0]["global_heads"] == [0], result
+
+
+@pytest.mark.asyncio
+async def test_an_mla_receive_counting_only_the_sender_finishes_too_early():
+    """The mutation the test above guards against: a pairing of the sender
+    alone finishes the request at its answer. Its bytes pass; the completion
+    order (finished only after every paired producer answered) does not."""
+    native = 2
+    results, pulled, landed = await _assembled_receive(narrow=lambda ranks: ranks[:1], mla=True)
+    assert pulled == ["tcp://p2"] and landed == [True]
+    ((result,),) = results
+    assert result["ok"]
+    assert _finished_after(results) != native
+
+
 def test_simulated_decode_fails_reads_from_a_prefill_of_another_tp_size():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = worker.is_kv_producer = True
-    worker.vllm_config = _simulation_config(mla=True)
+    worker.vllm_config = _simulation_config(mla=True, model_type="deepseek_v32", dsa=True)
     worker.tp_size = 2
     worker._tp_size = {"prefill-engine": 1}
     worker._handle_failed_recv = MagicMock()
@@ -3357,7 +3479,7 @@ async def test_simulated_prefill_refuses_a_decode_of_another_tp_size():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = worker.is_kv_producer = True
-    worker.vllm_config = _simulation_config(mla=True)
+    worker.vllm_config = _simulation_config(mla=True, model_type="deepseek_v32", dsa=True)
     worker.tp_size = 1
     worker._encoder = msgspec.msgpack.Encoder()
     sock = SimpleNamespace(send_multipart=AsyncMock())

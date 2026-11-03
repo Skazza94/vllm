@@ -248,22 +248,112 @@ def transfer_rates_from_log(path: str) -> tuple[TransferRate, TransferRate | Non
     return rates[0], rates[1]
 
 
+def nixl_runs(xfer_list) -> np.ndarray | None:
+    """The prepared runs of a descriptor list in NIXL's strided form (Nx5:
+    address, length, device, stride, count; one run a row, kept as given):
+    each run's (length, stride, count). None for any other form (a flat
+    list, whose runs NIXL builds itself)."""
+    if not isinstance(xfer_list, np.ndarray) or xfer_list.ndim != 2 or xfer_list.shape[1] != 5:
+        return None
+    return xfer_list[:, [1, 3, 4]].astype(np.int64)
+
+
+def nixl_merged_descriptors(
+    local_runs: np.ndarray,
+    local_ids: Sequence[int],
+    remote_runs: np.ndarray,
+    remote_ids: Sequence[int],
+    skip_desc_merge: bool = False,
+) -> int | None:
+    """How many descriptors NIXL's `makeXferReq` makes of the selected
+    indices (pinned NIXL 1683cf3b, src/core/nixl_agent.cpp:831-901): a
+    selection i merges with the following ones while both sides' indices
+    advance by one, within the prepared run holding each side's index (it
+    stops at either run's end, even where the next run's addresses
+    continue), and only when the local run is dense (stride = length) and
+    both runs share that stride. `*_runs` are `nixl_runs`. None where NIXL
+    would refuse the request (an index out of range, lengths that differ)."""
+    starts = [np.cumsum(runs[:, 2]) - runs[:, 2] for runs in (local_runs, remote_runs)]
+    sizes = [int(runs[:, 2].sum()) for runs in (local_runs, remote_runs)]
+    n = len(local_ids)
+    if n != len(remote_ids):
+        return None
+
+    def run_of(side: int, index: int) -> tuple[int, int, int, int]:
+        runs = (local_runs, remote_runs)[side]
+        r = int(np.searchsorted(starts[side], index, side="right")) - 1
+        return int(runs[r, 0]), int(runs[r, 1]), int(starts[side][r]), int(runs[r, 2])
+
+    merged, i = 0, 0
+    while i < n:
+        local, remote = int(local_ids[i]), int(remote_ids[i])
+        if not (0 <= local < sizes[0] and 0 <= remote < sizes[1]):
+            return None
+        l_len, l_stride, l_start, l_count = run_of(0, local)
+        r_len, r_stride, r_start, r_count = run_of(1, remote)
+        if l_len != r_len:
+            return None
+        seq = 1
+        if not skip_desc_merge and l_stride == l_len and l_stride == r_stride:
+            cap = min(l_start + l_count - local, r_start + r_count - remote, n - i)
+            while (
+                seq < cap
+                and int(local_ids[i + seq]) == local + seq
+                and int(remote_ids[i + seq]) == remote + seq
+            ):
+                seq += 1
+        merged += 1
+        i += seq
+    return merged
+
+
 class NixlReadPeers:
     """Each NIXL READ's producer TP rank, local slot and descriptors, beside
     its telemetry in the worker's stats (`peer`, `plan`): the hooks wrap the
     wrapper's `make_prepped_xfer` (the handle's remote side names the rank,
     its local side the slot a heterogeneous-TP split writes) and
-    `get_xfer_telemetry` (read just before the stats record that READ)."""
+    `get_xfer_telemetry` (read just before the stats record that READ).
+
+    A plan is [slot, selected, predicted]: the indices selected (vLLM's
+    descriptors, before NIXL merges them) and the descriptors NIXL makes of
+    them, predicted from the prepared runs of both lists
+    (`nixl_merged_descriptors`), independently of the telemetry's measured
+    count; None when a list's runs are unknown. `prep_xfer_dlist` is wrapped
+    to keep each prepared list's runs; the local list prepared at
+    registration, before this hook, is the worker's `src_blocks_data`."""
 
     def __init__(self, worker) -> None:
         self.worker = worker
-        self.handles: dict[object, tuple[int | None, list[int]]] = {}
+        self.handles: dict[object, tuple[int | None, list[int | None]]] = {}
+        # id(prepared list handle) -> its runs (handles are kept by the worker).
+        self.runs: dict[int, np.ndarray | None] = {}
         wrapper = worker.nixl_wrapper
         make, telemetry = wrapper.make_prepped_xfer, wrapper.get_xfer_telemetry
+        prep = getattr(wrapper, "prep_xfer_dlist", None)
+        registered = getattr(worker, "src_xfer_handles_by_block_size", {}).get(
+            getattr(worker, "block_size", None)
+        )
+        if registered is not None and not getattr(worker, "_mixed_mem_types", False):
+            self.runs[id(registered)] = nixl_runs(getattr(worker, "src_blocks_data", None))
+
+        def prep_xfer_dlist(agent_name, xfer_list, *args, **kw):
+            handle = prep(agent_name, xfer_list, *args, **kw)
+            self.runs[id(handle)] = nixl_runs(xfer_list)
+            return handle
 
         def make_prepped_xfer(op, local, local_ids, remote, remote_ids, *args, **kw):
             handle = make(op, local, local_ids, remote, remote_ids, *args, **kw)
-            self.handles[handle] = (self._rank(remote), [self._slot(local), len(local_ids)])
+            skip = kw.get("skip_desc_merge", args[2] if len(args) > 2 else False)
+            local_runs, remote_runs = self.runs.get(id(local)), self.runs.get(id(remote))
+            predicted = (
+                nixl_merged_descriptors(local_runs, local_ids, remote_runs, remote_ids, bool(skip))
+                if local_runs is not None and remote_runs is not None
+                else None
+            )
+            self.handles[handle] = (
+                self._rank(remote),
+                [self._slot(local), len(local_ids), predicted],
+            )
             return handle
 
         def get_xfer_telemetry(handle):
@@ -277,6 +367,8 @@ class NixlReadPeers:
 
         wrapper.make_prepped_xfer = make_prepped_xfer
         wrapper.get_xfer_telemetry = get_xfer_telemetry
+        if prep is not None:
+            wrapper.prep_xfer_dlist = prep_xfer_dlist
 
     def _rank(self, remote) -> int | None:
         for ranks in self.worker.dst_xfer_side_handles.values():

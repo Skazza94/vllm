@@ -964,6 +964,31 @@ def test_real_transfers_pair_tp_sizes_one_dividing_the_other(model_dir, local_tp
             assert nixl is None
     assert simulated_tp_mismatch(VllmConfig(), local_tp, remote_tp) is None
 
+
+# The tiny models' 2 attention heads bound the local TP size at 2.
+@pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (1, 4), (2, 4)])
+def test_real_transfers_pair_plain_mla_at_unequal_tp(
+    mla_model_dir, tmp_path_factory, local_tp, remote_tp
+):
+    """Plain MLA (the tiny DeepSeek-V3): one latent, the same on every rank,
+    pairs unequal sizes either way over either connector (NIXL exempts MLA
+    from its replicated-producer refusal). Sparse MLA (the tiny
+    DeepSeek-V3.2: an indexer cache beside the latent) waits for several
+    groups' checkpoint."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        plain_mla,
+        simulated_tp_mismatch,
+    )
+
+    mla = engine_config(mla_model_dir, tensor_parallel_size=local_tp)
+    assert plain_mla(mla.model_config)
+    assert simulated_tp_mismatch(mla, local_tp, remote_tp) is None
+    assert simulated_tp_mismatch(mla, local_tp, remote_tp, nixl_consumer=True) is None
+    v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-tp", DEEPSEEK_V32)
+    sparse = engine_config(v32, dtype="bfloat16", block_size=64, tensor_parallel_size=local_tp)
+    assert sparse.model_config.use_mla and not plain_mla(sparse.model_config)
+    assert "plain attention or plain MLA only" in simulated_tp_mismatch(sparse, local_tp, remote_tp)
+
 def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
     monkeypatch, model_dir
 ):
