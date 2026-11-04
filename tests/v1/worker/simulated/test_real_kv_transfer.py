@@ -989,6 +989,26 @@ def test_real_transfers_pair_plain_mla_at_unequal_tp(
     assert sparse.model_config.use_mla and not plain_mla(sparse.model_config)
     assert "plain attention or plain MLA only" in simulated_tp_mismatch(sparse, local_tp, remote_tp)
 
+# The tiny gpt-oss's 2 KV heads bound the local TP size at 2.
+@pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (1, 4), (2, 4)])
+def test_real_transfers_pair_sliding_window_models_at_unequal_tp(
+    gpt_oss_model_dir, local_tp, remote_tp
+):
+    """The tiny gpt-oss (sliding-window and full groups, 2 KV heads each)
+    pairs unequal sizes either way over either connector; each layer's own
+    total heads (the model's) give its heads, so both groups are head-v1."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    config = engine_config(gpt_oss_model_dir, tensor_parallel_size=local_tp)
+    assert config.model_config.get_sliding_window() == 32
+    assert simulated_tp_mismatch(config, local_tp, remote_tp) is None
+    # NIXL's decode refuses a larger producer whose 2 heads are replicated.
+    refused = remote_tp > local_tp and remote_tp > 2
+    assert (simulated_tp_mismatch(config, local_tp, remote_tp, nixl_consumer=True) is not None) == refused
+
+
 def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
     monkeypatch, model_dir
 ):
@@ -3166,3 +3186,155 @@ def test_each_rank_serves_tent_metrics_on_its_own_port(
             if conf == "both":
                 assert resolved["metrics/http_port"] == 9400  # TENT ignores it
             assert resolved["transports"] == tent["transports"]
+
+
+def test_nixl_two_attention_groups_are_seeded_by_their_global_heads(
+    gpt_oss_model_dir, monkeypatch
+):
+    """The runner's own selection for the tiny gpt-oss's two attention groups
+    over NIXL (sliding and full layers of 2 KV heads): its filler is
+    head-aware (`heads` the rank's global heads), so each selected span is
+    its heads' slabs, the same bytes on any TP size, not the rank's pattern;
+    a checker over that selection accepts a read of them and fails a flipped
+    byte."""
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.v1.worker.simulated.kv_pattern import (
+        NativeChecker,
+        NativeFiller,
+        _stream,
+        get_base_request_id,
+        pattern,
+    )
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    llm = LLM(
+        model=gpt_oss_model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    llm.generate(
+        [{"prompt_token_ids": [5] * 100}],
+        SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+        use_tqdm=False,
+    )
+    engine = llm.llm_engine.engine_core.engine_core
+    runner = engine.model_executor.driver_worker.worker.model_runner
+    groups = engine.scheduler.kv_cache_config.kv_cache_groups
+    worker = get_kv_transfer_group().connector_worker
+    filler = runner._kv_filler
+    assert isinstance(filler, NativeFiller) and filler.heads == (0, 1)
+    s = filler.selection
+    free = iter(range(2, worker.num_blocks))
+    source = [[next(free), next(free)] for _ in groups]
+    target = [[next(free), next(free)] for _ in groups]
+    filler._extend("cmpl-a-0", source, replace=True)
+    base = get_base_request_id("cmpl-a-0")
+    for index, blocks in enumerate(source):
+        for row, block, place in s.select(index, blocks):
+            view = s.rows[row].view
+            size = view.shape[1]
+            want = torch.cat(
+                [_stream(f"{base}|h{head}|{s.name(index, row)}|{place}", size // 2) for head in (0, 1)]
+            )
+            assert torch.equal(view[block], want)
+            assert not torch.equal(
+                view[block], pattern("cmpl-a-0", s.name(index, row), place, size, 0)
+            )
+
+    # A read of them (what NIXL posts: every group's target blocks) checks.
+    checker = NativeChecker(s, heads=filler.heads)
+
+    def read(corrupt=False):
+        checker.expect("cmpl-b-0", "cmpl-a-0", [0] * len(groups), target)
+        ids = [int(d) for d in worker._compute_desc_ids(target, worker.num_blocks, None, 1)]
+        checker.posted["cmpl-a-0"] = ids
+        checker.reads["cmpl-a-0"] = [ids]
+        for index in range(len(groups)):
+            for (row, src, _), (_, dst, _) in zip(
+                s.select(index, source[index]), s.select(index, target[index])
+            ):
+                s.rows[row].view[dst] = s.rows[row].view[src]
+        if corrupt:
+            s.rows[0].view[target[0][0], 0] ^= 1
+        return checker._compare("cmpl-b-0", checker.pending.pop("cmpl-b-0"))
+
+    result = read()
+    assert result["ok"]
+    # What the harness requires of every transfer check's groups.
+    assert all(
+        g["pattern"] == "head-v1" and g["global_heads"] == [0, 1] for g in result["groups"]
+    ) and len(result["groups"]) == len(groups)
+    assert not read(corrupt=True)["ok"]
+
+
+@pytest.mark.parametrize("fill", [True, False], ids=["patterned", "unpatterned"])
+def test_nixl_attention_groups_take_a_peer_of_another_tp_size(
+    gpt_oss_model_dir, monkeypatch, fill
+):
+    """The hybrid-state guard (a peer's conv/SSM sizes and block lengths must
+    equal ours) is not installed on attention-only groups, with byte patterns
+    on or off: a peer whose blocks are twice as long (another TP size) is
+    not refused by it. The hybrid's refusal is kept in both modes
+    (test_nixl_peers_of_other_mtp_depths_are_refused_before_a_read)."""
+    from types import SimpleNamespace
+
+    from vllm import LLM
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    llm = LLM(  # kept: its engine owns the transfer group
+        model=gpt_oss_model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            **({"kv_pattern_fill": True} if fill else {}),
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    worker = get_kv_transfer_group().connector_worker
+    peer = SimpleNamespace(
+        ssm_sizes=tuple(worker._mamba_ssm_size),
+        block_lens=[2 * n for n in worker.block_len_per_layer],
+    )
+    try:
+        worker.add_remote_agent(peer)
+    except Exception as e:  # the stand-in peer fails NIXL's own checks, not ours
+        assert "holds its states otherwise" not in str(e)
+    assert llm is not None

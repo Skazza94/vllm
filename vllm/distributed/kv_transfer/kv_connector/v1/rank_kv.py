@@ -129,8 +129,9 @@ def simulated_tp_mismatch(
 ) -> str | None:
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
     real KV transfers under simulated compute pair equal sizes, or unequal
-    ones (one dividing the other) for a model of plain attention (no sliding
-    window, recurrent state or draft), whose pattern is each KV head's
+    ones (one dividing the other) for a model of plain attention (sliding
+    window layers beside full ones included; no recurrent state or draft),
+    whose pattern is each KV head's
     (``kv_pattern.head_pattern``) wherever the connector re-shards it, or of
     plain MLA (`plain_mla`: one latent, the same on every rank). NIXL's
     decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
@@ -145,18 +146,25 @@ def simulated_tp_mismatch(
     if larger % smaller:
         return f"Simulated real KV transfers pair TP sizes one dividing the other, not {sizes}."
     model = vllm_config.model_config
-    layer_types = getattr(model.hf_text_config, "layer_types", None) or ()
+    # Layers of different KV heads (Gemma4's global layers beside its
+    # sliding ones): the connectors count one head total, so their geometry
+    # at unequal sizes is not established.
+    per_layer = getattr(model.hf_text_config, "per_layer_config", None) or ()
+    if len({getattr(layer, "num_key_value_heads", None) for layer in per_layer}) > 1:
+        return (
+            "Simulated real KV transfers pair unequal TP sizes for layers of one "
+            "KV head count only (this model's layers differ in KV heads), "
+            f"not {sizes}."
+        )
     if (
         (model.use_mla and not plain_mla(model))
         or model.is_hybrid
-        or model.get_sliding_window() is not None
-        or any("sliding" in str(kind) for kind in layer_types)
         or vllm_config.speculative_config is not None
     ):
         return (
             "Simulated real KV transfers pair unequal TP sizes for plain attention "
-            "or plain MLA only (no sparse or compressed MLA, sliding window, "
-            f"recurrent state or draft), not {sizes}."
+            "or plain MLA only (no sparse or compressed MLA, recurrent state "
+            f"or draft), not {sizes}."
         )
     if (
         nixl_consumer

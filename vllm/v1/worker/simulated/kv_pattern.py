@@ -199,11 +199,64 @@ def group_pattern(views: Mapping[str, object], heads: "HeadMap | None") -> dict:
     }
 
 
+def uniform_heads(
+    heads: "HeadMap | None", layers: Sequence[str]
+) -> tuple[int, ...] | None:
+    """The global KV heads every one of `layers` holds, when they all hold
+    the same (head patterns, each page its heads' slabs); None otherwise
+    (a layer without a head pattern, or layers of different heads)."""
+    if not heads or not layers or any(layer not in heads for layer in layers):
+        return None
+    held = {heads[layer][0] for layer in layers}
+    return held.pop() if len(held) == 1 else None
+
+
+def row_pattern(
+    request_id: str,
+    name: str,
+    logical_block: int,
+    size: int,
+    tp_rank: int = 0,
+    identity: str | None = None,
+    heads: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """A selected span's expected bytes: with `heads` (the global heads every
+    attention layer holds) its heads' slabs in order, each one's stream the
+    same on any TP size, as a head-v1 layer's page; else (a state's span, or
+    a span its heads do not divide) the rank's pattern."""
+    if heads and size % len(heads) == 0:
+        base = identity if identity is not None else get_base_request_id(request_id)
+        slab = size // len(heads)
+        return torch.cat(
+            [_stream(f"{base}|h{head}|{name}|{logical_block}", slab) for head in heads]
+        )
+    return pattern(request_id, name, logical_block, size, tp_rank, identity)
+
+
+def layer_total_heads(model_config, layers) -> dict[str, int]:
+    """Each named layer's own total KV heads, where the model gives layers
+    their own (`per_layer_config`, Gemma4's global layers): the layer's
+    `num_key_value_heads`, indexed as the model builds it. Layers of a model
+    without one are absent: the model's total applies."""
+    per_layer = getattr(model_config.hf_text_config, "per_layer_config", None)
+    if not per_layer:
+        return {}
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    totals = {}
+    for layer in layers:
+        index = extract_layer_index(layer)
+        if 0 <= index < len(per_layer):
+            totals[layer] = int(per_layer[index].num_key_value_heads)
+    return totals
+
+
 def head_map(
     specs: Mapping[str, "KVCacheSpec"],
     total_num_kv_heads: int,
     tp_rank: int,
     tp_size: int,
+    layer_totals: Mapping[str, int] | None = None,
 ) -> dict[str, tuple[tuple[int, ...], int]]:
     """Each attention layer's global KV heads and slab, from its own spec:
     one slot per KV head of plain states (`num_kv_heads`, `head_size`), the
@@ -211,7 +264,9 @@ def head_map(
     of tp > K: head r*K/tp, replicated); an MLA layer one latent, global
     head 0, on every rank. A layer whose page packs otherwise (head slots,
     packed content, compressed states), a state or a layer whose heads do
-    not match that sharding keeps its rank's pattern (absent)."""
+    not match that sharding keeps its rank's pattern (absent). A layer's
+    total is `layer_totals`' where the model gives layers their own
+    (`layer_total_heads`), else the model's `total_num_kv_heads`."""
     from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
     heads = {}
@@ -228,13 +283,14 @@ def head_map(
                 heads[layer] = ((0,), spec.unpadded_page_size_bytes)
             continue
         local = spec.num_kv_heads
-        if tp_size <= total_num_kv_heads:
-            first = tp_rank * total_num_kv_heads // tp_size
-            expected = total_num_kv_heads // tp_size
+        total = (layer_totals or {}).get(layer, total_num_kv_heads)
+        if tp_size <= total:
+            first = tp_rank * total // tp_size
+            expected = total // tp_size
             global_heads = tuple(range(first, first + local))
         else:
             expected = 1
-            global_heads = (tp_rank * total_num_kv_heads // tp_size,)
+            global_heads = (tp_rank * total // tp_size,)
         if local != expected:
             continue
         heads[layer] = (global_heads, spec.unpadded_page_size_bytes // local)
@@ -1162,22 +1218,30 @@ class NativeSelection:
         return groups
 
 
-def _write_selected(selection, req_id, group, logical, block, tp_rank, identity):
+def _write_selected(selection, req_id, group, logical, block, tp_rank, identity, heads=None):
     s = selection
     for row, b, _ in s.select(group, [block]):
-        view = s.rows[row].view
+        r = s.rows[row]
+        view = r.view
         view[b].copy_(
-            pattern(req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity)
+            row_pattern(
+                req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
+                None if r.state else heads,
+            )
         )
 
 
-def _compare_selected(selection, req_id, group, logical, block, tp_rank, identity):
+def _compare_selected(selection, req_id, group, logical, block, tp_rank, identity, heads=None):
     s = selection
     compared = wrong = 0
     entries = []
     for row, b, _ in s.select(group, [block]):
-        view = s.rows[row].view
-        want = pattern(req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity)
+        r = s.rows[row]
+        view = r.view
+        want = row_pattern(
+            req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
+            None if r.state else heads,
+        )
         bad = int((view[b] != want).sum())
         compared += view.shape[1]
         if bad:
@@ -1200,16 +1264,20 @@ class NativeFiller(_ContentPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+    heads: tuple[int, ...] | None = None
+    """Every attention layer's global KV heads: its spans are head patterns."""
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
         _after_update(self, scheduler_output)
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
-        _write_selected(self.selection, req_id, group, logical, block, self.tp_rank, identity)
+        _write_selected(
+            self.selection, req_id, group, logical, block, self.tp_rank, identity, self.heads
+        )
 
     def _compare_block(self, req_id, group, logical, block, identity):
         return _compare_selected(
-            self.selection, req_id, group, logical, block, self.tp_rank, identity
+            self.selection, req_id, group, logical, block, self.tp_rank, identity, self.heads
         )
 
     def _extend(self, req_id, block_ids, replace: bool, hits=None) -> None:
@@ -1239,15 +1307,17 @@ class NativeFiller(_ContentPages):
                 self.results.append(_lifecycle_failure(req_id, "fill", e))
                 continue
             for row, block, place in selected:
-                view = s.rows[row].view
+                r = s.rows[row]
+                view = r.view
                 view[block].copy_(
-                    pattern(
+                    row_pattern(
                         req_id,
                         s.name(group, row),
                         start + places[place],
                         view.shape[1],
                         self.tp_rank,
                         identities[place],
+                        None if r.state else self.heads,
                     )
                 )
             for region in s.state_regions(selected) & set(s.padding):
@@ -1271,19 +1341,27 @@ class NativeChecker(_ConsumerPages):
     lost: set[str] = field(default_factory=set)
     # The local descriptors of the READs NIXL posted, by producer request.
     posted: dict[str, list[int]] = field(default_factory=dict)
+    # The same, one list a READ (a page gathered from several producers is
+    # several READs of the same local blocks).
+    reads: dict[str, list[list[int]]] = field(default_factory=dict)
     awaiting: dict[str, _Expected] = field(default_factory=dict)
     pull_starts: dict[str, dict[int, int]] = field(default_factory=dict)
     tables: dict[str, list[list[int]]] = field(default_factory=dict)
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+    heads: tuple[int, ...] | None = None
+    """Every attention layer's global KV heads: its spans are head patterns,
+    whichever ranks NIXL reads them from."""
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
-        _write_selected(self.selection, req_id, group, logical, block, self.tp_rank, identity)
+        _write_selected(
+            self.selection, req_id, group, logical, block, self.tp_rank, identity, self.heads
+        )
 
     def _compare_block(self, req_id, group, logical, block, identity):
         return _compare_selected(
-            self.selection, req_id, group, logical, block, self.tp_rank, identity
+            self.selection, req_id, group, logical, block, self.tp_rank, identity, self.heads
         )
 
     def watch_reads(self) -> None:
@@ -1299,6 +1377,7 @@ class NativeChecker(_ConsumerPages):
                 notif = notif.decode()
             request = notif.rsplit(":", 1)[0]
             self.posted.setdefault(request, []).extend(int(i) for i in local_ids)
+            self.reads.setdefault(request, []).append([int(i) for i in local_ids])
             return make(op, local, local_ids, remote, remote_ids, *args, **kw)
 
         wrapper.make_prepped_xfer = make_prepped_xfer
@@ -1358,13 +1437,24 @@ class NativeChecker(_ConsumerPages):
         for req_id, remote_request_id in ended.items():
             if req_id not in self.awaiting:
                 self.posted.pop(remote_request_id, None)
+                self.reads.pop(remote_request_id, None)
         return results
 
     def _check_geometry(self) -> None:
         """The selection is the local one: a remote read whole by the same
         rank, at the same block size. NIXL's other geometries (split reads,
-        another block size) are refused, not assumed."""
+        another block size) are refused, not assumed; with head patterns
+        (`heads`) any TP size's reads are checked, the block size's still
+        equal."""
         w = self.selection.worker
+        if self.heads is not None:
+            sizes = set(w.src_xfer_handles_by_block_size) - {w.block_size}
+            if sizes:
+                raise ValueError(
+                    "Pattern checks of several KV cache groups over NIXL need a "
+                    f"remote of equal block size, not {sorted(sizes)}."
+                )
+            return
         other = {
             engine: plan
             for engine, plan in w.tp_mappings.items()
@@ -1404,13 +1494,14 @@ class NativeChecker(_ConsumerPages):
                 r = s.rows[row]
                 view = r.view
                 logical = first + places[place]
-                want = pattern(
+                want = row_pattern(
                     expected.remote_request_id,
                     s.name(group.group, row),
                     logical,
                     view.shape[1],
                     self.tp_rank,
                     identity_of(group.group, logical) if identity_of else None,
+                    None if r.state else self.heads,
                 )
                 wrong = int((view[block] != want).sum())
                 payload += view.shape[1]
@@ -1434,9 +1525,17 @@ class NativeChecker(_ConsumerPages):
                 if bad:
                     padding_wrong += bad
                     mismatched_blocks.append([f"padding.r{region}", None, held, bad])
+            # The scheme these spans' bytes were checked under: head patterns
+            # for attention spans, the rank's for a state's.
+            holds_state = any(s.rows[row].state for row, _, _ in selected)
             groups.append(
                 {
                     "group": group.group,
+                    **(
+                        {"pattern": HEAD_PATTERN, "global_heads": list(self.heads)}
+                        if self.heads and not holds_state
+                        else {"pattern": "mixed" if self.heads else RANK_PATTERN, "global_heads": None}
+                    ),
                     # Where the pull's metadata placed the blocks among the
                     # request's (a state's clipped running slot: index k, its
                     # slot physically before the scratch ones), and the
@@ -1466,7 +1565,12 @@ class NativeChecker(_ConsumerPages):
             }
         )
         posted = self.posted.pop(expected.remote_request_id, None)
-        posted_ok = posted == checked
+        reads = self.reads.pop(expected.remote_request_id, [])
+        # With head patterns a page may be read from several producers, each
+        # READ writing the same local blocks: every READ is the checked ones.
+        posted_ok = posted == checked or (
+            self.heads is not None and bool(reads) and all(read == checked for read in reads)
+        )
         return {
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,

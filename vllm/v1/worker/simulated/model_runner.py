@@ -43,6 +43,8 @@ from vllm.v1.worker.simulated.kv_pattern import (
     block_views,
     group_pattern,
     head_map,
+    layer_total_heads,
+    uniform_heads,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
     NixlReadPeers,
@@ -296,37 +298,53 @@ class SimulatedModelRunner(GPUModelRunner):
         # Each attention layer's page is its global KV heads' patterns, so a
         # connector may re-shard heads between unequal TP sizes; NIXL's
         # selection of several groups keeps its rank's.
+        layers = [group.layer_names for group in groups]
+        # Each layer's global heads: a property of the model and the TP size,
+        # whether or not bytes are patterned (it decides what geometry a
+        # peer may have, below).
+        layer_heads = head_map(
+            layer_specs(groups),
+            self.model_config.get_total_num_kv_heads(),
+            tp.rank_in_group,
+            tp.world_size,
+            layer_total_heads(self.model_config, [n for names in layers for n in names]),
+        )
         heads = None
-        if (sim.kv_pattern_fill or sim.kv_pattern_check) and not native:
+        if sim.kv_pattern_fill or sim.kv_pattern_check:
+            heads = layer_heads
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).
             pages = packed_pages(kv_caches_dict, layer_specs(groups))
             views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
-            layers = [group.layer_names for group in groups]
-            heads = head_map(
-                layer_specs(groups),
-                self.model_config.get_total_num_kv_heads(),
-                tp.rank_in_group,
-                tp.world_size,
-            )
-            if sim.kv_pattern_fill:
-                self._kv_filler = PatternFiller(
-                    views, tp.rank_in_group, layers, chains, heads
+            if not native:
+                if sim.kv_pattern_fill:
+                    self._kv_filler = PatternFiller(
+                        views, tp.rank_in_group, layers, chains, heads
+                    )
+                if sim.kv_pattern_check:
+                    self._kv_checker = PatternChecker(
+                        views,
+                        tp.rank_in_group,
+                        layers,
+                        self.kv_cache_config.transfer_group_ids,
+                        chains,
+                        heads,
+                    )
+                logger.info(
+                    "KV pattern %s over %d layers.",
+                    "fill" if sim.kv_pattern_fill else "check",
+                    len(views),
                 )
-            if sim.kv_pattern_check:
-                self._kv_checker = PatternChecker(
-                    views,
-                    tp.rank_in_group,
-                    layers,
-                    self.kv_cache_config.transfer_group_ids,
-                    chains,
-                    heads,
-                )
-            logger.info(
-                "KV pattern %s over %d layers.",
-                "fill" if sim.kv_pattern_fill else "check",
-                len(views),
+        # NIXL's selection of attention-only groups holding the same global
+        # heads in every layer is seeded by those heads, so its reads are
+        # checked from any TP size; a hybrid's states keep the rank's.
+        native_heads = None
+        if native and layer_heads and not self.model_config.is_hybrid:
+            native_heads = uniform_heads(
+                layer_heads, [n for g in groups for n in g.layer_names]
             )
+        if native and native_heads is None:
+            heads = None
         connector = super()._make_kv_connector(kv_caches_dict)
         nixl_worker = getattr(get_kv_transfer_group(), "connector_worker", None)
         if (
@@ -337,7 +355,12 @@ class SimulatedModelRunner(GPUModelRunner):
             self._nixl_read_peers = NixlReadPeers(nixl_worker)
         selection = None
         if native:
-            refuse_foreign_state_geometry(get_kv_transfer_group().connector_worker)
+            # A hybrid's peer must hold its states as this instance does;
+            # attention-only groups seeded by head patterns have none, and
+            # their block lengths differ with the TP size by design (NIXL's
+            # own per-region check covers them).
+            if native_heads is None:
+                refuse_foreign_state_geometry(get_kv_transfer_group().connector_worker)
             selection = NativeSelection(
                 get_kv_transfer_group().connector_worker,
                 kv_caches_dict,
@@ -345,13 +368,16 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.kv_cache_config.transfer_group_ids,
             )
             if sim.kv_pattern_fill:
-                self._kv_filler = NativeFiller(selection, tp.rank_in_group, chains)
+                self._kv_filler = NativeFiller(
+                    selection, tp.rank_in_group, chains, heads=native_heads
+                )
             if sim.kv_pattern_check:
                 self._kv_checker = NativeChecker(
                     selection,
                     tp.rank_in_group,
                     self.kv_cache_config.transfer_group_ids,
                     chains,
+                    heads=native_heads,
                 )
                 self._kv_checker.watch_reads()
             logger.info(

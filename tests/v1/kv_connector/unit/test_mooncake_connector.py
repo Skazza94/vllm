@@ -3151,6 +3151,7 @@ def _simulation_config(
     hybrid=False,
     sliding_window=None,
     layer_types=None,
+    layer_heads=None,
     kv_heads=8,
     speculative=None,
     model_type=None,
@@ -3161,6 +3162,8 @@ def _simulation_config(
     `index_topk` (sparse MLA's indexer; its presence counts, set or not);
     `text_model_type` nests a text config of its own (Kimi-K2.5's)."""
     text = SimpleNamespace(layer_types=layer_types, model_type=text_model_type or model_type)
+    if layer_heads is not None:
+        text.per_layer_config = [SimpleNamespace(num_key_value_heads=n) for n in layer_heads]
     if dsa:
         text.index_topk = None
     model = SimpleNamespace(
@@ -3197,8 +3200,6 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
         _simulation_config(mla=True, hybrid=True, model_type="kimi_linear"),
         _simulation_config(mla=True, model_type="deepseek_v3", speculative=SimpleNamespace(method="mtp")),
         _simulation_config(hybrid=True),
-        _simulation_config(sliding_window=1024),
-        _simulation_config(layer_types=["sliding_attention", "full_attention"]),
         _simulation_config(speculative=SimpleNamespace(method="mtp")),
     ):
         assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, 2, 4)
@@ -3216,6 +3217,37 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     sparse = {"mla": True, "model_type": "deepseek_v32", "dsa": True}
     assert simulated_tp_mismatch(_simulation_config(kv_transfer_mode="simulated", **sparse), 2, 1) is None
     assert simulated_tp_mismatch(_simulation_config(False, "simulated", **sparse), 2, 1) is None
+
+
+def test_simulated_real_transfers_pair_unequal_tp_with_sliding_window_layers():
+    """Sliding window layers beside full ones (gpt-oss, Gemma4) are plain
+    attention: a window group's pattern is its heads' too, so unequal sizes
+    pair either way (a recurrent state or a draft still refuses)."""
+    for config in (
+        _simulation_config(sliding_window=128, kv_heads=8),
+        _simulation_config(layer_types=["sliding_attention", "full_attention"], kv_heads=8),
+        _simulation_config(sliding_window=1024, layer_types=["sliding_attention", "full_attention"], kv_heads=8),
+    ):
+        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (2, 8), (8, 2)):
+            assert simulated_tp_mismatch(config, local, remote) is None
+    assert "plain attention or plain MLA only" in simulated_tp_mismatch(
+        _simulation_config(hybrid=True, sliding_window=128), 2, 4
+    )
+    # Gemma4: sliding layers of 8 KV heads beside global layers of 2. Equal
+    # sizes pair; unequal ones wait for that geometry's checkpoint (the
+    # connectors count one head total: Mooncake's own validator rejects a
+    # 2-head layer's page under the model's 8), whichever way and with the
+    # model's total alone replicated or not.
+    gemma = _simulation_config(
+        sliding_window=1024, layer_types=["sliding_attention", "full_attention"],
+        kv_heads=8, layer_heads=[8, 2],
+    )
+    assert simulated_tp_mismatch(gemma, 2, 2) is None
+    for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2)):
+        assert "layers differ in KV heads" in simulated_tp_mismatch(gemma, local, remote)
+        assert "layers differ in KV heads" in simulated_tp_mismatch(gemma, local, remote, nixl_consumer=True)
+    # Layers of one head count (a per-layer config repeating it) pair.
+    assert simulated_tp_mismatch(_simulation_config(kv_heads=8, layer_heads=[8, 8]), 2, 4) is None
 
 
 def test_simulated_real_transfers_pair_unequal_tp_for_plain_mla():

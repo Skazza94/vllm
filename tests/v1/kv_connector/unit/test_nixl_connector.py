@@ -5262,6 +5262,7 @@ def _gathered_read(monkeypatch, narrow=None):
     )
     worker.num_descs = int(worker.src_blocks_data[:, 4].sum())
     fake = worker.nixl_wrapper
+    posted: list[tuple[int, object, list[int]]] = []
     handles: dict[int, tuple[int, int]] = {}
     released: set[int] = set()
     landed: set[int] = set()
@@ -5271,6 +5272,7 @@ def _gathered_read(monkeypatch, narrow=None):
         handle = make(op, local, local_ids, remote, remote_ids, notif_msg=notif_msg)
         sides = worker.dst_xfer_side_handles[engine].items()
         handles[handle] = (next(r for r, h in sides if h == remote), len(local_ids))
+        posted.append((handles[handle][0], local, [int(i) for i in local_ids]))
         return handle
 
     def check_xfer_state(handle):
@@ -5333,7 +5335,10 @@ def _gathered_read(monkeypatch, narrow=None):
             released.add(rank)
         _, done = worker.get_finished()
         results.append(checker.after_step(KVConnectorOutput(finished_recving=done)))
-    return results, sources, worker.xfer_stats.data
+    data = worker.xfer_stats.data
+    # Each READ the native path posted: its source, local slot handle, ids.
+    data["posted_reads"] = posted
+    return results, sources, data
 
 
 @patch(
@@ -5362,6 +5367,13 @@ def test_a_nixl_page_gathered_from_two_producers_finishes_after_the_last(
     # Head slices (a slot's length below the page stride) never merge: the
     # hook predicts each selected descriptor, as NIXL measures them here.
     assert [plan[2] for plan in data["plan"]] == [plan[1] for plan in data["plan"]]
+    # One READ a source, each into its own local slot handle, every one with
+    # the same local descriptor ids: what the checker's per-READ comparison
+    # (`posted_matches_checked` for head patterns) relies on.
+    posted = data["posted_reads"]
+    assert [rank for rank, _, _ in posted] == [0, 1]
+    assert len({local for _, local, _ in posted}) == 2
+    assert posted[0][2] == posted[1][2] and posted[0][2]
 
 
 @patch(

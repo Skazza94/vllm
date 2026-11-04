@@ -1944,3 +1944,181 @@ def test_nixl_reads_record_their_producer_rank_and_slot():
     ]
     # No prepared runs known for these stand-in lists: no prediction.
     assert [entry[5:] for entry in each] == [[3, [1, 2, None]], [2, [0, 2, None]]]
+
+
+def test_a_layer_with_its_own_total_heads_is_sharded_by_them():
+    """Gemma4: sliding layers of 8 KV heads beside global layers of 2 (the
+    model's `per_layer_config`). Each layer's global heads follow its own
+    total: at TP 2, rank 1 holds sliding heads 4-7 and global head 1; at TP 4
+    the global layers replicate (ranks 2 and 3 both hold head 1). Under the
+    model's total of 8 a global layer's heads would not match its sharding
+    and the layer would keep the rank's pattern."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.simulated.kv_pattern import head_map, layer_total_heads
+
+    def spec(local, head_size):
+        return FullAttentionSpec(block_size=4, num_kv_heads=local, head_size=head_size, dtype=torch.uint8)
+
+    per_layer = [SimpleNamespace(num_key_value_heads=8), SimpleNamespace(num_key_value_heads=2)]
+    model = SimpleNamespace(hf_text_config=SimpleNamespace(per_layer_config=per_layer))
+    names = ["model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn"]
+    totals = layer_total_heads(model, names)
+    assert totals == {names[0]: 8, names[1]: 2}
+    assert layer_total_heads(SimpleNamespace(hf_text_config=SimpleNamespace()), names) == {}
+    for tp, rank, local, want in (
+        (2, 1, (4, 1), ((4, 5, 6, 7), (1,))),
+        (1, 0, (8, 2), (tuple(range(8)), (0, 1))),
+        (4, 2, (2, 1), ((4, 5), (1,))),
+        (4, 3, (2, 1), ((6, 7), (1,))),
+    ):
+        specs = {names[0]: spec(local[0], 8), names[1]: spec(local[1], 16)}
+        heads = head_map(specs, 8, rank, tp, totals)
+        assert (heads[names[0]][0], heads[names[1]][0]) == want, (tp, rank)
+        # The model's total alone leaves the global layer's pattern the rank's.
+        assert names[1] not in head_map(specs, 8, rank, tp) or tp == 1
+
+
+def _stub_selection(rows, groups=1, block_ids=(1,)):
+    """A native selection's surface over given spans: `rows` are
+    [num_blocks, size] byte tensors, one a region, each group moving block b
+    of every row."""
+    from types import SimpleNamespace
+
+    def select(group, blocks):
+        return [(r, b, i) for i, b in enumerate(blocks) for r in range(len(rows))]
+
+    return SimpleNamespace(
+        rows=[SimpleNamespace(view=v, region=i, offset=0, state=False) for i, v in enumerate(rows)],
+        select=select,
+        members=[set(range(len(rows))) for _ in range(groups)],
+        padding={},
+        groups=[["l"] for _ in range(groups)],
+        name=lambda group, row: f"g{group}.r{row}.o0",
+        state_regions=lambda selected: set(),
+        regions=lambda selected: {r for r, _, _ in selected},
+        order=lambda blocks: [b for ids in blocks.values() for b in ids],
+        worker=None,
+    )
+
+
+def test_native_head_patterns_check_reads_from_any_tp_size():
+    """A head-aware NIXL selection (several attention groups) is checked from
+    unequal TP sizes: a decode page of 4 KV heads' ranks reads its heads'
+    slabs from whichever producers hold them. K = 4 heads of 8 bytes, 2
+    regions. P TP2 -> D TP4: decode rank 1 (head 1) takes it from producer 0
+    (heads 0, 1); P TP4 -> D TP2: decode rank 1 (heads 2, 3) gathers
+    producers 2 and 3. A wrong head's slice, or a missing one, fails."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.simulated.kv_pattern import (
+        NativeChecker,
+        NativeFiller,
+        row_pattern,
+    )
+
+    slab, regions, blocks = 8, 2, 4
+
+    def side(heads):
+        return _stub_selection([torch.zeros(blocks, slab * len(heads), dtype=torch.uint8) for _ in range(regions)])
+
+    def producer(heads):
+        s = side(heads)
+        NativeFiller(s, 0, heads=heads)._write_block("cmpl-a-0", 0, 3, 2, None)
+        return s
+
+    def consumer(heads, copy, reads=1):
+        s = side(heads)
+        for r in range(regions):
+            s.rows[r].view[2] = copy(r)
+        checker = NativeChecker(s, tp_rank=1, heads=heads)
+        checker._check_geometry = lambda: None
+        # One READ a source posts the checked blocks.
+        checker.posted["cmpl-a-0"] = [2] * reads
+        checker.reads["cmpl-a-0"] = [[2] for _ in range(reads)]
+        expected = SimpleNamespace(
+            remote_request_id="cmpl-a-0",
+            block_ids=[[2]],
+            groups=[SimpleNamespace(group=0, block_ids=[2], first_logical_block=3)],
+        )
+        return checker._compare("cmpl-b-0", expected)
+
+    def harness_accepts(result, mine):
+        """What the e2e harness reads of every transfer check (pd.py's
+        `_hetero_tp`): each group's pattern is head-v1 and its global heads
+        the decode rank's own."""
+        assert result["groups"]
+        for group in result["groups"]:
+            assert group["pattern"] == "head-v1" and group["global_heads"] == mine, group
+
+    # Split: decode head 1 from producer 0's heads (0, 1), at slab 1.
+    p = producer((0, 1))
+    ok = consumer((1,), lambda r: p.rows[r].view[2][slab:2 * slab])
+    assert ok["ok"], ok
+    harness_accepts(ok, [1])
+    wrong = consumer((1,), lambda r: p.rows[r].view[2][:slab])  # head 0's slice
+    assert not wrong["ok"] and wrong["mismatched_bytes"] > 0
+    missing = consumer((1,), lambda r: torch.zeros(slab, dtype=torch.uint8))
+    assert not missing["ok"]
+    # Gather: decode heads (2, 3) from producers holding head 2 and head 3.
+    p2, p3 = producer((2,)), producer((3,))
+    ok = consumer((2, 3), lambda r: torch.cat([p2.rows[r].view[2], p3.rows[r].view[2]]), reads=2)
+    assert ok["ok"] and ok["posted_matches_checked"], ok
+    harness_accepts(ok, [2, 3])
+    swapped = consumer((2, 3), lambda r: torch.cat([p3.rows[r].view[2], p2.rows[r].view[2]]), reads=2)
+    assert not swapped["ok"]
+    # Truthful fallbacks: rank patterns report rank-v0 and no heads; a group
+    # holding a state's span under head patterns is mixed.
+    for heads, state, want in ((None, False, ("rank-v0", None)), ((1,), True, ("mixed", None))):
+        s = side((1,))
+        s.rows[0].state = state
+        NativeFiller(s, 1, heads=heads)._write_block("cmpl-a-0", 0, 3, 2, None)
+        checker = NativeChecker(s, tp_rank=1, heads=heads)
+        checker._check_geometry = lambda: None
+        checker.posted["cmpl-a-0"] = [2]
+        checker.reads["cmpl-a-0"] = [[2]]
+        expected = SimpleNamespace(
+            remote_request_id="cmpl-a-0", block_ids=[[2]],
+            groups=[SimpleNamespace(group=0, block_ids=[2], first_logical_block=3)],
+        )
+        (group,) = checker._compare("cmpl-b-0", expected)["groups"]
+        assert (group["pattern"], group["global_heads"]) == want
+    # Only the head patterns are TP-independent: the rank's are not.
+    assert not torch.equal(
+        row_pattern("cmpl-a-0", "g0.r0.o0", 3, slab, 0, None, None),
+        row_pattern("cmpl-a-0", "g0.r0.o0", 3, slab, 1, None, None),
+    )
+
+
+def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
+    """`NativeChecker._check_geometry`: a split or gathered read (another
+    source rank, several consumers, split local handles) is refused for rank
+    patterns, as NIXL's selection is the local one, and admitted for head
+    patterns; a remote of another block size is refused either way."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from vllm.v1.worker.simulated.kv_pattern import NativeChecker
+
+    def worker(block_sizes=(16,), split=None):
+        plan = SimpleNamespace(all_source_ranks=(0, 1), local_consumers=2)
+        return SimpleNamespace(
+            tp_rank=1, engine_id="d", block_size=16,
+            tp_mappings={"d": SimpleNamespace(all_source_ranks=(1,), local_consumers=1), "p": plan},
+            src_xfer_handles_by_block_size=dict.fromkeys(block_sizes, 1),
+            src_xfer_handles_by_tp_ratio=split or {},
+        )
+
+    def checker(w, heads):
+        return NativeChecker(SimpleNamespace(worker=w), heads=heads)
+
+    with pytest.raises(ValueError, match="equal TP and block size"):
+        checker(worker(split={(-2, 16): [1, 2]}), None)._check_geometry()
+    checker(worker(split={(-2, 16): [1, 2]}), (2, 3))._check_geometry()
+    for heads in (None, (2, 3)):
+        with pytest.raises(ValueError, match="block size"):
+            checker(worker(block_sizes=(16, 32)), heads)._check_geometry()
