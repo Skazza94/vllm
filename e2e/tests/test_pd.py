@@ -2387,3 +2387,166 @@ class HeterogeneousTpTests(unittest.TestCase):
                          ["10.100.0.1", "10.100.0.1"])
         self.assertEqual(pd.global_heads(3, 8, 4), [1])
         self.assertEqual(pd.global_heads(1, 2, 8), [4, 5, 6, 7])
+
+
+class UcxBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def fixture(self, backend="ucx", change=None):
+        factory = HeterogeneousTpTests()
+        factory.model = self.model
+        run = factory.run_for(2, 4, 8, True)
+        run.server.nixl_backend = backend
+        prefill, decode, ports, moved, tents = hetero_logs(2, 4, 8, True)
+        def identity(text):
+            records = pd._records(text)
+            for record in records:
+                if "kv_layout" in record:
+                    record["kv_layout"]["nixl_transport"] = {
+                        "backends": ["UCX"], "num_threads": 4, "progress_thread": True, "binding": {"address": "10.1.0.1", "interface": "kv0",
+                                                            "UCX_NET_DEVICES": "kv0", "UCX_TLS": "tcp,self"}}
+            return "".join(line(**record) for record in records)
+        if backend == "ucx":
+            prefill, decode = [identity(t) for t in prefill], [identity(t) for t in decode]
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        return run, prefill, decode, ports, moved, tents
+
+    def verdict(self, backend="ucx", change=None):
+        run, p, d, ports, moved, tents = self.fixture(backend, change)
+        return pd.check({"completed": 2, "errors": []}, p, d, {"control": 50, "kv": moved + 500},
+                        run, None if backend == "ucx" else tents, ports)
+
+    def test_ucx_full_accounting_and_missing_identity(self):
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["transport"], {"backend": "UCX", "tent_applicable": False})
+        self.assertIsNone(verdict["hp_tcp_task_limit"])
+        for find, replace in [('"nixl_transport"', '"missing_identity"'), ('"UCX"', '"Mooncake"'),
+                              ('"tcp,self"', '"all"'), ('"progress_thread": true', '"progress_thread": false')]:
+            problems = self.verdict(change=lambda p,d,ports: (p,[t.replace(find,replace) for t in d],ports))["problems"]
+            self.assertTrue(any("backend" in s or "interface evidence" in s or "thread/progress" in s for s in problems), problems)
+
+    def test_ucx_keeps_byte_descriptor_ownership_and_port_failures(self):
+        mutations = [
+            lambda p,d,ports: (p,[t.replace('"ok": true','"ok": false') for t in d],ports),
+            lambda p,d,ports: (p,d,{}),
+            lambda p,d,ports: (p,[t.replace('"mismatched_bytes": 0','"mismatched_bytes": 1') for t in d],ports),
+        ]
+        for mutate in mutations:
+            self.assertTrue(self.verdict(change=mutate)["problems"])
+        def wrong_count(p,d,ports):
+            records=pd._records(d[0])
+            for r in records:
+                for e in ((r.get("kv_transfers") or {}).get("load") or {}).get("each",[]):
+                    e[3]+=1
+            return p,["".join(line(**r) for r in records),*d[1:]],ports
+        self.assertTrue(any("measured" in s for s in self.verdict(change=wrong_count)["problems"]))
+        def wrong_peer(p,d,ports):
+            records=pd._records(d[0])
+            for r in records:
+                for e in ((r.get("kv_transfers") or {}).get("load") or {}).get("each",[]): e[5]=1
+            return p,["".join(line(**r) for r in records),*d[1:]],ports
+        self.assertTrue(self.verdict(change=wrong_peer)["problems"])
+
+    def test_descriptor_guards_follow_backend_in_both_reconcilers(self):
+        from unittest.mock import patch
+        with patch.object(pd,"NIXL_MAX_DESCRIPTORS",1):
+            self.assertEqual(self.verdict()["problems"], [])
+            self.assertTrue(any("guard" in s for s in self.verdict("mooncake")["problems"]))
+            hybrid=HybridHeterogeneousTpTests()
+            hybrid.setUp()
+            try:
+                # Exercise the hybrid's third guard with exactly the same logs.
+                p,d,ports=hybrid_logs(1,2)
+                run=pd.Run(**{**RUN.__dict__,"model":hybrid.model,"server":pd.Server(connector="nixl",nixl_backend="ucx"),
+                              "prefill":pd.Side("p","kv",tensor_parallel_size=1),"decode":pd.Side("d","kv",tensor_parallel_size=2)})
+                logs={"prefill":{(0,r):pd._records(t) for r,t in enumerate(p)},"decode":{(0,r):pd._records(t) for r,t in enumerate(d)}}
+                ranks={role:{key:{"transfers":{"bytes":sum(((x.get("kv_transfers") or {}).get("load") or {}).get("bytes",0) for x in records)},"requests":["a","b"]} for key,records in ls.items()} for role,ls in logs.items()}
+                reconcile=lambda:pd._hetero_tp(run,{"prefill":1,"decode":2},logs,ranks,ports)
+                self.assertEqual(reconcile()["problems"],[])
+                run.server.nixl_backend="mooncake"
+                self.assertTrue(any("guard" in s for s in reconcile()["problems"]))
+                run.server.nixl_backend="ucx"
+                for records in logs["decode"].values():
+                    for r in records:
+                        if "kv_check" in r:r["kv_check"]["coverage"]["reads"][0]["completed"]=False
+                self.assertTrue(any("not complete" in s for s in reconcile()["problems"]))
+            finally:hybrid.tearDown()
+
+    def test_command_and_config_restrictions(self):
+        run,*_=self.fixture()
+        command=pd.server_command(run,"decode",["10.1.0.1","10.1.0.3","10.1.0.5","10.1.0.7"])
+        extra=json.loads(command[command.index("--kv-transfer-config")+1])["kv_connector_extra_config"]
+        self.assertEqual(extra["backends"],["UCX"])
+        self.assertEqual(len(extra["rank_addresses"]),4)
+        env=dict(v.split("=",1) for v in command[1:command.index(pd.VLLM)])
+        self.assertEqual(env["UCX_TLS"],"tcp,self")
+        self.assertFalse(any(k.startswith(("MC_","TENT_","NIXL_MOONCAKE_")) for k in env))
+        for overrides in ({"UCX_TLS":"all"},{"UCX_NET_DEVICES":"control"},{"MC_USE_TENT":"0"},{"UCX_CONFIG_FILE":"x"},{"NIXL_UCX_DEVICE_LIST":"kv0"}):
+            run.server.env=overrides
+            with self.assertRaises(ValueError):pd.server_command(run,"decode",["10.1.0.1"]*4)
+        run.server.env={};run.server.connector="mooncake"
+        with self.assertRaises(ValueError):pd.server_command(run,"decode",["10.1.0.1"]*4)
+
+    def test_ucx_saved_run_needs_no_tent_file_or_fetch(self):
+        from unittest.mock import patch
+        run,p,d,ports,moved,_=self.fixture()
+        run.server.timing="linear"
+        out=Path(self.directory.name)/"saved";out.mkdir()
+        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model),"proxy":str(run.proxy)}))
+        for role,texts in (("prefill",p),("decode",d)):
+            for rank,text in enumerate(texts):(out/pd._step_log_name(role,0,rank)).write_text(text)
+        for file,data in (("bench.json",{"completed":2,"errors":[]}),("routers.json",{"control":50,"kv":moved+500}),("router-ports.json",ports)):
+            (out/file).write_text(json.dumps(data))
+        self.assertEqual(pd.recheck(out)["problems"],[])
+        with patch.object(topology,"exec_in",side_effect=AssertionError("must not fetch TENT")):
+            self.assertEqual(pd._tent_metrics(run,{}),{})
+        run.server.nixl_backend="mooncake"
+        raw=json.loads((out/"run.json").read_text());raw["server"]["nixl_backend"]="mooncake"
+        (out/"run.json").write_text(json.dumps(raw))
+        with self.assertRaises(FileNotFoundError):pd.recheck(out)
+
+    def test_ucx_live_collection_marks_tent_not_applicable(self):
+        from unittest.mock import patch
+        run,p,d,ports,moved,_=self.fixture()
+        output=Path(self.directory.name)/"live"
+        state={"nodes":{name:{"container":name,"interfaces":{"control":{"address":"10.250.0.1"}}}
+                        for name in ("p","d","c")}}
+        def collect(*_):
+            (output/"bench.json").write_text(json.dumps({"completed":2,"errors":[]}))
+            for role,texts in (("prefill",p),("decode",d)):
+                for rank,text in enumerate(texts):(output/pd._step_log_name(role,0,rank)).write_text(text)
+        def addresses(*_):return ["10.1.0.1"]*4
+        with patch.object(topology,"load_state",return_value=state), \
+             patch.object(topology,"exec_in",return_value=""), \
+             patch.object(pd.shell,"run",return_value=""), \
+             patch.object(pd,"stop_services"),patch.object(pd,"_background"),patch.object(pd,"_wait"), \
+             patch.object(pd,"_kv_addresses",side_effect=addresses), \
+             patch.object(pd,"router_bytes",side_effect=[{"control":0,"kv":0},{"control":50,"kv":moved+500}]), \
+             patch.object(pd,"router_ports",side_effect=[{},ports]), \
+             patch.object(pd,"_port_deltas",return_value=ports), \
+             patch.object(pd,"_collect",side_effect=collect),patch.object(pd.time,"sleep"):
+            self.assertEqual(pd.execute(run,output)["problems"],[])
+        self.assertFalse((output/"tent.json").exists())
+        self.assertFalse((output/"tent-after.json").exists())
+        self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":"UCX","tent_applicable":False})
+
+    def test_ucx_large_descriptor_plan_keeps_exact_counts_and_bytes(self):
+        heads={"decode":{0:[[0]]}}
+        sender=[{(0,0):0}]
+        sources={0:[0]}
+        plan=[0,2048,2048]
+        entry=[2048,0.01,0,2048,1,0,plan]
+        args=((0,0),entry,plan,True,heads,sender,sources,[1])
+        self.assertEqual(pd._plan_problems(*args,max_descriptors=None),[])
+        self.assertTrue(any("guard" in s for s in pd._plan_problems(*args)))
+        entry[3]=2047
+        self.assertTrue(any("measured" in s for s in pd._plan_problems(*args,max_descriptors=None)))
+        entry[3]=2048;entry[0]=2049
+        self.assertTrue(any("bytes" in s for s in pd._plan_problems(*args,max_descriptors=None)))
