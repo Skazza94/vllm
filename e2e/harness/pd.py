@@ -1325,6 +1325,39 @@ def global_heads(rank: int, tp: int, kv_heads: int) -> list[int]:
     return [rank * kv_heads // tp]
 
 
+def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | None]:
+    """Each KV cache group's total KV heads, from its layout `kind`: the
+    model's own for all groups, except in the config family that gives its
+    full-attention layers a count of their own (`num_global_key_value_heads`,
+    Gemma4): a `FullAttentionSpec` group takes that, a `SlidingWindowSpec`
+    group `num_key_value_heads`. Any other kind in such a config, or an
+    invalid count, is an error: never a default. (None, error) then."""
+    uniform = kv_heads_of(model)
+    if uniform is None:
+        return None, f"{model}/config.json gives no num_key_value_heads"
+    try:
+        config = json.loads((Path(model) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None, f"{model}/config.json is unreadable"
+    sources = (config, config.get("text_config") or {}, config.get("llm_config") or {})
+    own = next((source["num_global_key_value_heads"] for source in sources
+                if source.get("num_global_key_value_heads") is not None), None)
+    if own is None:
+        return [uniform] * len(kinds), None
+    if isinstance(own, bool) or not isinstance(own, int) or own <= 0:
+        return None, f"num_global_key_value_heads {own!r} is not a positive integer"
+    totals = []
+    for kind in kinds:
+        if kind == "FullAttentionSpec":
+            totals.append(own)
+        elif kind == "SlidingWindowSpec":
+            totals.append(uniform)
+        else:
+            return None, (f"a {kind} group has no KV head rule in a config with num_global_key_value_heads "
+                          "(full-attention and sliding-window groups only)")
+    return totals, None
+
+
 def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,
                unwritten: set[int] = frozenset()) -> dict:
     """Unequal prefill and decode TP sizes, reconciled with the native
@@ -1351,41 +1384,63 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
     if kv_heads is None:
         return {**evidence, "problems": [f"{run.model}/config.json gives no num_key_value_heads"],
                 "sources": {d: [0] for d in range(decode_tp)}, "received": {}}
-    heads = {role: {rank: global_heads(rank, sizes[role], kv_heads) for rank in range(sizes[role])}
-             for role in sizes}
-    ratio = max(prefill_tp, decode_tp) // min(prefill_tp, decode_tp)
-    paired = {d: [d * prefill_tp // decode_tp] if decode_tp >= prefill_tp else
-              [d * ratio + i for i in range(ratio)] for d in range(decode_tp)}
-    sender = {(h, d): min(p for p in paired[d] if h in heads["prefill"][p])
-              for d in range(decode_tp) for h in heads["decode"][d]}
-    # NIXL reads each unique head once (its first rank); Mooncake's decode
-    # pulls every paired producer.
-    sources = {d: sorted({sender[(h, d)] for h in heads["decode"][d]}) if nixl else paired[d]
-               for d in range(decode_tp)}
-    evidence["heads"] = heads
-    evidence["sources"] = sources
-
     def layout(role: str, rank: int) -> dict | None:
         return next((r["kv_layout"] for r in logs[role].get((0, rank), []) if "kv_layout" in r), None)
 
-    slabs: dict[tuple[str, int], int | None] = {}
+    # Each group's kind, the same on every rank of both sides (a group's
+    # correspondence across P and D), then its total KV heads.
+    kind_lists = {(role, rank): [g.get("kind") for g in (layout(role, rank) or {}).get("groups") or []]
+                  for role in sizes for rank in range(sizes[role])}
+    kinds = next((k for k in kind_lists.values() if k), [])
+    for (role, rank), found in sorted(kind_lists.items()):
+        if found != kinds:
+            problems.append(f"{role} rank {rank}'s groups are {found}, not the others' {kinds}")
+    totals, why = group_kv_heads(run.model, kinds) if kinds else ([kv_heads], None)
+    if why:
+        return {**evidence, "problems": problems + [why], "sources": {d: [0] for d in range(decode_tp)},
+                "received": {}}
+    evidence["group_kv_heads"] = totals
+    gheads = {role: {rank: [global_heads(rank, sizes[role], k) for k in totals] for rank in range(sizes[role])}
+              for role in sizes}
+    heads = {role: {rank: gheads[role][rank][0] for rank in gheads[role]} for role in sizes}
+    ratio = max(prefill_tp, decode_tp) // min(prefill_tp, decode_tp)
+    paired = {d: [d * prefill_tp // decode_tp] if decode_tp >= prefill_tp else
+              [d * ratio + i for i in range(ratio)] for d in range(decode_tp)}
+    gsender = [{(h, d): min(p for p in paired[d] if h in gheads["prefill"][p][g])
+                for d in range(decode_tp) for h in gheads["decode"][d][g]} for g in range(len(totals))]
+    sender = gsender[0]
+    # NIXL reads each unique head once (its first rank); Mooncake's decode
+    # pulls every paired producer.
+    sources = {d: sorted({gsender[g][(h, d)] for g in range(len(totals)) for h in gheads["decode"][d][g]})
+               if nixl else paired[d] for d in range(decode_tp)}
+    evidence["heads"] = heads
+    evidence["sources"] = sources
+
+    # Each group's head slab: its page (padding excluded) over its heads,
+    # the same on every rank of both sides.
+    slabs: dict[tuple[str, int], tuple[int | None, ...]] = {}
     for role in sizes:
         for rank in range(sizes[role]):
             groups = (layout(role, rank) or {}).get("groups") or []
+            mine_slabs = []
             for index, group in enumerate(groups):
-                if group.get("pattern") != "head-v1" or group.get("global_heads") != heads[role][rank]:
+                want = gheads[role][rank][index] if index < len(totals) else None
+                if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
                     problems.append(f"{role} rank {rank}'s group {index} holds {group.get('pattern')} heads "
-                                    f"{group.get('global_heads')}, not head-v1 heads {heads[role][rank]}")
-            # A head's bytes in one block of one layer: the page's heads'
-            # bytes (padding excluded) over its heads.
-            pages = {group.get("real_page_bytes") or group.get("block_bytes") for group in groups}
-            page = pages.pop() if len(pages) == 1 else None
-            slabs[(role, rank)] = page // len(heads[role][rank]) if (
-                isinstance(page, int) and page > 0 and page % len(heads[role][rank]) == 0) else None
-    slab = next(iter(set(slabs.values()))) if len(set(slabs.values())) == 1 else None
-    if slab is None:
+                                    f"{group.get('global_heads')}, not head-v1 heads {want}")
+                    mine_slabs.append(None)
+                    continue
+                page = group.get("real_page_bytes") or group.get("block_bytes")
+                mine_slabs.append(page // len(want) if (
+                    isinstance(page, int) and page > 0 and page % len(want) == 0) else None)
+            slabs[(role, rank)] = tuple(mine_slabs) or (None,)
+    distinct = set(slabs.values())
+    gslabs = list(next(iter(distinct))) if len(distinct) == 1 else [None]
+    if None in gslabs or len(distinct) != 1:
         problems.append(f"the ranks' layouts give no single head size in a block of a layer: "
-                        f"{ {f'{role}{rank}': n for (role, rank), n in sorted(slabs.items())} }")
+                        f"{ {f'{role}{rank}': (n[0] if len(set(n)) == 1 else n) for (role, rank), n in sorted(slabs.items())} }")
+        gslabs = [None] * len(totals)
+    slab = gslabs[0] if len(set(gslabs)) == 1 else gslabs
     evidence["slab_bytes"] = slab
 
     expected: dict[tuple[int, int], int] = {}
@@ -1396,17 +1451,30 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
             check = record.get("kv_check")
             if not check or check.get("kind") not in (None, "transfer") or "error" in check:
                 continue
-            for group in check.get("groups") or []:
-                if group.get("pattern") != "head-v1" or group.get("global_heads") != mine:
+            cgroups = check.get("groups") or []
+            for position, group in enumerate(cgroups):
+                index = group.get("group", position)
+                want = gheads["decode"][d][index] if isinstance(index, int) and 0 <= index < len(totals) else None
+                if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
                     problems.append(f"decode rank {d} checked {check.get('req_id')}'s heads "
-                                    f"{group.get('global_heads')} ({group.get('pattern')}), not its {mine}")
-            per_head = int(check.get("bytes") or 0) // len(mine)
-            if d == 0:
-                # Each request's KV once: every global head's bytes.
-                unique += per_head * kv_heads
-            for p in {sender[(h, d)] for h in mine}:
-                expected[(p, d)] = expected.get((p, d), 0) + per_head * sum(
-                    1 for h in mine if sender[(h, d)] == p)
+                                    f"{group.get('global_heads')} ({group.get('pattern')}), not its {want}")
+            # Bytes per head, each group's own (its bytes over its heads); a
+            # check without per-group bytes counts one set of heads.
+            per_group = []
+            if cgroups and all(isinstance(g.get("bytes"), int) and isinstance(g.get("group", 0), int)
+                               and 0 <= g.get("group", 0) < len(totals) for g in cgroups):
+                for position, group in enumerate(cgroups):
+                    index = group.get("group", position)
+                    per_group.append((index, group["bytes"] // len(gheads["decode"][d][index])))
+            else:
+                per_group = [(0, int(check.get("bytes") or 0) // len(mine))]
+            for index, per_head in per_group:
+                if d == 0:
+                    # Each request's KV once: every global head's bytes.
+                    unique += per_head * totals[index]
+                for p in {gsender[index][(h, d)] for h in gheads["decode"][d][index]}:
+                    expected[(p, d)] = expected.get((p, d), 0) + per_head * sum(
+                        1 for h in gheads["decode"][d][index] if gsender[index][(h, d)] == p)
 
     # Each decode rank's requests (its byte checks'), which each paired
     # producer answers.
@@ -1439,7 +1507,7 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                         descriptors.append(plan[1])
                     if nixl and isinstance(entry[3], int):
                         merged.append(entry[3])
-                    problems.extend(_plan_problems(pair, entry, plan, nixl, heads, sender, sources, slab))
+                    problems.extend(_plan_problems(pair, entry, plan, nixl, gheads, gsender, sources, gslabs))
                 for answer in transfer.get("zero_payload") or []:
                     peer, requests, plan = (list(answer) + [None, None, None])[:3]
                     if not isinstance(peer, int) or rank not in paired.get(peer, ()):
@@ -1557,9 +1625,13 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
     places in the producer's and decode's pages, the carried heads' length."""
     p, d = pair
     at = f"prefill rank {p} -> decode rank {d}: "
-    carried = [h for h in heads["decode"][d] if sender[(h, d)] == p]
+    # `heads`, `sender` and `slab` are each KV cache group's (lists by group).
+    by_group = [[h for h in heads["decode"][d][g] if sender[g][(h, d)] == p] for g in range(len(sender))]
+    carried = next((c for c in by_group if c), [])
     if not carried:
         return [f"{at}a transfer, though decode takes none of its heads from it"]
+    known = all(n is not None for n in slab)
+    spans = {len(c) * slab[g] for g, c in enumerate(by_group) if c and slab[g] is not None}
     if not plan:
         return [f"{at}a transfer of {entry[0]} bytes without its plan ({plan})"]
     if nixl:
@@ -1593,18 +1665,33 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
         if selected > NIXL_MAX_DESCRIPTORS:
             problems.append(f"{at}a READ of {selected} selected descriptors, more than the "
                             f"{NIXL_MAX_DESCRIPTORS} guard")
-        if slab is not None and int(entry[0]) != selected * len(carried) * slab:
-            problems.append(f"{at}a READ of {entry[0]} bytes in {selected} selected descriptors, not "
-                            f"{len(carried)} head(s) of {slab} bytes each")
+        if known and len(spans) != 1:
+            problems.append(f"{at}a READ whose groups carry different spans {sorted(spans)}: the exact bytes "
+                            "need one common carried span per descriptor")
+        elif known:
+            span = spans.pop()
+            if int(entry[0]) != selected * span:
+                if len({len(c) for c in by_group if c}) == 1 and len({n for n in slab}) == 1:
+                    problems.append(f"{at}a READ of {entry[0]} bytes in {selected} selected descriptors, not "
+                                    f"{len(carried)} head(s) of {slab[0]} bytes each")
+                else:
+                    problems.append(f"{at}a READ of {entry[0]} bytes in {selected} selected descriptors, not "
+                                    f"{span} bytes (the carried span) each")
         return problems
-    if slab is None:
+    if not known:
         return []
     problems = []
-    want = [True, heads["prefill"][p].index(carried[0]) * slab, heads["decode"][d].index(carried[0]) * slab,
-            len(carried) * slab]
+    wants = []
+    for g, c in enumerate(by_group):
+        if c:
+            want = [True, heads["prefill"][p][g].index(c[0]) * slab[g], heads["decode"][d][g].index(c[0]) * slab[g],
+                    len(c) * slab[g]]
+            if want not in wants:
+                wants.append(want)
     for region in plan:
-        if list(region) != want:
-            problems.append(f"{at}plan {list(region)}, not {want} (heads {carried}, {slab} bytes each)")
+        if list(region) not in wants:
+            shown = wants[0] if len(wants) == 1 else wants
+            problems.append(f"{at}plan {list(region)}, not {shown} (heads {carried}, {slab[0]} bytes each)")
     return problems
 
 

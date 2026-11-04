@@ -1616,47 +1616,59 @@ SLAB = 10  # a head's bytes in a block of a layer
 PER_HEAD = 100  # a request's bytes of one head (5 blocks x 2 layers x SLAB)
 
 
-def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requests=("a", "b")):
+def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requests=("a", "b"), groups=None):
     """Consistent step logs, transfers, ports and TENT scrapes of a run whose
     instances have unequal TP sizes: each request's heads moved as the
     native pairing gives them, a READ's descriptors one per block and layer,
     a replica's answers naming their requests, and each rank's TENT series
-    as a scrape serves them (one never incremented absent)."""
-    heads = {role: [pd.global_heads(r, n, kv_heads) for r in range(n)]
-             for role, n in (("prefill", prefill_tp), ("decode", decode_tp))}
+    as a scrape serves them (one never incremented absent). `groups`: KV
+    cache groups of (kind, total heads, slab) each, in place of one group of
+    `kv_heads` heads of SLAB bytes (Gemma4: sliding 8 heads of 10 bytes, full
+    2 of 40: pages of equal bytes at TP1)."""
+    groups = groups or [("FullAttentionSpec", kv_heads, SLAB)]
+    tps = (("prefill", prefill_tp), ("decode", decode_tp))
+    gheads = {role: [[pd.global_heads(r, n, g[1]) for g in groups] for r in range(n)] for role, n in tps}
+    heads = {role: [gh[0] for gh in gheads[role]] for role in gheads}
     ratio = max(prefill_tp, decode_tp) // min(prefill_tp, decode_tp)
     paired = {d: [d * prefill_tp // decode_tp] if decode_tp >= prefill_tp else
               [d * ratio + i for i in range(ratio)] for d in range(decode_tp)}
-    sender = {(h, d): min(p for p in paired[d] if h in heads["prefill"][p])
-              for d in range(decode_tp) for h in heads["decode"][d]}
+    gsender = [{(h, d): min(p for p in paired[d] if h in gheads["prefill"][p][g])
+                for d in range(decode_tp) for h in gheads["decode"][d][g]} for g in range(len(groups))]
+    ph = [10 * g[2] for g in groups]  # a request's bytes of one head of each group
 
     def layout(rank, tp, mine):
         return line(kv_layout={"tp_rank": rank, "tp_size": tp, "block_bytes": 20, "bytes": 1600, "groups": [
-            {"kind": "FullAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 2,
-             "block_bytes": SLAB * len(mine), "real_page_bytes": SLAB * len(mine), "pattern": "head-v1",
-             "global_heads": mine}]})
+            {"kind": kind, "sliding_window": None, "block_size": 16, "layers": 2,
+             "block_bytes": slab * len(mine[g]), "real_page_bytes": slab * len(mine[g]), "pattern": "head-v1",
+             "global_heads": mine[g]} for g, (kind, _, slab) in enumerate(groups)]})
 
     def group(mine):
-        return {"group": 0, "first_logical_block": 0, "blocks": 5, "layers": 2, "block_bytes": SLAB * len(mine),
-                "bytes": PER_HEAD * len(mine), "mismatched_bytes": 0, "pattern": "head-v1", "global_heads": mine}
+        return [{"group": g, "first_logical_block": 0, "blocks": 5, "layers": 2, "block_bytes": groups[g][2] * len(mine[g]),
+                 "bytes": ph[g] * len(mine[g]), "mismatched_bytes": 0, "pattern": "head-v1", "global_heads": mine[g]}
+                for g in range(len(groups))]
 
     sends = {p: [] for p in range(prefill_tp)}
     loads = {d: [] for d in range(decode_tp)}
     zero = {p: [] for p in range(prefill_tp)}
     for d in range(decode_tp):
-        sources = sorted({sender[(h, d)] for h in heads["decode"][d]})
+        sources = sorted({gsender[g][(h, d)] for g in range(len(groups)) for h in gheads["decode"][d][g]})
         for p in paired[d]:
-            carried = [h for h in heads["decode"][d] if sender[(h, d)] == p]
-            if not carried:
+            carried = [[h for h in gheads["decode"][d][g] if gsender[g][(h, d)] == p] for g in range(len(groups))]
+            if not any(carried):
                 zero[p] += [[d, [f"cmpl-{r}-0-d"], [[False, 0, 0, SLAB]]] for r in requests]
                 continue
-            plan = [[True, heads["prefill"][p].index(carried[0]) * SLAB,
-                     heads["decode"][d].index(carried[0]) * SLAB, SLAB * len(carried)]]
+            plan = []
+            for g, c in enumerate(carried):
+                region = [True, gheads["prefill"][p][g].index(c[0]) * groups[g][2],
+                          gheads["decode"][d][g].index(c[0]) * groups[g][2], groups[g][2] * len(c)]
+                if c and region not in plan:
+                    plan.append(region)
             for _ in requests:
-                entry = [PER_HEAD * len(carried), 0.01, 0.0, 10, 10.0]
+                moved_bytes = sum(ph[g] * len(c) for g, c in enumerate(carried))
+                entry = [moved_bytes, 0.01, 0.0, 10 * len(groups), 10.0]
                 if nixl:
                     slot = sources.index(p) if len(sources) > 1 else 0
-                    loads[d].append(entry + [p, [slot, 10, 10]])
+                    loads[d].append(entry + [p, [slot, 10 * len(groups), 10 * len(groups)]])
                 else:
                     sends[p].append(entry + [d, plan])
 
@@ -1666,13 +1678,14 @@ def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requ
             record["zero_payload"] = list(zero_payload)
         return line(kv_transfers={direction: record})
 
-    prefill = [layout(p, prefill_tp, heads["prefill"][p]) + allocated(*requests)
+    prefill = [layout(p, prefill_tp, gheads["prefill"][p]) + allocated(*requests)
                + transfers("send", sends[p], zero[p]) for p in range(prefill_tp)]
-    decode = [layout(d, decode_tp, heads["decode"][d])
+    decode = [layout(d, decode_tp, gheads["decode"][d])
               + "".join(stepped(r, "d", 80, 1, 80) for r in requests)
               + transfers("load", loads[d])
-              + "".join(line(kv_check=checked(r, blocks=5, layers=2, bytes=PER_HEAD * len(heads["decode"][d]),
-                                              groups=[group(heads["decode"][d])])) for r in requests)
+              + "".join(line(kv_check=checked(r, blocks=5, layers=2,
+                                              bytes=sum(ph[g] * len(gheads["decode"][d][g]) for g in range(len(groups))),
+                                              groups=group(gheads["decode"][d]))) for r in requests)
               for d in range(decode_tp)]
     sent = {p: sum(e[0] for e in sends[p]) + sum(e[0] for d in loads for e in loads[d] if e[5] == p)
             for p in range(prefill_tp)}
@@ -1704,6 +1717,12 @@ def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requ
     return prefill, decode, ports, sum(sent.values()), tents
 
 
+# Gemma4's groups: sliding layers of 8 KV heads (10-byte slabs), full ones of
+# 2 (40-byte slabs): pages of equal bytes (80) at TP1, a common carried span of
+# 40 bytes at TP1 <-> 2.
+GEMMA = [("SlidingWindowSpec", 8, 10), ("FullAttentionSpec", 2, 40)]
+
+
 class HeterogeneousTpTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -1712,25 +1731,28 @@ class HeterogeneousTpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def run_for(self, prefill_tp, decode_tp, kv_heads, nixl):
+    def run_for(self, prefill_tp, decode_tp, kv_heads, nixl, global_heads=None):
         # kv_heads 1: an MLA model's latent (DeepSeek-V3's config: 128
         # attention KV heads, one latent cached).
         config = {"num_key_value_heads": 128, "kv_lora_rank": 512} if kv_heads == 1 else {
             "num_key_value_heads": kv_heads}
+        if global_heads is not None:
+            config["num_global_key_value_heads"] = global_heads
         (self.model / "config.json").write_text(json.dumps(config))
         return pd.Run(**{**RUN.__dict__, "model": self.model,
                          "prefill": pd.Side("p", "kv", tensor_parallel_size=prefill_tp),
                          "decode": pd.Side("d", "kv", tensor_parallel_size=decode_tp),
                          "server": pd.Server(connector="nixl" if nixl else "mooncake")})
 
-    def verdict(self, prefill_tp, decode_tp, kv_heads, nixl, change=None, tent_change=None) -> dict:
-        prefill, decode, ports, moved, tents = hetero_logs(prefill_tp, decode_tp, kv_heads, nixl)
+    def verdict(self, prefill_tp, decode_tp, kv_heads, nixl, change=None, tent_change=None, groups=None,
+                global_heads=None) -> dict:
+        prefill, decode, ports, moved, tents = hetero_logs(prefill_tp, decode_tp, kv_heads, nixl, groups=groups)
         if change:
             prefill, decode, ports = change(prefill, decode, ports)
         if tent_change:
             tent_change(tents)
         return pd.check({"completed": 2, "errors": []}, prefill, decode, {"control": 50, "kv": moved + 500},
-                        self.run_for(prefill_tp, decode_tp, kv_heads, nixl), tents, ports)
+                        self.run_for(prefill_tp, decode_tp, kv_heads, nixl, global_heads), tents, ports)
 
     def test_heads_resharded_either_way_over_both_connectors(self) -> None:
         for sizes, kv_heads in (((2, 4), 8), ((4, 2), 8), ((2, 8), 4)):
@@ -1746,6 +1768,86 @@ class HeterogeneousTpTests(unittest.TestCase):
         # gathers two producers' (4 -> 2).
         self.assertEqual(self.verdict(2, 4, 8, True)["hetero_tp"]["sources"], {0: [0], 1: [0], 2: [1], 3: [1]})
         self.assertEqual(self.verdict(4, 2, 8, True)["hetero_tp"]["sources"], {0: [0, 1], 1: [2, 3]})
+
+    def reconcile(self, prefill_tp, decode_tp, kv_heads, nixl, change=None, groups=None, global_heads=None) -> dict:
+        """`_hetero_tp` alone over the fixture's logs (several groups' byte
+        checks and pull events are `check`'s other rules): its evidence,
+        with the problems."""
+        prefill, decode, ports, _, tents = hetero_logs(prefill_tp, decode_tp, kv_heads, nixl, groups=groups)
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        run = self.run_for(prefill_tp, decode_tp, kv_heads, nixl, global_heads)
+        logs = {"prefill": {(0, r): pd._records(text) for r, text in enumerate(prefill)},
+                "decode": {(0, r): pd._records(text) for r, text in enumerate(decode)}}
+        def moved(records):
+            return sum(((r.get("kv_transfers") or {}).get(d) or {}).get("bytes", 0)
+                       for r in records for d in ("send", "load"))
+
+        ranks = {role: {key: {"transfers": {"bytes": moved(records)}, "requests": ["a", "b"]} for key, records in logs[role].items()}
+                 for role in logs}
+        return pd._hetero_tp(run, {"prefill": prefill_tp, "decode": decode_tp}, logs, ranks, ports)
+
+    def test_groups_of_differing_total_heads_pair_per_group(self) -> None:
+        """Gemma4-like groups (sliding 8 heads, full 2) at TP1 <-> 2 over both
+        connectors: each group's heads, slab and bytes are its own, the
+        carried span (40 B) is common, and the reconciliation passes."""
+        for sizes in ((1, 2), (2, 1)):
+            for nixl in (False, True):
+                with self.subTest(sizes=sizes, nixl=nixl):
+                    hetero = self.reconcile(*sizes, 8, nixl, groups=GEMMA, global_heads=2)
+                    self.assertEqual(hetero["problems"], [])
+                    self.assertEqual(hetero["group_kv_heads"], [8, 2])
+                    self.assertEqual(hetero["slab_bytes"], [10, 40])
+                    self.assertEqual(hetero["replication_factor"], 1.0)
+
+    def test_a_wrong_group_total_is_rejected_despite_matching_slabs_and_bytes(self) -> None:
+        """The slab counterexample: the full group's total taken as 8 (the
+        config's global count wrong) gives the same 10-byte slab on both
+        sides (80/8 at TP1, 40/4 at TP2) and the same bytes, yet its actual
+        TP2 head set is [0], not four heads: rejected by the logged heads."""
+        for nixl in (False, True):
+            with self.subTest(nixl=nixl):
+                problems = self.reconcile(1, 2, 8, nixl, groups=GEMMA, global_heads=8)["problems"]
+                self.assertTrue(any("group 1 holds head-v1 heads [0], not head-v1 heads [0, 1, 2, 3]" in problem
+                                    for problem in problems), problems)
+                self.assertTrue(any("decode rank 0 checked" in problem and "heads [0]" in problem
+                                    for problem in problems), problems)
+
+    def test_group_totals_come_from_the_config_by_kind_or_fail(self) -> None:
+        def totals(config, kinds):
+            (self.model / "config.json").write_text(json.dumps(config))
+            return pd.group_kv_heads(self.model, kinds)
+
+        plain = {"num_key_value_heads": 8}
+        self.assertEqual(totals(plain, ["FullAttentionSpec", "SlidingWindowSpec"]), ([8, 8], None))
+        gemma = {"num_key_value_heads": 8, "num_global_key_value_heads": 2}
+        self.assertEqual(totals(gemma, ["SlidingWindowSpec", "FullAttentionSpec"]), ([8, 2], None))
+        # Nested text config, as a multimodal wrapper writes it.
+        nested = {"text_config": {"num_key_value_heads": 8, "num_global_key_value_heads": 2}}
+        self.assertEqual(totals(nested, ["FullAttentionSpec"]), ([2], None))
+        # No default: an unknown kind, or an invalid count, is an error.
+        self.assertIsNone(totals(gemma, ["MLAAttentionSpec"])[0])
+        self.assertIn("MLAAttentionSpec", totals(gemma, ["MLAAttentionSpec"])[1])
+        for bad in (0, -2, True, 2.0, "2"):
+            result = totals({**gemma, "num_global_key_value_heads": bad}, ["FullAttentionSpec"])
+            self.assertIsNone(result[0], bad)
+        self.assertIsNone(totals({"num_global_key_value_heads": 2}, ["FullAttentionSpec"])[0])
+
+    def test_groups_must_agree_across_ranks_and_carry_one_span(self) -> None:
+        # A rank whose groups are of other kinds than the rest's.
+        def other_kind(prefill, decode, ports):
+            decode = list(decode)
+            decode[1] = decode[1].replace('"kind": "SlidingWindowSpec"', '"kind": "FullAttentionSpec"', 1)
+            return prefill, decode, ports
+
+        found = self.reconcile(1, 2, 8, False, other_kind, groups=GEMMA, global_heads=2)["problems"]
+        self.assertTrue(any("groups are" in problem for problem in found), found)
+        # A READ whose bytes are not its selected descriptors' carried span.
+        def off_by_one(prefill, decode, ports):
+            return prefill, [log.replace("[800, 0.01", "[801, 0.01") for log in decode], ports
+
+        found = self.reconcile(1, 2, 8, True, off_by_one, groups=GEMMA, global_heads=2)["problems"]
+        self.assertTrue(any("carried span" in problem for problem in found), found)
 
     def test_a_replicated_producer_answers_without_a_payload(self) -> None:
         """Mooncake 8 -> 2 with 4 KV heads: ranks 0, 2, 4, 6 send; 1, 3, 5, 7
