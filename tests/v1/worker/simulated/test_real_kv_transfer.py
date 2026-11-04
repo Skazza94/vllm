@@ -1045,7 +1045,7 @@ def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
         True,
         "10.101.0.1",
     )
-    for backends in (["UCX"], ["Mooncake", "UCX"]):
+    for backends in (["Mooncake", "UCX"],):
         with pytest.raises(ValueError, match="Mooncake backend only"):
             _bind_rank_kv_address(config(backends, addresses), backends)
 

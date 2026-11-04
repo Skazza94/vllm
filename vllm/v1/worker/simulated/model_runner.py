@@ -418,6 +418,8 @@ class SimulatedModelRunner(GPUModelRunner):
             self.step_log.write_kv_layout(
                 {
                     **layout,
+                    **({"nixl_transport": nixl_worker.simulated_transport}
+                       if getattr(nixl_worker, "simulated_transport", None) is not None else {}),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
                     # Its identity, and its place on the host (NIC, port).

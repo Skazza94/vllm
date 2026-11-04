@@ -131,26 +131,33 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     return len(block_strides) == len(storage_ptrs) == 1
 
 
-def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> None:
+def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dict | None:
     """With ``rank_addresses`` in the connector's extra config (real KV
     transfers under simulated execution), this rank's own address carries
     its KV: NIXL's Mooncake backend registers its segment there
     (NIXL_MOONCAKE_IP_ADDR, read when the backend is created) and TENT's
-    hp_tcp binds there, as MooncakeConnector's ranks do. Other backends are
-    not bound, so are refused. The handshake stays on the instance's
-    side channel."""
+    hp_tcp binds there, as MooncakeConnector's ranks do. UCX resolves the
+    selected IPv4 address to an interface and restricts its transport to TCP.
+    The handshake stays on the instance's side channel."""
     sim = vllm_config.simulation_config
     if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
         return
+    if list(backends) not in (["Mooncake"], ["UCX"]):
+        raise ValueError(
+            f"rank_addresses supports a single UCX or Mooncake backend only, not backends {backends}."
+        )
     kv_transfer_config = vllm_config.kv_transfer_config
     assert kv_transfer_config is not None
     if kv_transfer_config.kv_connector_extra_config.get("rank_addresses") is None:
+        if list(backends) == ["UCX"]:
+            raise ValueError("Managed UCX/TCP needs rank_addresses, including single-rank runs")
         return
-    if list(backends) != ["Mooncake"]:
-        raise ValueError(
-            "rank_addresses binds NIXL's Mooncake backend only, not backends "
-            f"{backends}."
-        )
+    if list(backends) == ["UCX"]:
+        from .simulated_tcp import bind_ucx_tcp
+
+        address = this_rank_kv_address(vllm_config)
+        assert address is not None
+        return bind_ucx_tcp(address, kv_transfer_config.kv_connector_extra_config)
     address = this_rank_kv_address(vllm_config)
     assert address is not None
     os.environ["NIXL_MOONCAKE_IP_ADDR"] = address
@@ -785,13 +792,13 @@ class NixlBaseConnectorWorker:
             config = (
                 nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
                 if len(non_ucx_backends) > 0
-                else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
+                else nixl_agent_config(backends=["UCX"], num_threads=num_threads, capture_telemetry=True)
             )
 
         sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
         if sleep_mode:
             config = nixl_agent_config(backends=[], capture_telemetry=True)
-        _bind_rank_kv_address(vllm_config, self.nixl_backends)
+        binding = _bind_rank_kv_address(vllm_config, self.nixl_backends)
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         if sleep_mode:
             # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
@@ -802,6 +809,16 @@ class NixlBaseConnectorWorker:
                     "engine_config": "RCACHE_ENABLE=n,TLS=^cuda_ipc",
                 },
             )
+        self.simulated_transport = None
+        sim = vllm_config.simulation_config
+        if sim.simulate_forward and sim.kv_transfer_mode == "real":
+            from .simulated_tcp import agent_evidence
+
+            self.simulated_transport = agent_evidence(self.nixl_wrapper, self.nixl_backends, binding)
+            if binding is not None:
+                self.simulated_transport.update(
+                    num_threads=num_threads, progress_thread=config.enable_pthread
+                )
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
