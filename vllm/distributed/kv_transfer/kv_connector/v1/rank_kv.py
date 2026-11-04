@@ -130,7 +130,7 @@ def simulated_tp_mismatch(
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
     real KV transfers under simulated compute pair equal sizes, or unequal
     ones (one dividing the other) for a model of plain attention (sliding
-    window layers beside full ones included; no recurrent state or draft),
+    window layers beside full ones included; no recurrent state or draft), or, over NIXL only, a hybrid of Mamba2 or GDN states (`state_layout.pairing_problem`),
     whose pattern is each KV head's
     (``kv_pattern.head_pattern``) wherever the connector re-shards it, or of
     plain MLA (`plain_mla`: one latent, the same on every rank). NIXL's
@@ -167,6 +167,17 @@ def simulated_tp_mismatch(
                 f"evenly on both sides (this model's layers differ in KV heads: "
                 f"{sorted(set(totals))}), not {sizes}."
             )
+    if model.is_hybrid and nixl_consumer:
+        from vllm.v1.worker.simulated.state_layout import pairing_problem
+
+        problem = pairing_problem(vllm_config, local_tp_size, remote_tp_size)
+        if problem is not None:
+            return (
+                "Simulated real KV transfers pair unequal TP sizes for a hybrid model "
+                f"over NIXL only for Mamba2 or GDN states that split on both sides, not {sizes}: "
+                f"{problem}."
+            )
+        return None
     if (
         (model.use_mla and not plain_mla(model))
         or model.is_hybrid

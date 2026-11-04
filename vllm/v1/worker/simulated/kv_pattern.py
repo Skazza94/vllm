@@ -52,7 +52,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.worker.simulated.kv_transfer import requested_reads
+from vllm.v1.worker.simulated.kv_transfer import layer_specs, requested_reads
+from vllm.v1.worker.simulated import state_layout as sl
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -215,16 +216,58 @@ def native_group_heads(
     layer_heads: "HeadMap | None",
     groups: Sequence[Sequence[str]],
     hybrid: bool,
+    state_groups: frozenset[int] = frozenset(),
 ) -> tuple[tuple[int, ...], ...] | None:
     """What decides whether NIXL's selection of several groups is seeded by
     global heads: for each transfer group, the heads all its layers hold;
     every group must have them and the model must hold no recurrent state,
-    else None (the rank's patterns, and the state-geometry guard). It reads
-    the model's heads at this TP size only, never the pattern flags."""
-    if hybrid or not layer_heads or not groups:
+    else None (the rank's patterns, and the state-geometry guard). A hybrid
+    whose every state group is in `state_groups` (its states eligible for
+    state-v1, decided by the caller from the layout) holds `()` for those
+    groups and is not refused by `hybrid`. It reads the model's heads at this
+    TP size only, never the pattern flags."""
+    if (hybrid and not state_groups) or not groups:
         return None
-    held = tuple(uniform_heads(layer_heads, list(names)) for names in groups)
+    if not layer_heads and len(state_groups) != len(groups):
+        return None
+    held = tuple(
+        () if i in state_groups else uniform_heads(layer_heads or {}, list(names))
+        for i, names in enumerate(groups)
+    )
     return held if all(h is not None for h in held) else None
+
+
+def native_state_heads(vllm_config, groups, layer_heads, layers):
+    """(per-group heads, the state layout) of NIXL's selection of a model
+    whose transfer groups are all attention with uniform heads, or a hybrid
+    whose state groups are all Mamba2/GDN states equal to the model's layout
+    at this TP size (`state_layout.check_spec`, field by field); (None, None)
+    otherwise (the rank's patterns and the foreign-state guard). Decided from
+    the model and this rank's registrations only: never the pattern flags,
+    never the peer, whose TP size is not known when pages are filled."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    model = vllm_config.model_config
+    if not model.is_hybrid:
+        return native_group_heads(layer_heads, layers, False), None
+    layout = sl.layout_for(vllm_config)
+    if layout is None:
+        return None, None
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    state_groups = set()
+    for index, group in enumerate(groups):
+        specs = list(layer_specs([group]).values())
+        kinds = {isinstance(spec, MambaSpec) for spec in specs}
+        if kinds == {True}:
+            if any(sl.check_spec(layout, spec, tp) for spec in specs):
+                return None, None
+            state_groups.add(index)
+        elif True in kinds:
+            return None, None
+    if not state_groups:
+        return None, None
+    heads = native_group_heads(layer_heads, layers, True, frozenset(state_groups))
+    return (heads, layout) if heads is not None else (None, None)
 
 
 def _group_heads(heads, group: int):
@@ -1009,6 +1052,9 @@ class PatternChecker(_ConsumerPages):
 # that group included (a transfer-only region). The filler and the checker
 # follow the native descriptor selection itself.
 
+STATE_ORIGIN = 0
+"""Where a state page's conv and SSM bytes start in a region's page."""
+
 POISON = 0xA5
 """What a producer writes into a state page's padding, which no transfer
 moves: a receiver's padding keeps its sentinel, or the padding was copied."""
@@ -1026,6 +1072,8 @@ class _Row:
     """Within the region's block."""
     state: bool
     """A recurrent state's (conv or SSM), past the attention descriptors."""
+    span: "sl.Span | None" = None
+    """With a state layout: the layout's span this row is."""
 
 
 @dataclass(frozen=True)
@@ -1070,6 +1118,7 @@ class NativeSelection:
         kv_caches: dict[str, torch.Tensor],
         groups: Sequence[Sequence[str]],
         transfer_group_ids: Sequence[int] | None = None,
+        layout: "sl.StateLayout | None" = None,
     ) -> None:
         if transfer_group_ids is not None and list(transfer_group_ids) != list(
             range(len(groups))
@@ -1096,6 +1145,8 @@ class NativeSelection:
         bases = list(worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank])
         strides = list(worker.block_stride_per_layer)
         num_blocks = worker.num_blocks
+
+        self.bases, self.strides = bases, strides
 
         def region_of(address: int) -> int:
             for index, (base, stride) in enumerate(zip(bases, strides)):
@@ -1130,6 +1181,10 @@ class NativeSelection:
             }
             for names in self.groups
         ]
+        self.layout = layout
+        self.state_layer: dict[tuple[int, int], str] = {}
+        if layout is not None:
+            self._bind_state(kv_caches, region_of)
         # A state region's page beyond its conv and SSM spans: padding.
         self.padding: dict[int, _Padding] = {}
         for region in sorted(set(worker._ssm_region_indices)):
@@ -1150,6 +1205,63 @@ class NativeSelection:
                     ),
                     region,
                 )
+
+    def _bind_state(self, kv_caches, region_of) -> None:
+        """Each state row is the layout's span at this rank, by region: the
+        native decomposition must be the layout's (offsets and lengths), else
+        it is refused, never trusted. Each (group, region) gets the model's
+        layer name of the group's layer there, or its own transfer-only
+        identity."""
+        tp = self.worker.transfer_topo.tp_size
+        want = self.layout.spans(self.worker.tp_rank, tp)
+        by_region: dict[int, list[int]] = {}
+        for index, row in enumerate(self.rows):
+            if row.state:
+                by_region.setdefault(row.region, []).append(index)
+        for region, indices in sorted(by_region.items()):
+            indices.sort(key=lambda i: self.rows[i].offset)
+            # Absolute offsets within the region's page, against the layout's:
+            # a state starts at the page's origin (offset 0, the supported
+            # state pages'), never normalized to wherever the descriptors
+            # begin, so a common shift of every span fails. Transfer-only
+            # regions are included (every region with state rows).
+            got = [(self.rows[i].offset, self.rows[i].view.shape[1]) for i in indices]
+            exp = [(w.offset + STATE_ORIGIN, w.length) for w in want]
+            if got != exp:
+                raise ValueError(
+                    f"NIXL's state descriptors of region {region} (offset, length) {got} are not the "
+                    f"{self.layout.family} layout's spans {exp} at TP {tp} (a state starts at "
+                    f"page offset {STATE_ORIGIN})."
+                )
+            for i, w in zip(indices, want):
+                self.rows[i] = _Row(
+                    self.rows[i].view, self.rows[i].region, self.rows[i].offset, True, w
+                )
+        for group, names in enumerate(self.groups):
+            for name in names:
+                if name not in kv_caches:
+                    continue
+                region = region_of(kv_caches[name].data_ptr())
+                if region in by_region:
+                    if (group, region) in self.state_layer:
+                        raise ValueError(
+                            f"Group {group} holds two state layers in region {region}."
+                        )
+                    self.state_layer[(group, region)] = name
+
+    def piece(self, address: int, length: int) -> "sl.Piece":
+        """Where a local descriptor's bytes land: (region, block, offset in
+        the region's page, length)."""
+        for region, (base, stride) in enumerate(zip(self.bases, self.strides)):
+            if base <= address < base + self.worker.num_blocks * stride:
+                block, offset = divmod(address - base, stride)
+                return (region, int(block), int(offset), int(length))
+        raise ValueError(f"No native region holds {address:#x}.")
+
+    def state_identity(self, group: int, region: int) -> str:
+        """A state span's layer: the model's layer name, or the transfer-only
+        region's own identity (a region the group holds no layer in)."""
+        return self.state_layer.get((group, region), f"xfer.g{group}.r{region}")
 
     def select(
         self, group: int, block_ids: Sequence[int]
@@ -1242,17 +1354,32 @@ class NativeSelection:
         return groups
 
 
+def _expected_bytes(
+    s, group: int, row: int, request_id: str, logical: int, tp_rank: int,
+    identity: str | None, heads,
+) -> torch.Tensor:
+    """The expected bytes of a request's logical block in one selected span:
+    a state span's from the layout's global coordinates (state-v1) when the
+    selection has a layout, else `row_pattern` (head patterns for attention,
+    the rank's for any other)."""
+    r = s.rows[row]
+    if r.state and getattr(s, "layout", None) is not None:
+        base = identity if identity is not None else get_base_request_id(request_id)
+        return sl.state_span_pattern(
+            base, s.state_identity(group, r.region), logical, s.layout, r.span
+        )
+    return row_pattern(
+        request_id, s.name(group, row), logical, r.view.shape[1], tp_rank,
+        identity, None if r.state else _group_heads(heads, group),
+    )
+
+
 def _write_selected(selection, req_id, group, logical, block, tp_rank, identity, heads=None):
     s = selection
     for row, b, _ in s.select(group, [block]):
         r = s.rows[row]
         view = r.view
-        view[b].copy_(
-            row_pattern(
-                req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
-                None if r.state else _group_heads(heads, group),
-            )
-        )
+        view[b].copy_(_expected_bytes(s, group, row, req_id, logical, tp_rank, identity, heads))
 
 
 def _compare_selected(selection, req_id, group, logical, block, tp_rank, identity, heads=None):
@@ -1262,10 +1389,7 @@ def _compare_selected(selection, req_id, group, logical, block, tp_rank, identit
     for row, b, _ in s.select(group, [block]):
         r = s.rows[row]
         view = r.view
-        want = row_pattern(
-            req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
-            None if r.state else _group_heads(heads, group),
-        )
+        want = _expected_bytes(s, group, row, req_id, logical, tp_rank, identity, heads)
         bad = int((view[b] != want).sum())
         compared += view.shape[1]
         if bad:
@@ -1335,14 +1459,9 @@ class NativeFiller(_ContentPages):
                 r = s.rows[row]
                 view = r.view
                 view[block].copy_(
-                    row_pattern(
-                        req_id,
-                        s.name(group, row),
-                        start + places[place],
-                        view.shape[1],
-                        self.tp_rank,
-                        identities[place],
-                        None if r.state else _group_heads(self.heads, group),
+                    _expected_bytes(
+                        s, group, row, req_id, start + places[place], self.tp_rank,
+                        identities[place], self.heads,
                     )
                 )
             for region in s.state_regions(selected) & set(s.padding):
@@ -1378,6 +1497,10 @@ class NativeChecker(_ConsumerPages):
     heads: tuple | None = None
     """Global KV heads, as the filler's: its spans are head patterns,
     whichever ranks NIXL reads them from."""
+    # With a state layout: each READ normalized (producer, destination pieces
+    # through its own prepared list, completion), by producer request.
+    records: dict[str, list] = field(default_factory=dict)
+    lists: dict = field(default_factory=dict)
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
         _write_selected(
@@ -1392,9 +1515,46 @@ class NativeChecker(_ConsumerPages):
     def watch_reads(self) -> None:
         """Record each READ's local descriptors as NIXL posts it (its
         notification names the producer's request): the blocks it writes,
-        which must be the checked ones, never a state's scratch slot."""
-        wrapper = self.selection.worker.nixl_wrapper
+        which must be the checked ones, never a state's scratch slot. With a
+        state layout also each READ's producer, destination pieces (resolved
+        through the prepared list of the handle it names, not by raw ids) and
+        completion (`check_xfer_state` DONE)."""
+        worker = self.selection.worker
+        wrapper = worker.nixl_wrapper
         make = wrapper.make_prepped_xfer
+        prep = getattr(wrapper, "prep_xfer_dlist", None)
+        check = getattr(wrapper, "check_xfer_state", None)
+        registered = getattr(worker, "src_xfer_handles_by_block_size", {}).get(getattr(worker, "block_size", None))
+        if registered is not None:
+            self.lists[registered] = np.asarray(worker.src_blocks_data, dtype=np.int64)
+        by_handle: dict = {}
+
+        def prep_xfer_dlist(agent_name, xfer_list, *args, **kw):
+            handle = prep(agent_name, xfer_list, *args, **kw)
+            try:
+                self.lists[handle] = np.asarray(xfer_list, dtype=np.int64)
+            except (TypeError, ValueError):
+                self.lists[handle] = None
+            return handle
+
+        def rank_of(remote):
+            for ranks in worker.dst_xfer_side_handles.values():
+                for rank, handle in ranks.items():
+                    if handle == remote:
+                        return int(rank)
+            return None
+
+        def resolve(handle, ids):
+            table = self.lists.get(handle)
+            if table is None:
+                return None
+            starts = np.cumsum(table[:, 4]) - table[:, 4]
+            ids = np.asarray(ids, dtype=np.int64)
+            rows = np.searchsorted(starts, ids, side="right") - 1
+            return [
+                (int(table[r, 0] + (i - starts[r]) * table[r, 3]), int(table[r, 1]))
+                for i, r in zip(ids.tolist(), rows.tolist())
+            ]
 
         def make_prepped_xfer(op, local, local_ids, remote, remote_ids, *args, **kw):
             notif = kw.get("notif_msg", args[0] if args else b"")
@@ -1403,9 +1563,30 @@ class NativeChecker(_ConsumerPages):
             request = notif.rsplit(":", 1)[0]
             self.posted.setdefault(request, []).extend(int(i) for i in local_ids)
             self.reads.setdefault(request, []).append([int(i) for i in local_ids])
-            return make(op, local, local_ids, remote, remote_ids, *args, **kw)
+            handle = make(op, local, local_ids, remote, remote_ids, *args, **kw)
+            if getattr(self.selection, "layout", None) is not None:
+                spans = resolve(local, local_ids)
+                record = sl.ReadRecord(
+                    request,
+                    rank_of(remote),
+                    handle,
+                    None if spans is None else [self.selection.piece(a, n) for a, n in spans],
+                )
+                by_handle[handle] = record
+                self.records.setdefault(request, []).append(record)
+            return handle
+
+        def check_xfer_state(handle):
+            state = check(handle)
+            if state == "DONE" and handle in by_handle:
+                by_handle[handle].done = True
+            return state
 
         wrapper.make_prepped_xfer = make_prepped_xfer
+        if prep is not None:
+            wrapper.prep_xfer_dlist = prep_xfer_dlist
+        if check is not None:
+            wrapper.check_xfer_state = check_xfer_state
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
         self._admit_scheduled(scheduler_output)
@@ -1463,6 +1644,7 @@ class NativeChecker(_ConsumerPages):
             if req_id not in self.awaiting:
                 self.posted.pop(remote_request_id, None)
                 self.reads.pop(remote_request_id, None)
+                self.records.pop(remote_request_id, None)
         return results
 
     def _check_geometry(self) -> None:
@@ -1496,6 +1678,84 @@ class NativeChecker(_ConsumerPages):
                 f"split reads {sorted(w.src_xfer_handles_by_tp_ratio)}."
             )
 
+    def _coverage(self, expected: "_Expected", records: list) -> dict:
+        """Ownership against the request's READs (`sl.coverage_problems`),
+        with each READ's bytes by group, component and class."""
+        s = self.selection
+        w = s.worker
+        engines = [e for e in w.tp_mappings if e != w.engine_id]
+        if len(engines) != 1:
+            return {"problems": [f"{len(engines)} remote engines, one expected"], "reads": []}
+        remote_tp = w.transfer_topo.get_engine_info(engines[0]).remote_tp_size
+        local_tp = w.transfer_topo.tp_size
+        kv_heads = w.transfer_topo.total_num_kv_heads
+        want: dict[int, list] = {}
+        owner: dict[tuple[int, int], int] = {}
+        row_of: dict[int, dict] = {}
+        for group in expected.groups:
+            held = [b for b in group.block_ids if b != NULL_BLOCK_ID]
+            if not held:
+                continue
+            rows = {}
+            for row, block, _ in s.select(group.group, held):
+                rows[row] = block
+                owner.update({(s.rows[row].region, b): group.group for b in held})
+            mine = _group_heads(self.heads, group.group)
+            described = []
+            for row in rows:
+                r = s.rows[row]
+                entry = {
+                    "region": r.region, "offset": r.offset, "length": r.view.shape[1],
+                    "state": r.state, "heads": tuple(mine) if not r.state else None,
+                    "span": r.span, "group": group.group,
+                    "logical": r.region in s.members[group.group],
+                }
+                described.append(entry)
+                row_of.setdefault(r.region, {})[(group.group, r.offset)] = entry
+            for p, pieces in sl.expected_pieces(
+                described, held, self.tp_rank, local_tp, remote_tp, s.layout, kv_heads
+            ).items():
+                want.setdefault(p, []).extend(pieces)
+        problems = []
+        unresolved = [r for r in records if r.pieces is None]
+        if unresolved:
+            problems.append(
+                f"{len(unresolved)} READs' descriptors could not be resolved through their prepared lists"
+            )
+        records = [r for r in records if r.pieces is not None]
+        problems += sl.coverage_problems(want, records)
+        reads = []
+        for record in records:
+            classes: dict[str, list[int]] = {}
+            for region, block, offset, length in record.pieces:
+                group = owner.get((region, block))
+                entry = next(
+                    (
+                        e for (g, o), e in row_of.get(region, {}).items()
+                        if g == group and o <= offset < o + e["length"]
+                    ),
+                    None,
+                )
+                if entry is None:
+                    key = f"unattributed.r{region}"
+                else:
+                    span = entry["span"]
+                    kind = "attention" if span is None else f"{span.kind}.{span.component}"
+                    key = f"g{group}.{kind}.{'logical' if entry['logical'] else 'transfer-only'}"
+                slot = classes.setdefault(key, [0, 0])
+                slot[0] += 1
+                slot[1] += length
+            reads.append(
+                {
+                    "rank": record.rank,
+                    "completed": record.done,
+                    "descriptors": len(record.pieces),
+                    "bytes": sum(p[3] for p in record.pieces),
+                    "classes": classes,
+                }
+            )
+        return {"problems": problems[:8], "problem_count": len(problems), "reads": reads}
+
     def _compare(self, req_id: str, expected: _Expected, identity_of=None) -> dict:
         s = self.selection
         self._check_geometry()
@@ -1519,14 +1779,9 @@ class NativeChecker(_ConsumerPages):
                 r = s.rows[row]
                 view = r.view
                 logical = first + places[place]
-                want = row_pattern(
-                    expected.remote_request_id,
-                    s.name(group.group, row),
-                    logical,
-                    view.shape[1],
-                    self.tp_rank,
-                    identity_of(group.group, logical) if identity_of else None,
-                    None if r.state else _group_heads(self.heads, group.group),
+                want = _expected_bytes(
+                    s, group.group, row, expected.remote_request_id, logical, self.tp_rank,
+                    identity_of(group.group, logical) if identity_of else None, self.heads,
                 )
                 wrong = int((view[block] != want).sum())
                 payload += view.shape[1]
@@ -1560,6 +1815,8 @@ class NativeChecker(_ConsumerPages):
                     **(
                         {"pattern": HEAD_PATTERN, "global_heads": list(mine)}
                         if mine and not holds_state
+                        else {"pattern": sl.STATE_PATTERN, "global_heads": None}
+                        if holds_state and getattr(s, "layout", None) is not None
                         else {"pattern": "mixed" if mine else RANK_PATTERN, "global_heads": None}
                     ),
                     # Where the pull's metadata placed the blocks among the
@@ -1592,12 +1849,23 @@ class NativeChecker(_ConsumerPages):
         )
         posted = self.posted.pop(expected.remote_request_id, None)
         reads = self.reads.pop(expected.remote_request_id, [])
-        # With head patterns a page may be read from several producers, each
-        # READ writing the same local blocks: every READ is the checked ones.
-        posted_ok = posted == checked or (
-            self.heads is not None and bool(reads) and all(read == checked for read in reads)
-        )
+        records = self.records.pop(expected.remote_request_id, [])
+        coverage = None
+        if getattr(s, "layout", None) is not None:
+            # A page may come from several producers in several READs, each
+            # carrying part of the blocks (an attention READ, then a state
+            # one): the union of the READs must be what ownership says, once,
+            # and each must have completed.
+            coverage = self._coverage(expected, records)
+            posted_ok = not coverage["problems"]
+        else:
+            # With head patterns a page may be read from several producers, each
+            # READ writing the same local blocks: every READ is the checked ones.
+            posted_ok = posted == checked or (
+                self.heads is not None and bool(reads) and all(read == checked for read in reads)
+            )
         return {
+            **({"coverage": coverage} if coverage is not None else {}),
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,
             "blocks": sum(g["blocks"] for g in groups),

@@ -146,7 +146,11 @@ def test_the_hook_logs_selected_and_predicted_beside_the_measured_count():
     for local in (registered, unknown):
         handle = wrapper.make_prepped_xfer("READ", local, selected, remote, selected, b"req:1")
         worker.xfer_stats.record_transfer(wrapper.get_xfer_telemetry(handle))
-    assert worker.xfer_stats.data["plan"] == [[0, 9, 3], [0, 9, None]]
+    plans = worker.xfer_stats.data["plan"]
+    # [slot, selected, predicted] then the selected bytes and length table,
+    # exact whatever NIXL merges (None where the runs are unknown).
+    assert [plan[:3] for plan in plans] == [[0, 9, 3], [0, 9, None]]
+    assert plans[0][3:] == [576, {64: 9}]
     assert worker.xfer_stats.data["peer"] == [0, 0]
 
 
@@ -244,7 +248,10 @@ def test_the_hook_predicts_what_nixl_measures(agents):
         measured.append(telemetry.descCount)
         worker.xfer_stats.record_transfer(telemetry)
     assert measured == [LAYERS, 4 * LAYERS]
-    assert worker.xfer_stats.data["plan"] == [[0, 4 * LAYERS, LAYERS], [0, 4 * LAYERS, 4 * LAYERS]]
+    plans = worker.xfer_stats.data["plan"]
+    assert [plan[:3] for plan in plans] == [[0, 4 * LAYERS, LAYERS], [0, 4 * LAYERS, 4 * LAYERS]]
+    assert all(plan[3] == sum(n * c for n, c in plan[4].items()) and sum(plan[4].values()) == 4 * LAYERS
+               for plan in plans)
 
 
 def _run(rows, index):

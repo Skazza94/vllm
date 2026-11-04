@@ -1943,7 +1943,8 @@ def test_nixl_reads_record_their_producer_rank_and_slot():
         "each"
     ]
     # No prepared runs known for these stand-in lists: no prediction.
-    assert [entry[5:] for entry in each] == [[3, [1, 2, None]], [2, [0, 2, None]]]
+    assert [[entry[5], entry[6][:3]] for entry in each] == [[3, [1, 2, None]], [2, [0, 2, None]]]
+    assert [entry[6][3:] for entry in each] == [[None, None], [None, None]]
 
 
 def test_a_layer_with_its_own_total_heads_is_sharded_by_them():

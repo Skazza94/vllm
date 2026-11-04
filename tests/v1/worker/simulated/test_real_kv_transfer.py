@@ -1638,7 +1638,21 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             for region in s.state_regions(s.select(index, blocks)) & set(s.padding):
                 assert bool((s.padding[region].view[blocks] == POISON).all())
 
-        checker = NativeChecker(s)
+        # The runner's own checker holds the filler's heads (an eligible hybrid's
+        # attention groups are head patterns, its states state-v1).
+        checker = NativeChecker(s, heads=filler.heads)
+        posted_ids = {}
+        if s.layout is not None:
+            # An eligible hybrid is checked by the per-READ coverage rule
+            # (tests of its own); this single-worker stand-in has no remote
+            # engine, so it keeps asserting the posted descriptors are the
+            # checked ones, never a state's scratch slot.
+            def posted_only(expected, records):
+                want = s.order({g.group: [b for b in g.block_ids if b != 0]
+                                for g in expected.groups})
+                return {"problems": [] if posted_ids.get("ids") == want else ["posted descriptors differ"],
+                        "reads": []}
+            checker._coverage = posted_only
 
         def post(blocks, extra=()):
             """The local descriptors NIXL posts for a read into `blocks`
@@ -1646,6 +1660,7 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             checker.posted["cmpl-a-0"] = [
                 int(d) for d in worker._compute_desc_ids(blocks, worker.num_blocks, None, 1)
             ] + list(extra)
+            posted_ids["ids"] = list(checker.posted["cmpl-a-0"])
 
         def read(corrupt=None, whole_page=False, skip=None, extra=(), swap=False):
             """The read NIXL would post: each selected span from the source
@@ -1795,11 +1810,71 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             saved = getattr(worker, name)
             setattr(worker, name, value)
             try:
-                with pytest.raises(ValueError, match="equal TP and block size"):
-                    read()
+                if checker.heads is not None and name != "src_xfer_handles_by_block_size":
+                    # Head and state patterns are global: another TP size's
+                    # sources are checked (their ownership by the coverage
+                    # rule), only another block size is refused.
+                    assert read()["ok"]
+                else:
+                    with pytest.raises(ValueError, match="equal (TP and )?block size"):
+                        read()
             finally:
                 setattr(worker, name, saved)
         assert read()["ok"]
+    finally:
+        del llm
+
+
+@pytest.mark.parametrize(
+    "flags, role", [({}, "kv_producer"), ({"kv_pattern_check": True}, "kv_consumer")], ids=["checks-off", "checks-on"]
+)
+def test_a_hybrid_peer_of_another_block_size_is_refused_whether_or_not_bytes_are_checked(
+    flags, role, tmp_path, monkeypatch, ds_conv_layout
+):
+    """The block-size equality the CP4 scope rests on is the peer validator's,
+    not the pattern checker's (absent from performance runs): an eligible
+    hybrid refuses a peer of a larger or a smaller block size at the handshake,
+    before NIXL's own (not-mamba) assertion could, in both directions."""
+    from vllm import LLM
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    (tmp_path / "config.json").write_text(json.dumps(NEMOTRON_3))
+    llm = LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=256,
+        kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            **({"log_path": str(tmp_path / "steps")} if flags else {}),
+            **flags,
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": role,
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    try:
+        worker = get_kv_transfer_group().connector_worker
+        for remote in (worker.block_size * 2, worker.block_size // 2):
+            peer = SimpleNamespace(
+                ssm_sizes=tuple(worker._mamba_ssm_size), block_lens=list(worker.block_len_per_layer),
+                block_size=remote,
+            )
+            with pytest.raises(ValueError, match="unequal block sizes"):
+                worker.add_remote_agent(peer, 0, worker.world_size)
     finally:
         del llm
 

@@ -3157,8 +3157,11 @@ def _simulation_config(
     model_type=None,
     text_model_type=None,
     dsa=False,
+    text_attrs=None,
+    prefix_caching=False,
+    ssm_dtype="auto",
 ):
-    """A model config for the TP gate: `dsa` gives the text config an
+    """A model config for the TP gate (`text_attrs`: a hybrid's state config): `dsa` gives the text config an
     `index_topk` (sparse MLA's indexer; its presence counts, set or not);
     `text_model_type` nests a text config of its own (Kimi-K2.5's)."""
     text = SimpleNamespace(layer_types=layer_types, model_type=text_model_type or model_type)
@@ -3166,7 +3169,10 @@ def _simulation_config(
         text.per_layer_config = [SimpleNamespace(num_key_value_heads=n) for n in layer_heads]
     if dsa:
         text.index_topk = None
+    for name, value in (text_attrs or {}).items():
+        setattr(text, name, value)
     model = SimpleNamespace(
+        dtype=torch.bfloat16,
         use_mla=mla,
         is_hybrid=hybrid,
         get_sliding_window=lambda: sliding_window,
@@ -3180,7 +3186,53 @@ def _simulation_config(
         ),
         model_config=model,
         speculative_config=speculative,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=prefix_caching, mamba_ssm_cache_dtype=ssm_dtype
+        ),
     )
+
+
+NEMOTRON_STATE = dict(
+    mamba_num_heads=64, mamba_head_dim=64, n_groups=8, ssm_state_size=128, conv_kernel=4,
+    mamba_ssm_cache_dtype="float32",
+)
+QWEN_STATE = dict(
+    linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=48,
+    linear_value_head_dim=128, linear_conv_kernel_dim=4, mamba_ssm_dtype="float32",
+)
+
+
+def test_simulated_real_transfers_pair_unequal_tp_for_a_hybrid_over_nixl_only():
+    """A Mamba2 or GDN hybrid pairs unequal sizes over NIXL (its decode side)
+    where the state splits on both sides and attention splits or replicates
+    evenly; Mooncake keeps refusing; the pure-attention replicated-producer
+    rule does not apply (Nemotron's K=2 at TP4 -> TP2 is native hybrid mapping)."""
+    nemotron = _simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE)
+    qwen = _simulation_config(hybrid=True, kv_heads=4, text_attrs=QWEN_STATE)
+    for config in (nemotron, qwen):
+        assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=True) is None
+        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4), (8, 2)):
+            assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None, (local, remote)
+            assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, local, remote)
+    # A larger producer whose attention replicates: admitted for a hybrid (K=2 on 4).
+    assert simulated_tp_mismatch(nemotron, 2, 4, nixl_consumer=True) is None
+    for config, why in (
+        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE, speculative=SimpleNamespace(method="mtp")), "speculative"),
+        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE, prefix_caching=True), "prefix caching"),
+        (_simulation_config(hybrid=True, mla=True, kv_heads=1, text_attrs=NEMOTRON_STATE), "MLA"),
+        (_simulation_config(hybrid=True, kv_heads=2), "neither Mamba2 nor GDN"),
+        # Mamba1's, or any state without the config this layout needs.
+        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=dict(mamba_num_heads=64)), "neither Mamba2 nor GDN"),
+        # A state that does not split over TP 16 (8 groups).
+        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE), "does not split over TP 16"),
+        # Attention heads that neither split nor replicate evenly (K=6 on TP4).
+        (_simulation_config(hybrid=True, kv_heads=6, text_attrs=NEMOTRON_STATE), "neither split nor replicate"),
+    ):
+        local, remote = (2, 16) if "16" in why else (2, 4)
+        reason = simulated_tp_mismatch(config, local, remote, nixl_consumer=True)
+        assert reason is not None and why in reason, (why, reason)
+    # Indivisible sizes stay refused first.
+    assert "one dividing" in simulated_tp_mismatch(nemotron, 2, 3, nixl_consumer=True)
 
 
 def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():

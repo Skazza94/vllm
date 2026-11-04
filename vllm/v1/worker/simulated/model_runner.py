@@ -45,7 +45,9 @@ from vllm.v1.worker.simulated.kv_pattern import (
     head_map,
     layer_total_heads,
     native_group_heads,
+    native_state_heads,
 )
+from vllm.v1.worker.simulated.state_layout import STATE_PATTERN, state_layout_record
 from vllm.v1.worker.simulated.kv_transfer import (
     NixlReadPeers,
     ReadsInFlight,
@@ -59,6 +61,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     layer_specs,
     packed_pages,
     refuse_foreign_state_geometry,
+    validate_state_peer,
     registered_block_bytes,
     scheduled_kv_events,
     simulated_kv_connector,
@@ -339,9 +342,10 @@ class SimulatedModelRunner(GPUModelRunner):
         # global heads in all its layers, is seeded by those heads, so its reads are
         # checked from any TP size; a hybrid's states keep the rank's.
         native_heads = None
+        state_layout = None
         if native:
-            native_heads = native_group_heads(
-                layer_heads, layers, self.model_config.is_hybrid
+            native_heads, state_layout = native_state_heads(
+                self.vllm_config, groups, layer_heads, layers
             )
         if native and native_heads is None:
             heads = None
@@ -361,11 +365,14 @@ class SimulatedModelRunner(GPUModelRunner):
             # own per-region check covers them).
             if native_heads is None:
                 refuse_foreign_state_geometry(get_kv_transfer_group().connector_worker)
+            elif state_layout is not None:
+                validate_state_peer(get_kv_transfer_group().connector_worker, state_layout)
             selection = NativeSelection(
                 get_kv_transfer_group().connector_worker,
                 kv_caches_dict,
                 [group.layer_names for group in groups],
                 self.kv_cache_config.transfer_group_ids,
+                state_layout,
             )
             if sim.kv_pattern_fill:
                 self._kv_filler = NativeFiller(
@@ -399,8 +406,14 @@ class SimulatedModelRunner(GPUModelRunner):
                 for entry, transfer in zip(layout["groups"], selection.describe()):
                     entry["transfer"] = transfer
             # Each group's pattern scheme, and the global KV heads it holds.
-            for entry, group in zip(layout["groups"], groups):
+            for index, (entry, group) in enumerate(zip(layout["groups"], groups)):
                 entry.update(group_pattern(dict.fromkeys(group.layer_names), heads))
+                if state_layout is not None and native_heads is not None and native_heads[index] == ():
+                    # A state group's own scheme and the layout its bytes follow.
+                    entry.update(
+                        {"pattern": STATE_PATTERN, "global_heads": None,
+                         "state": state_layout_record(state_layout, tp.rank_in_group, tp.world_size)}
+                    )
             # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
                 {

@@ -307,6 +307,20 @@ def nixl_merged_descriptors(
     return merged
 
 
+def selected_lengths(runs: np.ndarray | None, ids: Sequence[int]) -> tuple:
+    """(selected bytes, {length: count}) of the descriptors `ids` pick from a
+    prepared list's runs: exact whatever NIXL later merges; (None, None) when
+    the runs are unknown. Both sides' lists carry the same lengths per
+    descriptor, so the local list's are the READ's."""
+    if runs is None:
+        return None, None
+    starts = np.cumsum(runs[:, 2]) - runs[:, 2]
+    rows = np.searchsorted(starts, np.asarray(ids, dtype=np.int64), side="right") - 1
+    lengths = runs[rows, 0]
+    values, counts = np.unique(lengths, return_counts=True)
+    return int(lengths.sum()), {int(v): int(c) for v, c in zip(values, counts)}
+
+
 class NixlReadPeers:
     """Each NIXL READ's producer TP rank, local slot and descriptors, beside
     its telemetry in the worker's stats (`peer`, `plan`): the hooks wrap the
@@ -314,7 +328,7 @@ class NixlReadPeers:
     its local side the slot a heterogeneous-TP split writes) and
     `get_xfer_telemetry` (read just before the stats record that READ).
 
-    A plan is [slot, selected, predicted]: the indices selected (vLLM's
+    A plan is [slot, selected, predicted, selected bytes, {length: count}]: the indices selected (vLLM's
     descriptors, before NIXL merges them) and the descriptors NIXL makes of
     them, predicted from the prepared runs of both lists
     (`nixl_merged_descriptors`), independently of the telemetry's measured
@@ -352,7 +366,7 @@ class NixlReadPeers:
             )
             self.handles[handle] = (
                 self._rank(remote),
-                [self._slot(local), len(local_ids), predicted],
+                [self._slot(local), len(local_ids), predicted, *selected_lengths(local_runs, local_ids)],
             )
             return handle
 
@@ -533,6 +547,54 @@ def refuse_foreign_state_geometry(worker) -> None:
                 f"{local[0]} and {local[1]} (e.g. another MTP depth)."
             )
         return add(metadata, *args, **kwargs)
+
+    worker.add_remote_agent = add_remote_agent
+
+
+def validate_state_peer(worker, layout) -> None:
+    """A hybrid's NIXL peer of another TP size must hold states of the same
+    model at its own size: the peer's `ssm_sizes` (conv and SSM bytes, the
+    metadata's aggregates) equal the layout's at its TP size, its state
+    regions at least that long, and that size splits the layout. Conv
+    components and the two dtypes are not in the peer's metadata: they are
+    validated locally on each endpoint (`check_spec`, under the identical
+    model/config assumption), not observed remotely. Replaces the equal-geometry
+    guard (`refuse_foreign_state_geometry`) for eligible states; block sizes
+    are enforced here (equal) whether or not bytes are checked."""
+    add = worker.add_remote_agent
+
+    def add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1, *args, **kwargs):
+        # Equal block sizes, whether or not bytes are checked: NIXL's own
+        # block-size assertion for P TP > D TP is in its not-mamba branch, and
+        # the pattern checker (absent from performance runs) is not the guard.
+        if metadata.block_size != worker.block_size:
+            raise ValueError(
+                f"A hybrid model's NIXL peer has block size {metadata.block_size}, not this "
+                f"instance's {worker.block_size}: pairs of unequal block sizes are not supported "
+                "(tokens per block would not correspond)."
+            )
+        if not layout.divides(remote_tp_size):
+            raise ValueError(
+                f"A {layout.family} peer of TP {remote_tp_size} does not split the model's state."
+            )
+        want = layout.local_sizes(remote_tp_size)
+        if tuple(metadata.ssm_sizes) != want:
+            raise ValueError(
+                "A hybrid model's NIXL peer holds its states otherwise: conv and "
+                f"SSM sizes {tuple(metadata.ssm_sizes)}, not {want} (the model's at TP "
+                f"{remote_tp_size}; e.g. another MTP depth or dtype)."
+            )
+        need = sum(want)
+        regions = [
+            i
+            for i in worker._ssm_region_indices
+            if i < len(metadata.block_lens) and metadata.block_lens[i] < need
+        ]
+        if regions:
+            raise ValueError(
+                f"A peer's state regions {regions} are shorter than its state ({need} bytes)."
+            )
+        return add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
 
     worker.add_remote_agent = add_remote_agent
 
