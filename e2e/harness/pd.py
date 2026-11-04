@@ -774,8 +774,8 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             # The requests decode consumed: its byte checks, else its
             # allocations (never its steps alone).
             consumed_ids = "checked_ids" if run.kv_check else "allocated_ids"
-            handoff = _handoff_problems(
-                joint_steps[("prefill", tp)], joint_steps[("decode", tp)],
+            handoff = _handoff_from_sources(
+                joint_steps, tp, hetero["sources"][tp] if hetero else [tp],
                 set().union(*(summary[consumed_ids] for summary in of["decode"].values())))
             problems.extend(f"{at}{problem}" for problem in handoff["problems"])
         hit = {role: {key: sum(summary[key] for summary in of[role].values())
@@ -1395,6 +1395,8 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
     for (role, rank), found in sorted(kind_lists.items()):
         if found != kinds:
             problems.append(f"{role} rank {rank}'s groups are {found}, not the others' {kinds}")
+    if "MambaSpec" in kinds:
+        return _hetero_hybrid(run, sizes, logs, ranks, ports, unwritten, kinds, kv_heads, evidence, problems, layout)
     totals, why = group_kv_heads(run.model, kinds) if kinds else ([kv_heads], None)
     if why:
         return {**evidence, "problems": problems + [why], "sources": {d: [0] for d in range(decode_tp)},
@@ -1695,6 +1697,317 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
     return problems
 
 
+def _state_spans(state: dict, rank: int, tp: int) -> list | None:
+    """A rank's state spans [kind, component, offset, length, first, count]
+    recomputed from the layout record's global components (the model's, the
+    same on every rank): conv components in order, each its columns
+    [rank*w/tp, ...) of `conv_rows * conv_itemsize` bytes, then the SSM
+    heads. None when the layout does not split over tp."""
+    column = state["conv_rows"] * state["conv_itemsize"]
+    units = [w for _, w in state["components"]] + [state["ssm_heads"]]
+    if tp < 1 or any(w % tp for w in units):
+        return None
+    spans, offset = [], 0
+    for name, width in state["components"]:
+        n = width // tp
+        spans.append(["conv", name, offset, n * column, rank * n, n])
+        offset += n * column
+    n = state["ssm_heads"] // tp
+    spans.append(["ssm", "ssm", offset, n * state["ssm_head_bytes"], rank * n, n])
+    return spans
+
+
+def _producers(rank: int, local_tp: int, remote_tp: int) -> list[int]:
+    """The producers of a decode rank's pairing: one when the producer has
+    no more ranks (floor(r*R/L)), else its R/L contiguous ones."""
+    if remote_tp <= local_tp:
+        return [rank * remote_tp // local_tp]
+    k = remote_tp // local_tp
+    return list(range(rank * k, (rank + 1) * k))
+
+
+def _state_overlap(rank: int, local_tp: int, remote_tp: int, width: int) -> dict[int, tuple[int, int]]:
+    """producer -> the global range [first, last) of a state component it
+    supplies a decode rank: every candidate whose range overlaps the rank's."""
+    lo, hi = rank * width // local_tp, (rank + 1) * width // local_tp
+    out = {}
+    for p in _producers(rank, local_tp, remote_tp):
+        first, last = max(lo, p * width // remote_tp), min(hi, (p + 1) * width // remote_tp)
+        if first < last:
+            out[p] = (first, last)
+    return out
+
+
+def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,
+                   unwritten: set[int], kinds: list, kv_heads: int, evidence: dict, problems: list[str],
+                   layout) -> dict:
+    """Unequal TP sizes for a hybrid model over NIXL (its attention groups
+    head-v1, its state groups state-v1), reconciled with ownership computed
+    here: each state group's rank spans recomputed from the layout record's
+    global components (never trusted), each decode rank's attention heads from
+    the first candidate producer holding each (the union over heads) and its
+    state ranges from every candidate whose range overlaps; each pair's bytes
+    from the checks' per-group blocks, selected regions and spans (logical
+    owned state, transfer-only regions and attention kept apart); each READ's
+    exact bytes (its selected-byte sum and its length histogram) and the
+    checker's per-READ record (producer, bytes by group, component and class,
+    completion); NIXL's selected/predicted/measured descriptors. Mooncake does
+    not pair a hybrid."""
+    prefill_tp, decode_tp = sizes["prefill"], sizes["decode"]
+    nixl = run.server.connector == "nixl"
+    evidence["hybrid"] = True
+    done = {"sources": {d: [0] for d in range(decode_tp)}, "received": {}}
+    if not nixl:
+        return {**evidence, "problems": problems + ["a hybrid model pairs unequal TP sizes over NIXL only"], **done}
+    groups_of = lambda role, rank: (layout(role, rank) or {}).get("groups") or []
+    state_idx = [i for i, k in enumerate(kinds) if k == "MambaSpec"]
+    attn_idx = [i for i, k in enumerate(kinds) if k != "MambaSpec"]
+    reference = None
+    for role in sizes:
+        for rank in range(sizes[role]):
+            for index, group in enumerate(groups_of(role, rank)):
+                if index in attn_idx:
+                    want = global_heads(rank, sizes[role], kv_heads)
+                    if group.get("pattern") != "head-v1" or group.get("global_heads") != want:
+                        problems.append(f"{role} rank {rank}'s group {index} holds {group.get('pattern')} heads "
+                                        f"{group.get('global_heads')}, not head-v1 heads {want}")
+                    continue
+                state = group.get("state")
+                if group.get("pattern") != "state-v1" or not isinstance(state, dict):
+                    problems.append(f"{role} rank {rank}'s group {index} is {group.get('pattern')}, not state-v1")
+                    continue
+                model = {k: state.get(k) for k in ("family", "components", "conv_rows", "conv_itemsize",
+                                                   "ssm_heads", "ssm_head_bytes")}
+                reference = reference or model
+                if model != reference:
+                    problems.append(f"{role} rank {rank}'s group {index} state layout {model} differs from {reference}")
+                want_spans = _state_spans(reference, rank, sizes[role])
+                if want_spans is None:
+                    problems.append(f"{role} rank {rank}: the state does not split over TP {sizes[role]}")
+                elif state.get("spans") != want_spans:
+                    problems.append(f"{role} rank {rank}'s group {index} state spans {state.get('spans')}, "
+                                    f"not the layout's {want_spans}")
+    if reference is None or problems:
+        return {**evidence, "problems": problems + ([] if reference else ["no state group's layout record"]), **done}
+    evidence["state_layout"] = reference
+    column = reference["conv_rows"] * reference["conv_itemsize"]
+
+    # Attention sources: for each local head the first candidate holding it.
+    def attention(d: int) -> dict[int, list[int]]:
+        out: dict[int, list[int]] = {}
+        for h in global_heads(d, decode_tp, kv_heads):
+            owner = next((q for q in _producers(d, decode_tp, prefill_tp)
+                          if h in global_heads(q, prefill_tp, kv_heads)), None)
+            if owner is None:
+                problems.append(f"no producer of decode rank {d} holds head {h}")
+            else:
+                out.setdefault(owner, []).append(h)
+        return out
+
+    sources = {}
+    for d in range(decode_tp):
+        got = set(attention(d))
+        for width in [w for _, w in reference["components"]] + [reference["ssm_heads"]]:
+            got |= set(_state_overlap(d, decode_tp, prefill_tp, width))
+        sources[d] = sorted(got)
+    evidence["sources"] = sources
+    expected: dict[tuple[int, int], int] = {}
+    classes: dict[tuple[int, int, str], int] = {}
+    attention_expected: dict[tuple[int, int], int] = {}
+    totals = {"attention": 0, "state_logical": 0, "state_transfer_only": 0}
+    unique = {"attention": 0, "state_logical": 0, "state_transfer_only": 0}
+    checks: dict[int, list[dict]] = {d: [] for d in range(decode_tp)}
+    for d in range(decode_tp):
+        local = _state_spans(reference, d, decode_tp)
+        span_bytes = sum(sp[3] for sp in local)
+        for record in logs["decode"].get((0, d), []):
+            check = record.get("kv_check")
+            if not check or check.get("kind") not in (None, "transfer") or "error" in check:
+                continue
+            checks[d].append(check)
+            coverage = check.get("coverage") or {}
+            if not isinstance(coverage, dict) or "reads" not in coverage:
+                problems.append(f"decode rank {d}'s check of {check.get('req_id')} has no READ coverage")
+            for text in coverage.get("problems") or []:
+                problems.append(f"decode rank {d} {check.get('req_id')}: {text}")
+            if check.get("posted_matches_checked") is not True:
+                problems.append(f"decode rank {d}'s check of {check.get('req_id')} did not match its posted READs")
+            for read in coverage.get("reads") or []:
+                if read.get("completed") is not True:
+                    problems.append(f"decode rank {d}: a READ from {read.get('rank')} was not complete")
+                if sum(c[1] for c in (read.get("classes") or {}).values()) != read.get("bytes"):
+                    problems.append(f"decode rank {d}: a READ's classes sum to "
+                                    f"{sum(c[1] for c in (read.get('classes') or {}).values())}, not {read.get('bytes')}")
+            for position, group in enumerate(check.get("groups") or []):
+                index = group.get("group", position)
+                if index in attn_idx:
+                    mine = global_heads(d, decode_tp, kv_heads)
+                    if group.get("pattern") != "head-v1" or group.get("global_heads") != mine:
+                        problems.append(f"decode rank {d} checked {check.get('req_id')}'s heads "
+                                        f"{group.get('global_heads')} ({group.get('pattern')}), not its {mine}")
+                    if not isinstance(group.get("bytes"), int) or group["bytes"] % len(mine):
+                        problems.append(f"decode rank {d}: attention group {index} moved {group.get('bytes')} bytes "
+                                        f"over {len(mine)} heads")
+                        continue
+                    per_head = group["bytes"] // len(mine)
+                    if d == 0:
+                        unique["attention"] += per_head * kv_heads
+                    totals["attention"] += group["bytes"]
+                    for p, heads in attention(d).items():
+                        expected[(p, d)] = expected.get((p, d), 0) + per_head * len(heads)
+                        attention_expected[(p, d)] = attention_expected.get((p, d), 0) + per_head * len(heads)
+                    continue
+                if index not in state_idx or group.get("pattern") != "state-v1":
+                    problems.append(f"decode rank {d} checked group {index} as {group.get('pattern')}, "
+                                    "not a state-v1 state group")
+                    continue
+                blocks, regions = group.get("blocks"), group.get("regions")
+                if not (isinstance(blocks, int) and isinstance(regions, int) and blocks > 0 and regions > 0):
+                    problems.append(f"decode rank {d}: state group {index} reports {blocks} blocks, {regions} regions")
+                    continue
+                if group.get("bytes") != blocks * regions * span_bytes:
+                    problems.append(f"decode rank {d}: state group {index} moved {group.get('bytes')} bytes, not "
+                                    f"{blocks} blocks x {regions} regions x {span_bytes} of its spans")
+                transfer_only = group.get("transfer_only_bytes", 0)
+                if transfer_only % (blocks * span_bytes):
+                    problems.append(f"decode rank {d}: state group {index}'s transfer-only bytes {transfer_only} "
+                                    f"are not whole regions of {span_bytes}")
+                    continue
+                only_regions = transfer_only // (blocks * span_bytes)
+                logical_regions = regions - only_regions
+                totals["state_transfer_only"] += transfer_only
+                totals["state_logical"] += group["bytes"] - transfer_only
+                if d == 0:
+                    whole = sum(w for _, w in reference["components"]) * column + (
+                        reference["ssm_heads"] * reference["ssm_head_bytes"])
+                    unique["state_logical"] += blocks * logical_regions * whole
+                    unique["state_transfer_only"] += blocks * only_regions * whole
+                for sp in local:
+                    width = (dict((n, w) for n, w in reference["components"])[sp[1]] if sp[0] == "conv"
+                             else reference["ssm_heads"])
+                    unit = column if sp[0] == "conv" else reference["ssm_head_bytes"]
+                    for p, (lo, hi) in _state_overlap(d, decode_tp, prefill_tp, width).items():
+                        for kind, regs in (("logical", logical_regions), ("transfer-only", only_regions)):
+                            n = blocks * regs * (hi - lo) * unit
+                            if n:
+                                classes[(p, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}")] = (
+                                    classes.get((p, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}"), 0) + n)
+                                expected[(p, d)] = expected.get((p, d), 0) + n
+
+    # Per-READ telemetry: exact bytes and lengths, then NIXL's three counts.
+    logged: dict[tuple[int, int], int] = {}
+    seen_classes: dict[tuple[int, int, str], int] = {}
+    attention_seen: dict[tuple[int, int], int] = {}
+    telemetry: dict[int, list[tuple]] = {d: [] for d in range(decode_tp)}
+    descriptors, merged, unknown = [], [], 0
+    for (_, rank), records in logs["decode"].items():
+        for record in records:
+            for entry in ((record.get("kv_transfers") or {}).get("load") or {}).get("each") or []:
+                peer = entry[5] if len(entry) > 5 else None
+                plan = entry[6] if len(entry) > 6 else None
+                if peer is None:
+                    unknown += 1
+                    continue
+                at = f"prefill rank {peer} -> decode rank {rank}: "
+                logged[(peer, rank)] = logged.get((peer, rank), 0) + int(entry[0])
+                if not (isinstance(plan, list) and len(plan) > 4):
+                    problems.append(f"{at}a READ without its selected bytes and lengths ({plan})")
+                    continue
+                selected, predicted, sel_bytes, table = plan[1], plan[2], plan[3], plan[4]
+                measured = entry[3]
+                if not (isinstance(table, dict) and isinstance(sel_bytes, int)):
+                    problems.append(f"{at}a READ without its selected bytes and lengths ({plan[3:]})")
+                    continue
+                if int(entry[0]) != sel_bytes:
+                    problems.append(f"{at}a READ of {entry[0]} bytes, its selected descriptors sum to {sel_bytes}")
+                if sum(int(n) * c for n, c in table.items()) != sel_bytes or sum(table.values()) != selected:
+                    problems.append(f"{at}a READ's length table {table} is not its {selected} descriptors of "
+                                    f"{sel_bytes} bytes")
+                count = lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0
+                if not (count(selected) and count(measured) and count(predicted)):
+                    problems.append(f"{at}a READ without counts: selected {selected}, predicted {predicted}, "
+                                    f"measured {measured}")
+                else:
+                    descriptors.append(selected)
+                    merged.append(measured)
+                    if not predicted == measured <= selected:
+                        problems.append(f"{at}a READ of {selected} selected descriptors predicted at {predicted} "
+                                        f"and measured at {measured} (need predicted = measured <= selected)")
+                    if selected > NIXL_MAX_DESCRIPTORS:
+                        problems.append(f"{at}a READ of {selected} selected descriptors, more than the "
+                                        f"{NIXL_MAX_DESCRIPTORS} guard")
+                telemetry[rank].append((peer, int(entry[0]), selected))
+    if unknown:
+        problems.append(f"{unknown} transfer(s) logged without their peer rank")
+    for d in range(decode_tp):
+        posted = sorted((r.get("rank"), r.get("bytes"), r.get("descriptors")) for c in checks[d]
+                        for r in (c.get("coverage") or {}).get("reads") or [])
+        for c in checks[d]:
+            for r in (c.get("coverage") or {}).get("reads") or []:
+                for name, (_, n) in (r.get("classes") or {}).items():
+                    if ".attention." in name:
+                        attention_seen[(r.get("rank"), d)] = attention_seen.get((r.get("rank"), d), 0) + n
+                        continue
+                    key = (r.get("rank"), d, name)
+                    seen_classes[key] = seen_classes.get(key, 0) + n
+        if posted != sorted(telemetry[d]):
+            problems.append(f"decode rank {d}'s checked READs {posted[:3]}... are not its logged READs "
+                            f"{sorted(telemetry[d])[:3]}... (producer, bytes, selected descriptors)")
+    for key in sorted(set(classes) | set(seen_classes)):
+        if classes.get(key, 0) != seen_classes.get(key, 0):
+            problems.append(f"producer {key[0]} -> decode rank {key[1]}: {key[2]} carried {seen_classes.get(key, 0)} "
+                            f"bytes, not the {classes.get(key, 0)} its owned range gives")
+    for pair in sorted(set(attention_expected) | set(attention_seen)):
+        if attention_expected.get(pair, 0) != attention_seen.get(pair, 0):
+            problems.append(f"prefill rank {pair[0]} -> decode rank {pair[1]}: attention carried "
+                            f"{attention_seen.get(pair, 0)} bytes, not the {attention_expected.get(pair, 0)} "
+                            "of the heads it holds for it")
+    for pair in sorted(set(expected) | set(logged)):
+        if logged.get(pair, 0) != expected.get(pair, 0):
+            problems.append(f"prefill rank {pair[0]} -> decode rank {pair[1]} moved {logged.get(pair, 0)} bytes, "
+                            f"not the {expected.get(pair, 0)} its owned heads and state ranges give")
+    for p in sorted(unwritten):
+        problems.append(f"prefill rank {p}'s TENT metrics lack tent_write_bytes_total")
+    received = {d: sum(n for (p, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
+    sent = {p: sum(n for (pp, d), n in logged.items() if pp == p) for p in range(prefill_tp)}
+    payload = sum(logged.values())
+    moved = sum(summary["transfers"]["bytes"] for summary in ranks["decode"].values())
+    if moved != payload:
+        problems.append(f"the connector moved {moved} bytes, not the {payload} its transfers' peers account for")
+    for p in range(prefill_tp):
+        produced = ranks["prefill"].get((0, p), {}).get("requests") or set()
+        if run.kv_check and len(produced) != run.workload.num_prompts:
+            problems.append(f"prefill rank {p} produced {len(produced)} request(s), not {run.workload.num_prompts}")
+    port_evidence = {}
+    if ports is not None:
+        network = ports.get(run.prefill.kv_network) or {}
+        by_rank = {(described["node"], described["slot"]): described for described in network.values()}
+        for role, node, carried, direction in (("prefill", run.prefill.node, sent, "rx"),
+                                               ("decode", run.decode.node, received, "tx")):
+            for rank, payload_bytes in carried.items():
+                port = by_rank.get((node, rank))
+                if port is None:
+                    problems.append(f"{role} rank {rank}'s router port was not measured")
+                    continue
+                measured = port[direction]
+                port_evidence[f"{role}{rank}"] = {"rx": port["rx"], "tx": port["tx"], "payload": payload_bytes}
+                if measured < payload_bytes or measured > payload_bytes * 1.05 + (1 << 20):
+                    problems.append(f"{role} rank {rank}'s router port {direction.upper()} {measured} bytes, not its "
+                                    f"{payload_bytes} of KV and little more")
+    else:
+        problems.append("no router port counters: unequal TP needs the switched network's")
+    evidence.update({
+        "pairs": [{"prefill": p, "decode": d, "bytes": logged.get((p, d), 0), "expected": expected.get((p, d), 0)}
+                  for p in range(prefill_tp) for d in range(decode_tp) if (p, d) in expected or (p, d) in logged],
+        "byte_classes": totals, "unique_bytes_by_class": unique, "payload_bytes": payload,
+        "max_descriptors": max(descriptors, default=None), "max_merged_descriptors": max(merged, default=None),
+        "state_classes": {f"{p}->{d} {name}": n for (p, d, name), n in sorted(classes.items())},
+        "ports": port_evidence or None, "received": received, "problems": problems,
+    })
+    return evidence
+
+
+
 def _hp_tcp_writes(records: list[dict], limit: int | None) -> dict:
     """A Mooncake prefill rank's connector writes (``send``) against hp_tcp's
     task limit, reported, never judged: TENT may merge a write's descriptors
@@ -1878,6 +2191,21 @@ def _request_steps(records: list[dict]) -> dict[str, list[tuple[int, int, int, i
                 (request["num_computed_tokens"], request["num_scheduled_tokens"], request["num_prompt_tokens"],
                  request.get("num_spec_tokens") or 0))
     return steps
+
+
+def _handoff_from_sources(joint_steps: dict, decode_rank: int, sources: list[int], consumed: set[str]) -> dict:
+    """Validate the handoff on every producer that supplies this decode rank.
+
+    TP ranks need not match: scatter shares a producer, while gather needs
+    each producer's steps. Keep the request count per decode rank.
+    """
+    results = [_handoff_problems(joint_steps[("prefill", source)], joint_steps[("decode", decode_rank)], consumed)
+               for source in sources]
+    evidence = results[0]["evidence"]
+    return {"evidence": evidence, "problems": [
+        (f"prefill rank {source}: " if sources != [decode_rank] else "") + problem
+        for source, result in zip(sources, results)
+        for problem in result["problems"]]}
 
 
 def _handoff_problems(prefill: dict[str, list[tuple[int, int, int, int]]],

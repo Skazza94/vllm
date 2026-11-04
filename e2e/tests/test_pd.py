@@ -473,6 +473,30 @@ def stepped(request: str, side: str, computed: int, scheduled: int, prompt: int,
 
 
 class HybridCheckTests(unittest.TestCase):
+    def test_handoff_uses_every_native_producer_rank(self) -> None:
+        for p, d in ((2, 2), (1, 2), (2, 1), (2, 4), (4, 2)):
+            joint = {("prefill", r): {"cmpl-a-0-p": [(0, 32, 32, 0)]} for r in range(p)}
+            joint.update({("decode", r): {"cmpl-a-0-d": [(32, 1, 33, 0)]} for r in range(d)})
+            for rank in range(d):
+                sources = ([rank * p // d] if p <= d else list(range(rank * p // d, (rank + 1) * p // d)))
+                with self.subTest(prefill_tp=p, decode_tp=d, decode_rank=rank):
+                    result = pd._handoff_from_sources(joint, rank, sources, {"cmpl-a-0-d"})
+                    self.assertEqual(result["problems"], [])
+                    self.assertEqual(result["evidence"]["requests"], 1)
+                    self.assertEqual(result["evidence"]["prompt_tokens"], [33, 33])
+
+    def test_handoff_rejects_missing_or_wrong_steps_on_each_gather_source(self) -> None:
+        for source in (0, 1):
+            for bad_steps in ({}, {"cmpl-a-0-p": [(0, 31, 31, 0)]}):
+                joint = {("prefill", r): {"cmpl-a-0-p": [(0, 32, 32, 0)]} for r in (0, 1)}
+                joint[("decode", 0)] = {"cmpl-a-0-d": [(32, 1, 33, 0)]}
+                joint[("prefill", source)] = bad_steps
+                with self.subTest(source=source, bad_steps=bad_steps):
+                    result = pd._handoff_from_sources(joint, 0, [0, 1], {"cmpl-a-0-d"})
+                    self.assertEqual(len(result["problems"]), 1)
+                    self.assertIn(f"prefill rank {source}:", result["problems"][0])
+                    self.assertIn("no prefill steps" if not bad_steps else "prefill took", result["problems"][0])
+
     def verdict(self, checks=None, prefill_steps=None, decode_steps=None, pulls=None,
                 layout=HYBRID_LAYOUT) -> dict:
         checks = checks or [hybrid_check("a"), hybrid_check("b")]
@@ -1281,6 +1305,205 @@ class SparseMlaLayoutTests(unittest.TestCase):
             with self.subTest(message=message):
                 problems = self.problems(change)
                 self.assertTrue(any(message in p for p in problems), problems)
+
+
+# ----- a hybrid's unequal TP: attention head-v1 beside a Mamba2 state group (state-v1) -----
+
+STATE = {"family": "mamba2", "components": [["x", 16], ["B", 4], ["C", 4]], "conv_rows": 3, "conv_itemsize": 2,
+         "ssm_heads": 4, "ssm_head_bytes": 8}
+ATTN_HEAD = 10  # bytes of one KV head over a request's blocks of the attention group
+
+
+def _hybrid_expectations(prefill_tp: int, decode_tp: int, kv_heads: int, only_regions: int = 1, logical_regions: int = 1):
+    """Per decode rank and producer: attention heads, the state's classes
+    (component -> bytes of a request's one block), written here from the
+    ownership rule (a producer's range overlap) for the fixture alone."""
+    out = {}
+    for d in range(decode_tp):
+        cands = ([d * prefill_tp // decode_tp] if prefill_tp <= decode_tp
+                 else list(range(d * (prefill_tp // decode_tp), (d + 1) * (prefill_tp // decode_tp))))
+        for p in cands:
+            heads = [h for h in pd.global_heads(d, decode_tp, kv_heads)
+                     if h in pd.global_heads(p, prefill_tp, kv_heads)
+                     and p == next(q for q in cands if h in pd.global_heads(q, prefill_tp, kv_heads))]
+            classes = {}
+            for kind, name, width, unit in ([("conv", n, w, 6) for n, w in STATE["components"]]
+                                            + [("ssm", "ssm", STATE["ssm_heads"], STATE["ssm_head_bytes"])]):
+                lo, hi = d * width // decode_tp, (d + 1) * width // decode_tp
+                a, b = p * width // prefill_tp, (p + 1) * width // prefill_tp
+                if max(lo, a) < min(hi, b):
+                    n = (min(hi, b) - max(lo, a)) * unit
+                    for tag, regs in (("logical", logical_regions), ("transfer-only", only_regions)):
+                        if regs:
+                            classes[f"g1.{kind}.{name}.{tag}"] = n * regs
+            if heads or classes:
+                out[(d, p)] = (heads, classes)
+    return out
+
+
+def hybrid_logs(prefill_tp, decode_tp, kv_heads=4, requests=("a", "b"), only_regions=1):
+    """Logs of a hybrid's unequal-TP run over NIXL consistent with ownership:
+    each READ's bytes, its class table, descriptors and length table."""
+    expect = _hybrid_expectations(prefill_tp, decode_tp, kv_heads, only_regions)
+    tps = (("prefill", prefill_tp), ("decode", decode_tp))
+
+    def layout(rank, tp):
+        spans = pd._state_spans(STATE, rank, tp)
+        heads = pd.global_heads(rank, tp, kv_heads)
+        return line(kv_layout={"tp_rank": rank, "tp_size": tp, "block_bytes": 20, "bytes": 1600, "groups": [
+            {"kind": "FullAttentionSpec", "block_size": 16, "layers": 2, "block_bytes": ATTN_HEAD * len(heads),
+             "real_page_bytes": ATTN_HEAD * len(heads), "pattern": "head-v1", "global_heads": heads},
+            {"kind": "MambaSpec", "block_size": 16, "layers": 2, "pattern": "state-v1", "global_heads": None,
+             "state": {**STATE, "spans": spans}}]})
+
+    loads = {d: [] for d in range(decode_tp)}
+    checks_of = {d: [] for d in range(decode_tp)}
+    sent = {p: 0 for p in range(prefill_tp)}
+    received = {d: 0 for d in range(decode_tp)}
+    for d in range(decode_tp):
+        spans = pd._state_spans(STATE, d, decode_tp)
+        span_bytes = sum(sp[3] for sp in spans)
+        mine = pd.global_heads(d, decode_tp, kv_heads)
+        for r in requests:
+            reads = []
+            for (dd, p), (heads, classes) in sorted(expect.items()):
+                if dd != d:
+                    continue
+                total = ATTN_HEAD * len(heads) + sum(classes.values())
+                a = total // 2
+                table = {a: 1, total - a: 1} if a != total - a else {a: 2}
+                classes_log = {k: [1, v] for k, v in classes.items()}
+                if heads:
+                    classes_log["g0.attention.logical"] = [1, ATTN_HEAD * len(heads)]
+                reads.append({"rank": p, "completed": True, "descriptors": 2, "bytes": total, "classes": classes_log})
+                loads[d].append([total, 0.01, 0.0, 2, 10.0, p, [0, 2, 2, total, table]])
+                sent[p] += total
+                received[d] += total
+            state_bytes = 1 * (1 + only_regions) * span_bytes
+            checks_of[d].append(checked(
+                r, blocks=6, layers=4, bytes=ATTN_HEAD * len(mine) + state_bytes, posted_matches_checked=True,
+                coverage={"problems": [], "reads": reads},
+                groups=[{"group": 0, "blocks": 5, "bytes": ATTN_HEAD * len(mine), "mismatched_bytes": 0,
+                         "pattern": "head-v1", "global_heads": mine},
+                        {"group": 1, "blocks": 1, "regions": 1 + only_regions, "bytes": state_bytes,
+                         "transfer_only_bytes": only_regions * span_bytes, "mismatched_bytes": 0,
+                         "pattern": "state-v1", "global_heads": None}]))
+    prefill = [layout(p, prefill_tp) + allocated(*requests) for p in range(prefill_tp)]
+    decode = [layout(d, decode_tp) + "".join(stepped(r, "d", 80, 1, 80) for r in requests)
+              + line(kv_transfers={"load": {"count": len(loads[d]), "bytes": sum(e[0] for e in loads[d]),
+                                            "each": loads[d]}})
+              + "".join(line(kv_check=c) for c in checks_of[d]) for d in range(decode_tp)]
+    ports = {"kv": {**{f"p{p}": {"node": "p", "slot": p, "rx": sent[p] + 100, "tx": 40} for p in range(prefill_tp)},
+                    **{f"p{prefill_tp + d}": {"node": "d", "slot": d, "rx": 40, "tx": received[d] + 100}
+                       for d in range(decode_tp)}}}
+    return prefill, decode, ports
+
+
+class HybridHeterogeneousTpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+        (self.model / "config.json").write_text(json.dumps({"num_key_value_heads": 4}))
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def reconcile(self, prefill_tp, decode_tp, change=None, nixl=True, kv_heads=4, **kw) -> dict:
+        prefill, decode, ports = hybrid_logs(prefill_tp, decode_tp, kv_heads, **kw)
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        run = pd.Run(**{**RUN.__dict__, "model": self.model,
+                        "prefill": pd.Side("p", "kv", tensor_parallel_size=prefill_tp),
+                        "decode": pd.Side("d", "kv", tensor_parallel_size=decode_tp),
+                        "server": pd.Server(connector="nixl" if nixl else "mooncake")})
+        logs = {"prefill": {(0, r): pd._records(text) for r, text in enumerate(prefill)},
+                "decode": {(0, r): pd._records(text) for r, text in enumerate(decode)}}
+        moved = lambda records: sum(((r.get("kv_transfers") or {}).get("load") or {}).get("bytes", 0) for r in records)
+        ranks = {role: {key: {"transfers": {"bytes": moved(records)}, "requests": ["a", "b"]}
+                        for key, records in logs[role].items()} for role in logs}
+        return pd._hetero_tp(run, {"prefill": prefill_tp, "decode": decode_tp}, logs, ranks, ports)
+
+    def test_state_and_attention_pair_every_direction(self) -> None:
+        for sizes in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4), (4, 1)):
+            with self.subTest(sizes=sizes):
+                hetero = self.reconcile(*sizes)
+                self.assertEqual(hetero["problems"], [], sizes)
+                self.assertTrue(hetero["hybrid"])
+        # TP2 <- TP4 (K=4): decode 0 takes heads 0,1 and half its state from 0 and 1.
+        self.assertEqual(self.reconcile(4, 2)["sources"], {0: [0, 1], 1: [2, 3]})
+        self.assertEqual(self.reconcile(2, 4)["sources"], {0: [0], 1: [0], 2: [1], 3: [1]})
+        classes = self.reconcile(2, 1)["byte_classes"]
+        self.assertGreater(classes["state_logical"], 0)
+        self.assertEqual(classes["state_transfer_only"], classes["state_logical"])
+
+    def test_transfer_only_regions_are_apart_from_logical_state(self) -> None:
+        none = self.reconcile(1, 2, only_regions=0)
+        self.assertEqual(none["problems"], [])
+        self.assertEqual(none["byte_classes"]["state_transfer_only"], 0)
+        two = self.reconcile(1, 2, only_regions=2)
+        self.assertEqual(two["problems"], [])
+        self.assertEqual(two["byte_classes"]["state_transfer_only"], 2 * two["byte_classes"]["state_logical"])
+
+    def test_mooncake_does_not_pair_a_hybrid(self) -> None:
+        problems = self.reconcile(1, 2, nixl=False)["problems"]
+        self.assertTrue(any("NIXL only" in p for p in problems), problems)
+
+    def mutate(self, text, find, replace, count=1):
+        self.assertIn(find, text)
+        return text.replace(find, replace, count)
+
+    def test_state_spans_must_be_the_models_layout(self) -> None:
+        # A rank's span offsets or lengths other than the layout's.
+        def spans(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"spans": [["conv", "x", 0, 48', '"spans": [["conv", "x", 0, 54'),
+                             *decode[1:]], ports
+        problems = self.reconcile(1, 2, change=spans)["problems"]
+        self.assertTrue(any("state spans" in p for p in problems), problems)
+        # Another layout on one side.
+        def other(prefill, decode, ports):
+            return [self.mutate(prefill[0], '"ssm_heads": 4', '"ssm_heads": 8'), *prefill[1:]], decode, ports
+        self.assertTrue(any("differs from" in p or "state spans" in p for p in self.reconcile(1, 2, change=other)["problems"]))
+
+    def test_the_posted_read_record_is_required_and_must_be_clean(self) -> None:
+        def strip(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"coverage": {"problems": [], "reads"', '"nocoverage": {"reads"'),
+                             *decode[1:]], ports
+        self.assertTrue(any("no READ coverage" in p for p in self.reconcile(1, 2, change=strip)["problems"]))
+        def flagged(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"coverage": {"problems": []',
+                                         '"coverage": {"problems": ["a shard twice"]'), *decode[1:]], ports
+        self.assertTrue(any("a shard twice" in p for p in self.reconcile(1, 2, change=flagged)["problems"]))
+        def unfinished(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"completed": true', '"completed": false'), *decode[1:]], ports
+        self.assertTrue(any("not complete" in p for p in self.reconcile(1, 2, change=unfinished)["problems"]))
+        def unmatched(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"posted_matches_checked": true', '"posted_matches_checked": false'),
+                             *decode[1:]], ports
+        self.assertTrue(any("did not match its posted READs" in p for p in self.reconcile(1, 2, change=unmatched)["problems"]))
+
+    def test_a_reads_bytes_lengths_and_counts_are_exact(self) -> None:
+        def bytes_off(prefill, decode, ports):  # a READ's bytes differ from its selected descriptors' sum
+            return prefill, [re.sub(r'\[(\d+), 0.01, 0.0, 2, 10.0, 0, \[0, 2, 2, (\d+)', lambda m: f"[{int(m.group(1)) + 8}, 0.01, 0.0, 2, 10.0, 0, [0, 2, 2, {m.group(2)}",
+                                    decode[0], count=1), *decode[1:]], ports
+        self.assertTrue(any("selected descriptors sum" in p for p in self.reconcile(1, 2, change=bytes_off)["problems"]))
+        def merged(prefill, decode, ports):  # predicted != measured
+            return prefill, [self.mutate(decode[0], ", 2, 10.0, 0, [0, 2, 2,", ", 2, 10.0, 0, [0, 2, 1,"), *decode[1:]], ports
+        self.assertTrue(any("predicted" in p for p in self.reconcile(1, 2, change=merged)["problems"]))
+        # A merged READ (predicted = measured < selected) is fine.
+        def success(prefill, decode, ports):
+            text = self.mutate(decode[0], ", 2, 10.0, 0, [0, 2, 2,", ", 1, 10.0, 0, [0, 2, 1,")
+            return prefill, [text, *decode[1:]], ports
+        self.assertEqual(self.reconcile(1, 2, change=success)["problems"], [])
+
+    def test_a_swapped_source_or_wrong_class_bytes_are_rejected(self) -> None:
+        def swapped(prefill, decode, ports):
+            text = decode[0].replace('"rank": 0', '"rank": 9', 1)
+            return prefill, [text, *decode[1:]], ports
+        self.assertTrue(self.reconcile(1, 2, change=swapped)["problems"])
+        def wrong_class(prefill, decode, ports):
+            return prefill, [self.mutate(decode[0], '"g1.conv.x.logical": [1, 48]', '"g1.conv.x.logical": [1, 42]'),
+                             *decode[1:]], ports
+        self.assertTrue(self.reconcile(1, 2, change=wrong_class)["problems"])
 
 
 if __name__ == "__main__":
