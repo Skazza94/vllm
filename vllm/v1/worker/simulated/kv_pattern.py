@@ -211,6 +211,30 @@ def uniform_heads(
     return held.pop() if len(held) == 1 else None
 
 
+def native_group_heads(
+    layer_heads: "HeadMap | None",
+    groups: Sequence[Sequence[str]],
+    hybrid: bool,
+) -> tuple[tuple[int, ...], ...] | None:
+    """What decides whether NIXL's selection of several groups is seeded by
+    global heads: for each transfer group, the heads all its layers hold;
+    every group must have them and the model must hold no recurrent state,
+    else None (the rank's patterns, and the state-geometry guard). It reads
+    the model's heads at this TP size only, never the pattern flags."""
+    if hybrid or not layer_heads or not groups:
+        return None
+    held = tuple(uniform_heads(layer_heads, list(names)) for names in groups)
+    return held if all(h is not None for h in held) else None
+
+
+def _group_heads(heads, group: int):
+    """`heads` of one transfer group: a tuple of heads (the same in every
+    group), a per-group sequence of them, or None."""
+    if not heads:
+        return None
+    return heads if isinstance(heads[0], int) else heads[group]
+
+
 def row_pattern(
     request_id: str,
     name: str,
@@ -1226,7 +1250,7 @@ def _write_selected(selection, req_id, group, logical, block, tp_rank, identity,
         view[b].copy_(
             row_pattern(
                 req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
-                None if r.state else heads,
+                None if r.state else _group_heads(heads, group),
             )
         )
 
@@ -1240,7 +1264,7 @@ def _compare_selected(selection, req_id, group, logical, block, tp_rank, identit
         view = r.view
         want = row_pattern(
             req_id, s.name(group, row), logical, view.shape[1], tp_rank, identity,
-            None if r.state else heads,
+            None if r.state else _group_heads(heads, group),
         )
         bad = int((view[b] != want).sum())
         compared += view.shape[1]
@@ -1264,8 +1288,9 @@ class NativeFiller(_ContentPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
-    heads: tuple[int, ...] | None = None
-    """Every attention layer's global KV heads: its spans are head patterns."""
+    heads: tuple | None = None
+    """Global KV heads: a tuple of them (every group's) or one tuple a
+    transfer group (`native_group_heads`); its spans are head patterns."""
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
         _after_update(self, scheduler_output)
@@ -1317,7 +1342,7 @@ class NativeFiller(_ContentPages):
                         view.shape[1],
                         self.tp_rank,
                         identities[place],
-                        None if r.state else self.heads,
+                        None if r.state else _group_heads(self.heads, group),
                     )
                 )
             for region in s.state_regions(selected) & set(s.padding):
@@ -1350,8 +1375,8 @@ class NativeChecker(_ConsumerPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
-    heads: tuple[int, ...] | None = None
-    """Every attention layer's global KV heads: its spans are head patterns,
+    heads: tuple | None = None
+    """Global KV heads, as the filler's: its spans are head patterns,
     whichever ranks NIXL reads them from."""
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
@@ -1501,7 +1526,7 @@ class NativeChecker(_ConsumerPages):
                     view.shape[1],
                     self.tp_rank,
                     identity_of(group.group, logical) if identity_of else None,
-                    None if r.state else self.heads,
+                    None if r.state else _group_heads(self.heads, group.group),
                 )
                 wrong = int((view[block] != want).sum())
                 payload += view.shape[1]
@@ -1528,13 +1553,14 @@ class NativeChecker(_ConsumerPages):
             # The scheme these spans' bytes were checked under: head patterns
             # for attention spans, the rank's for a state's.
             holds_state = any(s.rows[row].state for row, _, _ in selected)
+            mine = _group_heads(self.heads, group.group)
             groups.append(
                 {
                     "group": group.group,
                     **(
-                        {"pattern": HEAD_PATTERN, "global_heads": list(self.heads)}
-                        if self.heads and not holds_state
-                        else {"pattern": "mixed" if self.heads else RANK_PATTERN, "global_heads": None}
+                        {"pattern": HEAD_PATTERN, "global_heads": list(mine)}
+                        if mine and not holds_state
+                        else {"pattern": "mixed" if mine else RANK_PATTERN, "global_heads": None}
                     ),
                     # Where the pull's metadata placed the blocks among the
                     # request's (a state's clipped running slot: index k, its

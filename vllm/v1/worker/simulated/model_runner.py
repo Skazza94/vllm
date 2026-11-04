@@ -44,7 +44,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     group_pattern,
     head_map,
     layer_total_heads,
-    uniform_heads,
+    native_group_heads,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
     NixlReadPeers,
@@ -335,13 +335,13 @@ class SimulatedModelRunner(GPUModelRunner):
                     "fill" if sim.kv_pattern_fill else "check",
                     len(views),
                 )
-        # NIXL's selection of attention-only groups holding the same global
-        # heads in every layer is seeded by those heads, so its reads are
+        # NIXL's selection of attention-only groups, each holding one set of
+        # global heads in all its layers, is seeded by those heads, so its reads are
         # checked from any TP size; a hybrid's states keep the rank's.
         native_heads = None
-        if native and layer_heads and not self.model_config.is_hybrid:
-            native_heads = uniform_heads(
-                layer_heads, [n for g in groups for n in g.layer_names]
+        if native:
+            native_heads = native_group_heads(
+                layer_heads, layers, self.model_config.is_hybrid
             )
         if native and native_heads is None:
             heads = None

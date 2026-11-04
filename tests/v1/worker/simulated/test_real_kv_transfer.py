@@ -3243,7 +3243,8 @@ def test_nixl_two_attention_groups_are_seeded_by_their_global_heads(
     groups = engine.scheduler.kv_cache_config.kv_cache_groups
     worker = get_kv_transfer_group().connector_worker
     filler = runner._kv_filler
-    assert isinstance(filler, NativeFiller) and filler.heads == (0, 1)
+    assert isinstance(filler, NativeFiller)
+    assert filler.heads == ((0, 1),) * len(groups)
     s = filler.selection
     free = iter(range(2, worker.num_blocks))
     source = [[next(free), next(free)] for _ in groups]

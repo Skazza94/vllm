@@ -2122,3 +2122,118 @@ def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
     for heads in (None, (2, 3)):
         with pytest.raises(ValueError, match="block size"):
             checker(worker(block_sizes=(16, 32)), heads)._check_geometry()
+
+
+def test_native_group_heads_decide_the_selections_eligibility():
+    """A native NIXL selection is head-aware only when the model holds no
+    state and every transfer group's layers hold one head set: from the
+    model's heads at this TP size, never the pattern flags. A group lacking
+    heads (a layer without a head pattern, or layers of different heads), or
+    a hybrid, keeps the rank's patterns."""
+    from vllm.v1.worker.simulated.kv_pattern import native_group_heads
+
+    heads = {"a0": ((0, 1, 2, 3), 8), "a1": ((0, 1, 2, 3), 8), "b0": ((0,), 32), "b1": ((0,), 32)}
+    groups = [["a0", "a1"], ["b0", "b1"]]
+    assert native_group_heads(heads, groups, False) == ((0, 1, 2, 3), (0,))
+    assert native_group_heads(heads, groups, True) is None
+    assert native_group_heads(None, groups, False) is None
+    assert native_group_heads({}, groups, False) is None
+    assert native_group_heads(heads, [], False) is None
+    # A layer without a head pattern, or two head sets in one group.
+    assert native_group_heads({k: v for k, v in heads.items() if k != "b1"}, groups, False) is None
+    assert native_group_heads({**heads, "a1": ((4, 5, 6, 7), 8)}, groups, False) is None
+    # The same heads in every group (gpt-oss).
+    same = {k: ((0, 1), 8) for k in ("x", "y")}
+    assert native_group_heads(same, [["x"], ["y"]], False) == ((0, 1), (0, 1))
+
+
+def test_native_per_group_heads_check_a_gemma_like_split_and_gather():
+    """Two transfer groups of different total heads (Gemma4's sliding 8 and
+    global 2), pages of equal bytes (32) on a TP1 rank: group A 8 heads of
+    4 bytes, group B 2 of 16. At TP2 a rank holds 4 of A's heads and 1 of
+    B's, a page of 16 bytes either way. P TP1 -> D TP2 splits both groups;
+    P TP2 -> D TP1 gathers them from two producers. A group's slice in the
+    other group's place, a swapped producer order or a missing head fails;
+    each group reports its own pattern and heads."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.simulated.kv_pattern import NativeChecker, NativeFiller
+
+    blocks = 4
+
+    def stub(size):
+        """Group g's one row of `size` bytes (a block each)."""
+        rows = [SimpleNamespace(view=torch.zeros(blocks, size, dtype=torch.uint8), region=g, offset=0, state=False)
+                for g in range(2)]
+        return SimpleNamespace(
+            rows=rows,
+            select=lambda group, held: [(group, b, i) for i, b in enumerate(held)],
+            members=[{0}, {1}], padding={}, groups=[["a"], ["b"]],
+            name=lambda group, row: f"g{group}.r{row}.o0",
+            state_regions=lambda selected: set(),
+            regions=lambda selected: {r for r, _, _ in selected},
+            order=lambda held: [b for ids in held.values() for b in ids],
+            worker=None,
+        )
+
+    def producer(size, heads):
+        s = stub(size)
+        filler = NativeFiller(s, 0, heads=heads)
+        for group in range(2):
+            filler._write_block("cmpl-a-0", group, 3, 2, None)
+        return s
+
+    def consumer(size, heads, fill):
+        s = stub(size)
+        for group in range(2):
+            s.rows[group].view[2] = fill(group)
+        checker = NativeChecker(s, tp_rank=1, heads=heads)
+        checker._check_geometry = lambda: None
+        checker.posted["cmpl-a-0"] = [2, 2]
+        checker.reads["cmpl-a-0"] = [[2, 2]]
+        expected = SimpleNamespace(
+            remote_request_id="cmpl-a-0", block_ids=[[2], [2]],
+            groups=[SimpleNamespace(group=g, block_ids=[2], first_logical_block=3) for g in range(2)],
+        )
+        return checker._compare("cmpl-b-0", expected)
+
+    def identity(result, want):
+        got = [(g["pattern"], g["global_heads"]) for g in result["groups"]]
+        assert got == [("head-v1", w) for w in want], got
+
+    a_slab, b_slab = 4, 16
+    tp1 = producer(32, (tuple(range(8)), (0, 1)))
+    # Split: decode rank 1 holds A heads 4..7 and B head 1.
+    mine = (tuple(range(4, 8)), (1,))
+
+    def split(group):
+        row = tp1.rows[group].view[2]
+        return row[4 * a_slab:8 * a_slab] if group == 0 else row[b_slab:2 * b_slab]
+
+    ok = consumer(16, mine, split)
+    assert ok["ok"], ok
+    identity(ok, [[4, 5, 6, 7], [1]])
+    # A's slice where B's goes, and B's where A's goes (equal bytes, wrong group).
+    crossed = consumer(16, mine, lambda g: split(1 - g))
+    assert not crossed["ok"] and crossed["mismatched_bytes"] > 0
+    # A missing head: B's slice from head 0 instead of 1.
+    wrong_head = consumer(16, mine, lambda g: split(g) if g == 0 else tp1.rows[1].view[2][:b_slab])
+    assert not wrong_head["ok"]
+    # Gather: decode TP1 holds A 0..7 and B 0, 1, from producers 0 and 1.
+    p0 = producer(16, ((0, 1, 2, 3), (0,)))
+    p1 = producer(16, ((4, 5, 6, 7), (1,)))
+
+    def gather(group, order=(0, 1)):
+        rows = [(p0, p1)[i].rows[group].view[2] for i in order]
+        return torch.cat(rows)
+
+    ok = consumer(32, (tuple(range(8)), (0, 1)), gather)
+    assert ok["ok"], ok
+    identity(ok, [list(range(8)), [0, 1]])
+    swapped = consumer(32, (tuple(range(8)), (0, 1)), lambda g: gather(g, (1, 0)))
+    assert not swapped["ok"]
+    # A rank-pattern check of the same bytes (no heads) does not accept them.
+    s = stub(16)
+    for group in range(2):
+        s.rows[group].view[2] = split(group)
+    assert NativeChecker(s, tp_rank=1, heads=None) is not None

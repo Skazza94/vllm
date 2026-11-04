@@ -147,15 +147,26 @@ def simulated_tp_mismatch(
         return f"Simulated real KV transfers pair TP sizes one dividing the other, not {sizes}."
     model = vllm_config.model_config
     # Layers of different KV heads (Gemma4's global layers beside its
-    # sliding ones): the connectors count one head total, so their geometry
-    # at unequal sizes is not established.
+    # sliding ones): the connectors count one head total, so only sizes that
+    # replicate no layer and split every layer evenly on both sides are
+    # admitted (each total a positive integer, never a bool, at least the
+    # larger size and divisible by both).
     per_layer = getattr(model.hf_text_config, "per_layer_config", None) or ()
-    if len({getattr(layer, "num_key_value_heads", None) for layer in per_layer}) > 1:
-        return (
-            "Simulated real KV transfers pair unequal TP sizes for layers of one "
-            "KV head count only (this model's layers differ in KV heads), "
-            f"not {sizes}."
-        )
+    totals = [getattr(layer, "num_key_value_heads", None) for layer in per_layer]
+    if len(set(totals)) > 1:
+        if not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in totals):
+            return (
+                "Simulated real KV transfers pair unequal TP sizes for layers of "
+                f"valid KV head counts only (this model's layers differ: {sorted(map(str, set(totals)))}), "
+                f"not {sizes}."
+            )
+        if any(n < larger or n % local_tp_size or n % remote_tp_size for n in totals):
+            return (
+                "Simulated real KV transfers pair unequal TP sizes for layers of "
+                "differing KV heads only where none replicates and each splits "
+                f"evenly on both sides (this model's layers differ in KV heads: "
+                f"{sorted(set(totals))}), not {sizes}."
+            )
     if (
         (model.use_mla and not plain_mla(model))
         or model.is_hybrid

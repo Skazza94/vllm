@@ -3234,18 +3234,26 @@ def test_simulated_real_transfers_pair_unequal_tp_with_sliding_window_layers():
         _simulation_config(hybrid=True, sliding_window=128), 2, 4
     )
     # Gemma4: sliding layers of 8 KV heads beside global layers of 2. Equal
-    # sizes pair; unequal ones wait for that geometry's checkpoint (the
-    # connectors count one head total: Mooncake's own validator rejects a
-    # 2-head layer's page under the model's 8), whichever way and with the
-    # model's total alone replicated or not.
+    # sizes pair. Unequal ones pair where no layer replicates and each splits
+    # evenly on both sides (TP1 <-> 2); the connectors count one head total,
+    # so TP2 <-> 4 (the global layers replicate while the sliding ones split)
+    # is refused, whichever way and with NIXL's consumer flag.
     gemma = _simulation_config(
         sliding_window=1024, layer_types=["sliding_attention", "full_attention"],
         kv_heads=8, layer_heads=[8, 2],
     )
     assert simulated_tp_mismatch(gemma, 2, 2) is None
-    for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2)):
+    for local, remote in ((1, 2), (2, 1)):
+        assert simulated_tp_mismatch(gemma, local, remote) is None
+        assert simulated_tp_mismatch(gemma, local, remote, nixl_consumer=True) is None
+    for local, remote in ((2, 4), (4, 2), (1, 4), (4, 1), (2, 8), (1, 8)):
         assert "layers differ in KV heads" in simulated_tp_mismatch(gemma, local, remote)
         assert "layers differ in KV heads" in simulated_tp_mismatch(gemma, local, remote, nixl_consumer=True)
+    # Totals must be valid positive integers (never a bool) dividing evenly.
+    for heads in ([8, 0], [8, -2], [8, 2.0], [8, True], [8, None], [8, 3], [3, 2]):
+        config = _simulation_config(kv_heads=8, layer_heads=heads)
+        assert simulated_tp_mismatch(config, 1, 2) is not None, heads
+        assert simulated_tp_mismatch(config, 2, 2) is None
     # Layers of one head count (a per-layer config repeating it) pair.
     assert simulated_tp_mismatch(_simulation_config(kv_heads=8, layer_heads=[8, 8]), 2, 4) is None
 
