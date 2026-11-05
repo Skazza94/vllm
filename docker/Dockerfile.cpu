@@ -479,8 +479,36 @@ RUN curl -fL --retry 3 -o /tmp/ucx.tar.gz \
         --without-java --without-go && \
     make -j "${max_jobs}" && make install && /opt/ucx/bin/ucx_info -v
 
+######################### CPU LIBFABRIC (TCP ONLY) #########################
+FROM base-arch AS libfabric-build
+
+ARG LIBFABRIC_VERSION=2.7.0
+ARG LIBFABRIC_SHA256=366000427e194d4ce22e272519b608afbebb1fc9915bcf5da924157a8a47fe10
+ARG max_jobs=8
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        g++-13 make curl ca-certificates pkg-config bzip2 && \
+    rm -rf /var/lib/apt/lists/*
+RUN curl -fL --retry 3 -o /tmp/libfabric.tar.bz2 \
+        "https://github.com/ofiwg/libfabric/releases/download/v${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION}.tar.bz2" && \
+    echo "${LIBFABRIC_SHA256}  /tmp/libfabric.tar.bz2" | sha256sum -c - && \
+    tar -xjf /tmp/libfabric.tar.bz2 -C /tmp && cd "/tmp/libfabric-${LIBFABRIC_VERSION}" && \
+    CC=gcc-13 CXX=g++-13 ./configure \
+        --prefix=/opt/libfabric --libdir=/opt/libfabric/lib \
+        --sysconfdir=/opt/libfabric/etc --disable-static --enable-only --enable-tcp \
+        --without-cuda --disable-cuda-dlopen --without-rocr --disable-rocr-dlopen \
+        --without-ze --disable-ze-dlopen --without-neuron --without-synapseai && \
+    make -j "${max_jobs}" && make install && \
+    mkdir -p /opt/libfabric/etc && test ! -s /opt/libfabric/etc/libfabric.conf && \
+    /opt/libfabric/bin/fi_info --version && \
+    /opt/libfabric/bin/fi_info -l > /opt/libfabric/providers.txt && \
+    cat /opt/libfabric/providers.txt && \
+    awk '/^[^[:space:]].*:$/ { name=substr($0,1,length($0)-1); if(name=="tcp") tcp++; else if(name=="ofi_hook_noop") noop++; else if(name=="off_coll") coll++; else bad=1 } END { exit (tcp!=1 || noop>1 || coll>1 || bad) }' /opt/libfabric/providers.txt && \
+    /opt/libfabric/bin/fi_info -t FI_EP_RDM -a FI_SOCKADDR_IN \
+        > /opt/libfabric/tcp-rdm.txt && cat /opt/libfabric/tcp-rdm.txt && \
+    test "$(awk '/^provider:/ {print $2}' /opt/libfabric/tcp-rdm.txt | sort -u)" = "tcp"
+
 ######################### KV TRANSFER (NIXL + MOONCAKE) #########################
-# Unpatched, pinned NIXL with Python bindings, UCX/TCP and Mooncake/TENT
+# Unpatched, pinned NIXL with Python bindings, UCX/TCP, LIBFABRIC/TCP and Mooncake/TENT
 # hp_tcp backends, for the CPU simulator's real KV transfers
 # (simulation_config.kv_transfer_mode=real) through the NixlConnector.
 FROM base-arch AS kv-transfer-build
@@ -495,14 +523,15 @@ ARG max_jobs=32
 # the default gcc-15 is untested with them.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-        g++-13 cmake ninja-build pkg-config \
+        g++-13 cmake ninja-build pkg-config libhwloc-dev libnuma-dev \
         libboost-all-dev libcurl4-openssl-dev libgflags-dev libgoogle-glog-dev \
         libhiredis-dev libjsoncpp-dev liburing-dev libssl-dev libunwind-dev \
         libxxhash-dev libyaml-cpp-dev libzstd-dev libzmq3-dev libmsgpack-dev && \
     rm -rf /var/lib/apt/lists/*
 ENV CC=gcc-13 CXX=g++-13
 COPY --from=ucx-build /opt/ucx /opt/ucx
-ENV LD_LIBRARY_PATH=/opt/ucx/lib
+COPY --from=libfabric-build /opt/libfabric /opt/libfabric
+ENV LD_LIBRARY_PATH=/opt/ucx/lib:/opt/libfabric/lib
 
 RUN git init -q /src/mooncake && cd /src/mooncake && \
     git fetch -q --depth 1 https://github.com/kvcache-ai/Mooncake.git "${MOONCAKE_REVISION}" && \
@@ -527,7 +556,7 @@ RUN git init -q /src/mooncake && cd /src/mooncake && \
     # NIXL's Mooncake plugin finds libtransfer_engine and its header on the default paths.
     cp -a /opt/mooncake/. /usr/local/ && ldconfig
 
-# UCX and Mooncake plugins; the simulator selects one backend explicitly. The
+# UCX, LIBFABRIC and Mooncake plugins; the simulator selects one backend explicitly. The
 # Python extension modules (the CPU variant, nixl_cu12) install into /opt/venv,
 # then the `nixl` package that vLLM imports; --no-deps keeps pip from fetching
 # a CUDA variant from PyPI.
@@ -536,7 +565,8 @@ RUN git init -q /src/nixl && cd /src/nixl && \
     git checkout -q FETCH_HEAD && \
     uv pip install meson ninja pybind11 && \
     meson setup /tmp/nixl-build /src/nixl --prefix=/opt/nixl --buildtype=release \
-        -Dlibdir=lib -Ducx_path=/opt/ucx -Denable_plugins=UCX,MOONCAKE -Dpython.install_env=venv \
+        -Dlibdir=lib -Ducx_path=/opt/ucx -Dlibfabric_path=/opt/libfabric \
+        -Denable_plugins=UCX,LIBFABRIC,MOONCAKE -Dpython.install_env=venv \
         -Dbuild_tests=false -Dbuild_examples=false -Dwith_trace=false && \
     ninja -C /tmp/nixl-build -j "${max_jobs}" && \
     ninja -C /tmp/nixl-build install && \
@@ -561,32 +591,40 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         libcurl4 libgflags2.2 libgoogle-glog0v5 libhiredis0.14 libibverbs1 libjsoncpp25 \
-        liburing2 libssl3 libunwind8 libxxhash0 libyaml-cpp0.7 libzstd1 libzmq5 libnuma1 && \
+        liburing2 libssl3 libunwind8 libxxhash0 libyaml-cpp0.7 libzstd1 libzmq5 libnuma1 libhwloc15 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=kv-transfer-build /opt/mooncake/lib /opt/mooncake/lib
 COPY --from=kv-transfer-build /opt/nixl /opt/nixl
 COPY --from=ucx-build /opt/ucx /opt/ucx
+COPY --from=libfabric-build /opt/libfabric /opt/libfabric
 COPY --from=kv-transfer-build /opt/nixl-python /opt/nixl-python
 COPY --from=kv-transfer-build /opt/mooncake-python /opt/mooncake-python
 ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
 ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
 ARG UCX_VERSION=1.22.0
 ARG UCX_SHA256=258941cddd14ca60d38c0d31b9b09ec1052c901086841011a498da8b55a3cb24
-ENV LD_LIBRARY_PATH=/opt/ucx/lib:/opt/nixl/lib:/opt/mooncake/lib \
+ARG LIBFABRIC_VERSION=2.7.0
+ARG LIBFABRIC_SHA256=366000427e194d4ce22e272519b608afbebb1fc9915bcf5da924157a8a47fe10
+ENV LD_LIBRARY_PATH=/opt/ucx/lib:/opt/libfabric/lib:/opt/nixl/lib:/opt/mooncake/lib \
     NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
 LABEL ai.vllm.build.nixl-revision="${NIXL_REVISION}" \
       ai.vllm.build.mooncake-revision="${MOONCAKE_REVISION}" \
       ai.vllm.build.ucx-version="${UCX_VERSION}" \
-      ai.vllm.build.ucx-sha256="${UCX_SHA256}"
+      ai.vllm.build.ucx-sha256="${UCX_SHA256}" \
+      ai.vllm.build.libfabric-version="${LIBFABRIC_VERSION}" \
+      ai.vllm.build.libfabric-sha256="${LIBFABRIC_SHA256}"
 # Fail the build if a NIXL or Mooncake library cannot load, a Python API is
 # missing, or the Mooncake plugin was not built.
 RUN cp -a /opt/nixl-python/. /opt/mooncake-python/. "$(python -c 'import site; print(site.getsitepackages()[0])')/" && \
     rm -rf /opt/nixl-python /opt/mooncake-python && \
     python -c "from mooncake.engine import TransferEngine; TransferEngine()" && \
-    ! ldd /opt/ucx/lib/*.so* /opt/ucx/lib/ucx/*.so* /opt/nixl/lib/*.so* /opt/nixl/lib/plugins/*.so /opt/mooncake/lib/*.so* | grep "not found" && \
+    ! ldd /opt/libfabric/lib/*.so* /opt/ucx/lib/*.so* /opt/ucx/lib/ucx/*.so* /opt/nixl/lib/*.so* /opt/nixl/lib/plugins/*.so /opt/mooncake/lib/*.so* | grep "not found" && \
     python -c "from nixl._api import nixl_agent; import importlib.metadata as m; print('nixl', m.version('nixl'))" && \
     ls /opt/nixl/lib/plugins | grep -q Mooncake && \
     /opt/ucx/bin/ucx_info -v && \
+    test ! -s /opt/libfabric/etc/libfabric.conf && \
+    /opt/libfabric/bin/fi_info -l && \
+    FI_PROVIDER=tcp FI_TCP_IFACE=eth0 FI_ADDR_FORMAT=FI_SOCKADDR_IN FI_PREFER_SYSCONFIG=0 python -c "from nixl._api import nixl_agent,nixl_agent_config; a=nixl_agent('libfabric-build-check',nixl_agent_config(backends=['LIBFABRIC'],num_threads=4,capture_telemetry=True)); assert set(a.backends)=={'LIBFABRIC'}" && \
     UCX_TLS=tcp,self UCX_NET_DEVICES=lo python -c "from nixl._api import nixl_agent,nixl_agent_config; a=nixl_agent('ucx-build-check',nixl_agent_config(backends=['UCX'],num_threads=4,capture_telemetry=True)); assert set(a.backends)=={'UCX'}; b=nixl_agent('mooncake-build-check',nixl_agent_config(backends=['Mooncake'],capture_telemetry=True)); assert set(b.backends)=={'Mooncake'}"
 
 # Add labels to document build configuration

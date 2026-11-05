@@ -484,6 +484,25 @@ together. Each rank's transfer engine serves TENT's metrics on the base port
 (`MC_TENT_CONF`'s `metrics/http_port`, else `TENT_METRICS_HTTP_PORT`, else
 9100) plus its local DP rank times the TP size plus its TP rank.
 
+NIXL can also select exactly `["UCX"]` or `["LIBFABRIC"]` for CPU TCP
+transfers. Both require `rank_addresses` even for TP1; the selected IPv4
+address must identify one non-loopback interface without IPv4 aliases.
+UCX uses `tcp,self` and that interface. LIBFABRIC uses the direct `tcp`
+provider, IPv4 only, and requires its interface to be UP and RUNNING.
+Use the CPU image built with the corresponding plugins; the e2e harness
+selects them with `server.nixl_backend: ucx` or `libfabric` while retaining
+`mooncake` as its default.
+
+Managed LIBFABRIC sets provider/interface policy before loading the native
+library. It requires `/opt/libfabric/etc/libfabric.conf` to be absent or
+empty and refuses configuration/provider overrides and rebinding a process
+to another interface. `FI_LOG_LEVEL`, `FI_LOG_PROV` and `FI_LOG_SUBSYS` are
+allowed for diagnostics. Its agent config uses four posting threads and
+background progress; these configured values do not independently observe
+live threads or provider/rail selection. Backend options and policy are
+logged separately. TENT accounting applies to Mooncake, while UCX and
+LIBFABRIC use NIXL telemetry, byte checks and network counters.
+
 Every rank of the last pipeline stage logs its own KV (`kv_layout`,
 `kv_transfers`, `kv_check`, `kv_events` and `threads` records), and with
 speculative decoding its own requests' drafts and accepted drafts each

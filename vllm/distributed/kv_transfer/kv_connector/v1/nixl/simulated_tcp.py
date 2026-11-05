@@ -1,11 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Managed CPU UCX/TCP binding, before the NIXL agent creates its context."""
+"""Managed CPU TCP binding, before NIXL initializes its selected backend."""
 
 import os
 import socket
 
 import psutil
+
+
+def tcp_interface(address: str, backend: str) -> str:
+    """Resolve one non-loopback IPv4 address without accepting aliases."""
+    interfaces = psutil.net_if_addrs()
+    matches = [
+        name
+        for name, addrs in interfaces.items()
+        if any(a.family == socket.AF_INET and a.address == address for a in addrs)
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{backend}/TCP address {address} needs one unique local interface: "
+            f"{matches}"
+        )
+    interface = matches[0]
+    ipv4 = [a.address for a in interfaces[interface] if a.family == socket.AF_INET]
+    if ipv4 != [address] or address.startswith("127."):
+        raise ValueError(
+            f"{backend}/TCP interface {interface} has ambiguous/loopback "
+            f"IPv4 addresses: {ipv4}"
+        )
+    return interface
 
 
 def bind_ucx_tcp(address: str, extra: dict) -> dict:
@@ -29,22 +52,7 @@ def bind_ucx_tcp(address: str, extra: dict) -> dict:
         for k in os.environ
     ):
         raise ValueError("Managed UCX/TCP does not accept NIXL_UCX overrides")
-    interfaces = psutil.net_if_addrs()
-    matches = [
-        name
-        for name, addrs in interfaces.items()
-        if any(a.family == socket.AF_INET and a.address == address for a in addrs)
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"UCX/TCP address {address} needs one unique local interface: {matches}"
-        )
-    interface = matches[0]
-    ipv4 = [a.address for a in interfaces[interface] if a.family == socket.AF_INET]
-    if ipv4 != [address] or address.startswith("127."):
-        raise ValueError(
-            f"UCX/TCP interface {interface} has ambiguous/loopback IPv4 addresses: {ipv4}"
-        )
+    interface = tcp_interface(address, "UCX")
     expected = {"UCX_TLS": "tcp,self", "UCX_NET_DEVICES": interface}
     for key, value in expected.items():
         if key in os.environ and os.environ[key] != value:
@@ -65,6 +73,25 @@ def agent_evidence(agent, requested: list[str], binding: dict | None) -> dict:
             f"NIXL initialized backends {initialized}, requested {requested}"
         )
     if binding is not None:
+        if requested == ["LIBFABRIC"]:
+            from .simulated_libfabric import validate_libfabric_binding
+
+            validate_libfabric_binding(binding)
+            options = agent.get_backend_params("LIBFABRIC")
+            if options != {"num_threads": "4"}:
+                raise ValueError(f"Unexpected managed LIBFABRIC options: {options}")
+            defaults = agent.get_plugin_params("LIBFABRIC")
+            if defaults != {"num_threads": "0", "split_batch_size": "1024"}:
+                raise ValueError(f"Unexpected LIBFABRIC plugin defaults: {defaults}")
+            return {
+                "backends": sorted(initialized),
+                "binding": binding,
+                "backend_options": options,
+                "plugin_defaults": defaults,
+                "thread_policy_source": "agent_config",
+                "native_provider_observed": False,
+                "native_threads_observed": False,
+            }
         # Config and engine_config modifications defer to UCX_*; device_list
         # alone bypasses them. Check observed options for that override too.
         options = agent.get_backend_params("UCX")

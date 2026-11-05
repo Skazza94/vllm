@@ -142,15 +142,19 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
     sim = vllm_config.simulation_config
     if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
         return
-    if list(backends) not in (["Mooncake"], ["UCX"]):
+    if list(backends) not in (["Mooncake"], ["LIBFABRIC"], ["UCX"]):
         raise ValueError(
-            f"rank_addresses supports a single UCX or Mooncake backend only, not backends {backends}."
+            "rank_addresses supports a single LIBFABRIC, UCX or Mooncake "
+            f"backend only, not backends {backends}."
         )
     kv_transfer_config = vllm_config.kv_transfer_config
     assert kv_transfer_config is not None
     if kv_transfer_config.kv_connector_extra_config.get("rank_addresses") is None:
-        if list(backends) == ["UCX"]:
-            raise ValueError("Managed UCX/TCP needs rank_addresses, including single-rank runs")
+        if list(backends) in (["UCX"], ["LIBFABRIC"]):
+            raise ValueError(
+                f"Managed {backends[0]}/TCP needs rank_addresses, "
+                "including single-rank runs"
+            )
         return
     if list(backends) == ["UCX"]:
         from .simulated_tcp import bind_ucx_tcp
@@ -158,6 +162,12 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
         address = this_rank_kv_address(vllm_config)
         assert address is not None
         return bind_ucx_tcp(address, kv_transfer_config.kv_connector_extra_config)
+    if list(backends) == ["LIBFABRIC"]:
+        from .simulated_libfabric import bind_libfabric_tcp
+
+        address = this_rank_kv_address(vllm_config)
+        assert address is not None
+        return bind_libfabric_tcp(address, kv_transfer_config.kv_connector_extra_config)
     address = this_rank_kv_address(vllm_config)
     assert address is not None
     os.environ["NIXL_MOONCAKE_IP_ADDR"] = address
@@ -785,20 +795,32 @@ class NixlBaseConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
+        sim = vllm_config.simulation_config
+        managed_libfabric = (
+            sim.simulate_forward
+            and sim.kv_transfer_mode == "real"
+            and self.nixl_backends == ["LIBFABRIC"]
+        )
+        if managed_libfabric and vllm_config.model_config.enable_sleep_mode:
+            raise ValueError("Managed LIBFABRIC/TCP does not support sleep mode")
+        binding = _bind_rank_kv_address(vllm_config, self.nixl_backends)
         if nixl_agent_config is None:
             config = None
         else:
             # Enable telemetry by default for NIXL 0.7.1 and above.
             config = (
                 nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
-                if len(non_ucx_backends) > 0
-                else nixl_agent_config(backends=["UCX"], num_threads=num_threads, capture_telemetry=True)
+                if len(non_ucx_backends) > 0 and not managed_libfabric
+                else nixl_agent_config(
+                    backends=["LIBFABRIC"] if managed_libfabric else ["UCX"],
+                    num_threads=num_threads,
+                    capture_telemetry=True,
+                )
             )
 
         sleep_mode = vllm_config.model_config.enable_sleep_mode and config is not None
         if sleep_mode:
             config = nixl_agent_config(backends=[], capture_telemetry=True)
-        binding = _bind_rank_kv_address(vllm_config, self.nixl_backends)
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         if sleep_mode:
             # Keep slept pages unpinned, for this agent only; UCX_* env vars win.
@@ -814,7 +836,9 @@ class NixlBaseConnectorWorker:
         if sim.simulate_forward and sim.kv_transfer_mode == "real":
             from .simulated_tcp import agent_evidence
 
-            self.simulated_transport = agent_evidence(self.nixl_wrapper, self.nixl_backends, binding)
+            self.simulated_transport = agent_evidence(
+                self.nixl_wrapper, self.nixl_backends, binding
+            )
             if binding is not None:
                 self.simulated_transport.update(
                     num_threads=num_threads, progress_thread=config.enable_pthread
