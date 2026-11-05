@@ -2389,7 +2389,9 @@ class HeterogeneousTpTests(unittest.TestCase):
         self.assertEqual(pd.global_heads(1, 2, 8), [4, 5, 6, 7])
 
 
-class UcxBackendTests(unittest.TestCase):
+class NixlTcpBackendTests(unittest.TestCase):
+    backend = "ucx"
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.model = Path(self.directory.name)
@@ -2397,7 +2399,8 @@ class UcxBackendTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def fixture(self, backend="ucx", change=None):
+    def fixture(self, backend=None, change=None):
+        backend = backend or self.backend
         factory = HeterogeneousTpTests()
         factory.model = self.model
         run = factory.run_for(2, 4, 8, True)
@@ -2410,29 +2413,40 @@ class UcxBackendTests(unittest.TestCase):
                     record["kv_layout"]["nixl_transport"] = {
                         "backends": ["UCX"], "num_threads": 4, "progress_thread": True, "binding": {"address": "10.1.0.1", "interface": "kv0",
                                                             "UCX_NET_DEVICES": "kv0", "UCX_TLS": "tcp,self"}}
+                    if backend == "libfabric":
+                        record["kv_layout"]["nixl_transport"] = {
+                            "backends": ["LIBFABRIC"], "num_threads": 4, "progress_thread": True,
+                            "thread_policy_source": "agent_config", "native_provider_observed": False,
+                            "native_threads_observed": False,
+                            "backend_options": {"num_threads": "4"},
+                            "plugin_defaults": {"num_threads": "0", "split_batch_size": "1024"},
+                            "binding": {"address": "10.1.0.1", "interface": "kv0", "FI_PROVIDER": "tcp",
+                                        "FI_TCP_IFACE": "kv0", "FI_ADDR_FORMAT": "FI_SOCKADDR_IN",
+                                        "FI_PREFER_SYSCONFIG": "0", "config_policy": "absent_or_empty",
+                                        "config_file": "/opt/libfabric/etc/libfabric.conf"}}
             return "".join(line(**record) for record in records)
-        if backend == "ucx":
+        if backend in ("ucx", "libfabric"):
             prefill, decode = [identity(t) for t in prefill], [identity(t) for t in decode]
         if change:
             prefill, decode, ports = change(prefill, decode, ports)
         return run, prefill, decode, ports, moved, tents
 
-    def verdict(self, backend="ucx", change=None):
+    def verdict(self, backend=None, change=None):
         run, p, d, ports, moved, tents = self.fixture(backend, change)
         return pd.check({"completed": 2, "errors": []}, p, d, {"control": 50, "kv": moved + 500},
-                        run, None if backend == "ucx" else tents, ports)
+                        run, tents if pd.uses_tent(run.server) else None, ports)
 
-    def test_ucx_full_accounting_and_missing_identity(self):
+    def test_tcp_full_accounting_and_missing_identity(self):
         verdict = self.verdict()
         self.assertEqual(verdict["problems"], [])
-        self.assertEqual(verdict["transport"], {"backend": "UCX", "tent_applicable": False})
+        self.assertEqual(verdict["transport"], {"backend": pd.nixl_backend(pd.Server(nixl_backend=self.backend)), "tent_applicable": False})
         self.assertIsNone(verdict["hp_tcp_task_limit"])
-        for find, replace in [('"nixl_transport"', '"missing_identity"'), ('"UCX"', '"Mooncake"'),
-                              ('"tcp,self"', '"all"'), ('"progress_thread": true', '"progress_thread": false')]:
+        for find, replace in [('"nixl_transport"', '"missing_identity"'), (json.dumps(pd.nixl_backend(pd.Server(nixl_backend=self.backend))), '"Mooncake"'),
+                              (('"tcp,self"' if self.backend == 'ucx' else '"FI_SOCKADDR_IN"'), '"all"'), ('"progress_thread": true', '"progress_thread": false')]:
             problems = self.verdict(change=lambda p,d,ports: (p,[t.replace(find,replace) for t in d],ports))["problems"]
             self.assertTrue(any("backend" in s or "interface evidence" in s or "thread/progress" in s for s in problems), problems)
 
-    def test_ucx_keeps_byte_descriptor_ownership_and_port_failures(self):
+    def test_tcp_keeps_byte_descriptor_ownership_and_port_failures(self):
         mutations = [
             lambda p,d,ports: (p,[t.replace('"ok": true','"ok": false') for t in d],ports),
             lambda p,d,ports: (p,d,{}),
@@ -2464,7 +2478,7 @@ class UcxBackendTests(unittest.TestCase):
             try:
                 # Exercise the hybrid's third guard with exactly the same logs.
                 p,d,ports=hybrid_logs(1,2)
-                run=pd.Run(**{**RUN.__dict__,"model":hybrid.model,"server":pd.Server(connector="nixl",nixl_backend="ucx"),
+                run=pd.Run(**{**RUN.__dict__,"model":hybrid.model,"server":pd.Server(connector="nixl",nixl_backend=self.backend),
                               "prefill":pd.Side("p","kv",tensor_parallel_size=1),"decode":pd.Side("d","kv",tensor_parallel_size=2)})
                 logs={"prefill":{(0,r):pd._records(t) for r,t in enumerate(p)},"decode":{(0,r):pd._records(t) for r,t in enumerate(d)}}
                 ranks={role:{key:{"transfers":{"bytes":sum(((x.get("kv_transfers") or {}).get("load") or {}).get("bytes",0) for x in records)},"requests":["a","b"]} for key,records in ls.items()} for role,ls in logs.items()}
@@ -2472,7 +2486,7 @@ class UcxBackendTests(unittest.TestCase):
                 self.assertEqual(reconcile()["problems"],[])
                 run.server.nixl_backend="mooncake"
                 self.assertTrue(any("guard" in s for s in reconcile()["problems"]))
-                run.server.nixl_backend="ucx"
+                run.server.nixl_backend=self.backend
                 for records in logs["decode"].values():
                     for r in records:
                         if "kv_check" in r:r["kv_check"]["coverage"]["reads"][0]["completed"]=False
@@ -2483,18 +2497,28 @@ class UcxBackendTests(unittest.TestCase):
         run,*_=self.fixture()
         command=pd.server_command(run,"decode",["10.1.0.1","10.1.0.3","10.1.0.5","10.1.0.7"])
         extra=json.loads(command[command.index("--kv-transfer-config")+1])["kv_connector_extra_config"]
-        self.assertEqual(extra["backends"],["UCX"])
+        self.assertEqual(extra["backends"],[pd.nixl_backend(run.server)])
         self.assertEqual(len(extra["rank_addresses"]),4)
         env=dict(v.split("=",1) for v in command[1:command.index(pd.VLLM)])
-        self.assertEqual(env["UCX_TLS"],"tcp,self")
+        if self.backend == "ucx":
+            self.assertEqual(env["UCX_TLS"],"tcp,self")
+        else:
+            self.assertEqual(env["FI_PROVIDER"],"tcp")
+            self.assertEqual(env["FI_ADDR_FORMAT"],"FI_SOCKADDR_IN")
+            self.assertEqual(env["FI_PREFER_SYSCONFIG"],"0")
+            self.assertNotIn("FI_TCP_IFACE",env)
         self.assertFalse(any(k.startswith(("MC_","TENT_","NIXL_MOONCAKE_")) for k in env))
-        for overrides in ({"UCX_TLS":"all"},{"UCX_NET_DEVICES":"control"},{"MC_USE_TENT":"0"},{"UCX_CONFIG_FILE":"x"},{"NIXL_UCX_DEVICE_LIST":"kv0"}):
+        invalid = ({"UCX_TLS":"all"},{"UCX_NET_DEVICES":"control"},{"MC_USE_TENT":"0"},{"UCX_CONFIG_FILE":"x"},{"NIXL_UCX_DEVICE_LIST":"kv0"}) if self.backend == "ucx" else (
+            {"FI_PROVIDER":"sockets"},{"FI_TCP_IFACE":"control"},{"FI_PROVIDER_PATH":""},
+            {"FI_TCP_PROV_NAME":"other"},{"FI_PREFER_SYSCONFIG":"1"},{"FI_ADDR_FORMAT":"FI_SOCKADDR_IN6"},
+            {"FI_TCP_TX_SIZE":"1"},{"NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG":"100"},{"MC_USE_TENT":"0"})
+        for overrides in invalid:
             run.server.env=overrides
             with self.assertRaises(ValueError):pd.server_command(run,"decode",["10.1.0.1"]*4)
         run.server.env={};run.server.connector="mooncake"
         with self.assertRaises(ValueError):pd.server_command(run,"decode",["10.1.0.1"]*4)
 
-    def test_ucx_saved_run_needs_no_tent_file_or_fetch(self):
+    def test_tcp_saved_run_needs_no_tent_file_or_fetch(self):
         from unittest.mock import patch
         run,p,d,ports,moved,_=self.fixture()
         run.server.timing="linear"
@@ -2512,7 +2536,7 @@ class UcxBackendTests(unittest.TestCase):
         (out/"run.json").write_text(json.dumps(raw))
         with self.assertRaises(FileNotFoundError):pd.recheck(out)
 
-    def test_ucx_live_collection_marks_tent_not_applicable(self):
+    def test_tcp_live_collection_marks_tent_not_applicable(self):
         from unittest.mock import patch
         run,p,d,ports,moved,_=self.fixture()
         output=Path(self.directory.name)/"live"
@@ -2535,9 +2559,9 @@ class UcxBackendTests(unittest.TestCase):
             self.assertEqual(pd.execute(run,output)["problems"],[])
         self.assertFalse((output/"tent.json").exists())
         self.assertFalse((output/"tent-after.json").exists())
-        self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":"UCX","tent_applicable":False})
+        self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":pd.nixl_backend(run.server),"tent_applicable":False})
 
-    def test_ucx_large_descriptor_plan_keeps_exact_counts_and_bytes(self):
+    def test_tcp_large_descriptor_plan_keeps_exact_counts_and_bytes(self):
         heads={"decode":{0:[[0]]}}
         sender=[{(0,0):0}]
         sources={0:[0]}
@@ -2550,3 +2574,36 @@ class UcxBackendTests(unittest.TestCase):
         self.assertTrue(any("measured" in s for s in pd._plan_problems(*args,max_descriptors=None)))
         entry[3]=2048;entry[0]=2049
         self.assertTrue(any("bytes" in s for s in pd._plan_problems(*args,max_descriptors=None)))
+
+
+class LibfabricBackendTests(NixlTcpBackendTests):
+    backend = "libfabric"
+
+    def test_policy_metadata_is_not_a_native_provider_or_thread_observation(self):
+        for key, value in (("native_provider_observed", True), ("native_threads_observed", True),
+                           ("thread_policy_source", "native"), ("num_threads", 8),
+                           ("backend_options", {"num_threads":"0"}),
+                           ("plugin_defaults", {"num_threads":"0", "split_batch_size":"2048"})):
+            def change(p,d,ports):
+                records=pd._records(d[0])
+                for record in records:
+                    if "kv_layout" in record:record["kv_layout"]["nixl_transport"][key]=value
+                return p,["".join(line(**r) for r in records),*d[1:]],ports
+            self.assertTrue(any("configured-policy" in text for text in self.verdict(change=change)["problems"]))
+
+    def test_full_selected_span_bytes_and_length_bins_remain_mandatory(self):
+        hybrid=HybridHeterogeneousTpTests();hybrid.setUp()
+        try:
+            p,d,ports=hybrid_logs(1,2)
+            run=pd.Run(**{**RUN.__dict__,"model":hybrid.model,"server":pd.Server(connector="nixl",nixl_backend="libfabric"),
+                          "prefill":pd.Side("p","kv",tensor_parallel_size=1),"decode":pd.Side("d","kv",tensor_parallel_size=2)})
+            logs={"prefill":{(0,r):pd._records(t) for r,t in enumerate(p)},"decode":{(0,r):pd._records(t) for r,t in enumerate(d)}}
+            ranks={role:{key:{"transfers":{"bytes":sum(((x.get("kv_transfers") or {}).get("load") or {}).get("bytes",0) for x in records)},"requests":["a","b"]} for key,records in ls.items()} for role,ls in logs.items()}
+            reconcile=lambda:pd._hetero_tp(run,{"prefill":1,"decode":2},logs,ranks,ports)
+            self.assertEqual(reconcile()["problems"],[])
+            entry=next(e for records in logs["decode"].values() for r in records for e in ((r.get("kv_transfers") or {}).get("load") or {}).get("each",[]))
+            plan=entry[6]
+            for index,value in ((3,plan[3]-1),(4,{})):
+                saved=plan[index];plan[index]=value
+                self.assertTrue(reconcile()["problems"]);plan[index]=saved
+        finally:hybrid.tearDown()

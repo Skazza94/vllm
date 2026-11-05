@@ -2,8 +2,8 @@
 
 Prefill and decode each run ``vllm serve`` with simulated compute and real
 KV transfers through MooncakeConnector (prefill writes), or NixlConnector
-over its Mooncake or UCX/TCP backend (decode reads; ``server.connector: nixl``).
-The Mooncake paths use TENT's hp_tcp only; UCX uses its rank's resolved TCP
+over its Mooncake, UCX/TCP or LIBFABRIC/TCP backend (decode reads; ``server.connector: nixl``).
+The Mooncake paths use TENT's hp_tcp only; UCX and LIBFABRIC use each rank's resolved TCP
 interface. NIXL's handshake uses the KV network too: one side channel per DP
 engine, on rank 0's network, at ports of their own. HTTP, the proxy and
 Mooncake's bootstrap use the control network. The client node runs the
@@ -18,7 +18,7 @@ The run is then checked from what the servers and routers recorded: every
 request completed, decode compared every byte it received with prefill's
 pattern (``kv_check``) on every rank, the connector failed no transfer and
 moved the bytes decode checked, each Mooncake rank's TENT saw its connector's
-bytes (TENT is not applicable to UCX), and the KV crossed its rank's network's router, not another's or the
+bytes (TENT is not applicable to UCX/LIBFABRIC), and the KV crossed its rank's network's router, not another's or the
 control one's. A model of several KV cache groups (full and sliding-window
 attention) is checked group by group against the rank's layout, a window's
 pulls holding its last blocks only; the verdict keeps each group's evidence
@@ -138,9 +138,9 @@ class Server:
     """Its arguments; aisimulate's default to {gpu} (plus a target_model)."""
     connector: str = "mooncake"
     """The KV connector: mooncake (MooncakeConnector, prefill writes) or nixl
-    (NixlConnector, decode reads). nixl_backend selects Mooncake/TENT or UCX/TCP."""
+    (NixlConnector, decode reads). nixl_backend selects Mooncake/TENT, UCX/TCP or LIBFABRIC/TCP."""
     nixl_backend: str = "mooncake"
-    """NIXL backend: mooncake (legacy default) or CPU ucx over TCP."""
+    """NIXL backend: mooncake (default), ucx or libfabric over CPU TCP."""
     speculative: dict | None = None
     """Native MTP over NIXL: {method: mtp, num_speculative_tokens: k (1 to
     5), acceptance_rates: [...], seed: 0}. Both instances take the same
@@ -286,24 +286,41 @@ def uses_ucx(server: Server) -> bool:
     return server.connector == "nixl" and server.nixl_backend == "ucx"
 
 
+def uses_tent(server: Server) -> bool:
+    return server.connector != "nixl" or server.nixl_backend == "mooncake"
+
+
+def nixl_backend(server: Server) -> str:
+    return {"mooncake": "Mooncake", "ucx": "UCX", "libfabric": "LIBFABRIC"}[server.nixl_backend]
+
+
 def _check_backend(server: Server) -> None:
-    if server.nixl_backend not in ("mooncake", "ucx"):
-        raise ValueError("server.nixl_backend is one of mooncake, ucx")
-    if server.nixl_backend == "ucx" and server.connector != "nixl":
-        raise ValueError("UCX needs server.connector: nixl")
-    if uses_ucx(server):
+    if server.nixl_backend not in ("mooncake", "ucx", "libfabric"):
+        raise ValueError("server.nixl_backend is one of mooncake, ucx, libfabric")
+    if server.nixl_backend != "mooncake" and server.connector != "nixl":
+        raise ValueError("UCX/LIBFABRIC needs server.connector: nixl")
+    if not uses_tent(server):
         if server.hp_tcp_args or any(k.startswith(("MC_", "TENT_", "NIXL_MOONCAKE_")) for k in server.env):
-            raise ValueError("UCX does not accept TENT/Mooncake settings")
+            raise ValueError("UCX/LIBFABRIC does not accept TENT/Mooncake settings")
+    if uses_ucx(server):
         if "UCX_TLS" in server.env and server.env["UCX_TLS"] != "tcp,self":
             raise ValueError("Managed UCX needs UCX_TLS=tcp,self")
         if any(k in server.env for k in ("UCX_NET_DEVICES", "UCX_CONFIG_FILE")):
             raise ValueError("UCX interface/config selection is managed per rank")
         if any(k.startswith("NIXL_UCX_") and k != "NIXL_UCX_WARNING_TIMEOUT" for k in server.env):
             raise ValueError("Managed UCX does not accept NIXL_UCX overrides")
+    if server.nixl_backend == "libfabric":
+        policy = {"FI_PROVIDER": "tcp", "FI_ADDR_FORMAT": "FI_SOCKADDR_IN", "FI_PREFER_SYSCONFIG": "0"}
+        diagnostics = {"FI_LOG_LEVEL", "FI_LOG_PROV", "FI_LOG_SUBSYS"}
+        for key, value in server.env.items():
+            if key.startswith("NIXL_LIBFABRIC_") or (key.startswith("FI_") and key not in set(policy) | diagnostics):
+                raise ValueError(f"Managed LIBFABRIC does not accept {key}")
+            if key in policy and str(value) != policy[key]:
+                raise ValueError(f"Managed LIBFABRIC needs {key}={policy[key]}")
 
 
 def descriptor_limit(server: Server) -> int | None:
-    return None if uses_ucx(server) else NIXL_MAX_DESCRIPTORS
+    return NIXL_MAX_DESCRIPTORS if uses_tent(server) else None
 
 
 def hp_tcp_task_limit(server: Server) -> int | None:
@@ -316,7 +333,7 @@ def hp_tcp_task_limit(server: Server) -> int | None:
             hp_tcp, dict) else None
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    if uses_ucx(server):
+    if not uses_tent(server):
         return None
     env = {name: str(value) for name, value in server.env.items()}
     if env.get("MC_USE_TENT", "1") != "1":
@@ -368,6 +385,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
 
     _check_backend(run.server)
     ucx = uses_ucx(run.server)
+    non_tent = not uses_tent(run.server)
     kv_address = kv_addresses[0]
     side = getattr(run, role)
 
@@ -385,9 +403,9 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     kv_transfer = {"kv_connector": "NixlConnector" if nixl else "MooncakeConnector",
                    "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
                    "kv_buffer_device": "cpu",
-                   # NIXL's default backend is UCX, which the image lacks.
-                   "kv_connector_extra_config": {"backends": ["UCX" if ucx else "Mooncake"]} if nixl else {"mooncake_protocol": "tcp"}}
-    if ucx or len(set(kv_addresses)) > 1:
+                   # Explicit selection prevents another installed backend from taking over.
+                   "kv_connector_extra_config": {"backends": [nixl_backend(run.server)]} if nixl else {"mooncake_protocol": "tcp"}}
+    if non_tent or len(set(kv_addresses)) > 1:
         kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
@@ -409,9 +427,12 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
         "TENT_METRICS_REPORT_INTERVAL": "0",
         **{name: str(value) for name, value in run.server.env.items()},
     }
-    if ucx:
+    if non_tent:
         env = {k: v for k, v in env.items() if not k.startswith(("MC_", "TENT_", "NIXL_MOONCAKE_"))}
-        env["UCX_TLS"] = "tcp,self"
+        if ucx:
+            env["UCX_TLS"] = "tcp,self"
+        else:
+            env.update(FI_PROVIDER="tcp", FI_ADDR_FORMAT="FI_SOCKADDR_IN", FI_PREFER_SYSCONFIG="0")
     s = run.server
     return [
         "env", *(f"{name}={value}" for name, value in env.items()),
@@ -505,13 +526,13 @@ def execute(run: Run, output: Path | None = None) -> dict:
         (output / "router-ports.json").write_text(json.dumps(ports, indent=2) + "\n")
     tent = {role: [_tent_delta(before, after) for before, after in zip(tent_before[role], tent_after[role])]
             for role in tent_before}
-    if not uses_ucx(run.server):
+    if uses_tent(run.server):
         (output / "tent.json").write_text(json.dumps(tent, indent=2) + "\n")
     # As served after the workload: their labels (transports) included.
-    if not uses_ucx(run.server):
+    if uses_tent(run.server):
         (output / "tent-after.json").write_text(json.dumps(tent_after, indent=2) + "\n")
     else:
-        (output / "transport.json").write_text(json.dumps({"backend": "UCX", "tent_applicable": False}) + "\n")
+        (output / "transport.json").write_text(json.dumps({"backend": nixl_backend(run.server), "tent_applicable": False}) + "\n")
     verdict = check(
         json.loads((output / "bench.json").read_text()),
         *[[(output / _step_log_name(role, dp, tp)).read_text()
@@ -541,7 +562,7 @@ def recheck(output: str | Path) -> dict:
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         json.loads((output / "routers.json").read_text()), run,
-        None if uses_ucx(run.server) else json.loads((output / "tent.json").read_text()),
+        None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
@@ -559,8 +580,8 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
 
     problems = []
     _check_backend(run.server)
-    if uses_ucx(run.server) and tent:
-        problems.append("UCX received unexpected TENT accounting")
+    if not uses_tent(run.server) and tent:
+        problems.append(f"{nixl_backend(run.server)} received unexpected TENT accounting")
     w = run.workload
     sizes = {"prefill": run.prefill.tp(run.server), "decode": run.decode.tp(run.server)}
     # Equal sizes pair rank r with rank r; unequal ones re-shard heads
@@ -584,7 +605,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     logs = {role: dict(zip(side.ranks(sizes[role]), map(_records, steps)))
             for role, side, steps in (("prefill", run.prefill, prefill_steps),
                                       ("decode", run.decode, decode_steps))}
-    tents = {role: dict(zip(sides[role].ranks(sizes[role]), tent[role])) for role in tent} if tent and not uses_ucx(run.server) else {}
+    tents = {role: dict(zip(sides[role].ranks(sizes[role]), tent[role])) for role in tent} if tent and uses_tent(run.server) else {}
     # Each TP rank's steps, every DP rank's requests: under MoE DP only DP
     # rank 0 logs the joint steps, the others their own KV.
     joint_steps: dict[tuple[str, int], dict[str, list[tuple[int, int, int]]]] = {
@@ -615,23 +636,37 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             if sent["failed"]:
                 problems.append(f"{at}{role}'s connector failed {sent['failed']} transfer(s)")
             identity = (layout or {}).get("nixl_transport")
-            if run.server.connector == "nixl" and (uses_ucx(run.server) or identity is not None):
-                expected = ["UCX"] if uses_ucx(run.server) else ["Mooncake"]
+            if run.server.connector == "nixl" and (not uses_tent(run.server) or identity is not None):
+                expected = [nixl_backend(run.server)]
                 if not isinstance(identity, dict) or identity.get("backends") != expected:
                     problems.append(f"{at}{role}'s initialized NIXL backend is {identity}, expected {expected}")
-                elif uses_ucx(run.server):
+                elif not uses_tent(run.server):
                     binding = identity.get("binding") or {}
-                    if (not binding.get("address") or not binding.get("interface")
-                            or binding.get("UCX_TLS") != "tcp,self"
-                            or binding.get("UCX_NET_DEVICES") != binding.get("interface")):
-                        problems.append(f"{at}{role} has no valid UCX TCP/interface evidence: {binding}")
+                    ucx = uses_ucx(run.server)
+                    settings_ok = (binding.get("UCX_TLS") == "tcp,self"
+                                   and binding.get("UCX_NET_DEVICES") == binding.get("interface")) if ucx else (
+                        binding.get("FI_PROVIDER") == "tcp"
+                        and binding.get("FI_TCP_IFACE") == binding.get("interface")
+                        and binding.get("FI_ADDR_FORMAT") == "FI_SOCKADDR_IN"
+                        and binding.get("FI_PREFER_SYSCONFIG") == "0"
+                        and binding.get("config_file") == "/opt/libfabric/etc/libfabric.conf"
+                        and binding.get("config_policy") == "absent_or_empty")
+                    if not binding.get("address") or not binding.get("interface") or not settings_ok:
+                        problems.append(f"{at}{role} has no valid {nixl_backend(run.server)} TCP/interface evidence: {binding}")
                     if (identity.get("progress_thread") is not True
                             or type(identity.get("num_threads")) is not int or identity["num_threads"] < 0):
-                        problems.append(f"{at}{role} has no valid UCX thread/progress evidence")
+                        problems.append(f"{at}{role} has no valid {nixl_backend(run.server)} thread/progress evidence")
+                    if not ucx and (identity.get("num_threads") != 4
+                                    or identity.get("thread_policy_source") != "agent_config"
+                                    or identity.get("native_provider_observed") is not False
+                                    or identity.get("native_threads_observed") is not False
+                                    or identity.get("backend_options") != {"num_threads": "4"}
+                                    or identity.get("plugin_defaults") != {"num_threads": "0", "split_batch_size": "1024"}):
+                        problems.append(f"{at}{role} lacks LIBFABRIC configured-policy/backend-options evidence")
                     addresses = {p["address"] for network in (ports or {}).values() for p in network.values()
                                  if p.get("node") == side.node and p.get("slot") == tp and p.get("address")}
                     if addresses and addresses != {binding.get("address")}:
-                        problems.append(f"{at}{role}'s UCX address {binding.get('address')} differs from rank port {addresses}")
+                        problems.append(f"{at}{role}'s {nixl_backend(run.server)} address {binding.get('address')} differs from rank port {addresses}")
             logged = [record["kv_check"] for record in records if "kv_check" in record]
             # A transfer's check; a prefix hit's; a request the content
             # patterns could not describe (fill, write).
@@ -898,7 +933,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         speculation = _speculation(bench, logs["decode"], run)
         problems.extend(speculation.pop("problems"))
     return {
-        **({"transport": {"backend": "UCX", "tent_applicable": False}} if uses_ucx(run.server) else {}),
+        **({"transport": {"backend": nixl_backend(run.server), "tent_applicable": False}} if not uses_tent(run.server) else {}),
         "problems": problems,
         "requests": bench.get("completed"),
         "kv_checks": per_tp[0]["kv_checks"] if per_tp else 0,
@@ -1356,7 +1391,7 @@ def _fragmentation(prefill: list[list[dict]], decode: list[list[dict]], verified
 NIXL_MAX_DESCRIPTORS = 1024
 """A conservative benchmark guard on the descriptors vLLM selects for one
 NIXL/Mooncake READ (before NIXL merges them): not a proven native limit,
-since the plugin receives the merged list. This is not a UCX limit."""
+since the plugin receives the merged list. This is not a UCX or LIBFABRIC limit."""
 
 
 def kv_heads_of(model: Path) -> int | None:
@@ -2515,7 +2550,7 @@ def _tent_metrics(run: Run, container: dict[str, str]) -> dict[str, list[str | N
     fetch = ("import sys, urllib.request\n"
              "try:\n    print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())\n"
              "except Exception:\n    print('NO ANSWER')\n")
-    if uses_ucx(run.server):
+    if not uses_tent(run.server):
         return {}
     metrics: dict[str, list[str | None]] = {}
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
