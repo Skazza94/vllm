@@ -1,0 +1,4 @@
+FROM vllm-sim:cpu
+
+RUN printf '%s\n' 'aisimulate==0.13.0.dev202610290000000087 --hash=sha256:8da05b9ad25c26a70aeec4ac9cd674ab097a7db3a41797bb3f69c72b856a63a1' | \
+    /opt/venv/bin/python -m pip install --no-cache-dir --no-deps --require-hashes --extra-index-url https://pypi.nvidia.com -r /dev/stdin

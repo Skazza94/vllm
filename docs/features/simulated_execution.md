@@ -81,6 +81,13 @@ forward-pass performance model for each step. It needs the optional
 per attention data-parallel rank, from kernel timings measured on that GPU
 under a vLLM release, with no analytical fallback.
 
+To add the pinned package to an existing `vllm-sim:cpu` image, run from
+the vLLM checkout:
+
+```bash
+docker build -f docker/Dockerfile.aisim -t vllm-sim:cpu-aisim .
+```
+
 The deployment it times is the published model `target_model`, with that
 model's published weight precision. The model's own Hugging Face id or a
 `<org>--<name>/<commit>` directory names the target; a derived copy (a
