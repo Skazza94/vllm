@@ -1829,9 +1829,21 @@ class HpTcpEvidenceTests(unittest.TestCase):
         unknown = pd.Run(**{**RUN.__dict__, "server": pd.Server(env={"MC_TENT_CONF": "{not json"})})
         verdict = self.verdict(sends((2000, 100, 10.0, 10.1)), run=unknown)
         self.assertIn("task limit is unknown", self.hp_tcp(verdict)["notes"][0])
-        # NIXL: TENT's counters, no connector writes.
-        self.assertIsNone(self.verdict(sends((2000, 100, 10.0, 10.1)))["dp_ranks"]["decode"][0]["hp_tcp"].get(
-            "max_connector_descriptors_per_write"))
+        # NIXL (its own run: decode loads and TENT reads, prefill writes nothing): prefill's hp_tcp
+        # evidence is TENT's counters only, without the connector-write keys Mooncake's always has.
+        decode = ONE_RANK + line(kv_transfers={"load": {"count": 2, "bytes": 2000, "failed": 0}}) + line(
+            kv_check=checked("a")) + line(kv_check=checked("b"))
+        tents = {"prefill": [{"tent_registered_buffer_bytes": 1600, "tent_transport_attempts_total": 7}],
+                 "decode": [{"tent_read_bytes_total": 2000, "tent_registered_buffer_bytes": 1600}]}
+        nixl = pd.check({"completed": 2, "errors": []}, [ONE_RANK + allocated("a", "b")], [decode],
+                        {"control": 50, "data0": 2100}, NIXL, tents)
+        self.assertEqual(nixl["problems"], [])
+        evidence = self.hp_tcp(nixl)
+        for key in ("max_connector_descriptors_per_write", "connector_writes", "task_limit"):
+            self.assertNotIn(key, evidence)
+        self.assertEqual(evidence["transport_attempts"], 7)
+        mooncake = self.hp_tcp(self.verdict(sends((2000, 100, 10.0, 10.1))))
+        self.assertEqual((mooncake["max_connector_descriptors_per_write"], mooncake["task_limit"]), (100, 4096))
 
 
 # Unequal TP: heads re-sharded, reconciled with the native pairing.
