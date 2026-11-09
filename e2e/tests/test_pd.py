@@ -687,16 +687,18 @@ class RecheckTests(unittest.TestCase):
 
     def save(self, directory: Path, checks: list[dict], timing: bool = True) -> None:
         moved = sum(c["bytes"] for c in checks)
-        saved = {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}}
+        saved = {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}, "front": "proxy"}
         if not timing:  # saved before server.timing existed (the roofline's runs)
             saved["server"] = {k: v for k, v in saved["server"].items() if k not in ("timing", "timing_args")}
         (directory / "run.json").write_text(json.dumps(saved, default=str))
         (directory / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
         (directory / "routers.json").write_text(json.dumps({"control": 50, "data0": moved + 100}))
         (directory / "tent.json").write_text("{}")
-        (directory / "prefill-steps.jsonl").write_text(
+        (directory / "control-ports.json").write_text(json.dumps({"nodes": [], "bytes": 0, "ports": {
+            "p0": {"node": "c", "rx": 50, "tx": 0}, "p1": {"node": "p", "rx": 0, "tx": 25}, "p2": {"node": "d", "rx": 0, "tx": 25}}}))
+        (directory / "prefill-p-steps.jsonl").write_text(
             GROUPS_LAYOUT + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": moved}}))
-        (directory / "decode-steps.jsonl").write_text(
+        (directory / "decode-d-steps.jsonl").write_text(
             GROUPS_LAYOUT + PULLS + FIRST_STEPS + "".join(line(kv_check=c) for c in checks))
 
     def test_recheck_exits_with_the_verdict(self) -> None:
@@ -710,6 +712,19 @@ class RecheckTests(unittest.TestCase):
                 verdict = json.loads((Path(directory) / "verdict-recheck.json").read_text())
                 self.assertEqual(json.loads(printed.getvalue())["problems"], verdict["problems"])
                 self.assertEqual(bool(verdict["problems"]), bool(status))
+
+    def test_control_evidence_that_is_no_object_fails_the_replay(self) -> None:
+        for document in ("null", "[]", "0", '"ports"', "{}", '{"ports": null}'):
+            with self.subTest(document=document), tempfile.TemporaryDirectory() as directory:
+                self.save(Path(directory), [grouped("a"), grouped("b")])
+                (Path(directory) / "control-ports.json").write_text(document)
+                problems = pd.recheck(directory)["problems"]
+                self.assertEqual(problems, ["the control network's port evidence is missing"])
+        with tempfile.TemporaryDirectory() as directory:
+            self.save(Path(directory), [grouped("a"), grouped("b")])
+            (Path(directory) / "control-ports.json").unlink()
+            with self.assertRaises(FileNotFoundError):
+                pd.recheck(directory)
 
     def test_a_run_saved_without_a_timing_provider_still_rechecks(self) -> None:
         from harness.__main__ import main
@@ -915,13 +930,184 @@ class DataParallelCheckTests(unittest.TestCase):
     def test_ranks_follow_the_hosts_order(self) -> None:
         run = dp_run(2, 2, tp=2)
         self.assertEqual(run.prefill.ranks(2), [(0, 0), (0, 1), (1, 0), (1, 1)])
-        self.assertEqual(pd._step_log_name("decode", 1, 1), "decode-steps.dp1.tp1.jsonl")
-        self.assertEqual(pd._step_log_name("decode", 0, 0), "decode-steps.jsonl")
+        self.assertEqual(run.decode.step_log("decode", 1, 1), "decode-d-steps.dp1.tp1.jsonl")
+        self.assertEqual(run.decode.step_log("decode", 0, 0), "decode-d-steps.jsonl")
         command = " ".join(pd.server_command(run, "prefill", ["10.100.0.1", "10.101.0.1"]))
         # Local DP rank by TP rank, each TP rank on its own rail.
         self.assertIn('"rank_addresses": ["10.100.0.1", "10.101.0.1", "10.100.0.1", "10.101.0.1"]', command)
         self.assertIn("--data-parallel-size 2 --enable-expert-parallel", command)
         self.assertNotIn("--data-parallel-size", " ".join(pd.server_command(TP2, "prefill", ["a", "b"])))
+
+
+def instances_run(prefill: list[str], decode: list[str], tp: int = 1, connector: str = "mooncake") -> pd.Run:
+    networks = "data0" if tp == 1 else ["data0", "data1"]
+    return pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side(prefill, networks),
+                  decode=pd.Side(decode, networks), client="c", control_network="control",
+                  server=pd.Server(tensor_parallel_size=tp, connector=connector), workload=pd.Workload(num_prompts=2))
+
+
+def tent_counters(moved: int | None, mover: str = "tent_write_bytes_total") -> dict:
+    counters = {"tent_registered_buffer_bytes": 4096.0}
+    if moved is not None:
+        counters[mover] = float(moved)
+    return counters
+
+
+class InstanceCheckTests(unittest.TestCase):
+    """Several instances of a side (``node`` a list, one engine each, as
+    llm-d's router places requests): each instance owns requests as a DP
+    rank would, its logs saying DP rank 0."""
+
+    def verdict(self, prefill=None, decode=None, run=None, tent=None) -> dict:
+        prefill = prefill or [dp_layout(0) + allocated("a") + sent(1000), dp_layout(0) + allocated("b") + sent(1000)]
+        decode = decode or [dp_layout(0) + line(kv_check=checked("a")), dp_layout(0) + line(kv_check=checked("b"))]
+        run = run or instances_run(["p0", "p1"][:len(prefill)], ["d0", "d1"][:len(decode)])
+        return pd.check({"completed": 2, "errors": []}, prefill, decode, {"control": 50, "data0": 2100}, run, tent)
+
+    def test_each_request_has_one_producing_and_one_consuming_instance(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["ownership"], {"producers": {0: 1, 1: 1}, "consumers": {0: 1, 1: 1}})
+        self.assertEqual(verdict["instances"], {"prefill": ["p0", "p1"], "decode": ["d0", "d1"]})
+        self.assertEqual((verdict["kv_bytes_checked"], verdict["transfers"]["bytes"]), (2000, 2000))
+
+    def test_ownership_failures_name_the_instance(self) -> None:
+        cases = {
+            "1 request(s) more than one of the prefill DP ranks produced": {"prefill": [
+                dp_layout(0) + allocated("a", "b") + sent(1000), dp_layout(0) + allocated("b") + sent(1000)]},
+            "1 request(s) more than one of the decode DP ranks consumed": {"decode": [
+                dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b")),
+                dp_layout(0) + line(kv_check=checked("b"))]},
+            # Each instance is one engine: its log says DP rank 0.
+            "instance p1: prefill's log is DP rank 1, not 0": {"prefill": [
+                dp_layout(0) + allocated("a") + sent(1000), dp_layout(1) + allocated("b") + sent(1000)]},
+        }
+        for message, given in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(**given)["problems"]
+                self.assertTrue(any(message in problem for problem in problems), problems)
+
+    def test_an_idle_instance_may_lack_its_moved_series_an_owner_may_not(self) -> None:
+        prefill = [dp_layout(0) + allocated("a", "b") + sent(2000), dp_layout(0)]
+        decode = [dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b"))]
+        run = instances_run(["p0", "p1"], ["d0"])
+        verdict = self.verdict(prefill, decode, run, {"prefill": [tent_counters(2000), tent_counters(None)],
+                                                      "decode": [tent_counters(None)]})
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["idle_ranks"], ["prefill p1 rank 0"])
+        problems = self.verdict(prefill, decode, run, {"prefill": [tent_counters(None), tent_counters(None)],
+                                                       "decode": [tent_counters(None)]})["problems"]
+        self.assertTrue(any("instance p0: prefill's TENT metrics lack tent_write_bytes_total" in p
+                            for p in problems), problems)
+
+    def test_instances_name_their_step_logs_and_ports(self) -> None:
+        run = instances_run(["p0", "p1"], ["d0"], tp=2)
+        side = run.prefill
+        self.assertEqual(side.ranks(2), [(0, 0), (0, 1), (1, 0), (1, 1)])
+        self.assertEqual([side.node_of(dp) for dp, _ in side.ranks(2)], ["p0", "p0", "p1", "p1"])
+        self.assertEqual(side.step_log("prefill", 1, 1), "prefill-p1-steps.tp1.jsonl")
+        self.assertEqual(side.remote_step_log(1, 1), f"{pd.WORK}/steps.tp1.jsonl")
+        self.assertEqual(side.local_rank(1, 1, 2), 1)
+        # One instance: its DP ranks' suffixes, its node's name.
+        self.assertEqual(RUN.prefill.step_log("prefill", 0, 0), "prefill-p-steps.jsonl")
+        self.assertEqual(dp_run(2, 1).prefill.local_rank(1, 0, 1), 1)
+
+    def test_node_lists_are_validated(self) -> None:
+        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+                "prefill": {"node": ["p0", "p1"], "kv_network": "data0"},
+                "decode": {"node": ["d0"], "kv_network": "data0"}, "server": {"timing": "zero"}}
+        self.assertEqual(pd.parse(base, Path("/x/run.yaml")).prefill.nodes, ["p0", "p1"])
+        cases = {
+            "distinct nodes": {"prefill": {"node": ["p0", "p0"], "kv_network": "data0"}},
+            "one engine each": {"prefill": {"node": ["p0", "p1"], "kv_network": "data0", "data_parallel_size": 2}},
+            "distinct nodes ": {"decode": {"node": ["p1"], "kv_network": "data0"}},
+            "equal TP sizes": {"decode": {"node": ["d0"], "kv_network": "data0", "tensor_parallel_size": 2}},
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message.strip()):
+                pd.parse({**base, **change}, Path("/x/run.yaml"))
+
+    def test_the_front_ends_control_traffic_is_left_out_of_the_guard(self) -> None:
+        run = instances_run(["p0", "p1"], ["d0", "d1"])
+        prefill = [dp_layout(0) + allocated("a") + sent(1000), dp_layout(0) + allocated("b") + sent(1000)]
+        decode = [dp_layout(0) + line(kv_check=checked("a")), dp_layout(0) + line(kv_check=checked("b"))]
+        routers = {"control": 450, "data0": 2100}
+        problems = pd.check({"completed": 2, "errors": []}, prefill, decode, routers, run)["problems"]
+        self.assertTrue(any("control network carried 450 bytes, too much" in p for p in problems), problems)
+        # 450 bytes received at the router: 300 of them to or from the gateway.
+        verdict = pd.check({"completed": 2, "errors": []}, prefill, decode, routers, run, None, None,
+                           self.exemption(), ["gw"])
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["control_network"], {"bytes": 450, "front_end_bytes": 300,
+                                                      "front_end_nodes": ["gw"], "guarded_bytes": 150})
+        # What is left must still stay under the guard.
+        exempt = self.exemption()
+        exempt["ports"]["c"]["rx"] += 100
+        problems = pd.check({"completed": 2, "errors": []}, prefill, decode, routers, run, None, None,
+                            exempt, ["gw"])["problems"]
+        self.assertTrue(any("carried 250 bytes besides the front end's 300" in p for p in problems), problems)
+
+    @staticmethod
+    def exemption() -> dict:
+        ports = {"gw": (100, 200), "p0": (50, 25), "p1": (50, 25), "d0": (50, 25), "d1": (50, 25), "c": (150, 150)}
+        return {"nodes": ["gw"], "bytes": 300,
+                "ports": {node: {"node": node, "rx": rx, "tx": tx} for node, (rx, tx) in ports.items()}}
+
+    def test_the_control_evidence_is_derived_from_its_ports_and_validated(self) -> None:
+        run = instances_run(["p0", "p1"], ["d0", "d1"])
+        self.assertEqual(pd.control_evidence(self.exemption(), run, ["gw"]), (450, 300, []))
+
+        def drop(node):
+            def change(exempt): del exempt["ports"][node]
+            return change
+
+        def counter(node, key, value):
+            def change(exempt): exempt["ports"][node][key] = value
+            return change
+
+        cases = {
+            "no ports": (lambda e: e.update(ports={}, bytes=0), "lacks the nodes"),
+            "no port collection": (lambda e: e.pop("ports"), "port evidence is missing"),
+            "an inflated subtotal": (lambda e: e.update(bytes=3_000_000_000), "its ports give 300"),
+            "a zeroed subtotal": (lambda e: e.update(bytes=0), "its ports give 300"),
+            "no gateway port": (drop("gw"), r"lacks the nodes \['gw'\]"),
+            "no server port": (drop("d1"), r"lacks the nodes \['d1'\]"),
+            "no client port": (drop("c"), r"lacks the nodes \['c'\]"),
+            "other exempt nodes": (lambda e: e.update(nodes=["gw", "c"]), "the front end's are"),
+            "no exempt nodes": (lambda e: e.update(nodes=[]), "the front end's are"),
+            "a negative counter": (counter("p0", "rx", -5), "invalid rx counter"),
+            "a counter that is no integer": (counter("gw", "tx", "200"), "invalid tx counter"),
+            "a boolean counter": (counter("gw", "tx", True), "invalid tx counter"),
+            "a share above the total": (lambda e: (e["ports"]["gw"].update(tx=5000), e.update(bytes=5100)),
+                                        "exceed the control network's 450"),
+        }
+        prefill = [dp_layout(0) + allocated("a") + sent(1000), dp_layout(0) + allocated("b") + sent(1000)]
+        decode = [dp_layout(0) + line(kv_check=checked("a")), dp_layout(0) + line(kv_check=checked("b"))]
+        for name, (change, message) in cases.items():
+            with self.subTest(name):
+                exempt = self.exemption()
+                change(exempt)
+                self.assertRegex("; ".join(pd.control_evidence(exempt, run, ["gw"])[2]), message)
+                # And through the checks: a problem, never a pass.
+                problems = pd.check({"completed": 2, "errors": []}, prefill, decode,
+                                    {"control": 450, "data0": 2100}, run, None, None, exempt, ["gw"])["problems"]
+                self.assertRegex("; ".join(problems), message)
+        # The saved exemption's nodes never widen the front end's.
+        exempt = self.exemption()
+        exempt["nodes"] = []
+        self.assertRegex("; ".join(pd.control_evidence(exempt, run, [])[2]), "its ports give 0")
+
+    def test_the_front_ends_share_is_its_ports_bytes_both_ways(self) -> None:
+        before = {"p1": {"node": "gw", "rx": 10, "tx": 20}, "p2": {"node": "d0", "rx": 5, "tx": 5}}
+        after = {"p1": {"node": "gw", "rx": 110, "tx": 220}, "p2": {"node": "d0", "rx": 1005, "tx": 905}}
+        exempt = pd.control_exemption(before, after, ["gw"])
+        self.assertEqual(exempt["bytes"], 300)
+        self.assertEqual(exempt["ports"]["p2"]["rx"], 1000)
+        self.assertEqual(pd.control_exemption(before, after, [])["bytes"], 0)
+
+    def test_the_connectors_proxy_takes_one_node_a_side(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one prefill and one decode node"):
+            pd.ProxyFront(instances_run(["p0", "p1"], ["d0"])).prepare({})
 
 
 # DeepSeek-V4-like packed blocks: every 20-byte block is all of one group's
@@ -2535,9 +2721,10 @@ class NixlTcpBackendTests(unittest.TestCase):
         run,p,d,ports,moved,_=self.fixture()
         run.server.timing="linear"
         out=Path(self.directory.name)/"saved";out.mkdir()
-        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model),"proxy":str(run.proxy)}))
+        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model),"proxy":str(run.proxy),"front":"proxy"}))
+        (out/"control-ports.json").write_text(json.dumps({"nodes":[],"bytes":0,"ports":{"p0":{"node":"c","rx":50,"tx":0},"p1":{"node":"p","rx":0,"tx":25},"p2":{"node":"d","rx":0,"tx":25}}}))
         for role,texts in (("prefill",p),("decode",d)):
-            for rank,text in enumerate(texts):(out/pd._step_log_name(role,0,rank)).write_text(text)
+            for rank,text in enumerate(texts):(out/getattr(run,role).step_log(role,0,rank)).write_text(text)
         for file,data in (("bench.json",{"completed":2,"errors":[]}),("routers.json",{"control":50,"kv":moved+500}),("router-ports.json",ports)):
             (out/file).write_text(json.dumps(data))
         self.assertEqual(pd.recheck(out)["problems"],[])
@@ -2557,7 +2744,7 @@ class NixlTcpBackendTests(unittest.TestCase):
         def collect(*_):
             (output/"bench.json").write_text(json.dumps({"completed":2,"errors":[]}))
             for role,texts in (("prefill",p),("decode",d)):
-                for rank,text in enumerate(texts):(output/pd._step_log_name(role,0,rank)).write_text(text)
+                for rank,text in enumerate(texts):(output/getattr(run,role).step_log(role,0,rank)).write_text(text)
         def addresses(*_):return ["10.1.0.1"]*4
         with patch.object(topology,"load_state",return_value=state), \
              patch.object(topology,"exec_in",return_value=""), \
@@ -2566,6 +2753,7 @@ class NixlTcpBackendTests(unittest.TestCase):
              patch.object(pd,"_kv_addresses",side_effect=addresses), \
              patch.object(pd,"router_bytes",side_effect=[{"control":0,"kv":0},{"control":50,"kv":moved+500}]), \
              patch.object(pd,"router_ports",side_effect=[{},ports]), \
+             patch.object(pd,"network_ports",return_value={f"p{i}":{"node":n,"rx":0,"tx":0} for i,n in enumerate("pdc")}), \
              patch.object(pd,"_port_deltas",return_value=ports), \
              patch.object(pd,"_collect",side_effect=collect),patch.object(pd.time,"sleep"):
             self.assertEqual(pd.execute(run,output)["problems"],[])

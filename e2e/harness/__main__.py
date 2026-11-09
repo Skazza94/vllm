@@ -1,4 +1,4 @@
-"""Command line: python -m harness {up,down,status,exec,pd,recheck} ..."""
+"""Command line: python -m harness {up,down,status,exec,pd,llmd,recheck} ..."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from . import pd
+from . import llmd, pd
 from . import spec as specs
 from . import topology
 
@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("argv", nargs=argparse.REMAINDER)
     prefill_decode = commands.add_parser("pd", help="a prefill/decode run of the vLLM simulator in an up topology")
     prefill_decode.add_argument("run", help="the run config")
+    routed = commands.add_parser("llmd", help="a prefill/decode run behind llm-d's router in an up topology")
+    routed.add_argument("run", help="the run config (pd's, plus router)")
     recheck = commands.add_parser("recheck", help="a saved prefill/decode run's checks again (verdict-recheck.json)")
     recheck.add_argument("results", help="the run's results directory")
     args = parser.parse_args(argv)
@@ -36,9 +38,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "pd":
         print(json.dumps(pd.execute(pd.load(args.run)), indent=2))
         return 0
+    if args.command == "llmd":
+        print(json.dumps(llmd.execute(llmd.load(args.run)), indent=2))
+        return 0
     if args.command == "recheck":
         verdict = pd.recheck(args.results)
-        print(json.dumps({"problems": verdict["problems"], "kv_bytes_checked": verdict["kv_bytes_checked"],
+        print(json.dumps({"front": verdict["front"], "problems": verdict["problems"], "kv_bytes_checked": verdict["kv_bytes_checked"],
                           "transfers": verdict["transfers"]}, indent=2))
         return 1 if verdict["problems"] else 0
     name = _name(args.name)

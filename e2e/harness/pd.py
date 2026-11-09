@@ -61,7 +61,12 @@ DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 
 @dataclass
 class Side:
-    node: str
+    node: str | list[str]
+    """The instance's node; a list: several instances of this role, one per
+    node, each one engine (data_parallel_size 1) of the side's TP size, a
+    front end (llm-d's router) choosing among them. Each is then checked as
+    its own owner of requests, as a DP rank is (`ranks`: the instance's
+    index in place of the DP rank)."""
     # A list: one per tensor-parallel rank, which every DP rank's TP rank of
     # that index uses (any prefill DP rank may pair with any decode DP rank).
     kv_network: str | list[str]
@@ -83,8 +88,36 @@ class Side:
 
     def ranks(self, tp_size: int) -> list[tuple[int, int]]:
         """(DP rank, TP rank) of each of the instance's ranks, in the host's
-        order (rank_addresses, TENT metrics ports, step logs)."""
-        return [(dp, tp) for dp in range(self.data_parallel_size) for tp in range(tp_size)]
+        order (rank_addresses, TENT metrics ports, step logs); of several
+        instances, (instance index, TP rank)."""
+        groups = len(self.nodes) if self.instances else self.data_parallel_size
+        return [(dp, tp) for dp in range(groups) for tp in range(tp_size)]
+
+    @property
+    def nodes(self) -> list[str]:
+        return [self.node] if isinstance(self.node, str) else list(self.node)
+
+    @property
+    def instances(self) -> bool:
+        """Several instances (``node`` a list)."""
+        return not isinstance(self.node, str)
+
+    def node_of(self, dp: int) -> str:
+        """The node of `ranks`' DP rank (or instance) ``dp``."""
+        return self.nodes[dp] if self.instances else self.node
+
+    def local_rank(self, dp: int, tp: int, tp_size: int) -> int:
+        """A rank's index on its host (TENT metrics port offset)."""
+        return tp if self.instances else dp * tp_size + tp
+
+    def step_log(self, role: str, dp: int, tp: int) -> str:
+        """A rank's step log's name in the results: its role, its node, its
+        rank suffix on that node."""
+        return f"{role}-{self.node_of(dp)}-steps{_rank_suffix(0 if self.instances else dp, tp)}.jsonl"
+
+    def remote_step_log(self, dp: int, tp: int) -> str:
+        """A rank's step log on its node."""
+        return f"{WORK}/steps{_rank_suffix(0 if self.instances else dp, tp)}.jsonl"
 
 
 @dataclass
@@ -190,7 +223,12 @@ def load(path: str | Path) -> Run:
     """A run config; relative paths are the file's."""
 
     path = Path(path).resolve()
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path)
+
+
+def parse(raw: dict, path: Path) -> Run:
+    """A run config's contents, read from ``path`` (relative paths are its)."""
+
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
              "expect_fragmentation", "server", "workload", "proxy", "startup_timeout"}
     if unknown := set(raw) - known:
@@ -234,13 +272,26 @@ def load(path: str | Path) -> Run:
             raise ValueError("workload.prefix_repetition takes positive prefix_len, suffix_len and num_prefixes")
         if repetition["prefix_len"] + repetition["suffix_len"] != run.workload.input_len:
             raise ValueError("workload.input_len is prefix_repetition's prefix_len + suffix_len")
-    sizes = {side.node: side.tp(run.server) for side in (run.prefill, run.decode)}
+    for side in (run.prefill, run.decode):
+        if side.instances:
+            if not side.nodes or not all(isinstance(n, str) for n in side.nodes) or len(set(side.nodes)) != len(
+                    side.nodes):
+                raise ValueError(f"a side's node list names distinct nodes, not {side.node!r}")
+            if side.data_parallel_size != 1:
+                raise ValueError("several instances of a side are one engine each (data_parallel_size 1)")
+    if set(run.prefill.nodes) & set(run.decode.nodes):
+        raise ValueError("prefill and decode instances are on distinct nodes")
+    if run.prefill.instances or run.decode.instances:
+        if run.prefill.tp(run.server) != run.decode.tp(run.server):
+            raise ValueError("several instances of a side take equal TP sizes")
+        if run.server.speculative is not None:
+            raise ValueError("several instances of a side take no speculative decoding")
     for side in (run.prefill, run.decode):
         size = side.tensor_parallel_size
         if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 1):
-            raise ValueError(f"{side.node}: tensor_parallel_size is a positive integer")
+            raise ValueError(f"{side.nodes}: tensor_parallel_size is a positive integer")
         if not isinstance(side.kv_network, str) and len(side.kv_network) != side.tp(run.server):
-            raise ValueError(f"{side.node}: kv_network needs one network per rank ({side.tp(run.server)})")
+            raise ValueError(f"{side.nodes}: kv_network needs one network per rank ({side.tp(run.server)})")
     prefill_tp, decode_tp = run.prefill.tp(run.server), run.decode.tp(run.server)
     if prefill_tp == decode_tp:
         if run.prefill.rank_networks(prefill_tp) != run.decode.rank_networks(decode_tp):
@@ -254,7 +305,6 @@ def load(path: str | Path) -> Run:
                              "name, a link per rank)")
         if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
             raise ValueError("unequal TP sizes without data parallelism")
-    del sizes
     return run
 
 
@@ -356,9 +406,10 @@ def tent_config(address: str, hp_tcp_args: dict) -> dict:
     return {"rpc_server_hostname": address, "transports": transports}
 
 
-def bench_command(run: Run) -> list[str]:
+def bench_command(run: Run, base_url: str = f"http://127.0.0.1:{PROXY_PORT}") -> list[str]:
     """The client's benchmark: random prompts of the workload's lengths
-    through the proxy, tokenized with the model's tokenizer."""
+    through the front end at ``base_url`` (the proxy, by default),
+    tokenized with the model's tokenizer."""
     w = run.workload
     repetition = w.prefix_repetition
     dataset = ["--dataset-name", "random", "--random-input-len", str(w.input_len),
@@ -370,7 +421,7 @@ def bench_command(run: Run) -> list[str]:
         "--prefix-repetition-output-len", str(w.output_len)]
     return [
         VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
-        "--base-url", f"http://127.0.0.1:{PROXY_PORT}", "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
+        "--base-url", base_url, "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
         *(["--trust-remote-code"] if run.server.trust_remote_code else []),
         *dataset, "--num-prompts", str(w.num_prompts),
         "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
@@ -378,10 +429,10 @@ def bench_command(run: Run) -> list[str]:
     ]
 
 
-def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
-    """``vllm serve`` for ``role`` (prefill or decode), TP rank r's KV on
-    ``kv_addresses[r]`` in every DP rank (their own: ``rank_addresses``, DP
-    rank by TP rank)."""
+def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT) -> list[str]:
+    """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
+    rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
+    ``rank_addresses``, DP rank by TP rank)."""
 
     _check_backend(run.server)
     ucx = uses_ucx(run.server)
@@ -436,7 +487,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     s = run.server
     return [
         "env", *(f"{name}={value}" for name, value in env.items()),
-        VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(SERVER_PORT),
+        VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(port),
         "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
         *(["--block-size", str(s.block_size)] if s.block_size is not None else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
@@ -459,24 +510,89 @@ def server_command(run: Run, role: str, kv_addresses: list[str]) -> list[str]:
     ]
 
 
-def execute(run: Run, output: Path | None = None) -> dict:
+class ProxyFront:
+    """The front end requests enter through: the connector's proxy on the
+    client node, the servers on SERVER_PORT. Another front end (llm-d's
+    router, `harness.llmd`) offers the same methods."""
+
+    name = "proxy"
+    """Saved in run.json: `recheck` replays the same front end's checks."""
+
+    def __init__(self, run: Run) -> None:
+        self.run = run
+
+    def server_port(self, role: str) -> int:
+        """The HTTP port ``role``'s vLLM serves on."""
+        return SERVER_PORT
+
+    def health_url(self, role: str, control: str) -> str:
+        """The URL that answers once ``role``'s server is up (from the client)."""
+        return f"http://{control}:{self.server_port(role)}/health"
+
+    def prepare(self, container: dict[str, str]) -> None:
+        """Before the servers start (their nodes cleaned)."""
+        if self.run.prefill.instances or self.run.decode.instances:
+            raise ValueError("the connector's proxy takes one prefill and one decode node (node lists: harness.llmd)")
+        shell.run(["docker", "cp", str(self.run.proxy), f"{container[self.run.client]}:{WORK}/proxy.py"])
+
+    def start(self, container: dict[str, str], address: dict) -> str:
+        """Start the front end once the servers are up; returns the base URL
+        the client's benchmark sends to."""
+        run = self.run
+        prefill = address["instances"]["prefill"][run.prefill.node]["control"]
+        decode = address["instances"]["decode"][run.decode.node]["control"]
+        instances = ["--prefiller-hosts", prefill, "--prefiller-ports", str(SERVER_PORT),
+                     "--decoder-hosts", decode, "--decoder-ports", str(SERVER_PORT)] if (
+            run.server.connector == "nixl") else [
+            "--prefill", f"http://{prefill}:{SERVER_PORT}", str(BOOTSTRAP_PORT),
+            "--decode", f"http://{decode}:{SERVER_PORT}"]
+        _background(container[run.client], [PYTHON, f"{WORK}/proxy.py", "--host", "127.0.0.1",
+                                             "--port", str(PROXY_PORT), *instances], f"{WORK}/logs/proxy.log")
+        # The proxy has no health endpoint: FastAPI's docs page.
+        _wait(container[run.client], f"http://127.0.0.1:{PROXY_PORT}/docs", 120,
+              container[run.client], f"{WORK}/logs/proxy.log")
+        return f"http://127.0.0.1:{PROXY_PORT}"
+
+    def collect(self, container: dict[str, str], output: Path) -> None:
+        """Its logs and configs, whatever happened (the proxy's log is the
+        client's, collected with it)."""
+
+    def stop(self, container: dict[str, str]) -> None:
+        """After collecting (the proxy stops with the client's services)."""
+
+    def check(self, output: Path, verdict: dict) -> None:
+        """Its own checks, added to the run's ``verdict`` (its problems and
+        evidence) before it is written."""
+
+    def control_nodes(self) -> list[str]:
+        """Nodes of the front end's own control traffic (a router's metrics
+        scraping, its proxying), not KV: the bytes through their control
+        ports are left out of the control network's guard. The proxy: none
+        (its traffic is the client's, as it always was)."""
+        return []
+
+
+def execute(run: Run, output: Path | None = None, front: ProxyFront | None = None) -> dict:
     """Start the services, run the workload, collect and check; returns the
     verdict (also in ``<output>/verdict.json``). Raises AssertionError when
-    a check fails, after collecting."""
+    a check fails, after collecting. ``front``: what requests enter
+    through (default: the connector's proxy on the client)."""
 
+    front = front or ProxyFront(run)
     state = topology.load_state(run.topology)
     nodes = state["nodes"]
-    container = {name: nodes[name]["container"] for name in (run.prefill.node, run.decode.node, run.client)}
-    address = {
-        **{f"{role}_kv": _kv_addresses(nodes[side.node]["interfaces"], side, side.tp(run.server))
-           for role, side in (("prefill", run.prefill), ("decode", run.decode))},
-        "prefill_control": nodes[run.prefill.node]["interfaces"][run.control_network]["address"],
-        "decode_control": nodes[run.decode.node]["interfaces"][run.control_network]["address"],
-    }
+    roles = (("prefill", run.prefill), ("decode", run.decode))
+    container = {name: nodes[name]["container"] for name in (*run.prefill.nodes, *run.decode.nodes, run.client)}
+    # Each instance's KV address per rank and its control address.
+    instances = {role: {node: {"kv": _kv_addresses(nodes[node]["interfaces"], side, side.tp(run.server), node),
+                               "control": nodes[node]["interfaces"][run.control_network]["address"]}
+                        for node in side.nodes} for role, side in roles}
+    address: dict = {"instances": instances}
     output = output or RESULTS / f"{run.name}-{time.strftime('%Y%m%d-%H%M%S')}"
     output.mkdir(parents=True, exist_ok=True)
     (output / "run.json").write_text(json.dumps({**asdict(run), "model": str(run.model), "proxy": str(run.proxy),
-                                                 "addresses": address}, indent=2, default=str) + "\n")
+                                                 "addresses": address, "front": front.name},
+                                                indent=2, default=str) + "\n")
 
     for name in container.values():
         # A previous run's servers would answer this run's requests.
@@ -485,45 +601,49 @@ def execute(run: Run, output: Path | None = None) -> dict:
                                             f"&& mkdir -p {WORK}/logs"])
         topology.exec_in(name, ["mkdir", "-p", MODEL_DIRECTORY])
         shell.run(["docker", "cp", f"{run.model}/.", f"{name}:{MODEL_DIRECTORY}"])
-    shell.run(["docker", "cp", str(run.proxy), f"{container[run.client]}:{WORK}/proxy.py"])
+    front.prepare(container)
 
-    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
-        _background(container[side.node], server_command(run, role, address[f"{role}_kv"]),
-                    f"{WORK}/logs/{role}.log")
+    for role, side in roles:
+        for node in side.nodes:
+            _background(container[node],
+                        server_command(run, role, instances[role][node]["kv"], front.server_port(role)),
+                        f"{WORK}/logs/{role}.log")
     try:
-        for role in ("prefill", "decode"):
-            _wait(container[run.client], f"http://{address[f'{role}_control']}:{SERVER_PORT}/health",
-                  run.startup_timeout, container[getattr(run, role).node], f"{WORK}/logs/{role}.log")
-        instances = ["--prefiller-hosts", address["prefill_control"], "--prefiller-ports", str(SERVER_PORT),
-                     "--decoder-hosts", address["decode_control"], "--decoder-ports", str(SERVER_PORT)] if (
-            run.server.connector == "nixl") else [
-            "--prefill", f"http://{address['prefill_control']}:{SERVER_PORT}", str(BOOTSTRAP_PORT),
-            "--decode", f"http://{address['decode_control']}:{SERVER_PORT}"]
-        _background(container[run.client], [PYTHON, f"{WORK}/proxy.py", "--host", "127.0.0.1",
-                                             "--port", str(PROXY_PORT), *instances], f"{WORK}/logs/proxy.log")
-        # The proxy has no health endpoint: FastAPI's docs page.
-        _wait(container[run.client], f"http://127.0.0.1:{PROXY_PORT}/docs", 120,
-              container[run.client], f"{WORK}/logs/proxy.log")
+        # Every instance (the startup timeout counted from the first).
+        deadline = time.monotonic() + run.startup_timeout
+        for role, side in roles:
+            for node in side.nodes:
+                _wait(container[run.client], front.health_url(role, instances[role][node]["control"]),
+                      max(1.0, deadline - time.monotonic()), container[node], f"{WORK}/logs/{role}.log")
+        base_url = front.start(container, address)
 
         tent_before = _tent_metrics(run, container)
+        control_before = network_ports(state, run.control_network)
         routers_before = router_bytes(state)
         ports_before = router_ports(state)
-        bench = bench_command(run)
+        bench = bench_command(run, base_url)
         (output / "bench.log").write_text(topology.exec_in(container[run.client], bench, timeout=3600))
         # The servers' step logs settle shortly after the last response.
         time.sleep(2)
         routers_after = router_bytes(state)
         ports_after = router_ports(state)
+        control_after = network_ports(state, run.control_network)
         tent_after = _tent_metrics(run, container)
     finally:
-        _collect(run, container, output)
-        for name in container.values():
-            stop_services(name)
+        try:
+            _collect(run, container, output)
+            front.collect(container, output)
+        finally:
+            front.stop(container)
+            for name in container.values():
+                stop_services(name)
     routers = {network: routers_after[network] - routers_before[network] for network in routers_before}
     (output / "routers.json").write_text(json.dumps(routers, indent=2) + "\n")
     ports = _port_deltas(ports_before, ports_after)
     if ports:
         (output / "router-ports.json").write_text(json.dumps(ports, indent=2) + "\n")
+    exempt = control_exemption(control_before, control_after, front.control_nodes())
+    (output / "control-ports.json").write_text(json.dumps(exempt, indent=2) + "\n")
     tent = {role: [_tent_delta(before, after) for before, after in zip(tent_before[role], tent_after[role])]
             for role in tent_before}
     if uses_tent(run.server):
@@ -535,10 +655,11 @@ def execute(run: Run, output: Path | None = None) -> dict:
         (output / "transport.json").write_text(json.dumps({"backend": nixl_backend(run.server), "tent_applicable": False}) + "\n")
     verdict = check(
         json.loads((output / "bench.json").read_text()),
-        *[[(output / _step_log_name(role, dp, tp)).read_text()
+        *[[(output / getattr(run, role).step_log(role, dp, tp)).read_text()
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
-        routers, run, tent, ports or None)
+        routers, run, tent, ports or None, exempt, front.control_nodes())
+    front.check(output, verdict)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
         raise AssertionError(f"run {run.name} failed its checks ({output}): {'; '.join(verdict['problems'])}")
@@ -548,28 +669,51 @@ def execute(run: Run, output: Path | None = None) -> dict:
 def recheck(output: str | Path) -> dict:
     """A saved run's checks again, from its results directory, with this
     harness: written to ``verdict-recheck.json``, the run's own
-    ``verdict.json`` left as it was."""
+    ``verdict.json`` left as it was. A run through llm-d's router (run.json's
+    ``front``) has its routing evidence checked too: missing evidence is a
+    problem."""
     output = Path(output)
     raw = json.loads((output / "run.json").read_text())
     raw.pop("addresses", None)
+    front = raw.pop("front")
     run = Run(**{**raw, "model": Path(raw["model"]), "proxy": Path(raw["proxy"]),
                  "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
     ports = output / "router-ports.json"
+    control = output / "control-ports.json"
+    # The front end's nodes, from its saved configuration (never from the
+    # exemption being checked).
+    control_nodes: list[str] = []
+    if front == "llmd":
+        from . import llmd  # it imports this module
+        control_nodes = llmd.control_nodes(output)
+    # Required evidence: anything but an object (a `null` document) has no
+    # ports, a problem of `control_evidence`, never `check`'s caller without
+    # port evidence.
+    control_saved = json.loads(control.read_text())
+    if not isinstance(control_saved, dict):
+        control_saved = {}
     verdict = check(
         json.loads((output / "bench.json").read_text()),
-        *[[(output / _step_log_name(role, dp, tp)).read_text()
+        *[[(output / getattr(run, role).step_log(role, dp, tp)).read_text()
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         json.loads((output / "routers.json").read_text()), run,
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
-        json.loads(ports.read_text()) if ports.exists() else None)
+        json.loads(ports.read_text()) if ports.exists() else None,
+        control_saved, control_nodes)
+    if front == "llmd":
+        llmd.recheck(output, run, verdict)
+    elif front != ProxyFront.name:
+        verdict["problems"].append(f"run.json names an unknown front end {front!r}")
+    verdict["front"] = front
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
 
 
 def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], routers: dict[str, int],
-          run: Run, tent: dict[str, list[dict]] | None = None, ports: dict | None = None) -> dict:
+          run: Run, tent: dict[str, list[dict]] | None = None, ports: dict | None = None,
+          control_exempt: dict | None = None, control_nodes: list[str] | None = None) -> dict:
     """The run's checks, from the client's results, every rank's step logs
     (``prefill_steps[i]``, ``decode_steps[i]``, in each side's `Side.ranks`
     order), the bytes each router received during the workload and each
@@ -595,10 +739,13 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         problems.append(f"{bench.get('completed')} of {w.num_prompts} request(s) completed; errors: {errors[:3]}")
 
     sides = {"prefill": run.prefill, "decode": run.decode}
-    data_parallel = any(side.data_parallel_size > 1 for side in sides.values())
+    # Several owners of requests per side: DP ranks, or instances.
+    data_parallel = any(side.data_parallel_size > 1 or side.instances for side in sides.values())
 
-    def where(dp: int | None, tp: int) -> str:
-        parts = ([f"DP rank {dp}"] if data_parallel and dp is not None else []) + (
+    def where(dp: int | None, tp: int, side: Side | None = None) -> str:
+        owner = f"instance {side.node_of(dp)}" if side is not None and side.instances and dp is not None else (
+            f"DP rank {dp}")
+        parts = ([owner] if data_parallel and dp is not None else []) + (
             [f"rank {tp}"] if max(sizes.values()) > 1 else [])
         return " ".join(parts) + ": " if parts else ""
 
@@ -616,9 +763,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     ranks: dict[str, dict[tuple[int, int], dict]] = {role: {} for role in sides}
     # Mooncake producer ranks without a write series (unequal TP only).
     unwritten: set[int] = set()
+    # Instances' ranks without a moved series: given no request.
+    idle: list[str] = []
     for role, side in sides.items():
         for (dp, tp), records in logs[role].items():
-            at = where(dp, tp)
+            at = where(dp, tp, side)
             layout = next((r["kv_layout"] for r in records if "kv_layout" in r), None)
             # Each log must be this rank's (not another's supplied twice).
             if layout is None:
@@ -626,8 +775,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             elif (layout.get("tp_rank"), layout.get("tp_size")) != (tp, sizes[role]):
                 problems.append(f"{at}{role}'s log is TP rank {layout.get('tp_rank')} of "
                                 f"{layout.get('tp_size')}, not {tp} of {sizes[role]}")
-            elif data_parallel and layout.get("dp_rank") != dp:
-                problems.append(f"{at}{role}'s log is DP rank {layout.get('dp_rank')}, not {dp}")
+            elif data_parallel and layout.get("dp_rank") != (0 if side.instances else dp):
+                problems.append(f"{at}{role}'s log is DP rank {layout.get('dp_rank')}, not "
+                                f"{0 if side.instances else dp}")
             sent = {"count": 0, "bytes": 0, "failed": 0}
             for record in records:
                 for transfers in (record.get("kv_transfers") or {}).values():
@@ -664,7 +814,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                                     or identity.get("plugin_defaults") != {"num_threads": "0", "split_batch_size": "1024"}):
                         problems.append(f"{at}{role} lacks LIBFABRIC configured-policy/backend-options evidence")
                     addresses = {p["address"] for network in (ports or {}).values() for p in network.values()
-                                 if p.get("node") == side.node and p.get("slot") == tp and p.get("address")}
+                                 if p.get("node") == side.node_of(dp) and p.get("slot") == tp and p.get("address")}
                     if addresses and addresses != {binding.get("address")}:
                         problems.append(f"{at}{role}'s {nixl_backend(run.server)} address {binding.get('address')} differs from rank port {addresses}")
             logged = [record["kv_check"] for record in records if "kv_check" in record]
@@ -752,7 +902,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 if counters is None:
                     problems.append(f"{at}{role}'s TENT metrics did not answer")
                 elif missing := [name for name in required if name not in counters]:
-                    if tp_size is None and role == mover == "prefill" and missing == [moved_counter]:
+                    if side.instances and not owned and missing == [moved_counter]:
+                        # An instance the front end gave no request moved
+                        # nothing: its moved series was never incremented.
+                        idle.append(f"{role} {side.node_of(dp)} rank {tp}")
+                    elif tp_size is None and role == mover == "prefill" and missing == [moved_counter]:
                         # A replicated producer's rank that never writes never
                         # increments its write series: `_hetero_tp` accepts
                         # the absence only for a proven idle replica.
@@ -923,9 +1077,18 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             problems.append(f"the KV network {network} carried {carried} bytes, more than its ranks' "
                             f"{carried_by_ranks} (another rank's KV, or traffic the connectors did not count)")
     moved = sum(summary["transfers"]["bytes"] for role in sides for summary in ranks[role].values())
-    control = routers.get(run.control_network, 0)
-    if moved and control > moved / 10:
-        problems.append(f"the control network carried {control} bytes, too much beside {moved} of KV")
+    # The front end's own traffic (`ProxyFront.control_nodes`), measured at
+    # its ports, is not KV: the guard is on the rest, both derived here from
+    # the same snapshot of the control router's ports (`control_evidence`).
+    if control_exempt is None:
+        control, exempt = routers.get(run.control_network, 0), 0
+    else:
+        control, exempt, invalid = control_evidence(control_exempt, run, control_nodes or [])
+        problems.extend(invalid)
+    if moved and control - exempt > moved / 10:
+        problems.append(f"the control network carried {control - exempt} bytes"
+                        + (f" besides the front end's {exempt}" if exempt else "")
+                        + f", too much beside {moved} of KV")
     sums = {key: sum(summary["transfers"][key] for role in sides for summary in ranks[role].values())
             for key in ("count", "bytes", "failed")}
     speculation = None
@@ -949,8 +1112,13 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "fragmentation": per_tp[0]["fragmentation"] if per_tp else None,
         "transfers": sums,
         "router_bytes": routers,
+        "control_network": {"bytes": control, "front_end_bytes": exempt,
+                            "front_end_nodes": control_nodes or [],
+                            "guarded_bytes": control - exempt},
         "ranks": per_tp,
         "ownership": ownership,
+        **({"instances": {role: side.nodes for role, side in sides.items()}, "idle_ranks": idle}
+           if any(side.instances for side in sides.values()) else {}),
         "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
                              **{key: value for key, value in summary.items()
                                 if key not in ("requests", "checked_ids", "verified_ids", "allocated_ids")},
@@ -2470,6 +2638,77 @@ def router_ports(state: dict) -> dict[str, dict[str, dict]]:
     return totals
 
 
+def network_ports(state: dict, network: str) -> dict[str, dict]:
+    """Every port's bytes received and sent so far at ``network``'s router,
+    with the node, link and address on it."""
+
+    on = {interface["router_port"]: {"node": node, "slot": interface["slot"], "address": interface["address"]}
+          for node, described in state["nodes"].items() for interface in described["interfaces"].values()
+          if interface.get("network") == network and interface.get("router_port") is not None}
+    pid = int(shell.run(["docker", "inspect", "-f", "{{.State.Pid}}", state["networks"][network]["router"]]).strip())
+    links = json.loads(shell.in_netns(pid, "ip", "-j", "-s", "link", "show"))
+    return {link["ifname"]: {**on[link["ifname"]], "rx": link["stats64"]["rx"]["bytes"],
+                             "tx": link["stats64"]["tx"]["bytes"]}
+            for link in links if link["ifname"] in on}
+
+
+def control_exemption(before: dict, after: dict, nodes: list[str]) -> dict:
+    """The front end's share of the control network's bytes over the
+    workload: every byte to or from its nodes crosses their ports once,
+    received there (rx) or sent there (tx), and the router's total counts
+    each byte once, where it was received."""
+    deltas = {port: {**described, "rx": described["rx"] - before[port]["rx"],
+                     "tx": described["tx"] - before[port]["tx"]} for port, described in after.items()}
+    return {"nodes": nodes, "bytes": sum(p["rx"] + p["tx"] for p in deltas.values() if p["node"] in nodes),
+            "ports": deltas}
+
+
+def control_evidence(saved: dict, run: Run, nodes: list[str]) -> tuple[int, int, list[str]]:
+    """The control network's bytes over the workload and the front end's
+    share of them, derived from the saved ports (``control-ports.json``),
+    never taken from its stored subtotal: ``(total, exempt, problems)``.
+    ``nodes`` are the front end's, from its own configuration. Anything the
+    guard cannot stand on is a problem: a server, client or front-end node
+    without a port, a counter that is not a non-negative integer, a stored
+    node list or subtotal that differs from the derived one, and a front
+    end's share larger than the network's total."""
+    problems: list[str] = []
+    ports = saved.get("ports")
+    if not isinstance(ports, dict):
+        return 0, 0, ["the control network's port evidence is missing"]
+    valid = True
+    for port, described in ports.items():
+        if not isinstance(described, dict) or not isinstance(described.get("node"), str):
+            problems.append(f"the control port {port} names no node")
+            valid = False
+            continue
+        for key in ("rx", "tx"):
+            value = described.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                problems.append(f"the control port {port} ({described['node']}) has an invalid {key} counter: {value!r}")
+                valid = False
+    seen = {described["node"] for described in ports.values()
+            if isinstance(described, dict) and isinstance(described.get("node"), str)}
+    required = [*run.prefill.nodes, *run.decode.nodes, run.client, *nodes]
+    missing = sorted(set(required) - seen)
+    if missing:
+        problems.append(f"the control network's port evidence lacks the nodes {missing}")
+        valid = False
+    if saved.get("nodes") != nodes:
+        problems.append(f"the saved control exemption is for the nodes {saved.get('nodes')!r}, "
+                        f"the front end's are {nodes}")
+    if not valid:
+        return 0, 0, problems
+    total = sum(described["rx"] for described in ports.values())
+    exempt = sum(described["rx"] + described["tx"] for described in ports.values() if described["node"] in nodes)
+    if saved.get("bytes") != exempt or isinstance(saved.get("bytes"), bool):
+        problems.append(f"the saved control exemption is {saved.get('bytes')!r} bytes, "
+                        f"its ports give {exempt}")
+    if exempt > total:
+        problems.append(f"the front end's {exempt} control bytes exceed the control network's {total}")
+    return total, exempt, problems
+
+
 def _port_deltas(before: dict, after: dict) -> dict:
     """Each port's RX and TX over the workload (never summed: a byte crosses
     the router in on one port and out on another)."""
@@ -2479,7 +2718,7 @@ def _port_deltas(before: dict, after: dict) -> dict:
             for network, ports in after.items()}
 
 
-def _kv_addresses(interfaces: dict, side: Side, tp: int) -> list[str]:
+def _kv_addresses(interfaces: dict, side: Side, tp: int, node: str | None = None) -> list[str]:
     """Each TP rank's KV address: its network's address, or on a network the
     node joins with several links, link r's."""
     addresses = []
@@ -2491,7 +2730,7 @@ def _kv_addresses(interfaces: dict, side: Side, tp: int) -> list[str]:
         elif rank < len(links):
             addresses.append(links[rank]["address"])
         else:
-            raise ValueError(f"{side.node} has {len(links)} links on {network}, not one per rank ({tp})")
+            raise ValueError(f"{node or side.node} has {len(links)} links on {network}, not one per rank ({tp})")
     return addresses
 
 
@@ -2540,10 +2779,6 @@ def _rank_suffix(dp: int, tp: int) -> str:
     return (f".dp{dp}" if dp else "") + (f".tp{tp}" if tp else "")
 
 
-def _step_log_name(role: str, dp: int, tp: int) -> str:
-    return f"{role}-steps{_rank_suffix(dp, tp)}.jsonl"
-
-
 def _tent_metrics(run: Run, container: dict[str, str]) -> dict[str, list[str | None]]:
     """Every rank's TENT metrics, as served (None: no answer)."""
 
@@ -2555,10 +2790,12 @@ def _tent_metrics(run: Run, container: dict[str, str]) -> dict[str, list[str | N
     metrics: dict[str, list[str | None]] = {}
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
         metrics[role] = []
-        # The host's ranks, in order: local DP rank by TP rank.
-        for rank, _ in enumerate(side.ranks(side.tp(run.server))):
-            text = topology.exec_in(container[side.node], [
-                PYTHON, "-c", fetch, f"http://127.0.0.1:{TENT_METRICS_PORT + rank}/metrics"], check=False)
+        # Every rank, in `Side.ranks` order, at its host's port for it.
+        size = side.tp(run.server)
+        for dp, tp in side.ranks(size):
+            text = topology.exec_in(container[side.node_of(dp)], [
+                PYTHON, "-c", fetch,
+                f"http://127.0.0.1:{TENT_METRICS_PORT + side.local_rank(dp, tp, size)}/metrics"], check=False)
             metrics[role].append(None if text.strip() == "NO ANSWER" else text)
     return metrics
 
@@ -2586,17 +2823,19 @@ def _tent_delta(before: str | None, after: str | None) -> dict | None:
 
 
 def _collect(run: Run, container: dict[str, str], output: Path) -> None:
-    """Logs, every rank's step log and the client's results, whatever happened."""
+    """Logs, every rank's step log and the client's results, whatever
+    happened: an instance's logs under ``logs/<role>/<node>``."""
 
-    for role, node in (("prefill", run.prefill.node), ("decode", run.decode.node), ("client", run.client)):
-        name = container[node]
-        copies = [(f"{WORK}/logs/.", output / "logs" / role)]
-        if role == "client":
-            copies.append((f"{WORK}/results/bench.json", output / "bench.json"))
-        else:
-            side = run.prefill if role == "prefill" else run.decode
-            copies += [(f"{WORK}/steps{_rank_suffix(dp, tp)}.jsonl", output / _step_log_name(role, dp, tp))
-                       for dp, tp in side.ranks(side.tp(run.server))]
-        for remote, local in copies:
-            local.parent.mkdir(parents=True, exist_ok=True)
-            shell.run(["docker", "cp", f"{name}:{remote}", str(local)], check=False)
+    copies: list[tuple[str, str, Path]] = [
+        (container[run.client], f"{WORK}/logs/.", output / "logs" / "client"),
+        (container[run.client], f"{WORK}/results/bench.json", output / "bench.json")]
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            logs = output / "logs" / role / node
+            copies.append((container[node], f"{WORK}/logs/.", logs))
+        for dp, tp in side.ranks(side.tp(run.server)):
+            copies.append((container[side.node_of(dp)], side.remote_step_log(dp, tp),
+                           output / side.step_log(role, dp, tp)))
+    for name, remote, local in copies:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        shell.run(["docker", "cp", f"{name}:{remote}", str(local)], check=False)
