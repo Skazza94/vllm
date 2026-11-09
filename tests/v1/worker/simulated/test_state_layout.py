@@ -45,6 +45,25 @@ def test_the_layouts_come_from_the_model_config_alone():
         q.spans(0, 5)
 
 
+def test_element_sizes_are_resolved_as_the_native_allocation_resolves_them():
+    def config(mamba="auto", ssm="auto", text=NEMOTRON):
+        return SimpleNamespace(
+            speculative_config=None,
+            model_config=SimpleNamespace(hf_text_config=text, dtype=torch.bfloat16),
+            cache_config=SimpleNamespace(mamba_cache_dtype=mamba, mamba_ssm_cache_dtype=ssm),
+        )
+
+    sizes = lambda c: (sl.layout_for(c).conv_itemsize, sl.layout_for(c).ssm_itemsize)
+    # Both "auto": the model's dtype, the SSM following the conv state.
+    assert sizes(config()) == (2, 2)
+    # --mamba-cache-dtype sets the conv state, and an "auto" SSM state with it.
+    assert sizes(config(mamba="float32")) == (4, 4)
+    assert sizes(config(mamba="float32", ssm="bfloat16")) == (4, 2)
+    # An "auto" SSM dtype takes the config's own, as the hybrid configs' verification does.
+    own = SimpleNamespace(**vars(NEMOTRON), mamba_ssm_cache_dtype="float32")
+    assert sizes(config(text=own)) == (2, 4)
+
+
 def _spec(layout, tp, **over):
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -200,6 +219,12 @@ def test_a_valid_attention_plus_state_read_then_a_state_only_read_is_covered():
     # NIXL cutting the same bytes into more descriptors is the same coverage.
     split = [(r, b, o, 1) for r, b, o, n in want[0] if r == 1 for o in range(o, o + n)] + [p for p in want[0] if p[0] == 0]
     assert sl.coverage_problems(want, [_read(0, split), _read(1, want[1])]) == []
+
+
+def test_heads_a_page_does_not_hold_are_an_ownership_error_not_a_crash():
+    rows = [dict(ROWS[0], heads=(0, 1)), dict(ROWS[1], span=TOY.spans(0, 1)[0])]
+    with pytest.raises(ValueError, match=r"supplies heads \[2, 3\]"):
+        sl.expected_pieces(rows, [5], 0, 1, 2, TOY, 4)
 
 
 def test_coverage_rejects_what_ownership_does_not_say():

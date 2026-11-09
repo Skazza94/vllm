@@ -4,8 +4,17 @@
 
 import os
 import socket
+import threading
 
 import psutil
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# How long a managed TCP backend's add_remote_agent may run before it is
+# reported as stalled (a healthy one returns in well under a second).
+REMOTE_AGENT_STALL_S = 30.0
 
 
 def tcp_interface(address: str, backend: str) -> str:
@@ -97,9 +106,45 @@ def agent_evidence(agent, requested: list[str], binding: dict | None) -> dict:
         options = agent.get_backend_params("UCX")
         if options.get("device_list"):
             raise ValueError("Managed UCX/TCP agent has a device_list override")
-        for key in ("UCX_TLS", "UCX_NET_DEVICES"):
-            if os.environ.get(key) != binding[key]:
-                raise ValueError(
-                    f"UCX/TCP setting changed during agent initialization: {key}"
-                )
+        # The binding is the environment set before construction; UCX's own
+        # transport and device selection is not observed from Python.
+        return {
+            "backends": sorted(initialized),
+            "binding": binding,
+            "native_transport_observed": False,
+        }
     return {"backends": sorted(initialized), "binding": binding}
+
+
+def report_stalled_remote_agents(
+    agent, backend: str, after_s: float = REMOTE_AGENT_STALL_S
+) -> None:
+    """Log an error when the agent's add_remote_agent has not returned after
+    `after_s`. Over managed TCP it can block indefinitely when the peer's KV
+    address is unreachable (its side channel answering); it cannot be
+    interrupted, and it holds NIXL's single handshake thread, so later
+    handshakes and the process's exit wait behind it. The report makes such a
+    hang visible; it does not end it."""
+    add = agent.add_remote_agent
+
+    def add_remote_agent(*args, **kwargs):
+        timer = threading.Timer(
+            after_s,
+            logger.error,
+            args=(
+                "NIXL %s add_remote_agent has not returned after %.0f s: the "
+                "peer's KV address (rank_addresses) may be unreachable. This "
+                "handshake, those queued behind it and the process's exit "
+                "wait until it returns or the process is killed.",
+                backend,
+                after_s,
+            ),
+        )
+        timer.daemon = True
+        timer.start()
+        try:
+            return add(*args, **kwargs)
+        finally:
+            timer.cancel()
+
+    agent.add_remote_agent = add_remote_agent

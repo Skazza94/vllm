@@ -624,7 +624,8 @@ RUN cp -a /opt/nixl-python/. /opt/mooncake-python/. "$(python -c 'import site; p
     /opt/ucx/bin/ucx_info -v && \
     test ! -s /opt/libfabric/etc/libfabric.conf && \
     /opt/libfabric/bin/fi_info -l && \
-    FI_PROVIDER=tcp FI_TCP_IFACE=eth0 FI_ADDR_FORMAT=FI_SOCKADDR_IN FI_PREFER_SYSCONFIG=0 python -c "from nixl._api import nixl_agent,nixl_agent_config; a=nixl_agent('libfabric-build-check',nixl_agent_config(backends=['LIBFABRIC'],num_threads=4,capture_telemetry=True)); assert set(a.backends)=={'LIBFABRIC'}" && \
+    KV_IFACE="$(python -c "import psutil,socket; print(next(n for n,a in psutil.net_if_addrs().items() if n!='lo' and any(x.family==socket.AF_INET for x in a)))")" && \
+    FI_PROVIDER=tcp FI_TCP_IFACE="$KV_IFACE" FI_ADDR_FORMAT=FI_SOCKADDR_IN FI_PREFER_SYSCONFIG=0 python -c "from nixl._api import nixl_agent,nixl_agent_config; a=nixl_agent('libfabric-build-check',nixl_agent_config(backends=['LIBFABRIC'],num_threads=4,capture_telemetry=True)); assert set(a.backends)=={'LIBFABRIC'}" && \
     UCX_TLS=tcp,self UCX_NET_DEVICES=lo python -c "from nixl._api import nixl_agent,nixl_agent_config; a=nixl_agent('ucx-build-check',nixl_agent_config(backends=['UCX'],num_threads=4,capture_telemetry=True)); assert set(a.backends)=={'UCX'}; b=nixl_agent('mooncake-build-check',nixl_agent_config(backends=['Mooncake'],capture_telemetry=True)); assert set(b.backends)=={'Mooncake'}"
 
 # Add labels to document build configuration

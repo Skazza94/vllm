@@ -555,7 +555,8 @@ def validate_state_peer(worker, layout) -> None:
     """A hybrid's NIXL peer of another TP size must hold states of the same
     model at its own size: the peer's `ssm_sizes` (conv and SSM bytes, the
     metadata's aggregates) equal the layout's at its TP size, its state
-    regions at least that long, and that size splits the layout. Conv
+    regions at least that long, as many regions as this instance (of equal
+    block lengths at equal TP), and that size splits the layout. Conv
     components and the two dtypes are not in the peer's metadata: they are
     validated locally on each endpoint (`check_spec`, under the identical
     model/config assumption), not observed remotely. Replaces the equal-geometry
@@ -584,12 +585,19 @@ def validate_state_peer(worker, layout) -> None:
                 f"SSM sizes {tuple(metadata.ssm_sizes)}, not {want} (the model's at TP "
                 f"{remote_tp_size}; e.g. another MTP depth or dtype)."
             )
+        local_lens = list(worker.block_len_per_layer)
+        if len(metadata.block_lens) != len(local_lens):
+            raise ValueError(
+                f"A hybrid model's NIXL peer registers {len(metadata.block_lens)} regions, "
+                f"not this instance's {len(local_lens)}."
+            )
+        if remote_tp_size == worker.world_size and list(metadata.block_lens) != local_lens:
+            raise ValueError(
+                "A hybrid model's NIXL peer of equal TP holds its regions otherwise: "
+                f"block lengths {list(metadata.block_lens)}, not {local_lens}."
+            )
         need = sum(want)
-        regions = [
-            i
-            for i in worker._ssm_region_indices
-            if i < len(metadata.block_lens) and metadata.block_lens[i] < need
-        ]
+        regions = [i for i in worker._ssm_region_indices if metadata.block_lens[i] < need]
         if regions:
             raise ValueError(
                 f"A peer's state regions {regions} are shorter than its state ({need} bytes)."

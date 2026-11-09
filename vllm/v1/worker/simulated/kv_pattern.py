@@ -1108,9 +1108,11 @@ class NativeSelection:
     """A native NIXL worker's selection of a request's blocks: its local
     strided descriptors (`src_blocks_data`) and the descriptor ids
     `_compute_desc_ids` picks for a transfer group's blocks, in its order.
-    Read once the worker registered the KV caches; P and D have the same
-    geometry (equal TP, block sizes and one physical block a logical one),
-    which a remote of another geometry would break and which is refused."""
+    Read once the worker registered the KV caches. Without a state layout P
+    and D have the same geometry (equal TP, block sizes and one physical block
+    a logical one); with one (a hybrid) the TP sizes may differ, each READ's
+    pieces reconciled with ownership (`state_layout.expected_pieces`). A
+    remote outside these is refused."""
 
     def __init__(
         self,
@@ -1537,12 +1539,13 @@ class NativeChecker(_ConsumerPages):
                 self.lists[handle] = None
             return handle
 
-        def rank_of(remote):
-            for ranks in worker.dst_xfer_side_handles.values():
+        def owner_of(remote):
+            """The (producer engine, rank) a remote handle was prepared for."""
+            for engine, ranks in worker.dst_xfer_side_handles.items():
                 for rank, handle in ranks.items():
                     if handle == remote:
-                        return int(rank)
-            return None
+                        return engine, int(rank)
+            return None, None
 
         def resolve(handle, ids):
             table = self.lists.get(handle)
@@ -1566,11 +1569,13 @@ class NativeChecker(_ConsumerPages):
             handle = make(op, local, local_ids, remote, remote_ids, *args, **kw)
             if getattr(self.selection, "layout", None) is not None:
                 spans = resolve(local, local_ids)
+                engine, rank = owner_of(remote)
                 record = sl.ReadRecord(
                     request,
-                    rank_of(remote),
+                    rank,
                     handle,
                     None if spans is None else [self.selection.piece(a, n) for a, n in spans],
+                    engine=engine,
                 )
                 by_handle[handle] = record
                 self.records.setdefault(request, []).append(record)
@@ -1683,9 +1688,20 @@ class NativeChecker(_ConsumerPages):
         with each READ's bytes by group, component and class."""
         s = self.selection
         w = s.worker
-        engines = [e for e in w.tp_mappings if e != w.engine_id]
+        # A request reads from one producer engine; the consumer may have met
+        # several (each DP rank of a producer is an engine of its own). READs
+        # whose engine is unknown fall back to the consumer's only remote.
+        engines = sorted({r.engine for r in records if r.engine is not None})
+        if not engines:
+            others = [e for e in w.tp_mappings if e != w.engine_id]
+            engines = others if len(others) == 1 else []
         if len(engines) != 1:
-            return {"problems": [f"{len(engines)} remote engines, one expected"], "reads": []}
+            return {
+                "problems": [
+                    f"the request's READs name {len(engines)} producer engines, one expected"
+                ],
+                "reads": [],
+            }
         remote_tp = w.transfer_topo.get_engine_info(engines[0]).remote_tp_size
         local_tp = w.transfer_topo.tp_size
         kv_heads = w.transfer_topo.total_num_kv_heads
@@ -1712,9 +1728,15 @@ class NativeChecker(_ConsumerPages):
                 }
                 described.append(entry)
                 row_of.setdefault(r.region, {})[(group.group, r.offset)] = entry
-            for p, pieces in sl.expected_pieces(
-                described, held, self.tp_rank, local_tp, remote_tp, s.layout, kv_heads
-            ).items():
+            try:
+                expected_by_producer = sl.expected_pieces(
+                    described, held, self.tp_rank, local_tp, remote_tp, s.layout, kv_heads
+                )
+            except ValueError as error:
+                # Ownership the rows cannot express (heads a producer supplies
+                # that the page does not hold): a coverage problem, not a crash.
+                return {"problems": [f"group {group.group}: {error}"], "reads": []}
+            for p, pieces in expected_by_producer.items():
                 want.setdefault(p, []).extend(pieces)
         problems = []
         unresolved = [r for r in records if r.pieces is None]

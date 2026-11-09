@@ -145,21 +145,30 @@ def layout_from_config(
 
 
 def layout_for(vllm_config) -> StateLayout | None:
-    """The model's layout under this configuration: conv elements of the
-    model's dtype, SSM elements of the cache's `mamba_ssm_cache_dtype` (else
-    the config's own, else the model's); None for a model without one or one
-    run with speculative decoding (a widened conv state)."""
-    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+    """The model's layout under this configuration, its element sizes as the
+    native allocation resolves them (`MambaStateDtypeCalculator`): conv of the
+    cache's `mamba_cache_dtype`, SSM of its `mamba_ssm_cache_dtype` (an "auto"
+    one the config's own, as the hybrid configs' verification sets it, else
+    the conv dtype); None for a model without one or one run with
+    speculative decoding (a widened conv state)."""
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 
     if vllm_config.speculative_config is not None:
         return None
     model = vllm_config.model_config
     text = model.hf_text_config
-    name = vllm_config.cache_config.mamba_ssm_cache_dtype
+    cache = vllm_config.cache_config
+    name = cache.mamba_ssm_cache_dtype
     if name == "auto":
-        name = getattr(text, "mamba_ssm_cache_dtype", None) or getattr(text, "mamba_ssm_dtype", None)
-    ssm = STR_DTYPE_TO_TORCH_DTYPE.get(name, model.dtype) if name else model.dtype
-    return layout_from_config(text, _itemsize(model.dtype), _itemsize(ssm))
+        name = (
+            getattr(text, "mamba_ssm_cache_dtype", None)
+            or getattr(text, "mamba_ssm_dtype", None)
+            or "auto"
+        )
+    conv, ssm = MambaStateDtypeCalculator._mamba_state_dtype(
+        model.dtype, getattr(cache, "mamba_cache_dtype", "auto"), name
+    )
+    return layout_from_config(text, _itemsize(conv), _itemsize(ssm))
 
 
 def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
@@ -350,6 +359,10 @@ class ReadRecord:
     handle: object
     pieces: list[Piece]
     done: bool = False
+    engine: str | None = None
+    """The producer engine the READ's remote handle belongs to (None: not
+    known), so a request's coverage is reconciled with its own producer when
+    the consumer has met several (a DP producer is one engine a rank)."""
 
 
 def expected_pieces(
@@ -379,6 +392,12 @@ def expected_pieces(
             heads = row["heads"]
             slab = row["length"] // len(heads)
             for p, got in attention_sources(rank, local_tp, remote_tp, kv_heads).items():
+                missing = [head for head in got if head not in heads]
+                if missing:
+                    raise ValueError(
+                        f"producer {p} supplies heads {missing} that region "
+                        f"{row['region']}'s page (heads {heads}) does not hold"
+                    )
                 for head in got:
                     off = row["offset"] + heads.index(head) * slab
                     out.setdefault(p, []).extend((row["region"], b, off, slab) for b in blocks)

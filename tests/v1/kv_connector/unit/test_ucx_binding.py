@@ -38,6 +38,16 @@ def external_agent_config(request, monkeypatch):
         monkeypatch.setattr(base_worker, "nixl_agent_config", AgentConfig)
 
 
+@pytest.fixture
+def restored_env():
+    # The managed binders write os.environ directly.
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+@pytest.mark.usefixtures("restored_env")
 @pytest.mark.parametrize("backend,threads", [("UCX", 3), ("LIBFABRIC", 4)])
 def test_tcp_worker_binds_before_explicit_agent_creation(
     monkeypatch, dist_init, default_vllm_config, tmp_path, backend, threads
@@ -54,6 +64,7 @@ def test_tcp_worker_binds_before_explicit_agent_creation(
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import simulated_libfabric
 
     libfabric = importlib.reload(simulated_libfabric)
+    monkeypatch.setattr(libfabric, "_binding", None)
     monkeypatch.setattr(libfabric, "LIBFABRIC_CONFIG", tmp_path / "libfabric.conf")
     nicstat = next(iter(psutil.net_if_stats().values()))._replace(
         isup=True, flags="up,running"

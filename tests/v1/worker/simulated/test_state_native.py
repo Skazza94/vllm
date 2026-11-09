@@ -137,6 +137,7 @@ def test_the_peer_check_validates_the_aggregates_it_is_given():
     seen = []
     worker = SimpleNamespace(
         add_remote_agent=lambda *a, **k: seen.append(a) or "agent", _ssm_region_indices=[1],
+        block_len_per_layer=[512, 512], world_size=1,
     )
     validate_state_peer(worker, TOY)
     worker.block_size = 64
@@ -154,9 +155,16 @@ def test_the_peer_check_validates_the_aggregates_it_is_given():
     for bad, match in (
         (SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[512, 512], block_size=64), "holds its states otherwise"),
         (SimpleNamespace(ssm_sizes=TOY.local_sizes(2), block_lens=[512, 4], block_size=64), "shorter than its state"),
+        # A peer listing fewer regions is refused, not skipped region by region.
+        (SimpleNamespace(ssm_sizes=TOY.local_sizes(2), block_lens=[512], block_size=64), "registers 1 regions"),
     ):
         with pytest.raises(ValueError, match=match):
             worker.add_remote_agent(bad, 0, 2)
+    # At equal TP every region's block length must match, as the equal-geometry guard required.
+    same = SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[512, 512], block_size=64)
+    assert worker.add_remote_agent(same, 0, 1) == "agent"
+    with pytest.raises(ValueError, match="of equal TP holds its regions otherwise"):
+        worker.add_remote_agent(SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[1024, 512], block_size=64), 0, 1)
     with pytest.raises(ValueError, match="does not split"):
         worker.add_remote_agent(ok, 0, 8)
 
@@ -193,7 +201,7 @@ def test_watched_reads_resolve_pieces_through_their_handles_and_completion():
     wrapper.make_prepped_xfer("READ", "local-h", [1, 5, 9, 13], "remote-h", [0, 1, 2, 3], notif_msg=b"req-a:7")
     (record,) = checker.records["req-a"]
     spans = TOY.spans(1, 2)
-    assert record.rank == 3 and not record.done
+    assert record.rank == 3 and record.engine == "remote-engine" and not record.done
     assert record.pieces == [(0, 1, s.offset, s.length) for s in spans]
     assert wrapper.check_xfer_state("xfer-1") == "DONE" and record.done
     # A handle whose prepared list was never seen resolves to None (reported, never assumed).
@@ -243,3 +251,36 @@ def test_a_requests_coverage_reports_bytes_by_group_component_and_class():
     # An unresolved READ is reported, not assumed.
     unresolved = checker._coverage(expected, [sl.ReadRecord("r", 0, "h", None, True)])
     assert any("could not be resolved" in p for p in unresolved["problems"])
+
+
+def test_coverage_follows_the_requests_producer_among_several_engines():
+    """A DP producer is one engine a rank: the consumer meets several, while
+    each request reads from one of them."""
+    from vllm.v1.worker.simulated.kv_pattern import NativeChecker
+
+    worker, caches = _worker(2, 1)
+    worker.tp_mappings = {"e": object(), "p-dp0": object(), "p-dp1": object()}
+    worker.transfer_topo = SimpleNamespace(
+        tp_size=2, total_num_kv_heads=4, get_engine_info=lambda engine: SimpleNamespace(remote_tp_size=1)
+    )
+    rows = len(worker.src_blocks_data)
+    worker._compute_desc_ids = lambda lists, num_blocks, *a: np.array(
+        [4 * r + b for r in range(rows) for blocks in lists for b in blocks], dtype=np.int64
+    )
+    selection = NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+    checker = NativeChecker(selection, tp_rank=1, heads=((), ()))
+    expected = SimpleNamespace(
+        groups=[SimpleNamespace(group=0, block_ids=[2]), SimpleNamespace(group=1, block_ids=[3])]
+    )
+    produced = [(0, block, s.offset, s.length) for block in (2, 3) for s in TOY.spans(1, 2)]
+    one = checker._coverage(expected, [sl.ReadRecord("r", 0, "h", produced, True, engine="p-dp1")])
+    assert one["problems"] == [], one
+    split = checker._coverage(
+        expected,
+        [sl.ReadRecord("r", 0, "h", produced[:4], True, engine="p-dp0"),
+         sl.ReadRecord("r", 0, "h2", produced[4:], True, engine="p-dp1")],
+    )
+    assert split["problems"] == ["the request's READs name 2 producer engines, one expected"]
+    # Unknown engines with several remotes: reported, never guessed.
+    unknown = checker._coverage(expected, [sl.ReadRecord("r", 0, "h", produced, True)])
+    assert unknown["problems"] == ["the request's READs name 0 producer engines, one expected"]

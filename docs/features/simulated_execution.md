@@ -508,7 +508,19 @@ allowed for diagnostics. Its agent config uses four posting threads and
 background progress; these configured values do not independently observe
 live threads or provider/rail selection. Backend options and policy are
 logged separately. TENT accounting applies to Mooncake, while UCX and
-LIBFABRIC use NIXL telemetry, byte checks and network counters.
+LIBFABRIC use NIXL telemetry, byte checks and network counters. For both,
+the logged binding is the environment set before the agent is created;
+the native transport and device selection is not observed
+(`native_transport_observed: false` for UCX).
+
+A managed UCX or LIBFABRIC `add_remote_agent` can block indefinitely
+when the peer's side channel answers but its KV address is unreachable
+(a wrong `rank_addresses` entry, a missing route, a dead peer). The call
+cannot be interrupted and holds NIXL's single handshake thread: later
+handshakes wait behind it and the process does not exit until it is
+killed. After 30 seconds an error names the backend and the likely
+cause; check the peer's KV address and routes, then restart both
+instances.
 
 Every rank of the last pipeline stage logs its own KV (`kv_layout`,
 `kv_transfers`, `kv_check`, `kv_events` and `threads` records), and with

@@ -840,9 +840,12 @@ class NixlBaseConnectorWorker:
                 self.nixl_wrapper, self.nixl_backends, binding
             )
             if binding is not None:
+                from .simulated_tcp import report_stalled_remote_agents
+
                 self.simulated_transport.update(
                     num_threads=num_threads, progress_thread=config.enable_pthread
                 )
+                report_stalled_remote_agents(self.nixl_wrapper, self.nixl_backends[0])
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
         self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(

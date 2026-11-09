@@ -16,6 +16,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.simulated_tcp import (
 
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch):
+    # The binders write os.environ directly; restore it after each test.
+    saved = dict(os.environ)
     for key in list(os.environ):
         if key.startswith(("UCX_", "NIXL_UCX_")):
             monkeypatch.delenv(key)
@@ -27,6 +29,9 @@ def isolated_env(monkeypatch):
             "kv1": [NS(family=socket.AF_INET, address="10.110.0.3")],
         },
     )
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 def test_tcp_interface_and_repeat_initialization():
@@ -105,13 +110,13 @@ def test_backend_identity_and_device_override_are_observed():
             agent_evidence(agent, ["UCX"], binding)
 
 
-def test_settings_cannot_change_during_agent_construction(monkeypatch):
+def test_ucx_evidence_does_not_claim_native_observation():
     binding = bind_ucx_tcp("10.110.0.1", {})
-    monkeypatch.setenv("UCX_TLS", "all")
-    with pytest.raises(ValueError, match="changed"):
-        agent_evidence(
-            NS(backends={"UCX": 1}, get_backend_params=lambda _: {}), ["UCX"], binding
-        )
+    evidence = agent_evidence(
+        NS(backends={"UCX": 1}, get_backend_params=lambda _: {}), ["UCX"], binding
+    )
+    assert evidence["binding"] == binding
+    assert evidence["native_transport_observed"] is False
 
 
 @pytest.mark.parametrize("backend", ["UCX", "LIBFABRIC"])
@@ -161,6 +166,8 @@ def libfabric(monkeypatch, tmp_path):
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import simulated_libfabric
 
     module = importlib.reload(simulated_libfabric)
+    # Undone at teardown: no process binding outlives the test.
+    monkeypatch.setattr(module, "_binding", None)
     for key in list(os.environ):
         if key.startswith(("FI_", "NIXL_LIBFABRIC_")):
             monkeypatch.delenv(key)
@@ -333,3 +340,33 @@ def test_libfabric_observes_backend_options(libfabric, options):
             ["LIBFABRIC"],
             binding,
         )
+
+
+def test_a_stalled_remote_agent_is_reported_and_a_prompt_one_is_not(monkeypatch):
+    import threading
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import simulated_tcp
+
+    errors = []
+    monkeypatch.setattr(simulated_tcp.logger, "error", lambda *a: errors.append(a))
+    release = threading.Event()
+    agent = NS(add_remote_agent=lambda meta: release.wait(5) and f"agent-{meta}")
+    simulated_tcp.report_stalled_remote_agents(agent, "LIBFABRIC", after_s=0.05)
+    worker = threading.Thread(target=lambda: errors.append(agent.add_remote_agent("p")))
+    worker.start()
+    deadline = threading.Event()
+    for _ in range(100):
+        if errors:
+            break
+        deadline.wait(0.02)
+    assert errors and errors[0][1] == "LIBFABRIC"
+    release.set()
+    worker.join(5)
+    assert errors[-1] == "agent-p"
+    # A call that returns before the deadline reports nothing.
+    errors.clear()
+    prompt = NS(add_remote_agent=lambda m: m)
+    simulated_tcp.report_stalled_remote_agents(prompt, "UCX", after_s=0.05)
+    assert prompt.add_remote_agent("x") == "x"
+    deadline.wait(0.15)
+    assert errors == []
