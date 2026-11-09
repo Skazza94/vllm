@@ -182,6 +182,66 @@ def test_ownership_matches_nixl_compute_tp_mapping(kv):
                 assert tuple(sorted(sl.state_sources(rank, local, remote, width))) == plan.source_ranks_per_group[1], (local, remote, rank)
 
 
+@pytest.mark.parametrize("config", [NEMOTRON, QWEN], ids=["mamba2", "gdn"])
+@pytest.mark.parametrize("local,remote", [(1, 2), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)])
+def test_native_split_reads_land_where_ownership_says(monkeypatch, config, local, remote):
+    """P TP > D TP: the decode rank's local state descriptors as native NIXL
+    builds them (`_build_mamba_local`, the conv split from `MambaSpec`), cut
+    per producer by native `_build_local_splits_from_plan` under the native
+    mapping, resolved to (region, block, offset, length) pieces, equal the
+    independent rule's (`expected_pieces`) for every producer."""
+    import types
+
+    from vllm.distributed.kv_transfer.kv_connector.v1 import ssm_conv_transfer_utils
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        NixlBaseConnectorWorker as Native,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import compute_tp_mapping
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    monkeypatch.setattr(ssm_conv_transfer_utils, "is_conv_state_dim_first", lambda: True)
+    layout = sl.layout_from_config(config, 2, 4)
+    spec = _spec(layout, local)
+    decomp = ssm_conv_transfer_utils.derive_mamba_conv_split(spec, local)
+    page, regions, num_blocks, held = sum(decomp.ssm_sizes) + 512, 3, 6, [1, 4]
+    bases = [(r + 1) << 32 for r in range(regions)]
+    for rank in range(local):
+        topo = SimpleNamespace(
+            tp_rank=rank, tp_size=local, is_mla=False, total_num_kv_heads=8,
+            dcp_source_ranks=None, dcp_consumer_count=lambda *a: 1,
+        )
+        plan = compute_tp_mapping(topo, remote, (FullAttentionSpec, MambaSpec))
+        worker = SimpleNamespace(
+            _conv_decomp=decomp, _mamba_ssm_size=decomp.ssm_sizes, _logical_num_blocks=num_blocks,
+            _physical_blocks_per_logical_kv_block=1, device_id=0, _ssm_region_indices=list(range(regions)),
+            block_stride_per_layer=[page] * regions, _ple_region_index=None,
+            _group_spec_types=[FullAttentionSpec, MambaSpec], transfer_topo=topo,
+            block_len_per_layer=[], num_regions=0, _pack_strided_descs=Native._pack_strided_descs,
+            _strided_desc_starts=Native._strided_desc_starts,
+        )
+        worker._fa_desc_replicated = types.MethodType(Native._fa_desc_replicated, worker)
+        local_descs = Native._build_mamba_local(worker, bases)
+        handles = list(Native._build_local_splits_from_plan(worker, plan, local_descs, num_fa_descs=0))
+        assert len(handles) == len(plan.all_source_ranks)
+        native = {}
+        for p_idx, handle in enumerate(handles):
+            for addr, length, _, stride, count in handle.tolist():
+                region = next(r for r, base in enumerate(bases) if base <= addr < base + page)
+                assert stride == page and count == num_blocks
+                native.setdefault(plan.all_source_ranks[p_idx], []).extend(
+                    (region, b, addr - bases[region], length) for b in held
+                )
+        rows = [
+            {"region": r, "offset": span.offset, "length": span.length, "state": True, "span": span}
+            for r in range(regions)
+            for span in layout.spans(rank, local)
+        ]
+        want = sl.expected_pieces(rows, held, rank, local, remote, layout, 8)
+        assert {p: sorted(v) for p, v in native.items()} == {p: sorted(v) for p, v in want.items()}, (
+            local, remote, rank,
+        )
+
+
 # ----- the posted-read coverage rule -----
 
 ROWS = [
