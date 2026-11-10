@@ -1,5 +1,5 @@
-"""A prefill/decode run of the vLLM simulator behind llm-d's router, without
-Kubernetes (llm-d v1.0's no-Kubernetes deployment).
+"""llm-d's router, the front end of every prefill/decode run (`harness.pd`),
+without Kubernetes (llm-d v1.0's no-Kubernetes deployment).
 
 Requests enter through Envoy on the gateway node, which asks llm-d's
 endpoint picker (EPP, over ext_proc) where each goes. The EPP knows the
@@ -18,12 +18,22 @@ container:<node>``): the EPP and Envoy the gateway's, a sidecar each decode
 node's. They carry the topology's label, so ``down`` removes them too; a run
 removes them itself after saving their logs and configs. The servers, the
 client's benchmark, the KV transfers and the run's checks are
-`harness.pd`'s; this module adds the router's own evidence.
+`harness.pd`'s; this module starts the router and checks its own evidence.
+
+A component container gets its node's CPU set (``docker --cpuset-cpus``, as
+the node has it), so the router's processes run where the topology puts
+that node: Envoy and the EPP on the gateway's cores, a sidecar on its
+decode node's. What Docker reports for each is saved and checked.
+
+An instance of several DP ranks is one endpoint. Who picks the rank depends
+on the connector: under Mooncake the sidecar selects the producer (prefill)
+DP rank itself, any one of those the prefill's bootstrap server lists, and
+names it to both sides; decode's rank is vLLM's choice. Under NIXL vLLM
+balances the ranks of both sides. The EPP routes to instances, not ranks.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import re
@@ -92,55 +102,7 @@ def default_epp_plugins() -> dict:
     }
 
 
-@dataclass
-class Router:
-    gateway: str
-    """The node Envoy and the EPP run in (its control network address is
-    the client's base URL)."""
-    epp_plugins: Path | None = None
-    """An EndpointPickerConfig's plugins and schedulingProfiles (YAML), in
-    place of `default_epp_plugins`; the endpoints file and the metrics
-    source are added to it either way."""
-    epp_verbosity: int = 4
-    sidecar_verbosity: int = 4
-
-
-@dataclass
-class LlmdRun:
-    run: pd.Run
-    router: Router
-
-
-def load(path: str | Path) -> LlmdRun:
-    """A run config: `harness.pd`'s, plus ``router``."""
-
-    path = Path(path).resolve()
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    router_raw = raw.pop("router", None)
-    if not isinstance(router_raw, dict) or "gateway" not in router_raw:
-        raise ValueError("run config needs router.gateway (the node Envoy and the EPP run in)")
-    run = pd.parse(raw, path)
-    try:
-        router = Router(**router_raw)
-    except TypeError as error:
-        raise ValueError(f"router: {error}") from None
-    if router.epp_plugins is not None:
-        router.epp_plugins = (path.parent / router.epp_plugins).resolve()
-    for side in (run.prefill, run.decode):
-        if side.data_parallel_size != 1:
-            raise ValueError("llm-d runs take one engine per instance for now (data_parallel_size 1)")
-        if side.tensor_parallel_size is not None and side.tensor_parallel_size != run.server.tensor_parallel_size:
-            raise ValueError("llm-d runs take the server's TP size for every instance for now")
-    if run.prefill.tp(run.server) != run.decode.tp(run.server):
-        raise ValueError("llm-d runs take equal TP sizes for now")
-    if run.server.speculative is not None:
-        raise ValueError("llm-d runs take no speculative decoding for now")
-    if router.gateway in (*run.prefill.nodes, *run.decode.nodes):
-        raise ValueError("router.gateway is a node of its own (or the client), not a server's")
-    return LlmdRun(run, router)
-
-
-def epp_config(router: Router) -> dict:
+def epp_config(router: pd.Router) -> dict:
     """The EPP's config: the plugins, its endpoints from the file, their
     metrics scraped."""
 
@@ -266,7 +228,7 @@ def envoy_config() -> dict:
     }
 
 
-def epp_args(router: Router) -> list[str]:
+def epp_args(router: pd.Router) -> list[str]:
     """The EPP's flags (the no-Kubernetes guide's): plaintext, gRPC health
     on its ext_proc port for Envoy."""
     return ["--config-file=/etc/epp/config.yaml", "--pool-name=file-discovery", "--pool-namespace=default",
@@ -275,28 +237,35 @@ def epp_args(router: Router) -> list[str]:
             f"--v={router.epp_verbosity}"]
 
 
-def sidecar_args(run: pd.Run, router: Router) -> list[str]:
+def sidecar_args(run: pd.Run) -> list[str]:
     """The decode sidecar's flags: plaintext, no InferencePool allowlist
     (there is none without Kubernetes), the run's connector protocol."""
     return [f"--port={SIDECAR_PORT}", f"--model-server-port={DECODE_ENGINE_PORT}",
             f"--kv-connector={SIDECAR_CONNECTOR[run.server.connector]}",
             f"--mooncake-bootstrap-port={pd.BOOTSTRAP_PORT}", "--secure-serving=false",
-            "--enable-ssrf-protection=false", f"--zap-log-level={router.sidecar_verbosity}"]
+            "--enable-ssrf-protection=false", f"--zap-log-level={run.router.sidecar_verbosity}"]
 
 
 def component_name(topology_name: str, node: str, component: str) -> str:
     return f"{topology_name}-{node}-{component}"
 
 
+def cpuset(container: str) -> str:
+    """A container's CPU set as Docker has it ('' if unrestricted)."""
+    return shell.run(["docker", "inspect", "-f", "{{.HostConfig.CpusetCpus}}", container]).strip()
+
+
 def start_component(topology_name: str, node_container: str, name: str, image: str, args: list[str],
                     files: dict[str, dict[str, str]] | None = None) -> None:
-    """A container of ``image`` in ``node_container``'s network namespace,
-    labelled for ``down``; ``files`` maps a directory in it to the files
-    (name: text) copied there before it starts."""
+    """A container of ``image`` in ``node_container``'s network namespace
+    and on its CPU set (sharing the namespace alone would leave it on every
+    core), labelled for ``down``; ``files`` maps a directory in it to the
+    files (name: text) copied there before it starts."""
 
+    cpus = cpuset(node_container)
     shell.run(["docker", "create", "--name", name, "--label", f"{topology.LABEL}={topology_name}",
                "--label", f"{LLMD_LABEL}={topology_name}", "--network", f"container:{node_container}",
-               image, *args])
+               *(["--cpuset-cpus", cpus] if cpus else []), image, *args])
     for directory, contents in (files or {}).items():
         with tempfile.TemporaryDirectory() as local:
             # docker cp keeps modes (the owner becomes root): readable for
@@ -321,6 +290,54 @@ def _wait_component(client: str, url: str, name: str, timeout: float = 120) -> N
                            f"its log ends with:\n{tail}") from None
 
 
+def placement(names: list[str]) -> dict[str, dict]:
+    """Where Docker runs each component: its own CPU set, and the node whose
+    network namespace it joined with that node's CPU set."""
+    found: dict[str, dict] = {}
+    for name in names:
+        described = json.loads(shell.run(["docker", "inspect", name]))[0]["HostConfig"]
+        mode = described.get("NetworkMode") or ""
+        node: dict = {"name": None, "cpuset": None}
+        if mode.startswith("container:"):
+            inspected = json.loads(shell.run(["docker", "inspect", mode.split(":", 1)[1]]))[0]
+            node = {"name": inspected["Name"].lstrip("/"), "cpuset": inspected["HostConfig"].get("CpusetCpus") or ""}
+        found[name] = {"cpuset": described.get("CpusetCpus") or "", "network_mode": mode,
+                       "node": node["name"], "node_cpuset": node["cpuset"]}
+    return found
+
+
+def expected_components(run: pd.Run) -> dict[str, str]:
+    """The run's component containers and the node container each belongs to."""
+    gateway = run.router.gateway
+    expected = {component_name(run.topology, gateway, kind): f"{run.topology}-{gateway}" for kind in ("epp", "envoy")}
+    for node in run.decode.nodes:
+        expected[component_name(run.topology, node, "sidecar")] = f"{run.topology}-{node}"
+    return expected
+
+
+def placement_problems(saved: object, run: pd.Run) -> list[str]:
+    """The saved placement (``llmd/components.json``) against the run: every
+    component present, in its node's network namespace and on that node's
+    CPU set."""
+    if not isinstance(saved, dict):
+        return ["the router components' placement evidence is missing"]
+    problems = []
+    expected = expected_components(run)
+    for name, node in expected.items():
+        described = saved.get(name)
+        if not isinstance(described, dict):
+            problems.append(f"no placement evidence for the component {name}")
+            continue
+        if described.get("node") != node:
+            problems.append(f"{name} joined {described.get('node')!r}, not its node {node}")
+        if not isinstance(described.get("cpuset"), str) or described.get("cpuset") != described.get("node_cpuset"):
+            problems.append(f"{name} ran on CPUs {described.get('cpuset')!r}, its node {node} on "
+                            f"{described.get('node_cpuset')!r}")
+    if unknown := sorted(set(saved) - set(expected)):
+        problems.append(f"components the run does not have: {unknown}")
+    return problems
+
+
 def components(topology_name: str) -> list[str]:
     """The llm-d containers of a topology, running or not."""
     output = shell.run(["docker", "ps", "-a", "--filter", f"label={LLMD_LABEL}={topology_name}",
@@ -335,31 +352,33 @@ def remove_components(topology_name: str) -> list[str]:
     return names
 
 
-class LlmdFront(pd.ProxyFront):
-    """llm-d's router as `harness.pd`'s front end."""
+class Front:
+    """llm-d's router for a run: `harness.pd.execute` drives it."""
 
-    name = "llmd"
-
-    def __init__(self, llmd: LlmdRun) -> None:
-        super().__init__(llmd.run)
-        self.router = llmd.router
+    def __init__(self, run: pd.Run) -> None:
+        self.run = run
+        self.router = run.router
         self.configs: dict[str, str] = {}
         self.gateway_address: str | None = None
         self.output: Path | None = None
 
     def server_port(self, role: str) -> int:
+        """The HTTP port ``role``'s vLLM serves on: a decode instance's
+        sidecar has SIDECAR_PORT."""
         return DECODE_ENGINE_PORT if role == "decode" else pd.SERVER_PORT
 
-    def control_nodes(self) -> list[str]:
-        # Envoy and the EPP: the client's requests, the requests Envoy
-        # forwards and the EPP's metrics scraping of every instance.
-        return [self.router.gateway]
+    def health_url(self, role: str, control: str) -> str:
+        """The URL that answers once ``role``'s server is up (from the client)."""
+        return f"http://{control}:{self.server_port(role)}/health"
 
     def prepare(self, container: dict[str, str]) -> None:
-        # A previous run's router would route this run's requests.
+        """Before the servers start: a previous run's router would route
+        this run's requests."""
         remove_components(self.run.topology)
 
     def start(self, container: dict[str, str], address: dict) -> str:
+        """Start the router once the servers are up; returns the base URL
+        the client's benchmark sends to."""
         run, router = self.run, self.router
         state = topology.load_state(run.topology)
         nodes = state["nodes"]
@@ -372,7 +391,7 @@ class LlmdFront(pd.ProxyFront):
         }
         for node in run.decode.nodes:
             start_component(run.topology, container[node], component_name(run.topology, node, "sidecar"),
-                            IMAGES["sidecar"], sidecar_args(run, router))
+                            IMAGES["sidecar"], sidecar_args(run))
         start_component(run.topology, gateway, component_name(run.topology, router.gateway, "epp"), IMAGES["epp"],
                         epp_args(router), {"/etc/epp": {"config.yaml": self.configs["epp-config.yaml"],
                                                         "endpoints.yaml": self.configs["endpoints.yaml"]}})
@@ -410,6 +429,7 @@ class LlmdFront(pd.ProxyFront):
                            + "\n".join(line for line in text.splitlines() if "pool" in line)[:3000])
 
     def collect(self, container: dict[str, str], output: Path) -> None:
+        """Its configs and logs, whatever happened."""
         self.output = output
         directory = output / "llmd"
         directory.mkdir(parents=True, exist_ok=True)
@@ -424,6 +444,8 @@ class LlmdFront(pd.ProxyFront):
                 pd.PYTHON, "-c", fetch, f"http://{self.gateway_address}:{EPP_METRICS_PORT}/metrics"], check=False)
             (directory / "epp-metrics.txt").write_text(text, encoding="utf-8")
         names = components(self.run.topology)
+        # Where each ran, from Docker (not from this module's arguments).
+        (directory / "components.json").write_text(json.dumps(placement(names), indent=2) + "\n")
         # Stopped first: Envoy flushes its access log as it exits.
         for name in names:
             state = shell.run(["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", name],
@@ -436,14 +458,12 @@ class LlmdFront(pd.ProxyFront):
             (directory / f"{name}.log").write_text(logs, encoding="utf-8")
 
     def stop(self, container: dict[str, str]) -> None:
+        """After collecting: its containers removed."""
         removed = remove_components(self.run.topology)
         if self.output is not None:
             # What the run removed, and that nothing of it is left.
             (self.output / "llmd" / "cleanup.json").write_text(json.dumps(
                 {"removed": removed, "remaining": components(self.run.topology)}, indent=2) + "\n")
-
-    def check(self, output: Path, verdict: dict) -> None:
-        recheck(output, self.run, verdict)
 
 
 def _pool_ready(metrics: str, instances: int) -> bool:
@@ -500,7 +520,7 @@ def _engine_requests(texts: list[str]) -> tuple[dict[str, set[str]], dict[str, s
 
 
 REQUIRED_EVIDENCE = ("llmd/endpoints.yaml", "llmd/epp-config.yaml", "llmd/*-epp.log", "llmd/*-sidecar.log",
-                     "llmd/*-envoy.log", "llmd/cleanup.json", "bench.json")
+                     "llmd/*-envoy.log", "llmd/cleanup.json", "llmd/components.json", "bench.json")
 PICKED = "Completed running picker plugin successfully"
 
 
@@ -693,15 +713,9 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
     }}
 
 
-def control_nodes(output: Path) -> list[str]:
-    """A saved run's front-end nodes (`LlmdFront.control_nodes`), from its
-    ``router.json``."""
-    return [json.loads((Path(output) / "router.json").read_text())["gateway"]]
-
-
 def recheck(output: Path, run: pd.Run, verdict: dict) -> None:
-    """An llm-d run's routing evidence and its cleanup, checked into
-    ``verdict``."""
+    """A run's routing evidence, the router components' placement and their
+    cleanup, checked into ``verdict``."""
     evidence = routing_evidence(output, run)
     cleanup = output / "llmd" / "cleanup.json"
     if cleanup.exists():
@@ -709,12 +723,10 @@ def recheck(output: Path, run: pd.Run, verdict: dict) -> None:
         if evidence["evidence"]["cleanup"]["remaining"]:
             evidence["problems"].append(f"llm-d containers left after the run: "
                                         f"{evidence['evidence']['cleanup']['remaining']}")
+    placed = output / "llmd" / "components.json"
+    if placed.exists():
+        saved = json.loads(placed.read_text())
+        evidence["evidence"]["components"] = saved
+        evidence["problems"].extend(placement_problems(saved, run))
     verdict["llmd"] = evidence["evidence"]
     verdict["problems"].extend(evidence["problems"])
-
-
-def execute(llmd: LlmdRun, output: Path | None = None) -> dict:
-    output = output or pd.RESULTS / f"{llmd.run.name}-{time.strftime('%Y%m%d-%H%M%S')}"
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "router.json").write_text(json.dumps(asdict(llmd.router), indent=2, default=str) + "\n")
-    return pd.execute(llmd.run, output, LlmdFront(llmd))

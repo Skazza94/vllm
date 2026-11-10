@@ -9,16 +9,32 @@ import io
 import json
 import os
 import re
+import sys
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from harness import pd, spec, topology
+from harness import llmd, pd, spec, topology
+
+
+class SyntheticRouting:
+    """For test classes whose saved or live runs are synthetic fixtures with
+    no router evidence: the router's checks (`llmd.recheck`, tested in
+    test_llmd) are stubbed for the class, and only for it. A run on docker
+    must not use this: its routing is checked for real."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        stub = mock.patch.object(llmd, "recheck")
+        stub.start()
+        cls.addClassCleanup(stub.stop)
 
 
 E2E = Path(__file__).resolve().parent.parent
 RUN = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"),
-             decode=pd.Side("d", "data0"), client="c", control_network="control",
+             decode=pd.Side("d", "data0"), client="c", control_network="control", router=pd.Router("gw"),
              workload=pd.Workload(num_prompts=2))
 
 
@@ -114,11 +130,11 @@ class CheckTests(unittest.TestCase):
 
     def test_a_repositorys_own_code_runs_only_when_asked(self) -> None:
         self.assertNotIn("--trust-remote-code", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
-        self.assertNotIn("--trust-remote-code", pd.bench_command(RUN))
+        self.assertNotIn("--trust-remote-code", pd.bench_command(RUN, "http://gw"))
         trusted = pd.Run(**{**RUN.__dict__, "server": pd.Server(trust_remote_code=True)})
         for role in ("prefill", "decode"):
             self.assertIn("--trust-remote-code", pd.server_command(trusted, role, ["10.100.0.1"]))
-        self.assertIn("--trust-remote-code", pd.bench_command(trusted))
+        self.assertIn("--trust-remote-code", pd.bench_command(trusted, "http://gw"))
         # Only a boolean: the string "false" would turn the flags on.
         base = Path(__file__).parents[1] / "runs" / "pd-smoke.yaml"
         for value, ok in (("true", True), ("false", True), ('"false"', False), ("1", False), ("yes", True)):
@@ -167,6 +183,7 @@ class CheckTests(unittest.TestCase):
 
     def test_the_connector_is_mooncake_or_nixl(self) -> None:
         base = {"name": "t", "topology": "t", "model": ".", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw"},
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"}}
 
         def load(server: dict, **sides) -> pd.Run:
@@ -175,8 +192,7 @@ class CheckTests(unittest.TestCase):
                 path.write_text(json.dumps({**base, **sides, "server": {"timing": "zero", **server}}))
                 return pd.load(path)
 
-        self.assertEqual((load({}).server.connector, load({}).proxy), ("mooncake", pd.DEFAULT_PROXY))
-        self.assertEqual(load({"connector": "nixl"}).proxy, pd.NIXL_PROXY)
+        self.assertEqual(load({}).server.connector, "mooncake")
         self.assertEqual(load({"connector": "nixl", "tensor_parallel_size": 2}).server.tensor_parallel_size, 2)
         with self.assertRaisesRegex(ValueError, "server.connector is one of mooncake, nixl"):
             load({"connector": "ucx"})
@@ -213,13 +229,13 @@ class CheckTests(unittest.TestCase):
     def test_a_workload_may_share_prefixes(self) -> None:
         repetition = {"prefix_len": 768, "suffix_len": 256, "num_prefixes": 4}
         run = pd.Run(**{**RUN.__dict__, "workload": pd.Workload(input_len=1024, prefix_repetition=repetition)})
-        command = pd.bench_command(run)
+        command = pd.bench_command(run, "http://gw")
         self.assertEqual(command[command.index("--dataset-name") + 1], "prefix_repetition")
         self.assertEqual([command[command.index(f"--prefix-repetition-{name}") + 1]
                           for name in ("prefix-len", "suffix-len", "num-prefixes", "output-len")],
                          ["768", "256", "4", "16"])
         self.assertNotIn("--random-input-len", command)
-        self.assertIn("--random-input-len", pd.bench_command(RUN))
+        self.assertIn("--random-input-len", pd.bench_command(RUN, "http://gw"))
         base = (E2E / "runs" / "pd-smoke.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
         for workload, extra, error in (
                 ("prefix_repetition: {prefix_len: 700, suffix_len: 256, num_prefixes: 4}", "", "input_len is"),
@@ -245,7 +261,38 @@ class CheckTests(unittest.TestCase):
         run = pd.load(E2E / "runs" / "pd-smoke.yaml")
         self.assertEqual((run.prefill.node, run.decode.kv_network), ("prefill0", "data0"))
         self.assertTrue((run.model / "config.json").is_file(), run.model)
-        self.assertTrue(run.proxy.is_file(), run.proxy)
+        self.assertEqual(run.router, pd.Router("gateway"))
+        # Its topology has the gateway as a node of its own.
+        nodes = spec.load(E2E / "topologies" / f"{run.topology}.yaml").nodes
+        self.assertTrue({run.router.gateway, run.client, run.prefill.node, run.decode.node} <= set(nodes))
+
+    def test_servers_keep_idle_connections_longer_than_the_router(self) -> None:
+        # vLLM's 5 s default closes connections llm-d's sidecar and Envoy reuse.
+        for role in ("prefill", "decode"):
+            self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120", pd.server_command(RUN, role, ["10.1.0.1"]))
+        asked = pd.Run(**{**RUN.__dict__, "server": pd.Server(env={"VLLM_HTTP_TIMEOUT_KEEP_ALIVE": 30})})
+        command = pd.server_command(asked, "decode", ["10.1.0.1"])
+        self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=30", command)
+        self.assertNotIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120", command)
+
+    def test_the_router_is_required_on_a_node_of_its_own(self) -> None:
+        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+                "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
+                "server": {"timing": "zero"}}
+        path = Path("/x/run.yaml")
+        run = pd.parse({**base, "router": {"gateway": "gw", "epp_plugins": "plugins.yaml", "epp_verbosity": 2}}, path)
+        self.assertEqual(run.router, pd.Router("gw", Path("/x/plugins.yaml"), 2))
+        for router, message in ((None, "needs router.gateway"), ({}, "needs router.gateway"),
+                                ({"gateway": 3}, "needs router.gateway"),
+                                ({"gateway": "c"}, "a node of its own"), ({"gateway": "p"}, "a node of its own"),
+                                ({"gateway": "d"}, "a node of its own"),
+                                ({"gateway": "gw", "port": 1}, "router: ")):
+            with self.subTest(router=router), self.assertRaisesRegex(ValueError, message):
+                pd.parse({**base, **({} if router is None else {"router": router})}, path)
+        # The vLLM toy proxies are gone.
+        with self.assertRaisesRegex(ValueError, "unknown run key"):
+            pd.parse({**base, "router": {"gateway": "gw"}, "proxy": "proxy.py"}, path)
+        self.assertFalse(hasattr(pd, "ProxyFront"))
 
 
 # gpt-oss-like: a 32-token window group and a full one, 2 layers each, 4
@@ -682,20 +729,21 @@ class HybridCheckTests(unittest.TestCase):
                 self.assertEqual(verdict["ranks"][0]["handoff"]["requests"], checked)
 
 
-class RecheckTests(unittest.TestCase):
+class RecheckTests(SyntheticRouting, unittest.TestCase):
     """`python -m harness recheck` on a saved results directory."""
 
     def save(self, directory: Path, checks: list[dict], timing: bool = True) -> None:
         moved = sum(c["bytes"] for c in checks)
-        saved = {**asdict(RUN), "model": str(RUN.model), "proxy": str(RUN.proxy), "addresses": {}, "front": "proxy"}
+        saved = {**asdict(RUN), "model": str(RUN.model), "addresses": {}}
         if not timing:  # saved before server.timing existed (the roofline's runs)
             saved["server"] = {k: v for k, v in saved["server"].items() if k not in ("timing", "timing_args")}
         (directory / "run.json").write_text(json.dumps(saved, default=str))
         (directory / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
         (directory / "routers.json").write_text(json.dumps({"control": 50, "data0": moved + 100}))
         (directory / "tent.json").write_text("{}")
-        (directory / "control-ports.json").write_text(json.dumps({"nodes": [], "bytes": 0, "ports": {
-            "p0": {"node": "c", "rx": 50, "tx": 0}, "p1": {"node": "p", "rx": 0, "tx": 25}, "p2": {"node": "d", "rx": 0, "tx": 25}}}))
+        (directory / "control-ports.json").write_text(json.dumps({"nodes": ["gw"], "bytes": 40, "ports": {
+            "p0": {"node": "c", "rx": 50, "tx": 0}, "p1": {"node": "p", "rx": 0, "tx": 25},
+            "p2": {"node": "d", "rx": 0, "tx": 25}, "p3": {"node": "gw", "rx": 0, "tx": 40}}}))
         (directory / "prefill-p-steps.jsonl").write_text(
             GROUPS_LAYOUT + allocated("a", "b") + line(kv_transfers={"send": {"count": 2, "bytes": moved}}))
         (directory / "decode-d-steps.jsonl").write_text(
@@ -737,7 +785,7 @@ class RecheckTests(unittest.TestCase):
 
 
 TP2 = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", ["data0", "data1"]),
-             decode=pd.Side("d", ["data0", "data1"]), client="c", control_network="control",
+             decode=pd.Side("d", ["data0", "data1"]), client="c", control_network="control", router=pd.Router("gw"),
              server=pd.Server(tensor_parallel_size=2), workload=pd.Workload(num_prompts=2))
 
 
@@ -849,7 +897,7 @@ def dp_run(prefill_dp: int, decode_dp: int, tp: int = 1) -> pd.Run:
     return pd.Run(name="t", topology="t", model=Path("/m"),
                   prefill=pd.Side("p", networks, data_parallel_size=prefill_dp),
                   decode=pd.Side("d", networks, data_parallel_size=decode_dp), client="c",
-                  control_network="control", server=pd.Server(tensor_parallel_size=tp),
+                  control_network="control", router=pd.Router("gw"), server=pd.Server(tensor_parallel_size=tp),
                   workload=pd.Workload(num_prompts=2))
 
 
@@ -942,7 +990,7 @@ class DataParallelCheckTests(unittest.TestCase):
 def instances_run(prefill: list[str], decode: list[str], tp: int = 1, connector: str = "mooncake") -> pd.Run:
     networks = "data0" if tp == 1 else ["data0", "data1"]
     return pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side(prefill, networks),
-                  decode=pd.Side(decode, networks), client="c", control_network="control",
+                  decode=pd.Side(decode, networks), client="c", control_network="control", router=pd.Router("gw"),
                   server=pd.Server(tensor_parallel_size=tp, connector=connector), workload=pd.Workload(num_prompts=2))
 
 
@@ -1012,8 +1060,24 @@ class InstanceCheckTests(unittest.TestCase):
         self.assertEqual(RUN.prefill.step_log("prefill", 0, 0), "prefill-p-steps.jsonl")
         self.assertEqual(dp_run(2, 1).prefill.local_rank(1, 0, 1), 1)
 
+    def test_an_idle_dp_rank_may_lack_its_moved_series_an_owner_may_not(self) -> None:
+        # The Mooncake sidecar names any of the prefill's DP ranks: one may get none.
+        prefill = [dp_layout(0) + allocated("a", "b") + sent(2000), dp_layout(1)]
+        decode = [dp_layout(0) + line(kv_check=checked("a")) + line(kv_check=checked("b"))]
+        run = dp_run(2, 1)
+        verdict = pd.check({"completed": 2, "errors": []}, prefill, decode, {"control": 1, "data0": 2100}, run,
+                           {"prefill": [tent_counters(2000), tent_counters(None)], "decode": [tent_counters(None)]})
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["idle_ranks"], ["prefill DP rank 1 rank 0"])
+        problems = pd.check({"completed": 2, "errors": []}, prefill, decode, {"control": 1, "data0": 2100}, run,
+                            {"prefill": [tent_counters(None), tent_counters(None)],
+                             "decode": [tent_counters(None)]})["problems"]
+        self.assertTrue(any("DP rank 0: prefill's TENT metrics lack tent_write_bytes_total" in p for p in problems),
+                        problems)
+
     def test_node_lists_are_validated(self) -> None:
         base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw"},
                 "prefill": {"node": ["p0", "p1"], "kv_network": "data0"},
                 "decode": {"node": ["d0"], "kv_network": "data0"}, "server": {"timing": "zero"}}
         self.assertEqual(pd.parse(base, Path("/x/run.yaml")).prefill.nodes, ["p0", "p1"])
@@ -1036,7 +1100,7 @@ class InstanceCheckTests(unittest.TestCase):
         self.assertTrue(any("control network carried 450 bytes, too much" in p for p in problems), problems)
         # 450 bytes received at the router: 300 of them to or from the gateway.
         verdict = pd.check({"completed": 2, "errors": []}, prefill, decode, routers, run, None, None,
-                           self.exemption(), ["gw"])
+                           self.exemption())
         self.assertEqual(verdict["problems"], [])
         self.assertEqual(verdict["control_network"], {"bytes": 450, "front_end_bytes": 300,
                                                       "front_end_nodes": ["gw"], "guarded_bytes": 150})
@@ -1044,7 +1108,7 @@ class InstanceCheckTests(unittest.TestCase):
         exempt = self.exemption()
         exempt["ports"]["c"]["rx"] += 100
         problems = pd.check({"completed": 2, "errors": []}, prefill, decode, routers, run, None, None,
-                            exempt, ["gw"])["problems"]
+                            exempt)["problems"]
         self.assertTrue(any("carried 250 bytes besides the front end's 300" in p for p in problems), problems)
 
     @staticmethod
@@ -1055,7 +1119,7 @@ class InstanceCheckTests(unittest.TestCase):
 
     def test_the_control_evidence_is_derived_from_its_ports_and_validated(self) -> None:
         run = instances_run(["p0", "p1"], ["d0", "d1"])
-        self.assertEqual(pd.control_evidence(self.exemption(), run, ["gw"]), (450, 300, []))
+        self.assertEqual(pd.control_evidence(self.exemption(), run), (450, 300, []))
 
         def drop(node):
             def change(exempt): del exempt["ports"][node]
@@ -1087,15 +1151,15 @@ class InstanceCheckTests(unittest.TestCase):
             with self.subTest(name):
                 exempt = self.exemption()
                 change(exempt)
-                self.assertRegex("; ".join(pd.control_evidence(exempt, run, ["gw"])[2]), message)
+                self.assertRegex("; ".join(pd.control_evidence(exempt, run)[2]), message)
                 # And through the checks: a problem, never a pass.
                 problems = pd.check({"completed": 2, "errors": []}, prefill, decode,
-                                    {"control": 450, "data0": 2100}, run, None, None, exempt, ["gw"])["problems"]
+                                    {"control": 450, "data0": 2100}, run, None, None, exempt)["problems"]
                 self.assertRegex("; ".join(problems), message)
-        # The saved exemption's nodes never widen the front end's.
-        exempt = self.exemption()
-        exempt["nodes"] = []
-        self.assertRegex("; ".join(pd.control_evidence(exempt, run, [])[2]), "its ports give 0")
+        # The exempt node is the run's gateway, whatever the saved one says.
+        other = pd.Run(**{**run.__dict__, "router": pd.Router("c")})
+        self.assertRegex("; ".join(pd.control_evidence(self.exemption(), other)[2]),
+                         r"the front end's are \['c'\]")
 
     def test_the_front_ends_share_is_its_ports_bytes_both_ways(self) -> None:
         before = {"p1": {"node": "gw", "rx": 10, "tx": 20}, "p2": {"node": "d0", "rx": 5, "tx": 5}}
@@ -1104,10 +1168,6 @@ class InstanceCheckTests(unittest.TestCase):
         self.assertEqual(exempt["bytes"], 300)
         self.assertEqual(exempt["ports"]["p2"]["rx"], 1000)
         self.assertEqual(pd.control_exemption(before, after, [])["bytes"], 0)
-
-    def test_the_connectors_proxy_takes_one_node_a_side(self) -> None:
-        with self.assertRaisesRegex(ValueError, "one prefill and one decode node"):
-            pd.ProxyFront(instances_run(["p0", "p1"], ["d0"])).prepare({})
 
 
 # DeepSeek-V4-like packed blocks: every 20-byte block is all of one group's
@@ -1404,6 +1464,39 @@ class PrefillDecodeRunTests(unittest.TestCase):
         self.assertEqual(verdict["kv_checks"], 40)
         # The other rail stayed idle.
         self.assertLess(verdict["router_bytes"]["data1"], 1 << 20)
+        # Routed by llm-d, checked for real: every request's route, the
+        # components where their nodes are, nothing left behind.
+        routed = verdict["llmd"]
+        self.assertEqual((routed["completion_requests"], routed["producer_released"], routed["consumer_received"]),
+                         (40, 40, 40))
+        self.assertEqual(routed["pairs"], {"prefill0->decode0": 40})
+        self.assertEqual(routed["cleanup"]["remaining"], [])
+        self.assertEqual(len(routed["cleanup"]["removed"]), 3)
+        placed = routed["components"]
+        self.assertEqual({name.rsplit("-", 1)[1]: (c["node"], c["cpuset"]) for name, c in placed.items()},
+                         {"envoy": ("pd-two-rails-gateway", "15"), "epp": ("pd-two-rails-gateway", "15"),
+                          "sidecar": ("pd-two-rails-decode0", "7-13")})
+        self.assertTrue(all(c["cpuset"] == c["node_cpuset"] for c in placed.values()))
+
+
+class RoutingCheckScopeTests(unittest.TestCase):
+    """The router's checks are stubbed for synthetic fixtures only: a stub
+    reaching the docker run would let it pass without its routing checked."""
+
+    def test_the_docker_run_checks_its_routing_for_real(self) -> None:
+        self.assertFalse(issubclass(PrefillDecodeRunTests, SyntheticRouting))
+        self.assertFalse(hasattr(sys.modules[__name__], "setUpModule"))
+        self.assertNotIsInstance(llmd.recheck, mock.Mock)
+        # Whatever ran before it, in this module or another.
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(RecheckTests)
+        unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+        self.assertNotIsInstance(llmd.recheck, mock.Mock)
+
+    def test_a_run_without_router_evidence_fails_unstubbed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            RecheckTests().save(Path(directory), [grouped("a"), grouped("b")])
+            problems = pd.recheck(directory)["problems"]
+        self.assertTrue(any("missing routing evidence" in p for p in problems), problems)
 
 
 
@@ -2587,7 +2680,7 @@ class HeterogeneousTpTests(unittest.TestCase):
         self.assertEqual(pd.global_heads(1, 2, 8), [4, 5, 6, 7])
 
 
-class NixlTcpBackendTests(unittest.TestCase):
+class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
     backend = "ucx"
 
     def setUp(self):
@@ -2721,8 +2814,8 @@ class NixlTcpBackendTests(unittest.TestCase):
         run,p,d,ports,moved,_=self.fixture()
         run.server.timing="linear"
         out=Path(self.directory.name)/"saved";out.mkdir()
-        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model),"proxy":str(run.proxy),"front":"proxy"}))
-        (out/"control-ports.json").write_text(json.dumps({"nodes":[],"bytes":0,"ports":{"p0":{"node":"c","rx":50,"tx":0},"p1":{"node":"p","rx":0,"tx":25},"p2":{"node":"d","rx":0,"tx":25}}}))
+        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model)},default=str))
+        (out/"control-ports.json").write_text(json.dumps({"nodes":["gw"],"bytes":0,"ports":{"p0":{"node":"c","rx":50,"tx":0},"p1":{"node":"p","rx":0,"tx":25},"p2":{"node":"d","rx":0,"tx":25},"p3":{"node":"gw","rx":0,"tx":0}}}))
         for role,texts in (("prefill",p),("decode",d)):
             for rank,text in enumerate(texts):(out/getattr(run,role).step_log(role,0,rank)).write_text(text)
         for file,data in (("bench.json",{"completed":2,"errors":[]}),("routers.json",{"control":50,"kv":moved+500}),("router-ports.json",ports)):
@@ -2753,12 +2846,16 @@ class NixlTcpBackendTests(unittest.TestCase):
              patch.object(pd,"_kv_addresses",side_effect=addresses), \
              patch.object(pd,"router_bytes",side_effect=[{"control":0,"kv":0},{"control":50,"kv":moved+500}]), \
              patch.object(pd,"router_ports",side_effect=[{},ports]), \
-             patch.object(pd,"network_ports",return_value={f"p{i}":{"node":n,"rx":0,"tx":0} for i,n in enumerate("pdc")}), \
+             patch.object(pd,"network_ports",return_value={f"p{i}":{"node":n,"rx":0,"tx":0} for i,n in enumerate(("p","d","c","gw"))}), \
+             patch.object(llmd,"Front"), \
              patch.object(pd,"_port_deltas",return_value=ports), \
              patch.object(pd,"_collect",side_effect=collect),patch.object(pd.time,"sleep"):
             self.assertEqual(pd.execute(run,output)["problems"],[])
         self.assertFalse((output/"tent.json").exists())
         self.assertFalse((output/"tent-after.json").exists())
+        started=json.loads((output/"servers.json").read_text())
+        self.assertEqual({role:list(nodes) for role,nodes in started.items()},{"prefill":["p"],"decode":["d"]})
+        self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120",started["decode"]["d"])
         self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":pd.nixl_backend(run.server),"tent_applicable":False})
 
     def test_tcp_large_descriptor_plan_keeps_exact_counts_and_bytes(self):

@@ -1,6 +1,7 @@
 # Example topology (the only one tracked; copy it to make others):
 # a prefill and a decode node with two data rails (one per tensor-parallel
-# rank, say) and a control network the client shares.
+# rank, say), and a control network they share with the client and the
+# gateway (llm-d's router).
 #
 #   python -m harness up topologies/pd-two-rails.yaml   # from e2e/
 #   python -m harness status pd-two-rails
@@ -65,6 +66,15 @@ nodes:
     networks: [control, data0, data1]
     cpus: "7-13"
     memory: 24g
+  # llm-d's Envoy and endpoint picker run in containers that join this
+  # node's network namespace and get its cpus (a decode node's sidecar
+  # likewise gets decode's). Here the gateway shares CPU 15 with the network
+  # routers above, apart from the client and the servers: enough for a
+  # functional run, not an isolated router for performance numbers (give it
+  # cores of its own for those).
+  gateway:
+    networks: [control]
+    cpus: "15"
   client:
     networks: [control]
     cpus: "14"

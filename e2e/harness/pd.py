@@ -5,9 +5,11 @@ KV transfers through MooncakeConnector (prefill writes), or NixlConnector
 over its Mooncake, UCX/TCP or LIBFABRIC/TCP backend (decode reads; ``server.connector: nixl``).
 The Mooncake paths use TENT's hp_tcp only; UCX and LIBFABRIC use each rank's resolved TCP
 interface. NIXL's handshake uses the KV network too: one side channel per DP
-engine, on rank 0's network, at ports of their own. HTTP, the proxy and
-Mooncake's bootstrap use the control network. The client node runs the
-connector's proxy and ``vllm bench serve``.
+engine, on rank 0's network, at ports of their own. HTTP and Mooncake's
+bootstrap use the control network. Requests enter through llm-d's router
+(`harness.llmd`: Envoy and the endpoint picker on the run's gateway node, a
+disaggregation sidecar on each decode node); the client node runs ``vllm
+bench serve`` against the gateway.
 
 With tensor parallelism, every rank moves its own KV heads: on the side's KV
 network, or on its own one (``kv_network`` a list, one per rank, the same
@@ -41,9 +43,6 @@ from . import shell, topology
 
 E2E = Path(__file__).resolve().parent.parent
 REPOSITORY = E2E.parent
-DEFAULT_PROXY = (REPOSITORY / "vllm" / "examples" / "disaggregated" / "mooncake_connector"
-                 / "mooncake_connector_proxy.py")
-NIXL_PROXY = REPOSITORY / "vllm" / "tests" / "v1" / "kv_connector" / "nixl_integration" / "toy_proxy_server.py"
 CONNECTORS = ("mooncake", "nixl")
 RESULTS = E2E / "results"
 VLLM = "/opt/venv/bin/vllm"
@@ -51,8 +50,8 @@ PYTHON = "/opt/venv/bin/python"
 MODEL_DIRECTORY = "/model"
 MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
-PROXY_PORT = 8080
 BOOTSTRAP_PORT = 8998
+HTTP_KEEP_ALIVE = 120  # seconds: the servers' HTTP keep-alive
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
@@ -201,6 +200,21 @@ PREFIX_REPETITION_KEYS = ("prefix_len", "suffix_len", "num_prefixes")
 
 
 @dataclass
+class Router:
+    """llm-d's router, every run's front end (`harness.llmd`)."""
+    gateway: str
+    """The node Envoy and the endpoint picker (EPP) run in, one of its own:
+    not the client, not a server's. Its control network address is the
+    client's base URL."""
+    epp_plugins: Path | None = None
+    """An EndpointPickerConfig's plugins and schedulingProfiles (YAML), in
+    place of `harness.llmd.default_epp_plugins`; the endpoints file and the
+    metrics source are added to it either way."""
+    epp_verbosity: int = 4
+    sidecar_verbosity: int = 4
+
+
+@dataclass
 class Run:
     name: str
     topology: str  # its name: the topology must be up
@@ -209,13 +223,13 @@ class Run:
     decode: Side
     client: str
     control_network: str
+    router: Router
     kv_check: bool = True
     expect_fragmentation: bool = False
     """Require byte-checked transfers whose blocks are scattered on both
     instances (a tight KV budget's reuse); the counts are reported anyway."""
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
-    proxy: Path = DEFAULT_PROXY
     startup_timeout: float = 600.0
 
 
@@ -230,20 +244,27 @@ def parse(raw: dict, path: Path) -> Run:
     """A run config's contents, read from ``path`` (relative paths are its)."""
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
-             "expect_fragmentation", "server", "workload", "proxy", "startup_timeout"}
+             "expect_fragmentation", "server", "workload", "router", "startup_timeout"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
+    router_raw = raw.get("router")
+    if not isinstance(router_raw, dict) or not isinstance(router_raw.get("gateway"), str):
+        raise ValueError("run config needs router.gateway (the node llm-d's Envoy and EPP run in)")
+    try:
+        router = Router(**router_raw)
+    except TypeError as error:
+        raise ValueError(f"router: {error}") from None
+    if router.epp_plugins is not None:
+        router.epp_plugins = (path.parent / router.epp_plugins).resolve()
     try:
         run = Run(
             name=raw["name"], topology=raw["topology"],
             model=(path.parent / raw["model"]).resolve(),
             prefill=Side(**raw["prefill"]), decode=Side(**raw["decode"]),
-            client=raw["client"], control_network=raw["control_network"],
+            client=raw["client"], control_network=raw["control_network"], router=router,
             kv_check=bool(raw.get("kv_check", True)),
             expect_fragmentation=raw.get("expect_fragmentation", False),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
-            proxy=(path.parent / raw["proxy"]).resolve() if "proxy" in raw else (
-                NIXL_PROXY if (raw.get("server") or {}).get("connector") == "nixl" else DEFAULT_PROXY),
             startup_timeout=float(raw.get("startup_timeout", 600)),
         )
     except KeyError as missing:
@@ -281,6 +302,8 @@ def parse(raw: dict, path: Path) -> Run:
                 raise ValueError("several instances of a side are one engine each (data_parallel_size 1)")
     if set(run.prefill.nodes) & set(run.decode.nodes):
         raise ValueError("prefill and decode instances are on distinct nodes")
+    if run.router.gateway in (*run.prefill.nodes, *run.decode.nodes, run.client):
+        raise ValueError("router.gateway is a node of its own, not the client or a server's")
     if run.prefill.instances or run.decode.instances:
         if run.prefill.tp(run.server) != run.decode.tp(run.server):
             raise ValueError("several instances of a side take equal TP sizes")
@@ -406,10 +429,10 @@ def tent_config(address: str, hp_tcp_args: dict) -> dict:
     return {"rpc_server_hostname": address, "transports": transports}
 
 
-def bench_command(run: Run, base_url: str = f"http://127.0.0.1:{PROXY_PORT}") -> list[str]:
+def bench_command(run: Run, base_url: str) -> list[str]:
     """The client's benchmark: random prompts of the workload's lengths
-    through the front end at ``base_url`` (the proxy, by default),
-    tokenized with the model's tokenizer."""
+    through the router's gateway at ``base_url``, tokenized with the
+    model's tokenizer."""
     w = run.workload
     repetition = w.prefix_repetition
     dataset = ["--dataset-name", "random", "--random-input-len", str(w.input_len),
@@ -467,6 +490,11 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
     } if nixl else {"VLLM_MOONCAKE_BOOTSTRAP_PORT": str(BOOTSTRAP_PORT)}
     env = {
         "TRITON_CPU_BACKEND": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1", "OMP_NUM_THREADS": "1",
+        # llm-d's guides' value: vLLM's default (5 s) is shorter than the
+        # sidecar's and Envoy's idle connection timeouts, so a server closes
+        # a connection the router is about to reuse (the request is then
+        # answered 502).
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": str(HTTP_KEEP_ALIVE),
         # The address Mooncake's workers register (vLLM's get_ip).
         "VLLM_HOST_IP": kv_address,
         "MC_USE_TENT": "1",
@@ -510,75 +538,14 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
     ]
 
 
-class ProxyFront:
-    """The front end requests enter through: the connector's proxy on the
-    client node, the servers on SERVER_PORT. Another front end (llm-d's
-    router, `harness.llmd`) offers the same methods."""
+def execute(run: Run, output: Path | None = None) -> dict:
+    """Start the services and llm-d's router, run the workload, collect and
+    check; returns the verdict (also in ``<output>/verdict.json``). Raises
+    AssertionError when a check fails, after collecting."""
 
-    name = "proxy"
-    """Saved in run.json: `recheck` replays the same front end's checks."""
+    from . import llmd  # it imports this module
 
-    def __init__(self, run: Run) -> None:
-        self.run = run
-
-    def server_port(self, role: str) -> int:
-        """The HTTP port ``role``'s vLLM serves on."""
-        return SERVER_PORT
-
-    def health_url(self, role: str, control: str) -> str:
-        """The URL that answers once ``role``'s server is up (from the client)."""
-        return f"http://{control}:{self.server_port(role)}/health"
-
-    def prepare(self, container: dict[str, str]) -> None:
-        """Before the servers start (their nodes cleaned)."""
-        if self.run.prefill.instances or self.run.decode.instances:
-            raise ValueError("the connector's proxy takes one prefill and one decode node (node lists: harness.llmd)")
-        shell.run(["docker", "cp", str(self.run.proxy), f"{container[self.run.client]}:{WORK}/proxy.py"])
-
-    def start(self, container: dict[str, str], address: dict) -> str:
-        """Start the front end once the servers are up; returns the base URL
-        the client's benchmark sends to."""
-        run = self.run
-        prefill = address["instances"]["prefill"][run.prefill.node]["control"]
-        decode = address["instances"]["decode"][run.decode.node]["control"]
-        instances = ["--prefiller-hosts", prefill, "--prefiller-ports", str(SERVER_PORT),
-                     "--decoder-hosts", decode, "--decoder-ports", str(SERVER_PORT)] if (
-            run.server.connector == "nixl") else [
-            "--prefill", f"http://{prefill}:{SERVER_PORT}", str(BOOTSTRAP_PORT),
-            "--decode", f"http://{decode}:{SERVER_PORT}"]
-        _background(container[run.client], [PYTHON, f"{WORK}/proxy.py", "--host", "127.0.0.1",
-                                             "--port", str(PROXY_PORT), *instances], f"{WORK}/logs/proxy.log")
-        # The proxy has no health endpoint: FastAPI's docs page.
-        _wait(container[run.client], f"http://127.0.0.1:{PROXY_PORT}/docs", 120,
-              container[run.client], f"{WORK}/logs/proxy.log")
-        return f"http://127.0.0.1:{PROXY_PORT}"
-
-    def collect(self, container: dict[str, str], output: Path) -> None:
-        """Its logs and configs, whatever happened (the proxy's log is the
-        client's, collected with it)."""
-
-    def stop(self, container: dict[str, str]) -> None:
-        """After collecting (the proxy stops with the client's services)."""
-
-    def check(self, output: Path, verdict: dict) -> None:
-        """Its own checks, added to the run's ``verdict`` (its problems and
-        evidence) before it is written."""
-
-    def control_nodes(self) -> list[str]:
-        """Nodes of the front end's own control traffic (a router's metrics
-        scraping, its proxying), not KV: the bytes through their control
-        ports are left out of the control network's guard. The proxy: none
-        (its traffic is the client's, as it always was)."""
-        return []
-
-
-def execute(run: Run, output: Path | None = None, front: ProxyFront | None = None) -> dict:
-    """Start the services, run the workload, collect and check; returns the
-    verdict (also in ``<output>/verdict.json``). Raises AssertionError when
-    a check fails, after collecting. ``front``: what requests enter
-    through (default: the connector's proxy on the client)."""
-
-    front = front or ProxyFront(run)
+    front = llmd.Front(run)
     state = topology.load_state(run.topology)
     nodes = state["nodes"]
     roles = (("prefill", run.prefill), ("decode", run.decode))
@@ -590,8 +557,7 @@ def execute(run: Run, output: Path | None = None, front: ProxyFront | None = Non
     address: dict = {"instances": instances}
     output = output or RESULTS / f"{run.name}-{time.strftime('%Y%m%d-%H%M%S')}"
     output.mkdir(parents=True, exist_ok=True)
-    (output / "run.json").write_text(json.dumps({**asdict(run), "model": str(run.model), "proxy": str(run.proxy),
-                                                 "addresses": address, "front": front.name},
+    (output / "run.json").write_text(json.dumps({**asdict(run), "model": str(run.model), "addresses": address},
                                                 indent=2, default=str) + "\n")
 
     for name in container.values():
@@ -603,11 +569,14 @@ def execute(run: Run, output: Path | None = None, front: ProxyFront | None = Non
         shell.run(["docker", "cp", f"{run.model}/.", f"{name}:{MODEL_DIRECTORY}"])
     front.prepare(container)
 
+    commands: dict[str, dict[str, list[str]]] = {}
     for role, side in roles:
         for node in side.nodes:
-            _background(container[node],
-                        server_command(run, role, instances[role][node]["kv"], front.server_port(role)),
-                        f"{WORK}/logs/{role}.log")
+            command = server_command(run, role, instances[role][node]["kv"], front.server_port(role))
+            commands.setdefault(role, {})[node] = command
+            _background(container[node], command, f"{WORK}/logs/{role}.log")
+    # Each server as it was started: its environment and flags.
+    (output / "servers.json").write_text(json.dumps(commands, indent=2) + "\n")
     try:
         # Every instance (the startup timeout counted from the first).
         deadline = time.monotonic() + run.startup_timeout
@@ -642,7 +611,7 @@ def execute(run: Run, output: Path | None = None, front: ProxyFront | None = Non
     ports = _port_deltas(ports_before, ports_after)
     if ports:
         (output / "router-ports.json").write_text(json.dumps(ports, indent=2) + "\n")
-    exempt = control_exemption(control_before, control_after, front.control_nodes())
+    exempt = control_exemption(control_before, control_after, [run.router.gateway])
     (output / "control-ports.json").write_text(json.dumps(exempt, indent=2) + "\n")
     tent = {role: [_tent_delta(before, after) for before, after in zip(tent_before[role], tent_after[role])]
             for role in tent_before}
@@ -658,8 +627,8 @@ def execute(run: Run, output: Path | None = None, front: ProxyFront | None = Non
         *[[(output / getattr(run, role).step_log(role, dp, tp)).read_text()
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
-        routers, run, tent, ports or None, exempt, front.control_nodes())
-    front.check(output, verdict)
+        routers, run, tent, ports or None, exempt)
+    llmd.recheck(output, run, verdict)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
         raise AssertionError(f"run {run.name} failed its checks ({output}): {'; '.join(verdict['problems'])}")
@@ -669,28 +638,24 @@ def execute(run: Run, output: Path | None = None, front: ProxyFront | None = Non
 def recheck(output: str | Path) -> dict:
     """A saved run's checks again, from its results directory, with this
     harness: written to ``verdict-recheck.json``, the run's own
-    ``verdict.json`` left as it was. A run through llm-d's router (run.json's
-    ``front``) has its routing evidence checked too: missing evidence is a
-    problem."""
+    ``verdict.json`` left as it was. The router's evidence is part of them:
+    missing evidence is a problem."""
+    from . import llmd  # it imports this module
+
     output = Path(output)
     raw = json.loads((output / "run.json").read_text())
     raw.pop("addresses", None)
-    front = raw.pop("front")
-    run = Run(**{**raw, "model": Path(raw["model"]), "proxy": Path(raw["proxy"]),
+    router = Router(**raw["router"])
+    if router.epp_plugins is not None:
+        router.epp_plugins = Path(router.epp_plugins)
+    run = Run(**{**raw, "model": Path(raw["model"]), "router": router,
                  "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
     ports = output / "router-ports.json"
-    control = output / "control-ports.json"
-    # The front end's nodes, from its saved configuration (never from the
-    # exemption being checked).
-    control_nodes: list[str] = []
-    if front == "llmd":
-        from . import llmd  # it imports this module
-        control_nodes = llmd.control_nodes(output)
     # Required evidence: anything but an object (a `null` document) has no
     # ports, a problem of `control_evidence`, never `check`'s caller without
     # port evidence.
-    control_saved = json.loads(control.read_text())
+    control_saved = json.loads((output / "control-ports.json").read_text())
     if not isinstance(control_saved, dict):
         control_saved = {}
     verdict = check(
@@ -701,19 +666,15 @@ def recheck(output: str | Path) -> dict:
         json.loads((output / "routers.json").read_text()), run,
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None,
-        control_saved, control_nodes)
-    if front == "llmd":
-        llmd.recheck(output, run, verdict)
-    elif front != ProxyFront.name:
-        verdict["problems"].append(f"run.json names an unknown front end {front!r}")
-    verdict["front"] = front
+        control_saved)
+    llmd.recheck(output, run, verdict)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
 
 
 def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], routers: dict[str, int],
           run: Run, tent: dict[str, list[dict]] | None = None, ports: dict | None = None,
-          control_exempt: dict | None = None, control_nodes: list[str] | None = None) -> dict:
+          control_exempt: dict | None = None) -> dict:
     """The run's checks, from the client's results, every rank's step logs
     (``prefill_steps[i]``, ``decode_steps[i]``, in each side's `Side.ranks`
     order), the bytes each router received during the workload and each
@@ -902,10 +863,14 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 if counters is None:
                     problems.append(f"{at}{role}'s TENT metrics did not answer")
                 elif missing := [name for name in required if name not in counters]:
-                    if side.instances and not owned and missing == [moved_counter]:
-                        # An instance the front end gave no request moved
-                        # nothing: its moved series was never incremented.
-                        idle.append(f"{role} {side.node_of(dp)} rank {tp}")
+                    if (side.instances or side.data_parallel_size > 1) and not owned and missing == [moved_counter]:
+                        # An instance or a DP rank the router gave no request
+                        # (the EPP picks the instance; the Mooncake sidecar
+                        # any of the prefill's DP ranks, vLLM the others)
+                        # moved nothing: its moved series was never
+                        # incremented.
+                        idle.append(f"{role} {side.node_of(dp)} rank {tp}" if side.instances
+                                    else f"{role} DP rank {dp} rank {tp}")
                     elif tp_size is None and role == mover == "prefill" and missing == [moved_counter]:
                         # A replicated producer's rank that never writes never
                         # increments its write series: `_hetero_tp` accepts
@@ -1077,13 +1042,14 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             problems.append(f"the KV network {network} carried {carried} bytes, more than its ranks' "
                             f"{carried_by_ranks} (another rank's KV, or traffic the connectors did not count)")
     moved = sum(summary["transfers"]["bytes"] for role in sides for summary in ranks[role].values())
-    # The front end's own traffic (`ProxyFront.control_nodes`), measured at
-    # its ports, is not KV: the guard is on the rest, both derived here from
-    # the same snapshot of the control router's ports (`control_evidence`).
+    # The router's own traffic (the client's requests through the gateway,
+    # the EPP's metrics scraping), measured at the gateway's ports, is not
+    # KV: the guard is on the rest, both derived here from the same snapshot
+    # of the control router's ports (`control_evidence`).
     if control_exempt is None:
         control, exempt = routers.get(run.control_network, 0), 0
     else:
-        control, exempt, invalid = control_evidence(control_exempt, run, control_nodes or [])
+        control, exempt, invalid = control_evidence(control_exempt, run)
         problems.extend(invalid)
     if moved and control - exempt > moved / 10:
         problems.append(f"the control network carried {control - exempt} bytes"
@@ -1113,12 +1079,13 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "transfers": sums,
         "router_bytes": routers,
         "control_network": {"bytes": control, "front_end_bytes": exempt,
-                            "front_end_nodes": control_nodes or [],
+                            "front_end_nodes": [run.router.gateway],
                             "guarded_bytes": control - exempt},
         "ranks": per_tp,
         "ownership": ownership,
-        **({"instances": {role: side.nodes for role, side in sides.items()}, "idle_ranks": idle}
+        **({"instances": {role: side.nodes for role, side in sides.items()}}
            if any(side.instances for side in sides.values()) else {}),
+        **({"idle_ranks": idle} if idle or any(side.instances for side in sides.values()) else {}),
         "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
                              **{key: value for key, value in summary.items()
                                 if key not in ("requests", "checked_ids", "verified_ids", "allocated_ids")},
@@ -2561,13 +2528,13 @@ def _prefix_caching_flags(run: Run) -> list[str]:
 
 
 def _base_request_id(request_id: str) -> str:
-    """The id the proxy gives a request on both instances: vLLM appends its
+    """The id the router gives a request on both instances: vLLM appends its
     own random suffix to each (``cmpl-<uuid>-0-<suffix>``)."""
     return request_id.rsplit("-", 1)[0]
 
 
 def is_service(cmdline: bytes, comm: bytes) -> bool:
-    """A process of the run: vLLM and the proxy run on the image's Python;
+    """A process of the run: vLLM runs on the image's Python;
     vLLM renames its engine core and workers (VLLM::EngineCore,
     VLLM::Worker_TP0, ...)."""
     return cmdline.startswith((b"/opt/venv/", b"VLLM::")) or comm.startswith(b"VLLM::")
@@ -2608,7 +2575,7 @@ sys.exit(f"still running: {ours()}")
 
 
 def stop_services(container: str) -> None:
-    """Stop the vLLM servers, their workers and the proxy in ``container``."""
+    """Stop the vLLM servers and their workers in ``container``."""
 
     topology.exec_in(container, [PYTHON, "-c", STOP])
 
@@ -2663,16 +2630,17 @@ def control_exemption(before: dict, after: dict, nodes: list[str]) -> dict:
             "ports": deltas}
 
 
-def control_evidence(saved: dict, run: Run, nodes: list[str]) -> tuple[int, int, list[str]]:
+def control_evidence(saved: dict, run: Run) -> tuple[int, int, list[str]]:
     """The control network's bytes over the workload and the front end's
     share of them, derived from the saved ports (``control-ports.json``),
     never taken from its stored subtotal: ``(total, exempt, problems)``.
-    ``nodes`` are the front end's, from its own configuration. Anything the
+    The front end's node is the run's gateway. Anything the
     guard cannot stand on is a problem: a server, client or front-end node
     without a port, a counter that is not a non-negative integer, a stored
     node list or subtotal that differs from the derived one, and a front
     end's share larger than the network's total."""
     problems: list[str] = []
+    nodes = [run.router.gateway]
     ports = saved.get("ports")
     if not isinstance(ports, dict):
         return 0, 0, ["the control network's port evidence is missing"]

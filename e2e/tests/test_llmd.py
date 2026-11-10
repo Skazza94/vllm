@@ -1,5 +1,5 @@
-"""llm-d runs: their configs, the router evidence check, and (E2E_DOCKER=1)
-the llm-d containers' cleanup."""
+"""llm-d's router: a run's router configs, the router evidence check, and
+(E2E_DOCKER=1) the llm-d containers' cleanup."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -25,11 +26,85 @@ def run_config(**router) -> dict:
             "server": {"connector": "nixl", "timing": "zero"}}
 
 
-def load(raw: dict) -> llmd.LlmdRun:
+def load(raw: dict) -> types.SimpleNamespace:
+    """The run (``.run``) and its router (``.router``)."""
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "run.yaml"
         path.write_text(yaml.safe_dump(raw))
-        return llmd.load(path)
+        run = pd.load(path)
+        return types.SimpleNamespace(run=run, router=run.router)
+
+
+def placed(run: pd.Run, cpus: dict[str, str] | None = None) -> dict:
+    """A run's components where they belong: each in its node's network
+    namespace and on its CPU set."""
+    cpus = cpus or {}
+    return {name: {"cpuset": cpus.get(node, "15"), "network_mode": "container:abc", "node": node,
+                   "node_cpuset": cpus.get(node, "15")}
+            for name, node in llmd.expected_components(run).items()}
+
+
+class PlacementTests(unittest.TestCase):
+    """A component runs on its node's CPU set, not merely in its network
+    namespace."""
+
+    def setUp(self) -> None:
+        self.run = load(run_config()).run
+
+    def test_a_component_is_created_on_its_nodes_cpus(self) -> None:
+        for cpus, expected in (("7-13", ["--cpuset-cpus", "7-13"]), ("", [])):
+            calls: list[list[str]] = []
+
+            def run(command, **_):
+                calls.append(command)
+                return cpus + "\n" if command[:2] == ["docker", "inspect"] else ""
+
+            with self.subTest(cpus=cpus), mock.patch.object(shell, "run", side_effect=run):
+                llmd.start_component("t", "t-decode0", "t-decode0-sidecar", "image", ["--port=1"])
+                create = next(c for c in calls if c[:2] == ["docker", "create"])
+                self.assertEqual(calls[0], ["docker", "inspect", "-f", "{{.HostConfig.CpusetCpus}}", "t-decode0"])
+                self.assertIn("container:t-decode0", create)
+                image = create.index("image")
+                self.assertEqual([a for a in create[:image] if a in ("--cpuset-cpus", cpus) and cpus], expected)
+                self.assertEqual(create[image:], ["image", "--port=1"])
+
+    def test_the_runs_components_are_its_gateways_and_its_decode_nodes(self) -> None:
+        self.assertEqual(llmd.expected_components(self.run), {
+            "llmd-1p1d-gateway-epp": "llmd-1p1d-gateway", "llmd-1p1d-gateway-envoy": "llmd-1p1d-gateway",
+            "llmd-1p1d-decode0-sidecar": "llmd-1p1d-decode0"})
+
+    def test_placement_is_read_from_docker(self) -> None:
+        inspected = {"c-envoy": {"HostConfig": {"CpusetCpus": "15", "NetworkMode": "container:ID"}},
+                     "ID": {"Name": "/t-gateway", "HostConfig": {"CpusetCpus": "15"}}}
+        with mock.patch.object(shell, "run", side_effect=lambda command, **_: json.dumps([inspected[command[2]]])):
+            self.assertEqual(llmd.placement(["c-envoy"]), {"c-envoy": {
+                "cpuset": "15", "network_mode": "container:ID", "node": "t-gateway", "node_cpuset": "15"}})
+
+    def test_saved_placement_is_checked(self) -> None:
+        good = placed(self.run, {"llmd-1p1d-gateway": "15", "llmd-1p1d-decode0": "7-13"})
+        self.assertEqual(llmd.placement_problems(good, self.run), [])
+        sidecar, envoy = "llmd-1p1d-decode0-sidecar", "llmd-1p1d-gateway-envoy"
+
+        def changed(name, **change):
+            return {**good, name: {**good[name], **change}}
+
+        cases = {
+            "unrestricted while its node is pinned": (changed(envoy, cpuset=""), "ran on CPUs ''"),
+            "other cores than its node": (changed(sidecar, cpuset="0-6"), "ran on CPUs '0-6', its node"),
+            "another node's namespace": (changed(sidecar, node="llmd-1p1d-prefill0"), "not its node"),
+            "no node at all": (changed(envoy, node=None, node_cpuset=None), "not its node"),
+            "a missing component": ({k: v for k, v in good.items() if k != sidecar}, "no placement evidence"),
+            "an unknown component": ({**good, "x": good[envoy]}, "does not have"),
+            "a cpuset that is no string": (changed(envoy, cpuset=None, node_cpuset=None), "ran on CPUs None"),
+            "no document": (None, "placement evidence is missing"),
+            "a list": ([], "placement evidence is missing"),
+        }
+        for name, (saved, message) in cases.items():
+            with self.subTest(name):
+                self.assertRegex("; ".join(llmd.placement_problems(saved, self.run)), message)
+        # Unrestricted nodes: their components are unrestricted too.
+        self.assertEqual(llmd.placement_problems(placed(self.run, {"llmd-1p1d-gateway": "", "llmd-1p1d-decode0": ""}),
+                                                 self.run), [])
 
 
 class LoadTests(unittest.TestCase):
@@ -49,11 +124,39 @@ class LoadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "gateway"):
             load(raw)
 
-    def test_one_engine_per_instance_for_now(self) -> None:
+    def test_the_gateway_is_not_the_client(self) -> None:
+        raw = run_config()
+        raw["router"]["gateway"] = "client"
+        with self.assertRaisesRegex(ValueError, "a node of its own"):
+            load(raw)
+
+    def test_an_instance_may_have_dp_ranks_unequal_tp_or_speculation(self) -> None:
+        # One endpoint each: the instance's vLLM balances its DP ranks.
         raw = run_config()
         raw["decode"]["data_parallel_size"] = 2
-        with self.assertRaisesRegex(ValueError, "data_parallel_size"):
+        self.assertEqual(load(raw).run.decode.data_parallel_size, 2)
+        raw = run_config()
+        raw["decode"]["tensor_parallel_size"] = 2
+        self.assertEqual(load(raw).run.decode.tp(load(raw).run.server), 2)
+        raw = run_config()
+        raw["server"]["speculative"] = {"method": "mtp", "num_speculative_tokens": 1, "acceptance_rates": [1.0]}
+        self.assertEqual(load(raw).run.server.speculative["method"], "mtp")
+        # Several instances of a side stay one engine each.
+        raw = run_config()
+        raw["decode"] = {"node": ["decode0", "decode1"], "kv_network": "data0", "data_parallel_size": 2}
+        with self.assertRaisesRegex(ValueError, "data_parallel_size 1"):
             load(raw)
+
+    def test_an_instance_of_dp_ranks_is_one_endpoint(self) -> None:
+        raw = run_config()
+        raw["prefill"]["data_parallel_size"] = 4
+        raw["decode"]["data_parallel_size"] = 8
+        run = load(raw).run
+        address = {"instances": {"prefill": {"prefill0": {"control": "10.0.0.1"}},
+                                 "decode": {"decode0": {"control": "10.0.0.3"}}}}
+        self.assertEqual([e["name"] for e in llmd.endpoints(run, address)["endpoints"]], ["prefill0", "decode0"])
+        # The sidecar's own DP mode (an API server per rank) stays off.
+        self.assertFalse(any("data-parallel" in a or "dp-size" in a for a in llmd.sidecar_args(run)))
 
     def test_pd_keys_still_validated(self) -> None:
         raw = run_config()
@@ -99,7 +202,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(found["decode0"]["address"], "10.0.0.3")
 
     def test_decode_vllm_is_behind_the_sidecar(self) -> None:
-        front = llmd.LlmdFront(self.llmd)
+        front = llmd.Front(self.llmd.run)
         self.assertEqual(front.server_port("decode"), llmd.DECODE_ENGINE_PORT)
         self.assertEqual(front.server_port("prefill"), pd.SERVER_PORT)
         self.assertIn(f"--port {llmd.DECODE_ENGINE_PORT}",
@@ -108,7 +211,7 @@ class ConfigTests(unittest.TestCase):
     def test_sidecar_speaks_the_connector_in_plaintext(self) -> None:
         for connector, protocol in (("nixl", "nixlv2"), ("mooncake", "mooncake")):
             self.llmd.run.server.connector = connector
-            args = llmd.sidecar_args(self.llmd.run, self.llmd.router)
+            args = llmd.sidecar_args(self.llmd.run)
             with self.subTest(connector=connector):
                 self.assertIn(f"--kv-connector={protocol}", args)
                 self.assertIn("--secure-serving=false", args)
@@ -166,6 +269,7 @@ class EvidenceTests(unittest.TestCase):
                                           "decode": {"decode0": {"control": "10.0.0.3"}}}})))
         (directory / "epp-config.yaml").write_text(yaml.safe_dump(llmd.epp_config(self.llmd.router)))
         (directory / "cleanup.json").write_text(json.dumps({"removed": ["x"], "remaining": []}))
+        (directory / "components.json").write_text(json.dumps(placed(self.llmd.run)))
         epp, sidecar, envoy = [], [], []
         for index, request in enumerate(self.REQUESTS):
             trace = f"trace{index}"
@@ -326,6 +430,7 @@ class InstancesEvidenceTests(unittest.TestCase):
         (directory / "endpoints.yaml").write_text(yaml.safe_dump(llmd.endpoints(self.llmd.run, address)))
         (directory / "epp-config.yaml").write_text(yaml.safe_dump(llmd.epp_config(self.llmd.router)))
         (directory / "cleanup.json").write_text(json.dumps({"removed": ["x"], "remaining": []}))
+        (directory / "components.json").write_text(json.dumps(placed(self.llmd.run)))
         at = {node: f"{ip}:8000" for nodes in self.ADDRESS.values() for node, ip in nodes.items()}
         epp, sidecar, envoy = [], [], []
         engine: dict[str, list[str]] = {node: [] for nodes in self.ADDRESS.values() for node in nodes}
@@ -382,9 +487,8 @@ class InstancesEvidenceTests(unittest.TestCase):
 
 
 class RecheckTests(unittest.TestCase):
-    """`pd.recheck` replays a saved run's front end: llm-d's routing
-    evidence for an llm-d run (its run.json's front), nothing more for a
-    proxy run. The P/D checks themselves are stubbed."""
+    """`pd.recheck` replays a saved run's routing evidence with its P/D
+    checks (stubbed here): missing evidence is a problem."""
 
     def setUp(self) -> None:
         self.evidence = EvidenceTests("test_a_correct_run_passes")
@@ -392,11 +496,10 @@ class RecheckTests(unittest.TestCase):
         self.addCleanup(self.evidence.doCleanups)
         self.output = self.evidence.output
         run = self.evidence.llmd.run
-        self.saved = {**dataclasses.asdict(run), "model": str(run.model), "proxy": str(run.proxy), "addresses": {}}
+        self.saved = {**dataclasses.asdict(run), "model": str(run.model), "addresses": {}}
         (self.output / "routers.json").write_text("{}")
         (self.output / "tent.json").write_text("{}")
         (self.output / "control-ports.json").write_text(json.dumps({"nodes": ["gateway"], "bytes": 0, "ports": {}}))
-        (self.output / "router.json").write_text(json.dumps({"gateway": "gateway"}))
         stub = mock.patch.object(pd, "check", return_value={"problems": [], "kv_bytes_checked": 0, "transfers": {}})
         stub.start()
         self.addCleanup(stub.stop)
@@ -405,44 +508,48 @@ class RecheckTests(unittest.TestCase):
         (self.output / "run.json").write_text(json.dumps({**self.saved, **saved}, default=str))
         return pd.recheck(self.output)
 
-    def test_an_llmd_run_replays_its_routing_evidence(self) -> None:
-        verdict = self.recheck(front="llmd")
-        self.assertEqual((verdict["front"], verdict["problems"]), ("llmd", []))
+    def test_a_run_replays_its_routing_evidence(self) -> None:
+        verdict = self.recheck()
+        self.assertEqual(verdict["problems"], [])
         self.assertEqual(verdict["llmd"]["completion_requests"], 2)
+        self.assertNotIn("front", verdict)
 
-    def test_the_exempt_nodes_come_from_the_saved_router(self) -> None:
-        (self.output / "run.json").write_text(json.dumps({**self.saved, "front": "llmd"}, default=str))
-        (self.output / "router.json").write_text(json.dumps({"gateway": "elsewhere"}))
-        pd.recheck(self.output)
-        self.assertEqual(pd.check.call_args.args[-1], ["elsewhere"])
-        (self.output / "run.json").write_text(json.dumps({**self.saved, "front": "proxy"}, default=str))
-        pd.recheck(self.output)
-        self.assertEqual(pd.check.call_args.args[-1], [])
+    def test_the_exempt_node_is_the_saved_runs_gateway(self) -> None:
+        self.recheck(router={"gateway": "elsewhere"})
+        self.assertEqual(pd.check.call_args.args[4].router.gateway, "elsewhere")
+
+    def test_missing_or_wrong_component_placement_fails(self) -> None:
+        placement = self.output / "llmd" / "components.json"
+        saved = json.loads(placement.read_text())
+        self.assertEqual(self.recheck()["llmd"]["components"], saved)
+        name = next(iter(saved))
+        placement.write_text(json.dumps({**saved, name: {**saved[name], "cpuset": ""}}))
+        self.assertTrue(any("ran on CPUs ''" in p for p in self.recheck()["problems"]))
+        placement.write_text("null")
+        self.assertTrue(any("placement evidence is missing" in p for p in self.recheck()["problems"]))
+        placement.unlink()
+        self.assertTrue(any("llmd/components.json" in p for p in self.recheck()["problems"]))
 
     def test_a_missing_cleanup_record_fails(self) -> None:
         (self.output / "llmd" / "cleanup.json").unlink()
-        self.assertTrue(any("llmd/cleanup.json" in p for p in self.recheck(front="llmd")["problems"]))
+        self.assertTrue(any("llmd/cleanup.json" in p for p in self.recheck()["problems"]))
 
-    def test_an_llmd_run_without_its_evidence_fails(self) -> None:
+    def test_a_run_without_its_evidence_fails(self) -> None:
         shell.run(["rm", "-rf", str(self.output / "llmd")])
-        self.assertTrue(any("missing routing evidence" in p for p in self.recheck(front="llmd")["problems"]))
+        self.assertTrue(any("missing routing evidence" in p for p in self.recheck()["problems"]))
 
-    def test_a_run_without_its_front_is_refused(self) -> None:
+    def test_a_run_saved_without_a_router_is_refused(self) -> None:
+        del self.saved["router"]
         with self.assertRaises(KeyError):
             self.recheck()
 
     def test_containers_left_after_the_run_fail(self) -> None:
         cleanup = self.output / "llmd" / "cleanup.json"
         cleanup.write_text(json.dumps({"removed": ["a", "b"], "remaining": []}))
-        verdict = self.recheck(front="llmd")
+        verdict = self.recheck()
         self.assertEqual((verdict["problems"], verdict["llmd"]["cleanup"]["removed"]), ([], ["a", "b"]))
         cleanup.write_text(json.dumps({"removed": ["a"], "remaining": ["b"]}))
-        self.assertTrue(any("left after the run" in p for p in self.recheck(front="llmd")["problems"]))
-
-    def test_a_proxy_run_replays_as_before(self) -> None:
-        verdict = self.recheck(front="proxy")
-        self.assertEqual((verdict["front"], verdict["problems"]), ("proxy", []))
-        self.assertNotIn("llmd", verdict)
+        self.assertTrue(any("left after the run" in p for p in self.recheck()["problems"]))
 
 
 @unittest.skipUnless(os.environ.get("E2E_DOCKER") == "1", "set E2E_DOCKER=1 to run docker topologies")
@@ -454,7 +561,7 @@ class CleanupTests(unittest.TestCase):
         "name": "llmd-cleanup-selftest",
         "image": "python:3.12-slim",
         "networks": {"ctl": {"subnet": "10.241.0.0/24"}},
-        "nodes": {"gw": {"networks": ["ctl"]}},
+        "nodes": {"gw": {"networks": ["ctl"], "cpus": "0"}},
     })
 
     def setUp(self) -> None:
@@ -481,6 +588,12 @@ class CleanupTests(unittest.TestCase):
         mode = shell.run(["docker", "inspect", "-f", "{{.HostConfig.NetworkMode}}", running]).strip()
         node = shell.run(["docker", "inspect", "-f", "{{.Id}}", self.state["nodes"]["gw"]["container"]]).strip()
         self.assertEqual(mode, f"container:{node}")
+        # On its node's CPUs, as Docker and the kernel have it.
+        container = self.state["nodes"]["gw"]["container"]
+        self.assertEqual(llmd.placement([running]), {running: {
+            "cpuset": "0", "network_mode": f"container:{node}", "node": container, "node_cpuset": "0"}})
+        allowed = shell.run(["docker", "exec", running, "sh", "-c", "grep Cpus_allowed_list /proc/1/status"])
+        self.assertEqual(allowed.split()[-1], "0")
         self.assertEqual(shell.run(["docker", "exec", running, "cat", "/etc/test/config.yaml"]), "a: 1\n")
 
     def test_down_removes_running_exited_and_unstarted_components(self) -> None:
