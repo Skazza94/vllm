@@ -56,6 +56,8 @@ HTTP_KEEP_ALIVE = 120  # seconds: the servers' HTTP keep-alive
 KV_EVENTS_PORT = 5557  # a server's KV-cache events (ZMQ PUB), for the router's precise prefix index
 KV_EVENTS_REPLAY_PORT = 5559  # and their replay (ZMQ ROUTER)
 PREFIX_INDEXES = ("approximate", "precise")
+DP_ROUTINGS = ("instance", "rank")
+DP_SUPERVISOR_PORT = 9256  # a per-rank instance's aggregated health (vLLM's default)
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
@@ -224,6 +226,14 @@ class Router:
     endpoints, the EPP tokenizes each prompt through one of them and keeps
     an index of the blocks each instance holds (llm-d's precise P/D
     configuration)."""
+    dp_routing: str = "instance"
+    """Who picks the DP rank of an instance with several. ``instance``: the
+    instance is one endpoint and its ``vllm serve`` balances its ranks
+    (under Mooncake the sidecar names the prefill rank). ``rank``: llm-d's
+    per-rank routing — the instance runs one API server per DP rank on
+    consecutive ports (vLLM's multi-port external load balancing), each an
+    endpoint of its own that the EPP picks; a decode instance's sidecar
+    listens for each of its ranks."""
     peak_prefill_throughput: float | None = None
     """Tokens a second of one unloaded prefill chunk of
     ``max_num_batched_tokens`` on a prefill instance, as llm-d defines its
@@ -349,6 +359,16 @@ def parse(raw: dict, path: Path) -> Run:
         raise ValueError("prefill and decode instances are on distinct nodes")
     if run.router.gateway in (*run.prefill.nodes, *run.decode.nodes, run.client):
         raise ValueError("router.gateway is a node of its own, not the client or a server's")
+    if run.router.dp_routing not in DP_ROUTINGS:
+        raise ValueError(f"router.dp_routing is one of {', '.join(DP_ROUTINGS)}, not {run.router.dp_routing!r}")
+    if run.router.dp_routing == "rank" and run.prefill.data_parallel_size == run.decode.data_parallel_size == 1:
+        raise ValueError("router.dp_routing: rank needs a side with data_parallel_size > 1")
+    if run.router.dp_routing == "rank" and run.server.connector != "nixl":
+        # A server a rank each starts Mooncake's bootstrap server on the one
+        # bootstrap port, and llm-d's sidecar asks that one port for a rank of
+        # its own choosing, whichever rank the EPP picked.
+        raise ValueError("router.dp_routing: rank needs server.connector: nixl (MooncakeConnector's bootstrap "
+                         "server is one an instance, not one a rank)")
     if run.router.prefix_index not in PREFIX_INDEXES:
         raise ValueError(f"router.prefix_index is one of {', '.join(PREFIX_INDEXES)}, not "
                          f"{run.router.prefix_index!r}")
@@ -515,6 +535,12 @@ def bench_command(run: Run, base_url: str) -> list[str]:
     ]
 
 
+def rank_routed(run: Run, side: Side) -> bool:
+    """The side's DP ranks are endpoints of their own (``router.dp_routing:
+    rank``, several ranks)."""
+    return run.router.dp_routing == "rank" and side.data_parallel_size > 1
+
+
 def kv_events_topic(control: str, endpoint_port: int) -> str:
     """The topic a server publishes its KV-cache events under, as llm-d's
     index reads it: the endpoint the router knows the instance by."""
@@ -595,6 +621,9 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "--tensor-parallel-size", str(side.tp(s)),
         *(["--data-parallel-size", str(side.data_parallel_size), "--enable-expert-parallel"]
           if side.data_parallel_size > 1 else []),
+        # Per-rank routing: an API server a rank, on ``port`` + rank.
+        *(["--data-parallel-multi-port-external-lb", "--data-parallel-size-local", str(side.data_parallel_size),
+           "--data-parallel-supervisor-port", str(DP_SUPERVISOR_PORT)] if rank_routed(run, side) else []),
         "--generation-config", "vllm", "--enforce-eager",
         *(["--language-model-only"] if s.language_model_only else []),
         *(["--trust-remote-code"] if s.trust_remote_code else []),

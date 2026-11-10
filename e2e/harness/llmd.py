@@ -179,11 +179,26 @@ def endpoints(run: pd.Run, address: dict) -> dict:
     decode instance's sidecar, by their control network addresses."""
 
     instances = address["instances"]
-    return {"endpoints": [
-        {"name": node, "address": instances[role][node]["control"],
-         "port": str(pd.SERVER_PORT if role == "prefill" else SIDECAR_PORT),
-         "labels": {ROLE_LABEL: role, "model": pd.MODEL_NAME}}
-        for role, side in (("prefill", run.prefill), ("decode", run.decode)) for node in side.nodes]}
+    found = []
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        base = pd.SERVER_PORT if role == "prefill" else SIDECAR_PORT
+        for node in side.nodes:
+            entry = {"name": node, "address": instances[role][node]["control"], "port": str(base),
+                     "labels": {ROLE_LABEL: role, "model": pd.MODEL_NAME}}
+            if not pd.rank_routed(run, side):
+                found.append(entry)
+                continue
+            # Per-rank routing: each DP rank's API server (decode's: its
+            # sidecar's listener for the rank), on the port after the last.
+            for rank in range(side.data_parallel_size):
+                found.append({**entry, "name": endpoint_name(node, rank), "port": str(base + rank),
+                              "rankIndex": rank})
+    return {"endpoints": found}
+
+
+def endpoint_name(node: str, rank: int) -> str:
+    """A per-rank endpoint's name."""
+    return f"{node}-dp{rank}"
 
 
 def envoy_config() -> dict:
@@ -286,6 +301,8 @@ def sidecar_args(run: pd.Run) -> list[str]:
     """The decode sidecar's flags: plaintext, no InferencePool allowlist
     (there is none without Kubernetes), the run's connector protocol."""
     return [f"--port={SIDECAR_PORT}", f"--model-server-port={DECODE_ENGINE_PORT}",
+            # Per-rank routing: a listener a decode rank, each to its rank's API server.
+            *([f"--data-parallel-size={run.decode.data_parallel_size}"] if pd.rank_routed(run, run.decode) else []),
             f"--kv-connector={SIDECAR_CONNECTOR[run.server.connector]}",
             f"--mooncake-bootstrap-port={pd.BOOTSTRAP_PORT}", "--secure-serving=false",
             "--enable-ssrf-protection=false", f"--zap-log-level={run.router.sidecar_verbosity}"]
@@ -301,7 +318,7 @@ def cpuset(container: str) -> str:
 
 
 def start_component(topology_name: str, node_container: str, name: str, image: str, args: list[str],
-                    files: dict[str, dict[str, str]] | None = None) -> None:
+                    files: dict[str, dict[str, str]] | None = None, env: dict[str, str] | None = None) -> None:
     """A container of ``image`` in ``node_container``'s network namespace
     and on its CPU set (sharing the namespace alone would leave it on every
     core), labelled for ``down``; ``files`` maps a directory in it to the
@@ -310,7 +327,9 @@ def start_component(topology_name: str, node_container: str, name: str, image: s
     cpus = cpuset(node_container)
     shell.run(["docker", "create", "--name", name, "--label", f"{topology.LABEL}={topology_name}",
                "--label", f"{LLMD_LABEL}={topology_name}", "--network", f"container:{node_container}",
-               *(["--cpuset-cpus", cpus] if cpus else []), image, *args])
+               *(["--cpuset-cpus", cpus] if cpus else []),
+               *(arg for name_, value in (env or {}).items() for arg in ("--env", f"{name_}={value}")),
+               image, *args])
     for directory, contents in (files or {}).items():
         with tempfile.TemporaryDirectory() as local:
             # docker cp keeps modes (the owner becomes root): readable for
@@ -406,6 +425,7 @@ class Front:
         self.configs: dict[str, str] = {}
         self.gateway_address: str | None = None
         self.output: Path | None = None
+        self.address: dict = {}
 
     def server_port(self, role: str) -> int:
         """The HTTP port ``role``'s vLLM serves on: a decode instance's
@@ -417,7 +437,11 @@ class Front:
         return SIDECAR_PORT if role == "decode" else pd.SERVER_PORT
 
     def health_url(self, role: str, control: str) -> str:
-        """The URL that answers once ``role``'s server is up (from the client)."""
+        """The URL that answers once ``role``'s server is up (from the
+        client): with per-rank routing, once every rank's is (the
+        instance's aggregated health)."""
+        if pd.rank_routed(self.run, getattr(self.run, role)):
+            return f"http://{control}:{pd.DP_SUPERVISOR_PORT}/health"
         return f"http://{control}:{self.server_port(role)}/health"
 
     def prepare(self, container: dict[str, str]) -> None:
@@ -429,6 +453,7 @@ class Front:
         """Start the router once the servers are up; returns the base URL
         the client's benchmark sends to."""
         run, router = self.run, self.router
+        self.address = address
         state = topology.load_state(run.topology)
         nodes = state["nodes"]
         gateway = nodes[router.gateway]["container"]
@@ -439,8 +464,10 @@ class Front:
             "envoy.yaml": yaml.safe_dump(envoy_config(), sort_keys=False),
         }
         for node in run.decode.nodes:
+            # The sidecar names its per-rank listeners by its pod address.
             start_component(run.topology, container[node], component_name(run.topology, node, "sidecar"),
-                            IMAGES["sidecar"], sidecar_args(run))
+                            IMAGES["sidecar"], sidecar_args(run),
+                            env={"POD_IP": address["instances"]["decode"][node]["control"]})
         start_component(run.topology, gateway, component_name(run.topology, router.gateway, "epp"), IMAGES["epp"],
                         epp_args(router), {"/etc/epp": {"config.yaml": self.configs["epp-config.yaml"],
                                                         "endpoints.yaml": self.configs["endpoints.yaml"]}})
@@ -471,7 +498,7 @@ class Front:
         text = ""
         while time.monotonic() < deadline:
             text = topology.exec_in(client, [pd.PYTHON, "-c", fetch, url])
-            if _pool_ready(text, len(self.run.prefill.nodes) + len(self.run.decode.nodes)):
+            if _pool_ready(text, len(endpoints(self.run, self.address)["endpoints"])):
                 return
             time.sleep(3)
         raise TimeoutError(f"the EPP did not report a ready pool within {timeout:.0f} s:\n"
@@ -580,13 +607,15 @@ def _picked(record: dict) -> list[str]:
 
 
 def instance_steps(output: Path, run: pd.Run) -> dict[str, tuple[str, list[str]]]:
-    """Each instance's role and its own ranks' step logs, by its endpoint
-    name (its node)."""
+    """Each endpoint's role and its own ranks' step logs, by its name: an
+    instance's node, or with per-rank routing each DP rank's
+    (`endpoint_name`)."""
     found: dict[str, tuple[str, list[str]]] = {}
     for role in ("prefill", "decode"):
         side = getattr(run, role)
         for dp, tp in side.ranks(side.tp(run.server)):
-            found.setdefault(side.node_of(dp), (role, []))[1].append((output / side.step_log(role, dp, tp)).read_text())
+            name = endpoint_name(side.node_of(dp), dp) if pd.rank_routed(run, side) else side.node_of(dp)
+            found.setdefault(name, (role, []))[1].append((output / side.step_log(role, dp, tp)).read_text())
     return found
 
 
@@ -612,6 +641,16 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
     named = {f"{e['address']}:{e['port']}": e for e in
              yaml.safe_load((directory / "endpoints.yaml").read_text())["endpoints"]}
     role_of = {address: e["labels"].get(ROLE_LABEL) for address, e in named.items()}
+    # The endpoints the EPP was given are the run's: each instance, or with
+    # per-rank routing each of its DP ranks by its port and rank index.
+    def shape(found: list[dict]) -> list[tuple]:
+        return sorted((str(e.get("name")), str(e.get("port")), str((e.get("labels") or {}).get(ROLE_LABEL)),
+                       e.get("rankIndex")) for e in found)
+    expected = endpoints(run, {"instances": {role: {node: {"control": None} for node in getattr(run, role).nodes}
+                                             for role in ("prefill", "decode")}})["endpoints"]
+    if shape(list(named.values())) != shape(expected) or len(named) != len(expected):
+        problems.append(f"the saved endpoints are not the run's: {shape(list(named.values()))[:3]}..., "
+                        f"not {shape(expected)[:3]}...")
 
     handled: dict[str, list[dict]] = {}
     picks: dict[str, list[list[str]]] = {}

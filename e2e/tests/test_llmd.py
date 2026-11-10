@@ -110,6 +110,177 @@ class PlacementTests(unittest.TestCase):
                                                  self.run), [])
 
 
+class RankRoutingTests(unittest.TestCase):
+    """``router.dp_routing: rank``: each DP rank of an instance is an
+    endpoint of its own, the EPP picking it (llm-d's per-rank routing)."""
+
+    ADDRESS = {"instances": {"prefill": {"prefill0": {"control": "10.0.0.1"}},
+                             "decode": {"decode0": {"control": "10.0.0.3"}}}}
+
+    def run_config(self, prefill_dp=4, decode_dp=2, **router) -> pd.Run:
+        raw = run_config(dp_routing="rank", **router)
+        raw["prefill"]["data_parallel_size"] = prefill_dp
+        raw["decode"]["data_parallel_size"] = decode_dp
+        return load(raw).run
+
+    def test_rank_routing_needs_ranks_and_is_one_of_two(self) -> None:
+        self.assertEqual(self.run_config().router.dp_routing, "rank")
+        self.assertEqual(load(run_config()).run.router.dp_routing, "instance")
+        with self.assertRaisesRegex(ValueError, "needs a side with data_parallel_size > 1"):
+            self.run_config(1, 1)
+        with self.assertRaisesRegex(ValueError, "one of instance, rank"):
+            load(run_config(dp_routing="pod"))
+        raw = run_config(dp_routing="rank")
+        raw["decode"]["data_parallel_size"] = 2
+        raw["server"]["connector"] = "mooncake"
+        with self.assertRaisesRegex(ValueError, "needs server.connector: nixl"):
+            load(raw)
+
+    def test_a_ranks_server_and_sidecar_listener_are_its_endpoint(self) -> None:
+        run = self.run_config()
+        found = llmd.endpoints(run, self.ADDRESS)["endpoints"]
+        self.assertEqual([(e["name"], e["address"], e["port"], e["rankIndex"], e["labels"][llmd.ROLE_LABEL])
+                          for e in found],
+                         [(f"prefill0-dp{r}", "10.0.0.1", str(8000 + r), r, "prefill") for r in range(4)]
+                         + [(f"decode0-dp{r}", "10.0.0.3", str(8000 + r), r, "decode") for r in range(2)])
+        # A side of one rank stays the instance's one endpoint.
+        mixed = llmd.endpoints(self.run_config(1, 2), self.ADDRESS)["endpoints"]
+        self.assertEqual([(e["name"], e["port"], "rankIndex" in e) for e in mixed],
+                         [("prefill0", "8000", False), ("decode0-dp0", "8000", True), ("decode0-dp1", "8001", True)])
+        # Instance routing: one endpoint an instance, whatever its ranks.
+        raw = run_config()
+        raw["prefill"]["data_parallel_size"] = 4
+        self.assertEqual([e["name"] for e in llmd.endpoints(load(raw).run, self.ADDRESS)["endpoints"]],
+                         ["prefill0", "decode0"])
+
+    def test_servers_run_an_api_server_a_rank(self) -> None:
+        run = self.run_config()
+        for role, port, ranks in (("prefill", 8000, 4), ("decode", 8200, 2)):
+            command = pd.server_command(run, role, ["10.1.0.1"], port, ("10.0.0.1", 8000))
+            at = command.index("--data-parallel-multi-port-external-lb")
+            self.assertEqual(command[at + 1:at + 5], ["--data-parallel-size-local", str(ranks),
+                                                      "--data-parallel-supervisor-port", str(pd.DP_SUPERVISOR_PORT)])
+            self.assertEqual(command[command.index("--data-parallel-size") + 1], str(ranks))
+            self.assertEqual(command[command.index("--port") + 1], str(port))
+        # A side of one rank, and instance routing, keep the one server.
+        self.assertNotIn("--data-parallel-multi-port-external-lb",
+                         pd.server_command(self.run_config(1, 2), "prefill", ["10.1.0.1"]))
+        raw = run_config()
+        raw["decode"]["data_parallel_size"] = 2
+        self.assertNotIn("--data-parallel-multi-port-external-lb",
+                         pd.server_command(load(raw).run, "decode", ["10.1.0.1"]))
+
+    def test_the_sidecar_listens_for_each_decode_rank(self) -> None:
+        self.assertIn("--data-parallel-size=2", llmd.sidecar_args(self.run_config()))
+        self.assertFalse(any("data-parallel" in a for a in llmd.sidecar_args(self.run_config(4, 1))))
+        # It names its listeners by its pod address.
+        calls: list[list[str]] = []
+        with mock.patch.object(shell, "run", side_effect=lambda command, **_: calls.append(command) or ""):
+            llmd.start_component("t", "t-decode0", "t-decode0-sidecar", "image", ["--port=8000"],
+                                 env={"POD_IP": "10.0.0.3"})
+        create = next(c for c in calls if c[:2] == ["docker", "create"])
+        at = create.index("--env")
+        self.assertEqual((create[at + 1], create.index("image") > at), ("POD_IP=10.0.0.3", True))
+
+    def test_a_rank_routed_instance_is_up_when_all_its_ranks_are(self) -> None:
+        front = llmd.Front(self.run_config(4, 1))
+        self.assertEqual(front.health_url("prefill", "10.0.0.1"), f"http://10.0.0.1:{pd.DP_SUPERVISOR_PORT}/health")
+        self.assertEqual(front.health_url("decode", "10.0.0.3"), f"http://10.0.0.3:{llmd.DECODE_ENGINE_PORT}/health")
+
+    def test_each_ranks_step_logs_are_its_endpoints(self) -> None:
+        run = self.run_config(2, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+                for dp, tp in side.ranks(side.tp(run.server)):
+                    (output / side.step_log(role, dp, tp)).write_text(f"{role}{dp}")
+            found = llmd.instance_steps(output, run)
+        self.assertEqual(found, {"prefill0-dp0": ("prefill", ["prefill0"]), "prefill0-dp1": ("prefill", ["prefill1"]),
+                                 "decode0-dp0": ("decode", ["decode0"]), "decode0-dp1": ("decode", ["decode1"])})
+
+
+class RankRoutingEvidenceTests(unittest.TestCase):
+    """The routing evidence per rank: the rank the EPP picked ran the
+    request."""
+
+    def setUp(self) -> None:
+        raw = run_config(dp_routing="rank")
+        raw["prefill"]["data_parallel_size"] = 2
+        raw["decode"]["data_parallel_size"] = 2
+        self.run_ = load(raw).run
+        self.output = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shell.run(["rm", "-rf", str(self.output)]))
+
+    def write(self, ran: dict[str, tuple[int, int]] | None = None) -> None:
+        """Requests a (prefill rank 0 -> decode rank 1) and b (1 -> 0), as
+        picked; ``ran``: the ranks they ran on (default: as picked)."""
+        run = self.run_
+        picked = {"a": (0, 1), "b": (1, 0)}
+        ran = ran or picked
+        directory = self.output / "llmd"
+        directory.mkdir(exist_ok=True)
+        address = {"instances": {"prefill": {"prefill0": {"control": "10.0.0.1"}},
+                                 "decode": {"decode0": {"control": "10.0.0.3"}}}}
+        (directory / "endpoints.yaml").write_text(yaml.safe_dump(llmd.endpoints(run, address)))
+        (directory / "epp-config.yaml").write_text(yaml.safe_dump(llmd.epp_config(run.router)))
+        (directory / "cleanup.json").write_text(json.dumps({"removed": ["x"], "remaining": []}))
+        (directory / "components.json").write_text(json.dumps(placed(run)))
+        epp, sidecar, envoy = [], [], []
+        for request, (prefill, decode) in picked.items():
+            at_prefill, at_decode = f"10.0.0.1:{8000 + prefill}", f"10.0.0.3:{8000 + decode}"
+            epp += [picker(request, at_decode), picker(request, at_prefill),
+                    {"body": "Request handled", "x-request-id": request, "trace_id": f"t{request}",
+                     "incomingModelName": pd.MODEL_NAME, "endpoint": at_decode}]
+            sidecar += [{"body": "SSRF protection: prefill target allowed", "trace_id": f"t{request}",
+                         "target": at_prefill}, {"body": "running NIXL protocol V2"}]
+            envoy.append({"access": "request", "request_id": request, "method": "POST", "path": "/v1/completions",
+                          "status": "200", "upstream": at_decode})
+        epp.append({"body": "Selecting endpoints from candidates sorted by max score", "scored-endpoints": [
+            {"Endpoint": {"Name": e["name"], "MetricsHost": "m", "CacheNumBlocks": 100}}
+            for e in llmd.endpoints(run, address)["endpoints"]]})
+        for name, records in (("x-gateway-epp.log", epp), ("x-decode0-sidecar.log", sidecar),
+                              ("x-gateway-envoy.log", envoy)):
+            (directory / name).write_text("".join(json.dumps(r) + "\n" for r in records))
+        (self.output / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
+        logs: dict[tuple[str, int], list[str]] = {(role, dp): [] for role in ("prefill", "decode") for dp in (0, 1)}
+        for request, (prefill, decode) in ran.items():
+            engine = f"cmpl-{request}-0-abcd1234"
+            logs[("prefill", prefill)].append(json.dumps({"kv_events": {
+                "admitted": [engine], "allocated": {engine: [1]}, "sends_done": [engine]}}))
+            logs[("decode", decode)].append(json.dumps({"kv_events": {
+                "admitted": [engine], "reads_posted": [engine], "reads_done": [engine]}}))
+        for (role, dp), lines in logs.items():
+            (self.output / getattr(run, role).step_log(role, dp, 0)).write_text("\n".join(lines) + "\n")
+
+    def test_requests_on_the_ranks_the_epp_picked_pass(self) -> None:
+        self.write()
+        result = llmd.routing_evidence(self.output, self.run_)
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["evidence"]["routed"], {"prefill": {"prefill0-dp0": 1, "prefill0-dp1": 1},
+                                                        "decode": {"decode0-dp1": 1, "decode0-dp0": 1}})
+        self.assertEqual(result["evidence"]["pairs"], {"prefill0-dp0->decode0-dp1": 1, "prefill0-dp1->decode0-dp0": 1})
+
+    def test_a_request_on_another_rank_than_picked_fails(self) -> None:
+        self.write(ran={"a": (1, 1), "b": (1, 0)})
+        problems = llmd.routing_evidence(self.output, self.run_)["problems"]
+        self.assertTrue(any("a: the EPP picked prefill prefill0-dp0, it ran on ['prefill0-dp1']" in p for p in problems),
+                        problems)
+        self.write(ran={"a": (0, 0), "b": (1, 0)})
+        problems = llmd.routing_evidence(self.output, self.run_)["problems"]
+        self.assertTrue(any("a: the EPP picked decode decode0-dp1, it ran on ['decode0-dp0']" in p for p in problems),
+                        problems)
+
+    def test_endpoints_that_are_not_the_runs_fail(self) -> None:
+        self.write()
+        saved = self.output / "llmd" / "endpoints.yaml"
+        found = yaml.safe_load(saved.read_text())
+        for entry in found["endpoints"]:
+            entry.pop("rankIndex")
+        saved.write_text(yaml.safe_dump(found))
+        problems = llmd.routing_evidence(self.output, self.run_)["problems"]
+        self.assertTrue(any("the saved endpoints are not the run's" in p for p in problems), problems)
+
+
 class PreciseIndexEvidenceTests(unittest.TestCase):
     """llm-d's precise prefix index against the engines it indexes."""
 
