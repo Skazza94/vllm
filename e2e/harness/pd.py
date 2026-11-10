@@ -53,6 +53,9 @@ MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 BOOTSTRAP_PORT = 8998
 HTTP_KEEP_ALIVE = 120  # seconds: the servers' HTTP keep-alive
+KV_EVENTS_PORT = 5557  # a server's KV-cache events (ZMQ PUB), for the router's precise prefix index
+KV_EVENTS_REPLAY_PORT = 5559  # and their replay (ZMQ ROUTER)
+PREFIX_INDEXES = ("approximate", "precise")
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
@@ -213,6 +216,14 @@ class Router:
     metrics source are added to it either way."""
     epp_verbosity: int = 4
     sidecar_verbosity: int = 4
+    prefix_index: str = "approximate"
+    """Where the default plugins' prefix signal comes from. ``approximate``:
+    the router's own estimate from the requests it sent (llm-d's P/D
+    guide). ``precise``: the servers' KV-cache events — every server
+    publishes them over ZMQ on the control network and serves the render
+    endpoints, the EPP tokenizes each prompt through one of them and keeps
+    an index of the blocks each instance holds (llm-d's precise P/D
+    configuration)."""
     peak_prefill_throughput: float | None = None
     """Tokens a second of one unloaded prefill chunk of
     ``max_num_batched_tokens`` on a prefill instance, as llm-d defines its
@@ -338,6 +349,24 @@ def parse(raw: dict, path: Path) -> Run:
         raise ValueError("prefill and decode instances are on distinct nodes")
     if run.router.gateway in (*run.prefill.nodes, *run.decode.nodes, run.client):
         raise ValueError("router.gateway is a node of its own, not the client or a server's")
+    if run.router.prefix_index not in PREFIX_INDEXES:
+        raise ValueError(f"router.prefix_index is one of {', '.join(PREFIX_INDEXES)}, not "
+                         f"{run.router.prefix_index!r}")
+    if run.router.prefix_index == "precise":
+        if run.router.epp_plugins is not None:
+            raise ValueError("router.prefix_index selects the default plugins' prefix signal: a run with "
+                             "router.epp_plugins configures it in that file")
+        if not run.server.enable_prefix_caching:
+            raise ValueError("router.prefix_index: precise needs server.enable_prefix_caching (the index is of "
+                             "the servers' prefix caches)")
+        if run.server.block_size is None:
+            raise ValueError("router.prefix_index: precise needs server.block_size (the index's block size)")
+        if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
+            raise ValueError("router.prefix_index: precise takes one engine per instance for now (a DP rank "
+                             "publishes its own events)")
+        if run.router.epp_verbosity < 5:
+            raise ValueError("router.prefix_index: precise needs router.epp_verbosity 5 (the index's lookups, "
+                             "which the checks compare with the engines, are logged at that level)")
     if run.prefill.instances or run.decode.instances:
         if run.prefill.tp(run.server) != run.decode.tp(run.server):
             raise ValueError("several instances of a side take equal TP sizes")
@@ -486,10 +515,19 @@ def bench_command(run: Run, base_url: str) -> list[str]:
     ]
 
 
-def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT) -> list[str]:
+def kv_events_topic(control: str, endpoint_port: int) -> str:
+    """The topic a server publishes its KV-cache events under, as llm-d's
+    index reads it: the endpoint the router knows the instance by."""
+    return f"kv@{control}:{endpoint_port}@{MODEL_NAME}"
+
+
+def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT,
+                   endpoint: tuple[str, int] | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
-    ``rank_addresses``, DP rank by TP rank)."""
+    ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
+    address and port the router knows the instance by (a precise prefix
+    index names its events after it)."""
 
     _check_backend(run.server)
     ucx = uses_ucx(run.server)
@@ -568,6 +606,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         *(["--speculative-config", json.dumps({"method": spec["method"],
                                                 "num_speculative_tokens": spec["num_speculative_tokens"]}),
            "--seed", str(spec.get("seed", 0))] if spec is not None else []),
+        *_precise_index_flags(run, endpoint),
         "--simulate-forward",
     ]
 
@@ -606,7 +645,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
     commands: dict[str, dict[str, list[str]]] = {}
     for role, side in roles:
         for node in side.nodes:
-            command = server_command(run, role, instances[role][node]["kv"], front.server_port(role))
+            command = server_command(run, role, instances[role][node]["kv"], front.server_port(role),
+                                     (instances[role][node]["control"], front.endpoint_port(role)))
             commands.setdefault(role, {})[node] = command
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
@@ -2571,6 +2611,23 @@ def _group_evidence(layout: dict, checks: list[dict], records: list[dict]) -> li
             "reallocated_blocks": sum(len(held) > 1 for held in places.values()),
         })
     return evidence
+
+
+def _precise_index_flags(run: Run, endpoint: tuple[str, int] | None) -> list[str]:
+    """What a precise prefix index needs of a server: the render endpoints
+    (the router tokenizes through them) and its KV-cache events, published
+    on the control network under the instance's endpoint."""
+    if run.router.prefix_index != "precise":
+        return []
+    if endpoint is None:
+        raise ValueError("a precise prefix index needs the instance's endpoint (its events' topic)")
+    control, endpoint_port = endpoint
+    # Wildcard endpoints: vLLM binds those and connects out to any other
+    # (the router dials the instance's control address).
+    events = {"enable_kv_cache_events": True, "publisher": "zmq",
+              "endpoint": f"tcp://*:{KV_EVENTS_PORT}", "replay_endpoint": f"tcp://*:{KV_EVENTS_REPLAY_PORT}",
+              "topic": kv_events_topic(control, endpoint_port)}
+    return ["--enable-scale-out", "--kv-events-config", json.dumps(events)]
 
 
 def _prefix_routing(run: Run, sides: dict[str, Side], ranks: dict, bench: dict) -> dict:

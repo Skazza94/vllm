@@ -110,6 +110,160 @@ class PlacementTests(unittest.TestCase):
                                                  self.run), [])
 
 
+class PreciseIndexEvidenceTests(unittest.TestCase):
+    """llm-d's precise prefix index against the engines it indexes."""
+
+    NAMED = {"10.0.0.1:8000": {"name": "prefill0", "address": "10.0.0.1", "port": "8000"},
+             "10.0.0.2:8000": {"name": "prefill1", "address": "10.0.0.2", "port": "8000"},
+             "10.0.0.3:8000": {"name": "decode0", "address": "10.0.0.3", "port": "8000"}}
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shell.run(["rm", "-rf", str(self.directory)]))
+
+    def evidence(self, *, subscribers=None, produced=None, metrics=None, steps=None, picks=None, block=16,
+                 failures=0, reuse=True) -> dict:
+        subscribers = {"prefill0": "10.0.0.1", "prefill1": "10.0.0.2", "decode0": "10.0.0.3"} if (
+            subscribers is None) else subscribers
+        # r1: nothing cached anywhere (cold); r2: its 20-block prefix on prefill0, where it goes (warm).
+        produced = [("r1", 28, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}})] if produced is None else produced
+        records = [{"body": "Ensured KV-events subscriber", "endpoint": f"default/{name}",
+                    "zmq": f"tcp://{address}:5557"} for name, address in subscribers.items()]
+        records += [{"body": "Failed to connect subscriber socket"}] * failures
+        records += [{"body": "Produce completed", "x-request-id": rid, "blockKeys": keys, "matches": matches}
+                    for rid, keys, matches in produced]
+        (self.directory / "x-gateway-epp.log").write_text("".join(json.dumps(r) + "\n" for r in records))
+        metrics = {"admissions": 56, "evictions": 0, "lookup_requests": 2} if metrics is None else metrics
+        (self.directory / "epp-metrics.txt").write_text(
+            "# TYPE llm_d_epp_kv_cache_index_admissions_total counter\n"
+            + "".join(f"llm_d_epp_kv_cache_index_{name}_total {count}\n" for name, count in metrics.items())
+            + 'llm_d_epp_kv_cache_index_lookup_latency_seconds_bucket{le="1"} 2\n')
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 320)], "prefill1": []} if steps is None else steps
+        texts = {name: ["".join(json.dumps({"step": {"requests": [{
+            "req_id": f"cmpl-{rid}-0-abcd1234", "num_prompt_tokens": prompt, "num_cached_tokens": cached}]}}) + "\n"
+            for rid, prompt, cached in requests)] for name, requests in steps.items()}
+        picks = {rid: "10.0.0.1:8000" for rid, _, _ in produced} if picks is None else picks
+        return llmd.precise_index_evidence(self.directory, self.NAMED, set(picks), picks, texts, block, reuse)
+
+    def assertProblem(self, evidence: dict, message: str) -> None:
+        self.assertTrue(any(message in p for p in evidence["problems"]), evidence["problems"])
+
+    def test_an_index_that_agrees_with_the_engines_passes(self) -> None:
+        evidence = self.evidence()
+        self.assertEqual(evidence["problems"], [])
+        self.assertEqual((evidence["cold_exact"], evidence["warm"]), (1, {"exact": 1, "under": 0, "over": 0}))
+        self.assertEqual((evidence["lookups_compared"], evidence["block_tokens"]), (2, 16))
+        self.assertEqual((evidence["warm_validation"], evidence["unresolved_over"]), ("exercised", 0))
+        self.assertEqual(evidence["index_blocks_at_pick"], {"total": 20, "max": 20})
+        self.assertEqual(evidence["index"], {"admissions": 56, "evictions": 0, "lookup_requests": 2})
+        self.assertEqual(evidence["subscribers"]["decode0"], "tcp://10.0.0.3:5557")
+
+    def test_every_endpoint_is_subscribed_at_its_control_address(self) -> None:
+        self.assertProblem(self.evidence(subscribers={"prefill0": "10.0.0.1", "decode0": "10.0.0.3"}),
+                           "did not subscribe to prefill1's KV-cache events at tcp://10.0.0.2:5557")
+        self.assertProblem(self.evidence(subscribers={"prefill0": "10.0.0.1", "prefill1": "10.9.9.9",
+                                                      "decode0": "10.0.0.3"}), "did not subscribe to prefill1")
+        self.assertEqual(self.evidence(failures=3)["subscriber_connect_failures"], 3)
+
+    def test_an_index_no_event_reached_fails(self) -> None:
+        self.assertProblem(self.evidence(metrics={"admissions": 0}), "admitted no block")
+        self.assertProblem(self.evidence(metrics={}), "admitted no block")
+
+    def test_the_lookups_block_count_matches_the_engines_whole_blocks(self) -> None:
+        produced = [("r1", 27, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}})]
+        self.assertProblem(self.evidence(produced=produced),
+                           "r1: the EPP's lookup has 27 block key(s) of 16 tokens, the engine's prompt 448 tokens "
+                           "(28 whole blocks)")
+        # Only whole blocks are compared: tokens within a partial block are not.
+        steps = {"prefill0": [("r1", 455, 0), ("r2", 455, 320)], "prefill1": []}
+        self.assertEqual(self.evidence(steps=steps)["problems"], [])
+        for keys in (None, -1, True, "28"):
+            with self.subTest(keys=keys):
+                self.assertProblem(self.evidence(produced=[("r1", 28, {}), ("r2", keys, {})]), "block key(s)")
+
+    def test_every_completion_has_one_lookup_on_its_prefill_instance(self) -> None:
+        picks = {"r1": "10.0.0.1:8000", "r2": "10.0.0.1:8000"}
+        self.assertProblem(self.evidence(produced=[("r1", 28, {})], picks=picks),
+                           "r2: the precise index logged 0 lookup(s)")
+        twice = [("r1", 28, {}), ("r1", 28, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}})]
+        self.assertProblem(self.evidence(produced=twice, picks=picks), "r1: the precise index logged 2 lookup(s)")
+        self.assertProblem(self.evidence(picks={"r1": "10.0.0.1:8000", "r2": "10.0.0.2:8000"}),
+                           "r2: no step of it on the prefill instance the EPP picked")
+
+    def test_a_fully_cached_prompt_reuses_all_but_its_last_block(self) -> None:
+        # The index holds all 28 blocks; vLLM recomputes the last token, in whole blocks: 432 tokens reused.
+        produced = [("r1", 28, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 28}})]
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 432)], "prefill1": []}
+        evidence = self.evidence(produced=produced, steps=steps)
+        self.assertEqual((evidence["problems"], evidence["warm"]["exact"]), ([], 1))
+        self.assertEqual(evidence["index_blocks_at_pick"]["max"], 28)
+        # A prompt one token past a block boundary keeps all its full blocks.
+        steps = {"prefill0": [("r1", 449, 0), ("r2", 449, 448)], "prefill1": []}
+        self.assertEqual(self.evidence(produced=produced, steps=steps)["warm"]["exact"], 1)
+        self.assertEqual([llmd.reusable_tokens(b, p, 16) for b, p in ((28, 448), (28, 449), (20, 448), (0, 448),
+                                                                      (1, 1), (1, 17))], [432, 448, 320, 0, 0, 16])
+
+    def test_cold_agreement_does_not_hide_wrong_warm_lookups(self) -> None:
+        # Every lookup's matches emptied (the mutation of response 201): the cold one agrees, no warm one does.
+        empty = [("r1", 28, {}), ("r2", 28, {}), ("r3", 28, {}), ("r4", 28, {})]
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 320), ("r3", 448, 320), ("r4", 448, 320)], "prefill1": []}
+        evidence = self.evidence(produced=empty, steps=steps)
+        self.assertEqual((evidence["cold_exact"], evidence["warm"]), (1, {"exact": 0, "under": 3, "over": 0}))
+        self.assertProblem(evidence, "agreed with the engine on 0 of 3 warm lookup(s), not most")
+        # A reuse workload where nothing was ever cached: warm agreement is unexercised, a problem.
+        cold = [("r1", 28, {}), ("r2", 28, {})]
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 0)], "prefill1": []}
+        self.assertProblem(self.evidence(produced=cold, steps=steps), "warm agreement was not exercised")
+        # Not a reuse workload: reported, not a problem.
+        unexercised = self.evidence(produced=cold, steps=steps, reuse=False)
+        self.assertEqual((unexercised["problems"], unexercised["warm_validation"]), ([], "unexercised"))
+
+    def test_a_stale_index_is_a_problem_unless_it_saw_evictions(self) -> None:
+        # The index held r2's prefix; the engine no longer had it.
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 0), ("r3", 448, 320), ("r4", 448, 320)], "prefill1": []}
+        produced = [("r1", 28, {})] + [(rid, 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}}) for rid in ("r2", "r3", "r4")]
+        stale = self.evidence(steps=steps, produced=produced)
+        self.assertEqual(stale["warm"], {"exact": 2, "under": 0, "over": 1})
+        self.assertProblem(stale, "held more than the engine reused for 1 request(s)")
+        # With evictions in the index it is reported as unresolved, not excused as explained.
+        evicting = self.evidence(steps=steps, produced=produced, metrics={"admissions": 56, "evictions": 20})
+        self.assertEqual((evicting["problems"], evicting["unresolved_over"]), ([], 1))
+        # The engine had more than the index knew (an event not yet indexed): reported.
+        held = {"10.0.0.1:8000": {"MatchedBlocks": 20}}
+        behind = self.evidence(produced=[("r1", 28, {}), ("r2", 28, {}), ("r3", 28, held), ("r4", 28, held)],
+                               steps={"prefill0": [("r1", 448, 0), ("r2", 448, 320), ("r3", 448, 320),
+                                                   ("r4", 448, 320)], "prefill1": []})
+        self.assertEqual((behind["problems"], behind["warm"]), ([], {"exact": 2, "under": 1, "over": 0}))
+        # Another endpoint's match is not the picked one's.
+        elsewhere = [("r1", 28, {}), ("r2", 28, {"10.0.0.2:8000": {"MatchedBlocks": 20}}),
+                     ("r3", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}}), ("r4", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}})]
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 320), ("r3", 448, 320), ("r4", 448, 320)], "prefill1": []}
+        self.assertEqual(self.evidence(produced=elsewhere, steps=steps)["warm"]["under"], 1)
+
+    def test_impossible_matches_fail_even_with_evictions(self) -> None:
+        evicting = {"admissions": 56, "evictions": 20}
+        for value in (1_000_000, 29, -1, True, 2.5, "20", None):
+            with self.subTest(value=value):
+                produced = [("r1", 28, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": value}})]
+                self.assertProblem(self.evidence(produced=produced, metrics=evicting), "r2: the EPP's lookup matched")
+        # Another endpoint's impossible count is as wrong as the picked one's.
+        produced = [("r1", 28, {"10.0.0.2:8000": {"MatchedBlocks": 1_000_000}}),
+                    ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 20}})]
+        self.assertProblem(self.evidence(produced=produced, metrics=evicting), "r1: the EPP's lookup matched")
+        for matches in (None, [], {"10.0.0.1:8000": 20}):
+            with self.subTest(matches=matches):
+                problems = self.evidence(produced=[("r1", 28, {}), ("r2", 28, matches)])["problems"]
+                self.assertTrue(any("r2: the EPP's lookup" in p for p in problems), problems)
+        # The full block count is possible.
+        produced = [("r1", 28, {}), ("r2", 28, {"10.0.0.1:8000": {"MatchedBlocks": 28}})]
+        steps = {"prefill0": [("r1", 448, 0), ("r2", 448, 432)], "prefill1": []}
+        self.assertEqual(self.evidence(produced=produced, steps=steps)["problems"], [])
+
+    def test_the_index_needs_a_block_size(self) -> None:
+        for block in (None, 0, True, "16", -16):
+            self.assertProblem(self.evidence(block=block), "block size")
+
+
 class LoadTests(unittest.TestCase):
     def test_a_router_gateway_is_required(self) -> None:
         raw = run_config()
@@ -195,6 +349,38 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(throughput(llmd.epp_config(self.llmd.router)), llmd.UNCALIBRATED_PEAK_PREFILL_THROUGHPUT)
         self.llmd.router.peak_prefill_throughput = 46002.8
         self.assertEqual(throughput(llmd.epp_config(self.llmd.router)), 46002.8)
+
+    def test_a_precise_index_is_fed_by_the_endpoints_events(self) -> None:
+        self.llmd.router.prefix_index = "precise"
+        self.llmd.router.peak_prefill_throughput = 46002.8
+        config = llmd.epp_config(self.llmd.router, 32)
+        plugins = {p["type"]: p.get("parameters") or {} for p in config["plugins"]}
+        self.assertNotIn("approx-prefix-cache-producer", plugins)
+        producer = plugins["precise-prefix-cache-producer"]
+        self.assertEqual(producer["tokenProcessorConfig"], {"blockSizeTokens": 32})
+        self.assertEqual(producer["kvEventsConfig"]["podDiscoveryConfig"],
+                         {"socketPort": pd.KV_EVENTS_PORT, "replaySocketPort": pd.KV_EVENTS_REPLAY_PORT})
+        self.assertTrue(producer["kvEventsConfig"]["discoverPods"])
+        # The prompt tokenized by the servers themselves: prefill's port, decode's vLLM behind its sidecar.
+        token = plugins["token-producer"]
+        self.assertEqual(token["modelName"], pd.MODEL_NAME)
+        self.assertEqual([(r["selector"]["matchLabels"][llmd.ROLE_LABEL], r["basePort"])
+                          for r in token["vllm"]["endpointDiscovery"]["portRules"]],
+                         [("prefill", pd.SERVER_PORT), ("decode", llmd.DECODE_ENGINE_PORT)])
+        # The load and the affinity filter read the precise producer, with the run's throughput.
+        named = {"prefixMatchInfoProducerName": "precise-prefix-cache-producer"}
+        self.assertEqual(plugins["inflight-load-producer"], named)
+        self.assertEqual(plugins["prefix-cache-affinity-filter"], {**named, "peakPrefillThroughput": 46002.8})
+        # Endpoint notifications reach the producer (its subscribers), beside the metrics.
+        self.assertEqual(config["dataLayer"]["sources"], [
+            {"pluginRef": "metrics-source", "extractors": [{"pluginRef": "metrics-extractor"}]},
+            {"pluginRef": "endpoint-notification-source",
+             "extractors": [{"pluginRef": "precise-prefix-cache-producer"}]}])
+        # The profiles are the approximate configuration's.
+        self.llmd.router.prefix_index = "approximate"
+        approximate = llmd.epp_config(self.llmd.router)
+        self.assertEqual(config["schedulingProfiles"], approximate["schedulingProfiles"])
+        self.assertEqual(len(approximate["dataLayer"]["sources"]), 1)
 
     def test_custom_plugins_take_plugins_and_profiles_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

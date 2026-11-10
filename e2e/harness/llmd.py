@@ -70,7 +70,8 @@ SIDECAR_CONNECTOR = {"nixl": "nixlv2", "mooncake": "mooncake"}
 UNCALIBRATED_PEAK_PREFILL_THROUGHPUT = 33821
 
 
-def default_epp_plugins(peak_prefill_throughput: float | None = None) -> dict:
+def default_epp_plugins(peak_prefill_throughput: float | None = None, prefix_index: str = "approximate",
+                        block_tokens: int = 16) -> dict:
     """llm-d v1.0's P/D router configuration
     (guides/pd-disaggregation/router/pd-disaggregation.values.yaml): every
     request disaggregated, prefill picked by prefix affinity and queued
@@ -87,17 +88,41 @@ def default_epp_plugins(peak_prefill_throughput: float | None = None) -> dict:
       whatever the servers' block size (``approximateprefix`` clamps it): a
       coarser granularity than a server's own cache with smaller blocks."""
 
+    throughput = UNCALIBRATED_PEAK_PREFILL_THROUGHPUT if peak_prefill_throughput is None else peak_prefill_throughput
+    if prefix_index == "precise":
+        # llm-d's precise P/D configuration (guides/models/glm-5-2/router/
+        # precise-routing.values.yaml): the prompt tokenized by a server's
+        # render endpoint (prefill's server port, decode's behind its
+        # sidecar), the index fed by every instance's KV-cache events.
+        named = {"prefixMatchInfoProducerName": "precise-prefix-cache-producer"}
+        prefix = [
+            {"type": "token-producer", "parameters": {"modelName": pd.MODEL_NAME, "vllm": {"endpointDiscovery": {
+                "attemptTimeout": "2s",
+                "portRules": [{"selector": {"matchLabels": {ROLE_LABEL: "prefill"}}, "basePort": pd.SERVER_PORT},
+                              {"selector": {"matchLabels": {ROLE_LABEL: "decode"}}, "basePort": DECODE_ENGINE_PORT}]}}}},
+            {"type": "endpoint-notification-source"},
+            {"type": "precise-prefix-cache-producer", "parameters": {
+                "tokenProcessorConfig": {"blockSizeTokens": block_tokens},
+                "indexerConfig": {"kvBlockIndexConfig": {"enableMetrics": True}},
+                "kvEventsConfig": {"engineType": "vllm", "topicFilter": "kv@", "discoverPods": True,
+                                   "podDiscoveryConfig": {"socketPort": pd.KV_EVENTS_PORT,
+                                                          "replaySocketPort": pd.KV_EVENTS_REPLAY_PORT}}}},
+            {"type": "inflight-load-producer", "parameters": named},
+            {"type": "prefix-cache-affinity-filter", "parameters": {**named, "peakPrefillThroughput": throughput}},
+        ]
+    else:
+        prefix = [
+            {"type": "approx-prefix-cache-producer", "parameters": {"maxPrefixTokensToMatch": 131072}},
+            {"type": "inflight-load-producer"},
+            {"type": "prefix-cache-affinity-filter", "parameters": {"peakPrefillThroughput": throughput}},
+        ]
     return {
         "plugins": [
             {"type": "always-disagg-pd-decider"},
             {"type": "disagg-profile-handler", "parameters": {"deciders": {"prefill": "always-disagg-pd-decider"}}},
             {"type": "prefill-filter"},
             {"type": "decode-filter"},
-            {"type": "approx-prefix-cache-producer", "parameters": {"maxPrefixTokensToMatch": 131072}},
-            {"type": "inflight-load-producer"},
-            {"type": "prefix-cache-affinity-filter",
-             "parameters": {"peakPrefillThroughput": UNCALIBRATED_PEAK_PREFILL_THROUGHPUT if (
-                 peak_prefill_throughput is None) else peak_prefill_throughput}},
+            *prefix,
             {"type": "token-load-scorer"},
             {"type": "active-request-scorer"},
             {"type": "max-score-picker"},
@@ -114,12 +139,13 @@ def default_epp_plugins(peak_prefill_throughput: float | None = None) -> dict:
     }
 
 
-def epp_config(router: pd.Router) -> dict:
+def epp_config(router: pd.Router, block_tokens: int = 16) -> dict:
     """The EPP's config: the plugins, its endpoints from the file, their
-    metrics scraped."""
+    metrics scraped; with a precise prefix index (``block_tokens`` the
+    servers' block size), the endpoints' notifications feeding it."""
 
-    plugins = default_epp_plugins(router.peak_prefill_throughput) if router.epp_plugins is None else (
-        yaml.safe_load(router.epp_plugins.read_text(encoding="utf-8")))
+    plugins = default_epp_plugins(router.peak_prefill_throughput, router.prefix_index, block_tokens) if (
+        router.epp_plugins is None) else yaml.safe_load(router.epp_plugins.read_text(encoding="utf-8"))
     if set(plugins) - {"plugins", "schedulingProfiles"}:
         raise ValueError("router.epp_plugins takes plugins and schedulingProfiles only")
     return {
@@ -136,7 +162,14 @@ def epp_config(router: pd.Router) -> dict:
         "dataLayer": {
             "injectDefaults": False,
             "discovery": {"endpoints": {"pluginRef": "file-discovery"}},
-            "sources": [{"pluginRef": "metrics-source", "extractors": [{"pluginRef": "metrics-extractor"}]}],
+            "sources": [
+                {"pluginRef": "metrics-source", "extractors": [{"pluginRef": "metrics-extractor"}]},
+                # Each endpoint added or removed, to the plugins that follow them (the precise index's
+                # event subscribers).
+                *([{"pluginRef": "endpoint-notification-source",
+                    "extractors": [{"pluginRef": "precise-prefix-cache-producer"}]}]
+                  if any(p.get("type") == "precise-prefix-cache-producer" for p in plugins["plugins"]) else []),
+            ],
         },
     }
 
@@ -379,6 +412,10 @@ class Front:
         sidecar has SIDECAR_PORT."""
         return DECODE_ENGINE_PORT if role == "decode" else pd.SERVER_PORT
 
+    def endpoint_port(self, role: str) -> int:
+        """The port the router knows ``role``'s instance by."""
+        return SIDECAR_PORT if role == "decode" else pd.SERVER_PORT
+
     def health_url(self, role: str, control: str) -> str:
         """The URL that answers once ``role``'s server is up (from the client)."""
         return f"http://{control}:{self.server_port(role)}/health"
@@ -397,7 +434,7 @@ class Front:
         gateway = nodes[router.gateway]["container"]
         self.gateway_address = nodes[router.gateway]["interfaces"][run.control_network]["address"]
         self.configs = {
-            "epp-config.yaml": yaml.safe_dump(epp_config(router), sort_keys=False),
+            "epp-config.yaml": yaml.safe_dump(epp_config(router, run.server.block_size or 16), sort_keys=False),
             "endpoints.yaml": yaml.safe_dump(endpoints(run, address), sort_keys=False),
             "envoy.yaml": yaml.safe_dump(envoy_config(), sort_keys=False),
         }
@@ -656,6 +693,7 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
             problems.append(f"{role} {name} ran {request}, which the EPP never routed")
 
     chosen: dict[str, dict[str, int]] = {"prefill": {}, "decode": {}}
+    prefill_pick: dict[str, str] = {}
     pairs: dict[str, int] = {}
     released = received = 0
     for request, records in sorted(handled.items()):
@@ -688,6 +726,8 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
         elif "prefill" in choice and targets[0] != choice["prefill"]:
             problems.append(f"{request}: the sidecar sent its prefill to {targets[0]}, the EPP picked "
                             f"{choice['prefill']}")
+        if "prefill" in choice:
+            prefill_pick[request] = choice["prefill"]
         if set(choice) == {"prefill", "decode"}:
             pair = f"{by_address[choice['prefill']]}->{by_address[choice['decode']]}"
             pairs[pair] = pairs.get(pair, 0) + 1
@@ -707,7 +747,7 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
             problems.append(f"{request}: decode never received its KV ({CONSUMER_DONE})")
     saved_config = yaml.safe_load((directory / "epp-config.yaml").read_text())
     plugins = saved_config["plugins"]
-    if run.router.epp_plugins is None and saved_config != epp_config(run.router):
+    if run.router.epp_plugins is None and saved_config != epp_config(run.router, run.server.block_size or 16):
         # A run without its own plugins file ran the default ones, with its
         # router's settings (its calibrated throughput).
         problems.append("the saved EPP config is not the one the run's router settings give")
@@ -723,6 +763,15 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
     metrics = directory / "epp-metrics.txt"
     decisions = affinity_decisions(metrics.read_text(errors="replace")) if affinity and metrics.exists() else None
     throughputs = [(p.get("parameters") or {}).get("peakPrefillThroughput") for p in affinity]
+    precise = None
+    if any(p.get("type") == "precise-prefix-cache-producer" for p in plugins):
+        precise = precise_index_evidence(
+            directory, named, set(handled), prefill_pick,
+            {name: texts for name, (role, texts) in instances.items() if role == "prefill"},
+            next((p.get("parameters") or {}).get("tokenProcessorConfig", {}).get("blockSizeTokens")
+                 for p in plugins if p.get("type") == "precise-prefix-cache-producer"),
+            run.workload.prefix_repetition is not None)
+        problems.extend(precise.pop("problems"))
     return {"problems": pd._capped(problems, 5), "evidence": {
         "completion_requests": len(handled), "other_requests": len(others), "gateway": gateway,
         "sidecar_protocols": protocols, "routed": chosen, "pairs": dict(sorted(pairs.items())),
@@ -740,9 +789,157 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
         # the workload): only no_match means it never narrowed a choice, so
         # the run did not exercise its stickiness or its load gate.
         "affinity_filter_decisions": decisions,
+        # The precise prefix index against the engines (null: an approximate
+        # or no prefix signal).
+        "precise_index": precise,
         "uncalibrated": {"prefix-cache-affinity-filter.peakPrefillThroughput": UNCALIBRATED_PEAK_PREFILL_THROUGHPUT}
         if any(t in (None, UNCALIBRATED_PEAK_PREFILL_THROUGHPUT) for t in throughputs) else {},
     }}
+
+
+INDEX_METRIC = re.compile(r"^llm_d_epp_kv_cache_index_(?P<name>[a-z_]+)_total\s+(?P<count>[0-9.eE+]+)\s*$")
+
+
+def _count(value: object) -> int | None:
+    """A nonnegative integer count, else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def reusable_tokens(blocks: int, prompt: int, block_tokens: int) -> int:
+    """The tokens of ``blocks`` cached blocks a prompt of ``prompt`` tokens
+    can reuse: vLLM recomputes at least the last token for its logits, and
+    in whole blocks (``KVCacheManager.get_computed_blocks``: at most
+    ``prompt - 1`` tokens, rounded down to a block)."""
+    return min(blocks * block_tokens, (max(prompt - 1, 0) // block_tokens) * block_tokens)
+
+
+def precise_index_evidence(directory: Path, named: dict[str, dict], completions: set[str],
+                           prefill_pick: dict[str, str], prefill_steps: dict[str, list[str]],
+                           block_tokens: object, reuse_workload: bool = False) -> dict:
+    """llm-d's precise prefix index against the engines it indexes, from the
+    EPP's log (at TRACE: each request's lookup) and metrics and the prefill
+    instances' step logs.
+
+    - The EPP subscribed to every endpoint's KV-cache events at its control
+      address (so file discovery fed the subscribers), and events reached
+      the index.
+    - Whole-block token-count consistency: each completion's lookup has as
+      many block keys as the engine's prompt has whole blocks. This does not
+      compare token ids, nor token counts within a partial block.
+    - Each lookup's per-endpoint counts are nonnegative integers no larger
+      than the request's block count; anything else is a problem, whatever
+      the index evicted.
+    - At the prefill instance the picker chose, the tokens the index's match
+      lets the engine reuse (`reusable_tokens`: never the last token, whole
+      blocks) are compared with what the engine's first step found cached.
+      Cold comparisons (neither has anything) are counted apart from warm
+      ones. A warm comparison is ``exact``, ``under`` (the engine had more:
+      an event not yet indexed) or ``over`` (the index claimed blocks the
+      engine did not reuse). Over-counting is a problem when the index saw
+      no eviction; with evictions it is reported as unresolved (a global
+      eviction counter does not establish its cause).
+    - With a workload built for reuse (``reuse_workload``), warm comparisons
+      must exist and most of them must agree; otherwise warm agreement is
+      reported as unexercised."""
+
+    problems: list[str] = []
+    if _count(block_tokens) is None or not block_tokens:
+        return {"problems": [f"the precise index's block size is {block_tokens!r}"]}
+    subscribers: dict[str, str] = {}
+    failures = 0
+    produced: dict[str, list[dict]] = {}
+    for record in (r for log in sorted(directory.glob("*-epp.log")) for r in _json_lines(log)):
+        body = record.get("body")
+        if body == "Ensured KV-events subscriber":
+            subscribers[str(record.get("endpoint", "")).rsplit("/", 1)[-1]] = str(record.get("zmq"))
+        elif body == "Failed to connect subscriber socket":
+            failures += 1
+        elif body == "Produce completed" and record.get("x-request-id"):
+            produced.setdefault(record["x-request-id"], []).append(record)
+    for address, endpoint in named.items():
+        expected = f"tcp://{endpoint['address']}:{pd.KV_EVENTS_PORT}"
+        if subscribers.get(endpoint["name"]) != expected:
+            problems.append(f"the EPP did not subscribe to {endpoint['name']}'s KV-cache events at {expected} "
+                            f"(it had {subscribers.get(endpoint['name'])!r})")
+    index: dict[str, int] = {}
+    metrics = directory / "epp-metrics.txt"
+    for line in metrics.read_text(errors="replace").splitlines() if metrics.exists() else ():
+        if match := INDEX_METRIC.match(line):
+            index[match["name"]] = int(float(match["count"]))
+    if not index.get("admissions"):
+        problems.append(f"the precise index admitted no block (its metrics: {index or 'none'}): no KV-cache event "
+                        "reached it")
+    # Each request on its prefill instance: its prompt's tokens and what its
+    # first step found cached.
+    engine: dict[str, dict[str, tuple[int, int]]] = {}
+    for name, texts in prefill_steps.items():
+        for text in texts:
+            for record in pd._records(text):
+                step = record.get("step")
+                for request in (step.get("requests") or []) if isinstance(step, dict) else []:
+                    match = ENGINE_REQUEST_ID.match(str(request.get("req_id")))
+                    if match:
+                        engine.setdefault(match["id"], {}).setdefault(name, (
+                            int(request.get("num_prompt_tokens") or 0), int(request.get("num_cached_tokens") or 0)))
+    by_address = {address: e["name"] for address, e in named.items()}
+    cold = 0
+    warm = {"exact": 0, "under": 0, "over": 0}
+    raw_blocks: list[int] = []
+    for request in sorted(completions):
+        records = produced.get(request, [])
+        if len(records) != 1:
+            problems.append(f"{request}: the precise index logged {len(records)} lookup(s), not one (its "
+                            "records need router.epp_verbosity 5)")
+            continue
+        picked = prefill_pick.get(request)
+        found = engine.get(request, {}).get(by_address.get(picked, ""))
+        if found is None:
+            problems.append(f"{request}: no step of it on the prefill instance the EPP picked ({picked})")
+            continue
+        prompt, cached = found
+        keys = _count(records[0].get("blockKeys"))
+        if keys != prompt // block_tokens:
+            problems.append(f"{request}: the EPP's lookup has {records[0].get('blockKeys')!r} block key(s) of "
+                            f"{block_tokens} tokens, the engine's prompt {prompt} tokens ({prompt // block_tokens} "
+                            "whole blocks)")
+            continue
+        matches = records[0].get("matches")
+        if not isinstance(matches, dict):
+            problems.append(f"{request}: the EPP's lookup has no per-endpoint matches ({matches!r})")
+            continue
+        invalid = {endpoint: (match or {}).get("MatchedBlocks") if isinstance(match, dict) else match
+                   for endpoint, match in matches.items()
+                   if not isinstance(match, dict) or _count(match.get("MatchedBlocks")) is None
+                   or match["MatchedBlocks"] > keys}
+        if invalid:
+            problems.append(f"{request}: the EPP's lookup matched {invalid} block(s), not a count of at most its "
+                            f"{keys} block key(s)")
+            continue
+        blocks = (matches.get(picked) or {}).get("MatchedBlocks") or 0
+        raw_blocks.append(blocks)
+        reusable = reusable_tokens(blocks, prompt, block_tokens)
+        if reusable == 0 and cached == 0:
+            cold += 1
+        else:
+            warm["exact" if reusable == cached else "under" if reusable < cached else "over"] += 1
+    if warm["over"] and not index.get("evictions"):
+        problems.append(f"the precise index held more than the engine reused for {warm['over']} request(s) at "
+                        "their prefill instance, with no eviction in the index")
+    warm_compared = sum(warm.values())
+    if reuse_workload:
+        if not warm_compared:
+            problems.append("no request of this reuse workload found a cached prefix on its prefill instance or "
+                            "in the index: warm agreement was not exercised")
+        elif warm["exact"] * 2 <= warm_compared:
+            problems.append(f"the precise index agreed with the engine on {warm['exact']} of {warm_compared} warm "
+                            "lookup(s), not most")
+    return {"problems": pd._capped(problems, 5), "block_tokens": block_tokens, "subscribers": subscribers,
+            "subscriber_connect_failures": failures, "index": index,
+            "lookups_compared": cold + warm_compared, "cold_exact": cold, "warm": warm,
+            "warm_validation": "exercised" if warm_compared else "unexercised",
+            # Over-counts the index's evictions may or may not explain.
+            "unresolved_over": warm["over"] if index.get("evictions") else 0,
+            "index_blocks_at_pick": {"total": sum(raw_blocks), "max": max(raw_blocks, default=0)}}
 
 
 AFFINITY_DECISIONS = re.compile(

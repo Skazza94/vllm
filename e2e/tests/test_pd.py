@@ -1916,6 +1916,49 @@ class PrefixCachingCheckTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "a positive, finite number of tokens"):
                     pd.load(spec_path)
 
+    def test_a_precise_prefix_index_needs_the_servers_events_and_render(self) -> None:
+        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw", "prefix_index": "precise", "epp_verbosity": 5},
+                "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
+                "server": {"timing": "zero", "enable_prefix_caching": True}}
+        path = Path("/x/run.yaml")
+        run = pd.parse(base, path)
+        self.assertEqual(run.router.prefix_index, "precise")
+        # Each server: the render endpoints, and its events on a wildcard endpoint (vLLM binds only
+        # those) under the endpoint the router knows it by.
+        for role, port in (("prefill", 8000), ("decode", 8200)):
+            command = pd.server_command(run, role, ["10.1.0.1"], port, ("10.250.0.9", 8000))
+            self.assertIn("--enable-scale-out", command)
+            events = json.loads(command[command.index("--kv-events-config") + 1])
+            self.assertEqual(events, {
+                "enable_kv_cache_events": True, "publisher": "zmq", "endpoint": "tcp://*:5557",
+                "replay_endpoint": "tcp://*:5559", "topic": "kv@10.250.0.9:8000@sim-pd"})
+        with self.assertRaisesRegex(ValueError, "needs the instance's endpoint"):
+            pd.server_command(run, "prefill", ["10.1.0.1"])
+        # An approximate index asks nothing of the servers.
+        approximate = pd.server_command(RUN, "prefill", ["10.1.0.1"], 8000, ("10.250.0.9", 8000))
+        self.assertFalse({"--enable-scale-out", "--kv-events-config"} & set(approximate))
+        self.assertEqual(RUN.router.prefix_index, "approximate")
+
+        def changed(**change):
+            return {**base, **change}
+
+        def router(**change):
+            return {**base, "router": {**base["router"], **change}}
+
+        cases = {
+            "one of approximate, precise": router(prefix_index="exact"),
+            "configures it in that file": router(epp_plugins="plugins.yaml"),
+            "needs server.enable_prefix_caching": changed(server={"timing": "zero"}),
+            "needs server.block_size": changed(server={"timing": "zero", "enable_prefix_caching": True,
+                                                       "block_size": None}),
+            "one engine per instance": changed(prefill={"node": "p", "kv_network": "data0", "data_parallel_size": 2}),
+            "needs router.epp_verbosity 5": router(epp_verbosity=4),
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                pd.parse(change, path)
+
     def test_peak_prefill_throughput_is_an_unloaded_chunks(self) -> None:
         def step(tokens, seconds, *, cached=0, requests=1, decode=0, prefill=True):
             return line(step={"requests": [{"is_prefill": prefill, "num_cached_tokens": cached}] * requests,
