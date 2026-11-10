@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(topology.up(specs.load(args.spec)), indent=2))
         return 0
     if args.command == "run":
-        print(json.dumps(pd.execute(pd.load(args.run)), indent=2))
+        print(json.dumps(pd.execute(pd.load(args.run, fetch=True)), indent=2))
         return 0
     if args.command == "peak-prefill":
         found = pd.saved_peak_prefill_throughput(args.results)

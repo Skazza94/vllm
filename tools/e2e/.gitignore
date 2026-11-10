@@ -1,5 +1,6 @@
 state/
 results/
+models/
 __pycache__/
 # Local runs and topologies; each directory tracks one documented example.
 runs/*

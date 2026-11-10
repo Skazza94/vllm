@@ -34,9 +34,11 @@
 name: example
 topology: example  # its name: the topology must be up
 
-# A Hugging Face model directory (config and tokenizer, no weights), relative
-# to this file; ../../../models/ holds the fetched ones.
-model: ../../../models/Qwen--Qwen2.5-7B-Instruct/a09a35458c702b33eeacc393d103063234e8bc28
+# The model, by its Hugging Face id: <org>/<name>[@<revision>]. It is fetched
+# once, without its weights (the simulator never reads them), into
+# ../models/<org>--<name>/<commit>/; a gated model needs HF_TOKEN. Without a
+# revision the first fetch's commit is kept; pin one to fix the files.
+model: Qwen/Qwen2.5-7B-Instruct@a09a35458c702b33eeacc393d103063234e8bc28
 
 # Each side's node and KV network. A node may be a list: several instances
 # of that role, one engine per node, the router choosing among them (equal

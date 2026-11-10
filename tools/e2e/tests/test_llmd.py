@@ -21,7 +21,7 @@ E2E = Path(__file__).resolve().parent.parent
 
 
 def run_config(**router) -> dict:
-    return {"name": "llmd-test", "topology": "llmd-1p1d", "model": "model",
+    return {"name": "llmd-test", "topology": "llmd-1p1d", "model": "org/name",
             "prefill": {"node": "prefill0", "kv_network": "data0"},
             "decode": {"node": "decode0", "kv_network": "data0"},
             "client": "client", "control_network": "control",

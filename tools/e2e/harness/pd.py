@@ -39,7 +39,7 @@ import time
 
 import yaml
 
-from . import shell, topology
+from . import models, shell, topology
 
 
 E2E = Path(__file__).resolve().parent.parent
@@ -249,7 +249,7 @@ class Router:
 class Run:
     name: str
     topology: str  # its name: the topology must be up
-    model: Path  # a Hugging Face model directory (config and tokenizer)
+    model: Path  # the fetched copy (config and tokenizer) of the Hugging Face model the config names
     prefill: Side
     decode: Side
     client: str
@@ -268,14 +268,15 @@ class Run:
     startup_timeout: float = 600.0
 
 
-def load(path: str | Path) -> Run:
-    """A run config; relative paths are the file's."""
+def load(path: str | Path, *, fetch: bool = False) -> Run:
+    """A run config; relative paths are the file's. ``fetch``: download a
+    model named by its Hugging Face id if it is not here yet."""
 
     path = Path(path).resolve()
-    return parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path)
+    return parse(yaml.safe_load(path.read_text(encoding="utf-8")) or {}, path, fetch=fetch)
 
 
-def parse(raw: dict, path: Path) -> Run:
+def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     """A run config's contents, read from ``path`` (relative paths are its)."""
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
@@ -295,7 +296,7 @@ def parse(raw: dict, path: Path) -> Run:
     try:
         run = Run(
             name=raw["name"], topology=raw["topology"],
-            model=(path.parent / raw["model"]).resolve(),
+            model=models.resolve(str(raw["model"]), fetch=fetch),
             prefill=Side(**raw["prefill"]), decode=Side(**raw["decode"]),
             client=raw["client"], control_network=raw["control_network"], router=router,
             kv_check=bool(raw.get("kv_check", True)),

@@ -601,8 +601,11 @@ its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
 Layers still pick the CPU platform's attention backends and kernels, so a
-model needing one it lacks (decode context parallelism, NVFP4 or MXFP4
-weights, online FP8 quantization) fails to build there; DSA sparse MLA
+model needing one it lacks (decode context parallelism, NVFP4 weights,
+online FP8 quantization with `--quantization fp8`) fails to build there.
+A checkpoint published with FP8 or MXFP4 weights (DeepSeek-V3's,
+DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's) builds as published: serve it
+by its name, with no edited copy of its config. DSA sparse MLA
 (DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
 deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
 

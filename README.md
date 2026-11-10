@@ -179,19 +179,14 @@ You need Docker and an x86-64 Linux host. No GPU, no weights.
      -t vllm:cpu .
    ```
 
-2. Fetch a model's **configuration and tokenizer** (not its weights):
-
-   ```bash
-   hf download Qwen/Qwen3-8B --exclude "*.safetensors" --local-dir ./qwen3-8b
-   ```
-
-3. Serve it. The image's entrypoint is `vllm serve`; `--simulate-forward`
-   takes the GPU out:
+2. Serve a model by its Hugging Face name, as with vLLM. The image's
+   entrypoint is `vllm serve`; `--simulate-forward` takes the GPU out, and
+   only the model's **configuration and tokenizer** are downloaded, never
+   its weights:
 
    ```bash
    docker run --rm -p 8000:8000 -e TRITON_CPU_BACKEND=1 \
-     -v "$PWD/qwen3-8b:/model:ro" vllm:cpu /model \
-     --served-model-name decaf \
+     vllm:cpu Qwen/Qwen3-8B \
      --simulate-forward \
      --kv-cache-memory-bytes 1073741824 \
      --max-model-len 4096 \
@@ -201,24 +196,27 @@ You need Docker and an x86-64 Linux host. No GPU, no weights.
                                            "decode_us_per_req": 40}}'
    ```
 
-4. Talk to it like any vLLM server:
+3. Talk to it like any vLLM server:
 
    ```bash
    curl localhost:8000/v1/completions -H 'Content-Type: application/json' \
-     -d '{"model": "decaf", "prompt": "Same beans, same cup:", "max_tokens": 16}'
+     -d '{"model": "Qwen/Qwen3-8B", "prompt": "Same beans, same cup:", "max_tokens": 16}'
    ```
 
    The reply has real usage counts and timing; the text is filler, because
    no model ran.
 
-For GPU step times, build `vllm:cpu-aisim` as above, use it in step 3 and
-swap the simulation config:
+For GPU step times, build `vllm:cpu-aisim` as above, use it in step 2 and
+swap the simulation config. The model's name also names the deployment
+AISimulate times:
 
 ```bash
-     --simulation-config '{"timing": "aisimulate",
-                           "timing_args": {"gpu": "h100",
-                                           "target_model": "Qwen/Qwen3-8B"}}'
+     --simulation-config '{"timing": "aisimulate", "timing_args": {"gpu": "h100"}}'
 ```
+
+A local directory with a model's configuration and tokenizer works in place
+of the name (mount it and pass its path); `target_model` in `timing_args`
+then names the published model.
 
 `--kv-cache-memory-bytes` is the KV budget of the deployment you model:
 prefix-cache hits and preemption depend on it. Any client works unchanged,
@@ -244,11 +242,12 @@ python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m harness down example
 ```
 
-Before the first run, set `model` in
-[`runs/example.yaml`](tools/e2e/runs/example.yaml) to a directory with a
-model's configuration and tokenizer, and adapt the CPU sets, memory limits
-and subnets in [`topologies/example.yaml`](tools/e2e/topologies/example.yaml)
-to your host. Both files document every option; copy them to make your own.
+Before the first run, adapt the CPU sets, memory limits and subnets in
+[`topologies/example.yaml`](tools/e2e/topologies/example.yaml) to your host.
+[`runs/example.yaml`](tools/e2e/runs/example.yaml) names its model by its
+Hugging Face id; the harness fetches the configuration and tokenizer once
+(no weights) and gives them to the servers, which run without internet
+access. Both files document every option; copy them to make your own.
 
 A run writes its evidence to `results/<name>-<timestamp>/`: client metrics,
 server and router logs, per-rank transfer records and `verdict.json`. It

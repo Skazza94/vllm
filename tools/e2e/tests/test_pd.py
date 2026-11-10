@@ -142,7 +142,7 @@ class CheckTests(unittest.TestCase):
                 spec = Path(directory) / "x.yaml"
                 text = re.sub(r"^(server:.*)$", rf"\1\n  trust_remote_code: {value}",
                               base.read_text(), count=1, flags=re.M)
-                spec.write_text(text.replace("model: ", f"model: {base.parent}/", 1))
+                spec.write_text(text)
                 if ok:
                     pd.load(spec)
                 else:
@@ -182,7 +182,7 @@ class CheckTests(unittest.TestCase):
                          ("10.100.0.1", "10.100.0.1"))
 
     def test_the_connector_is_mooncake_or_nixl(self) -> None:
-        base = {"name": "t", "topology": "t", "model": ".", "client": "c", "control_network": "control",
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "router": {"gateway": "gw"},
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"}}
 
@@ -221,8 +221,7 @@ class CheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "run.yaml"
             spec.write_text((E2E / "runs" / "example.yaml").read_text().replace(
-                "server:  # both servers", "server:  # both servers\n  enable_prefix_caching: true").replace(
-                "model: ", f"model: {E2E / 'runs'}/", 1))
+                "server:  # both servers", "server:  # both servers\n  enable_prefix_caching: true"))
             run = pd.load(spec)
             self.assertTrue(run.kv_check and run.server.enable_prefix_caching)
 
@@ -236,7 +235,7 @@ class CheckTests(unittest.TestCase):
                          ["768", "256", "4", "16"])
         self.assertNotIn("--random-input-len", command)
         self.assertIn("--random-input-len", pd.bench_command(RUN, "http://gw"))
-        base = (E2E / "runs" / "example.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
+        base = (E2E / "runs" / "example.yaml").read_text()
         for workload, extra, error in (
                 ("prefix_repetition: {prefix_len: 700, suffix_len: 256, num_prefixes: 4}", "", "input_len is"),
                 ("prefix_repetition: {prefix_len: 768, suffix_len: 256}", "", "takes positive"),
@@ -260,7 +259,9 @@ class CheckTests(unittest.TestCase):
     def test_the_example_run_loads(self) -> None:
         run = pd.load(E2E / "runs" / "example.yaml")
         self.assertEqual((run.prefill.node, run.decode.kv_network), ("prefill0", "data0"))
-        self.assertTrue((run.model / "config.json").is_file(), run.model)
+        # Named by its Hugging Face id and commit: where a run fetches it.
+        self.assertEqual(run.model.parts[-3:], ("models", "Qwen--Qwen2.5-7B-Instruct",
+                                                "a09a35458c702b33eeacc393d103063234e8bc28"))
         self.assertEqual(run.router, pd.Router("gateway"))
         # Its topology has the gateway as a node of its own.
         nodes = spec.load(E2E / "topologies" / f"{run.topology}.yaml").nodes
@@ -276,7 +277,7 @@ class CheckTests(unittest.TestCase):
         self.assertNotIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120", command)
 
     def test_the_router_is_required_on_a_node_of_its_own(self) -> None:
-        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
                 "server": {"timing": "zero"}}
         path = Path("/x/run.yaml")
@@ -1076,7 +1077,7 @@ class InstanceCheckTests(unittest.TestCase):
                         problems)
 
     def test_node_lists_are_validated(self) -> None:
-        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "router": {"gateway": "gw"},
                 "prefill": {"node": ["p0", "p1"], "kv_network": "data0"},
                 "decode": {"node": ["d0"], "kv_network": "data0"}, "server": {"timing": "zero"}}
@@ -1877,7 +1878,7 @@ class PrefixCachingCheckTests(unittest.TestCase):
             RUN)["prefix_routing"])
 
     def test_the_hit_expectation_and_the_calibration_are_validated(self) -> None:
-        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "router": {"gateway": "gw"}, "prefill": {"node": "p", "kv_network": "data0"},
                 "decode": {"node": "d", "kv_network": "data0"},
                 "server": {"timing": "zero", "enable_prefix_caching": True}, "workload": {"num_prompts": 10}}
@@ -1917,7 +1918,7 @@ class PrefixCachingCheckTests(unittest.TestCase):
                     pd.load(spec_path)
 
     def test_a_precise_prefix_index_needs_the_servers_events_and_render(self) -> None:
-        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "router": {"gateway": "gw", "prefix_index": "precise", "epp_verbosity": 5},
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
                 "server": {"timing": "zero", "enable_prefix_caching": True}}
@@ -2766,7 +2767,7 @@ class HeterogeneousTpTests(unittest.TestCase):
                 self.assertEqual(verdict["hetero_tp"]["max_descriptors"], 10)
 
     def test_unequal_sizes_need_one_switched_network(self) -> None:
-        base = (E2E / "runs" / "example.yaml").read_text().replace("model: ", f"model: {E2E / 'runs'}/", 1)
+        base = (E2E / "runs" / "example.yaml").read_text()
         for prefill, decode, error in (
                 ("{node: prefill0, kv_network: data0, tensor_parallel_size: 2}",
                  "{node: decode0, kv_network: data0, tensor_parallel_size: 3}", "divide one another"),
@@ -3022,3 +3023,84 @@ class LibfabricBackendTests(NixlTcpBackendTests):
                 saved=plan[index];plan[index]=value
                 self.assertTrue(reconcile()["problems"]);plan[index]=saved
         finally:hybrid.tearDown()
+
+
+def yaml_example() -> dict:
+    import yaml
+    return yaml.safe_load((E2E / "runs" / "example.yaml").read_text())
+
+
+class ModelTests(unittest.TestCase):
+    """A run's model: a Hugging Face id, fetched without weights."""
+
+    COMMIT = "a" * 40
+
+    def setUp(self) -> None:
+        from harness import models
+        self.models = models
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.root, ignore_errors=True))
+        patch = mock.patch.object(models, "MODELS", self.root / "models")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.requested: list[str] = []
+
+    def hub(self, files: dict[str, bytes], status: int | None = None):
+        """urlopen of a hub holding ``files`` at COMMIT (or answering ``status``)."""
+        import urllib.error
+
+        def get(url: str):
+            self.requested.append(url)
+            if status:
+                raise urllib.error.HTTPError(url, status, "no", None, None)
+            if "/api/models/" in url:
+                body = json.dumps({"sha": self.COMMIT, "siblings": [{"rfilename": n} for n in files]}).encode()
+            else:
+                body = files[url.split(f"/resolve/{self.COMMIT}/", 1)[1]]
+            return contextlib.closing(io.BytesIO(body))
+        return mock.patch.object(self.models, "_get", get)
+
+    def test_only_a_hugging_face_id_names_a_model(self) -> None:
+        for value in ("../models/org--name/abc", "/abs/model", "name", ".", "org/name/extra@x y"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "model is a Hugging Face id"):
+                self.models.resolve(value, fetch=True)
+        with self.assertRaisesRegex(ValueError, "model is a Hugging Face id"):
+            pd.parse({**yaml_example(), "model": "../models/x"}, E2E / "runs" / "example.yaml")
+
+    def test_an_id_is_fetched_once_without_weights_into_its_commit(self) -> None:
+        files = {"config.json": b"{}", "tokenizer.json": b"t", "model-00001.safetensors": b"w",
+                 "pytorch_model.bin": b"w", "nested/tokenizer.model": b"s"}
+        with self.hub(files):
+            found = self.models.resolve("org/name", fetch=True)
+            self.assertEqual(found, self.root / "models" / "org--name" / self.COMMIT)
+            self.assertEqual(sorted(str(f.relative_to(found)) for f in found.rglob("*") if f.is_file()),
+                             ["config.json", "nested/tokenizer.model", "tokenizer.json"])
+            self.assertFalse(any(u.endswith((".safetensors", ".bin")) for u in self.requested))
+            self.assertIn("/revision/main", self.requested[0])
+            # Fetched: the unpinned id is that commit from now on, with no request.
+            self.requested.clear()
+            self.assertEqual(self.models.resolve("org/name", fetch=True), found)
+            self.assertEqual(self.models.resolve(f"org/name@{self.COMMIT}"), found)
+            self.assertEqual(self.requested, [])
+
+    def test_nothing_is_downloaded_without_fetch(self) -> None:
+        with self.hub({"config.json": b"{}"}):
+            self.assertEqual(self.models.resolve(f"org/name@{self.COMMIT}"),
+                             self.root / "models" / "org--name" / self.COMMIT)
+            self.assertEqual(self.models.resolve("org/name"), self.root / "models" / "org--name" / "main")
+            self.assertEqual(self.requested, [])
+
+    def test_several_fetched_commits_need_one_named(self) -> None:
+        for commit in ("a" * 40, "b" * 40):
+            (self.root / "models" / "org--name" / commit).mkdir(parents=True)
+            (self.root / "models" / "org--name" / commit / "config.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "2 commits are fetched .* name one as org/name@<commit>"):
+            self.models.resolve("org/name")
+        self.assertEqual(self.models.resolve(f"org/name@{'b' * 40}").name, "b" * 40)
+
+    def test_a_failed_fetch_says_why_and_leaves_no_model(self) -> None:
+        with self.hub({}, status=401), self.assertRaisesRegex(ValueError, "HTTP 401 .*HF_TOKEN"):
+            self.models.resolve("org/gated", fetch=True)
+        with self.hub({"README.md": b"x"}), self.assertRaisesRegex(ValueError, "has no config.json"):
+            self.models.resolve("org/empty", fetch=True)
+        self.assertEqual(list((self.root / "models").glob("*/*/config.json")), [])
