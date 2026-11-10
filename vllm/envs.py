@@ -176,6 +176,8 @@ if TYPE_CHECKING:
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
+    VLLM_DP_SUPERVISED_RANK_LOCAL: int | None = None
+    VLLM_DP_SUPERVISED_SIZE_LOCAL: int | None = None
     VLLM_DP_SIZE: int = 1
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
@@ -1503,6 +1505,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DP_RANK_LOCAL": lambda: int(
         os.getenv("VLLM_DP_RANK_LOCAL", sys.modules[__name__].VLLM_DP_RANK)
     ),
+    # Set by the multi-port external-LB supervisor
+    # (--data-parallel-multi-port-external-lb) in each DP server it launches:
+    # the server's index among, and the count of, the DP ranks the supervisor
+    # runs on this host. Such a server is configured as external LB with one
+    # local rank, as a rank on a host of its own is; these tell the two apart.
+    "VLLM_DP_SUPERVISED_RANK_LOCAL": lambda: (
+        int(os.environ["VLLM_DP_SUPERVISED_RANK_LOCAL"])
+        if "VLLM_DP_SUPERVISED_RANK_LOCAL" in os.environ
+        else None
+    ),
+    "VLLM_DP_SUPERVISED_SIZE_LOCAL": lambda: (
+        int(os.environ["VLLM_DP_SUPERVISED_SIZE_LOCAL"])
+        if "VLLM_DP_SUPERVISED_SIZE_LOCAL" in os.environ
+        else None
+    ),
     # World size of the data parallel setting
     "VLLM_DP_SIZE": lambda: int(os.getenv("VLLM_DP_SIZE", "1")),
     # IP address of the master node in the data parallel setting
@@ -2407,6 +2424,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MODEL_REDIRECT_PATH",
         "VLLM_HOST_IP",
         "VLLM_RAY_BUNDLE_INDICES",
+        "VLLM_DP_SUPERVISED_RANK_LOCAL",
+        "VLLM_DP_SUPERVISED_SIZE_LOCAL",
         "VLLM_CHAT_TEMPLATE_FUEL",
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
         "VLLM_FORCE_AOT_LOAD",

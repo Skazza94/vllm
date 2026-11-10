@@ -178,9 +178,88 @@ def test_build_multi_port_external_lb_child_args_sets_external_rank_server():
     assert child_args.data_parallel_hybrid_lb is False
     assert child_args.data_parallel_multi_port_external_lb is False
     assert child_args.api_server_count == 1
+    # Its place among the host's four supervised ranks, which its own
+    # configuration (one local rank) no longer says.
+    assert child_args.data_parallel_supervised_rank_local == 2
+    assert child_args.data_parallel_supervised_size_local == 4
 
 
-def test_run_vllm_dp_server_uses_python_server_by_default(monkeypatch):
+SUPERVISED_PLACE = ("VLLM_DP_SUPERVISED_RANK_LOCAL", "VLLM_DP_SUPERVISED_SIZE_LOCAL")
+
+
+@contextlib.contextmanager
+def _supervised_place_restored():
+    """`_run_vllm_dp_server` exports its child's place on the host into this
+    process's environment (in production, the child's own process). Starts
+    without one and puts back what was there, absent included: pytest's
+    `delenv` of an absent variable records nothing to undo."""
+    saved = {name: os.environ.pop(name, None) for name in SUPERVISED_PLACE}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
+
+
+@pytest.fixture
+def supervised_place():
+    with _supervised_place_restored():
+        yield
+
+
+@pytest.mark.parametrize("before", [None, ("7", "8")])
+def test_a_launched_servers_place_does_not_outlive_its_test(monkeypatch, before):
+    monkeypatch.setattr(dp_sup.os, "setpgrp", lambda: None)
+    monkeypatch.setattr(dp_sup, "set_process_title", lambda *_args: None)
+    monkeypatch.setattr(dp_sup, "decorate_logs", lambda *_args: None)
+    monkeypatch.setattr(dp_sup.envs, "VLLM_RUST_FRONTEND_PATH", None, raising=False)
+    monkeypatch.setattr(dp_sup, "_run_python_vllm_dp_server", lambda _args: None)
+    with _supervised_place_restored():  # this test's own, whatever the caller's
+        for name, value in zip(SUPERVISED_PLACE, before or ()):
+            os.environ[name] = value
+        with _supervised_place_restored():
+            assert all(name not in os.environ for name in SUPERVISED_PLACE)
+            dp_sup._run_vllm_dp_server(
+                _build_vllm_dp_server_args(
+                    _make_unit_args(data_parallel_start_rank=8), local_rank=3
+                )
+            )
+            assert [os.environ[name] for name in SUPERVISED_PLACE] == ["3", "4"]
+        found = tuple(os.environ.get(name) for name in SUPERVISED_PLACE)
+        assert found == (before or (None, None))
+
+
+def test_run_vllm_dp_server_exports_its_place_on_the_host(monkeypatch, supervised_place):
+    monkeypatch.setattr(dp_sup.os, "setpgrp", lambda: None)
+    monkeypatch.setattr(dp_sup, "set_process_title", lambda *_args: None)
+    monkeypatch.setattr(dp_sup, "decorate_logs", lambda *_args: None)
+    monkeypatch.setattr(dp_sup.envs, "VLLM_RUST_FRONTEND_PATH", None, raising=False)
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        dp_sup,
+        "_run_python_vllm_dp_server",
+        lambda _args: seen.update(
+            {name: dp_sup.os.environ.get(name) for name in SUPERVISED_PLACE}
+        ),
+    )
+    args = _make_unit_args(data_parallel_start_rank=8)
+
+    dp_sup._run_vllm_dp_server(_build_vllm_dp_server_args(args, local_rank=3))
+
+    # Before the server (and so its engine and worker processes) starts.
+    assert seen == {
+        "VLLM_DP_SUPERVISED_RANK_LOCAL": "3",
+        "VLLM_DP_SUPERVISED_SIZE_LOCAL": "4",
+    }
+    assert (
+        dp_sup.envs.VLLM_DP_SUPERVISED_RANK_LOCAL,
+        dp_sup.envs.VLLM_DP_SUPERVISED_SIZE_LOCAL,
+    ) == (3, 4)
+
+
+def test_run_vllm_dp_server_uses_python_server_by_default(monkeypatch, supervised_place):
     calls: list[str] = []
 
     monkeypatch.setattr(dp_sup.os, "setpgrp", lambda: None)
@@ -194,12 +273,18 @@ def test_run_vllm_dp_server_uses_python_server_by_default(monkeypatch):
         dp_sup, "_run_rust_vllm_dp_server", lambda _args: calls.append("rust")
     )
 
-    dp_sup._run_vllm_dp_server(_make_unit_args(data_parallel_rank=4))
+    dp_sup._run_vllm_dp_server(
+        _make_unit_args(
+            data_parallel_rank=4,
+            data_parallel_supervised_rank_local=0,
+            data_parallel_supervised_size_local=4,
+        )
+    )
 
     assert calls == ["python"]
 
 
-def test_run_vllm_dp_server_uses_rust_frontend_when_enabled(monkeypatch):
+def test_run_vllm_dp_server_uses_rust_frontend_when_enabled(monkeypatch, supervised_place):
     calls: list[str] = []
 
     monkeypatch.setattr(dp_sup.os, "setpgrp", lambda: None)
@@ -219,7 +304,13 @@ def test_run_vllm_dp_server_uses_rust_frontend_when_enabled(monkeypatch):
         dp_sup, "_run_rust_vllm_dp_server", lambda _args: calls.append("rust")
     )
 
-    dp_sup._run_vllm_dp_server(_make_unit_args(data_parallel_rank=4))
+    dp_sup._run_vllm_dp_server(
+        _make_unit_args(
+            data_parallel_rank=4,
+            data_parallel_supervised_rank_local=0,
+            data_parallel_supervised_size_local=4,
+        )
+    )
 
     assert calls == ["rust"]
 

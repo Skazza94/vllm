@@ -32,6 +32,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import host_dp_ranks
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.simulated.kv_pattern import (
     NativeChecker,
@@ -424,7 +425,7 @@ class SimulatedModelRunner(GPUModelRunner):
                     "tp_size": tp.world_size,
                     # Its identity, and its place on the host (NIC, port).
                     "dp_rank": self.parallel_config.data_parallel_index,
-                    "dp_local_rank": self.parallel_config.data_parallel_rank_local or 0,
+                    "dp_local_rank": host_dp_ranks(self.parallel_config)[0],
                     "tent_metrics_port": os.environ.get("TENT_METRICS_HTTP_PORT"),
                 },
                 self.clock.now(),

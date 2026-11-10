@@ -187,6 +187,8 @@ def engine_config(
         "pipeline_parallel_size": 1,
         "data_parallel_size": 1,
         "data_parallel_size_local": parallel.get("data_parallel_size", 1),
+        "data_parallel_rank_local": None,
+        "data_parallel_external_lb": False,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "enable_expert_parallel": False,
@@ -509,6 +511,65 @@ def test_dp_attention_with_expert_parallelism_is_mapped(fake_aisimulate):
     ) == (1, 8, 1, 8)
 
 
+def supervised(monkeypatch, rank, size):
+    """As the multi-port external-LB supervisor exports a server's place on
+    its host."""
+    monkeypatch.setenv("VLLM_DP_SUPERVISED_RANK_LOCAL", str(rank))
+    monkeypatch.setenv("VLLM_DP_SUPERVISED_SIZE_LOCAL", str(size))
+
+
+def supervised_rank_config(dp, **overrides):
+    """A DP server launched by the multi-port supervisor: external LB, one
+    local rank."""
+    return engine_config(
+        **{
+            "data_parallel_size": dp,
+            "data_parallel_size_local": 1,
+            "data_parallel_external_lb": True,
+            "enable_expert_parallel": True,
+            **overrides,
+        }
+    )
+
+
+def test_ranks_a_supervisor_launched_on_one_host_are_local(fake_aisimulate, monkeypatch):
+    """A server for each DP rank on one host is the layout of the ranks one
+    server launches: the same model configuration, the same joint step."""
+    together = provider(engine_config(data_parallel_size=8, enable_expert_parallel=True))
+    supervised(monkeypatch, 3, 8)
+    apart = provider(supervised_rank_config(8))
+    one, other = fake_aisimulate.instances
+    assert one.config.kwargs == other.config.kwargs
+    step = sim_step(
+        0,
+        on_rank(sim_req("p", 1024, 0, 1024), 0),
+        on_rank(sim_req("d", 1, 4000, 3000), 5),
+    )
+    assert together.estimate(step) == apart.estimate(step)
+    assert one.queries[-1] == other.queries[-1]
+    assert len(one.queries[-1]) == 8
+
+
+@pytest.mark.parametrize(
+    "exported, match",
+    [
+        (None, "1 local"),  # a rank on a host of its own
+        ((1, 4), "4 local"),  # half of the ranks on this host
+    ],
+)
+def test_ranks_on_other_hosts_stay_refused(fake_aisimulate, monkeypatch, exported, match):
+    if exported:
+        supervised(monkeypatch, *exported)
+    with pytest.raises(ValueError, match=match):
+        provider(supervised_rank_config(8))
+
+
+def test_a_supervised_place_needs_an_external_lb_rank_server(fake_aisimulate, monkeypatch):
+    supervised(monkeypatch, 0, 8)
+    with pytest.raises(ValueError, match="multi-port external-LB supervisor"):
+        provider(engine_config(data_parallel_size=8, enable_expert_parallel=True))
+
+
 def test_startup_probes_cover_a_prefill_and_a_decode_step(fake_aisimulate):
     p = provider(engine_config())
     prefill, decode = fake_aisimulate.instances[0].queries
@@ -772,6 +833,25 @@ def test_the_real_package_prices_handoff_mixed_and_uneven_dp_steps():
         )
     ).device_s
     light = p.estimate(sim_step(1, on_rank(sim_req("d", 1, 4000, 3000), 5))).device_s
+    # The same ranks as a server each (a multi-port supervisor's): the same costs.
+    with pytest.MonkeyPatch.context() as patch:
+        supervised(patch, 5, 8)
+        apart = provider(
+            supervised_rank_config(8, model="deepseek-ai/DeepSeek-V3", local=v3)
+        )
+        assert apart.assumptions() == p.assumptions()
+        assert (
+            apart.estimate(
+                sim_step(
+                    0,
+                    on_rank(sim_req("p", 1024, 0, 1024), 0),
+                    on_rank(sim_req("d", 1, 4000, 3000), 5),
+                )
+            ).device_s,
+            apart.estimate(
+                sim_step(1, on_rank(sim_req("d", 1, 4000, 3000), 5))
+            ).device_s,
+        ) == (busy, light)
     assert 0 < light < busy
 
     # The weight and attention modes passed are the ones AISimulate infers

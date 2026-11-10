@@ -3210,6 +3210,36 @@ def test_dp_ranks_on_a_host_serve_tent_metrics_on_their_own_ports(
 
 
 @pytest.mark.parametrize(
+    "supervised_rank, tp_rank, port", [(0, 0, 9100), (0, 1, 9101), (1, 0, 9102), (1, 1, 9103)]
+)
+def test_supervised_dp_servers_on_a_host_serve_tent_metrics_on_their_own_ports(
+    monkeypatch, supervised_rank, tp_rank, port
+):
+    """The same two DP engines of TP=2, a server each under the multi-port
+    external-LB supervisor: every server's own local rank is 0, its place on
+    the host is the supervisor's."""
+    from vllm.distributed import parallel_state
+    from vllm.v1.worker.simulated import worker
+
+    for name in ("TENT_METRICS_HTTP_PORT", "VLLM_SIM_TENT_METRICS_BASE_PORT", "MC_TENT_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_DP_SUPERVISED_RANK_LOCAL", str(supervised_rank))
+    monkeypatch.setenv("VLLM_DP_SUPERVISED_SIZE_LOCAL", "2")
+    group = SimpleNamespace(rank_in_group=tp_rank, world_size=2)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            data_parallel_rank_local=0,
+            data_parallel_size_local=1,
+            data_parallel_external_lb=True,
+        )
+    )
+    worker._rank_tent_metrics_port(config)
+    assert os.environ["TENT_METRICS_HTTP_PORT"] == str(port)
+
+
+@pytest.mark.parametrize(
     "env, conf, rank, port, conf_port",
     [
         ({}, None, 1, 9101, None),  # TENT's default port

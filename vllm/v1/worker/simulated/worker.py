@@ -17,6 +17,7 @@ if current_platform.is_cpu():
 from vllm.config.vllm import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import host_dp_ranks
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_random_seed
@@ -64,7 +65,7 @@ def _rank_tent_metrics_port(vllm_config: VllmConfig) -> None:
     )
     os.environ[_TENT_METRICS_BASE_PORT] = base
     tp = get_tp_group()
-    dp_local_rank = vllm_config.parallel_config.data_parallel_rank_local or 0
+    dp_local_rank, _ = host_dp_ranks(vllm_config.parallel_config)
     port = int(base) + dp_local_rank * tp.world_size + tp.rank_in_group
     os.environ[_TENT_METRICS_PORT] = str(port)
     if found is not None and int(found[1]) != port:

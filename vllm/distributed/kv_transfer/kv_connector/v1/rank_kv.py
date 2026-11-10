@@ -9,6 +9,7 @@ sizes real transfers pair."""
 import ipaddress
 import os
 
+from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
 from vllm.distributed.parallel_state import (
@@ -17,16 +18,47 @@ from vllm.distributed.parallel_state import (
 )
 
 
+def host_dp_ranks(parallel_config) -> tuple[int, int]:
+    """This DP engine's index among, and the count of, its model's DP engines
+    on this host. Engines launched together by one server say so in their
+    configuration (their local rank and local size). A multi-port external-LB
+    supervisor launches a server for each of the host's ranks instead, each
+    configured with one local rank; it exports their place on the host
+    (VLLM_DP_SUPERVISED_RANK_LOCAL, VLLM_DP_SUPERVISED_SIZE_LOCAL)."""
+    rank, size = envs.VLLM_DP_SUPERVISED_RANK_LOCAL, envs.VLLM_DP_SUPERVISED_SIZE_LOCAL
+    if rank is None and size is None:
+        return (
+            parallel_config.data_parallel_rank_local or 0,
+            parallel_config.data_parallel_size_local,
+        )
+    if (
+        rank is None
+        or size is None
+        or not parallel_config.data_parallel_external_lb
+        or parallel_config.data_parallel_size_local != 1
+        or not 0 <= rank < size <= parallel_config.data_parallel_size
+    ):
+        raise ValueError(
+            "VLLM_DP_SUPERVISED_RANK_LOCAL and VLLM_DP_SUPERVISED_SIZE_LOCAL are "
+            "set together by the multi-port external-LB supervisor, for a server "
+            "of one local DP rank in external LB mode: got rank "
+            f"{rank} of {size} (data_parallel_size "
+            f"{parallel_config.data_parallel_size}, data_parallel_size_local "
+            f"{parallel_config.data_parallel_size_local}, external LB "
+            f"{parallel_config.data_parallel_external_lb})."
+        )
+    return rank, size
+
+
 def local_kv_rank(vllm_config: VllmConfig, tp_rank: int, tp_size: int) -> tuple[int, int]:
     """This rank's place in ``rank_addresses``, and their count. An engine
     of its own (no DP, or a dense model's independent DP engine, which runs
     as DP=1) lists its TP ranks; an MoE model's DP engines on one host list
-    theirs in turn, local DP rank by TP rank."""
+    theirs in turn, host-local DP rank by TP rank (`host_dp_ranks`)."""
     parallel_config = vllm_config.parallel_config
     if parallel_config.data_parallel_size == 1:
         return tp_rank, tp_size
-    dp_local_rank = parallel_config.data_parallel_rank_local or 0
-    dp_local_size = parallel_config.data_parallel_size_local
+    dp_local_rank, dp_local_size = host_dp_ranks(parallel_config)
     if not 0 <= dp_local_rank < dp_local_size:
         # An engine launched on its own (offline MoE DP) keeps its host-local
         # rank among engines its configuration does not count.

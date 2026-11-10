@@ -3669,6 +3669,59 @@ def test_each_rank_takes_its_address_in_host_order():
     ) == "10.102.0.1"
 
 
+def _supervised_state(dp_size, **overrides):
+    """A DP server of the multi-port external-LB supervisor: external LB, one
+    local rank, its own local rank 0."""
+    state = _dp_state(dp_size, 1, 0)
+    state.parallel_config.data_parallel_external_lb = True
+    for name, value in overrides.items():
+        setattr(state.parallel_config, name, value)
+    return state
+
+
+def test_supervised_rank_servers_take_their_addresses_in_host_order(monkeypatch):
+    """A multi-port supervisor's server for each DP rank: the host's ranks
+    list their addresses as one server's would, by the place the supervisor
+    exported."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import host_dp_ranks
+
+    assert host_dp_ranks(_dp_state(2, 2, 1).parallel_config) == (1, 2)
+    monkeypatch.setenv("VLLM_DP_SUPERVISED_SIZE_LOCAL", "2")
+    found = []
+    for rank in (0, 1):
+        monkeypatch.setenv("VLLM_DP_SUPERVISED_RANK_LOCAL", str(rank))
+        assert host_dp_ranks(_supervised_state(2).parallel_config) == (rank, 2)
+        found += [local_kv_rank(_supervised_state(2), tp, 2) for tp in (0, 1)]
+    assert found == [(0, 4), (1, 4), (2, 4), (3, 4)]
+
+
+@pytest.mark.parametrize(
+    "rank, size, overrides",
+    [
+        ("0", None, {}),  # one without the other
+        (None, "2", {}),
+        ("2", "2", {}),  # no such place
+        ("-1", "2", {}),
+        ("0", "4", {}),  # more than the model's ranks
+        ("0", "2", {"data_parallel_external_lb": False}),  # no rank server
+        ("0", "2", {"data_parallel_size_local": 2}),
+    ],
+)
+def test_a_supervised_place_is_validated(monkeypatch, rank, size, overrides):
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import host_dp_ranks
+
+    for name, value in (
+        ("VLLM_DP_SUPERVISED_RANK_LOCAL", rank),
+        ("VLLM_DP_SUPERVISED_SIZE_LOCAL", size),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="multi-port external-LB supervisor"):
+        host_dp_ranks(_supervised_state(2, **overrides).parallel_config)
+
+
 def test_an_engine_launched_alone_needs_no_addresses(monkeypatch):
     """Offline MoE DP: one engine per launch (local size 1) keeps its local
     rank 1; rank_addresses cannot place it, so is refused, while without

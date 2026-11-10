@@ -727,9 +727,16 @@ class AisimulateTimingProvider:
                 )
             if tp > 1:
                 problems.append("tensor parallelism inside data parallelism")
-            if pc.data_parallel_size_local != dp or dp > MAX_LOCAL_DATA_PARALLEL:
+            # All on this host, whether one server launched them or a
+            # multi-port supervisor a server for each (`host_dp_ranks`).
+            from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+                host_dp_ranks,
+            )
+
+            local = host_dp_ranks(pc)[1]
+            if local != dp or dp > MAX_LOCAL_DATA_PARALLEL:
                 problems.append(
-                    f"{dp} data-parallel ranks ({pc.data_parallel_size_local} local; "
+                    f"{dp} data-parallel ranks ({local} local; "
                     f"up to {MAX_LOCAL_DATA_PARALLEL}, all local)"
                 )
         elif ep:

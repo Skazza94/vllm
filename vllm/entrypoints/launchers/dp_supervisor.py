@@ -124,6 +124,11 @@ def _build_vllm_dp_server_args(
         infer_multi_port_external_lb_start_rank(args) + local_rank
     )
     child_args.data_parallel_start_rank = None
+    # The child's place among this host's supervised ranks, for
+    # `_run_vllm_dp_server` to export: its own configuration says one local
+    # rank, as a rank on a host of its own would.
+    child_args.data_parallel_supervised_rank_local = local_rank
+    child_args.data_parallel_supervised_size_local = args.data_parallel_size_local
     child_args.data_parallel_size_local = 1
     child_args.data_parallel_external_lb = True
     child_args.data_parallel_hybrid_lb = False
@@ -256,6 +261,15 @@ def _run_vllm_dp_server(child_args: argparse.Namespace) -> None:
     # Create a fresh process group for the vLLM DP Server,
     # so that CTRL-C is propagated cleanly.
     os.setpgrp()
+
+    # Inherited by the server's engine and worker processes
+    # (`vllm.distributed.kv_transfer.kv_connector.v1.rank_kv.host_dp_ranks`).
+    os.environ["VLLM_DP_SUPERVISED_RANK_LOCAL"] = str(
+        child_args.data_parallel_supervised_rank_local
+    )
+    os.environ["VLLM_DP_SUPERVISED_SIZE_LOCAL"] = str(
+        child_args.data_parallel_supervised_size_local
+    )
 
     name = f"APIServer_DP{child_args.data_parallel_rank}"
     set_process_title(name)
