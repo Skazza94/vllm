@@ -1,0 +1,22 @@
+# The endpoint picker without any prefix or load awareness (see also
+# request-load.yaml and token-load.yaml): a random prefill
+# and a random decode instance for every request. The control for prefix-aware
+# routing (llm-d's default P/D plugins, harness/llmd.py default_epp_plugins).
+plugins:
+  - type: always-disagg-pd-decider
+  - type: disagg-profile-handler
+    parameters:
+      deciders:
+        prefill: always-disagg-pd-decider
+  - type: prefill-filter
+  - type: decode-filter
+  - type: random-picker
+schedulingProfiles:
+  - name: prefill
+    plugins:
+      - pluginRef: prefill-filter
+      - pluginRef: random-picker
+  - name: decode
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: random-picker

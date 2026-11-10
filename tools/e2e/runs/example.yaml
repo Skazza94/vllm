@@ -1,0 +1,99 @@
+# Example run (the only one tracked; copy it to make others): a short
+# byte-checked prefill/decode run on the example topology, both sides'
+# KV on data0, HTTP on control.
+#
+#   python -m harness up topologies/example.yaml   # from tools/e2e/, first
+#   python -m harness pd runs/example.yaml
+#
+# Prefill and decode run `vllm serve` with simulated compute and real KV
+# transfers (MooncakeConnector over TENT's hp_tcp, bound to the node's KV
+# network address; TENT's other transports off). HTTP and Mooncake's
+# bootstrap use the control network. Requests enter through llm-d's router
+# (v1.0, without Kubernetes): Envoy and the endpoint picker run on the
+# gateway node, a disaggregation sidecar next to decode's server, in
+# containers of llm-d's images that join those nodes' network namespaces
+# and run on those nodes' cpus.
+# The client node runs `vllm bench serve --dataset-name random` against the
+# gateway.
+#
+# Checks (verdict.json, `problems` empty when it passes): every request
+# completed; with kv_check, decode byte-checked every request with no
+# mismatch; the connector failed no transfer and moved at least the checked
+# bytes; each KV network's router carried its ranks' bytes and the control
+# router less than 10% of them besides the gateway's own traffic; every
+# request went client -> Envoy -> the picker's decode and prefill choices ->
+# sidecar -> those engines, once. Under tensor parallelism each rank is
+# checked on its own (its byte checks, layout, rail and TENT counters); under
+# data parallelism each request must have one producer and one consumer DP
+# rank (the same on every TP rank), its bytes counted once.
+# Output: results/<name>-<timestamp>/ (bench.json, step logs, server logs,
+# llmd/ with the router's configs, logs and components.json (where each
+# component ran), routers.json, control-ports.json,
+# servers.json (each server as started), tent.json, verdict.json).
+
+name: example
+topology: example  # its name: the topology must be up
+
+# A Hugging Face model directory (config and tokenizer, no weights), relative
+# to this file; ../../../models/ holds the fetched ones.
+model: ../../../models/Qwen--Qwen2.5-7B-Instruct/a09a35458c702b33eeacc393d103063234e8bc28
+
+# Each side's node and KV network. A node may be a list: several instances
+# of that role, one engine per node, the router choosing among them (equal
+# TP sizes, data_parallel_size 1, no speculative decoding). Under tensor parallelism kv_network may be
+# a list, one network per rank (rank r of both sides on the same network).
+# data_parallel_size > 1 (per side, may differ): an MoE model's data-parallel
+# attention with expert parallelism; every DP rank's TP rank r uses the same
+# KV network, as any prefill DP rank may pair with any decode DP rank. The
+# instance is one endpoint of the router: under Mooncake llm-d's sidecar
+# selects the prefill DP rank (decode's is vLLM's choice), under NIXL vLLM
+# balances both sides' ranks.
+prefill: {node: prefill0, kv_network: data0}
+decode: {node: decode0, kv_network: data0}
+client: client
+control_network: control
+
+# llm-d's router: the gateway is a node of its own on the control network
+# (not the client, not a server's).
+router:
+  gateway: gateway
+  # epp_plugins: plugins.yaml  # the endpoint picker's plugins and schedulingProfiles
+  #                            # (default: llm-d's P/D configuration)
+  # epp_verbosity: 4           # the checks read the picker's and the sidecar's
+  # sidecar_verbosity: 4       # records at these levels
+
+# Prefill writes a known pattern into its KV blocks and decode checks every
+# byte it receives (default true).
+kv_check: true
+
+# startup_timeout: 600      # seconds for the servers to come up
+
+server:  # both servers; defaults shown where set
+  gpu: h100                   # aisimulate's default GPU (a100, h100, h200, b200)
+  block_size: 16              # tokens per KV block (a multiple of 16); null: the platform's (a hybrid model's)
+  # enable_prefix_caching: null  # null: off with kv_check, else vLLM's default (on);
+  #                               a hybrid model's real transfers need false
+  kv_cache_memory_bytes: 2147483648  # KV cache per rank (default 2 GiB)
+  max_model_len: 4096
+  max_num_batched_tokens: 2048
+  max_num_seqs: 32
+  # tensor_parallel_size: 1   # > 1 needs a topology with --shm-size 4g
+  # dtype: auto
+  # kv_cache_dtype: auto     # --kv-cache-dtype (e.g. fp8); auto: the model's
+  # language_model_only: false  # a multimodal model as its language model (aisimulate times only that)
+  # The simulator's timing provider, required: zero, linear, table, replay,
+  # aisimulate or a module.Class. aisimulate times a published model it covers
+  # offline: timing_args {gpu, target_model: <org>/<name>} (the servers see
+  # the model as /model). Here fixed linear costs: a functional smoke setup,
+  # not a GPU prediction.
+  timing: linear
+  timing_args: {fixed_us: 5000, prefill_us_per_token: 20, decode_us_per_req: 200}
+  # hp_tcp_args: {max_outstanding_tasks: 1048576}  # extra hp_tcp settings
+  # env: {VLLM_LOGGING_LEVEL: DEBUG}               # extra server environment
+
+workload:  # vllm bench serve --dataset-name random
+  input_len: 1024
+  output_len: 16
+  num_prompts: 40
+  concurrency: 4
+  # seed: 0

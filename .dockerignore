@@ -36,3 +36,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# vllm-decaf: the e2e harness and local data are not part of the image
+/tools/e2e/

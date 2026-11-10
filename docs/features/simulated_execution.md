@@ -81,11 +81,12 @@ forward-pass performance model for each step. It needs the optional
 per attention data-parallel rank, from kernel timings measured on that GPU
 under a vLLM release, with no analytical fallback.
 
-To add the pinned package to an existing `vllm-sim:cpu` image, run from
-the vLLM checkout:
+`docker/Dockerfile.aisim` adds the pinned package to the CPU image (see
+[Running without a GPU](#running-without-a-gpu) for `vllm:cpu`). From the
+repository root:
 
 ```bash
-docker build -f docker/Dockerfile.aisim -t vllm-sim:cpu-aisim .
+docker build -f docker/Dockerfile.aisim -t vllm:cpu-aisim .
 ```
 
 The deployment it times is the published model `target_model`, with that
@@ -107,8 +108,10 @@ but a later batch of another shape can still lack data and fail then.
 
 Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
 or 8) and an MoE model's local data-parallel attention with expert
-parallelism (TP 1, up to 8 ranks). Pipeline and context parallelism and
-EPLB are rejected, and so are models or layouts AISimulate has no timing
+parallelism (TP 1, up to 8 ranks, all on one host: launched by one server,
+or a server each by a multi-port supervisor,
+`--data-parallel-multi-port-external-lb`; ranks on other hosts are
+rejected). Pipeline and context parallelism and EPLB are rejected, and so are models or layouts AISimulate has no timing
 for. Speculative decoding is timed for DeepSeek-V3's and DeepSeek-V4's
 native single-module MTP only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as
@@ -452,14 +455,35 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 * One rank per instance, or:
     * tensor parallelism of the same size on both instances: each rank moves
       its own KV heads to its peer, or the whole MLA latent, which every rank
-      holds; a peer of another size is refused at the handshake;
+      holds;
+    * tensor parallelism of different sizes, one dividing the other, for:
+        * plain attention, sliding-window layers beside full ones included:
+          the connector re-shards the KV heads either way, and each head's
+          pattern is its own;
+        * plain MLA (one latent a layer: DeepSeek-V3, Kimi-K2), the same
+          page on every rank;
+        * layers of different KV head counts (Gemma4's global layers beside
+          its sliding ones), only where every layer's count is at least the
+          larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
+        * over NIXL only, a hybrid of Mamba2 or gated delta-net states
+          whose state splits over both sizes and whose KV heads split or
+          replicate evenly on each side;
+
+      and not for sparse MLA (DSA), DeepSeek-V4's caches, an MLA hybrid
+      (Kimi-K3) or speculative decoding. A NIXL decode instance refuses, as
+      NIXL does, a larger prefill instance whose KV heads are replicated
+      (more ranks than KV heads); MLA's latent is exempt. A refused pair
+      fails at the handshake;
     * an MoE model's data-parallel attention with expert parallelism
       (`--data-parallel-size N --enable-expert-parallel`): each DP rank holds
       its own requests' KV; a request's prefill DP rank (pinned by
       Mooncake's proxy, else prefill's load balancer) names itself in its
       transfer parameters (NIXL: its engine id and side-channel port), and
       decode's load balancer picks its own, so the instances' DP sizes may
-      differ.
+      differ. With `--data-parallel-multi-port-external-lb` each rank has an
+      API server of its own (the port plus its rank) and an external router
+      picks the rank on both instances; this needs NIXL, as
+      `MooncakeConnector`'s bootstrap server is one an instance.
 * No pipeline or context parallelism, nor data parallelism of dense models
   (independent engines).
 * Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
@@ -470,7 +494,14 @@ blocks, derived from the request, the TP rank, the layer and the block's
 place among the request's blocks of its KV cache group, and
 `kv_pattern_check` (decode instance) checks every byte it receives, logging
 one `kv_check` record per request, each group's result nested in it (it
-needs `log_path`); the pattern needs prefix caching off. A group's blocks
+needs `log_path`). With prefix caching on, a block may hold KV computed for
+another request, so its pattern is its content's instead: the tokens up to
+the block's end, as prefix caching keys a full block. Prefix hits are then
+compared too, read-only, on both instances (`kind` hit, apart from the
+transferred blocks). Such a run takes token prompts only (no LoRA adapter,
+`cache_salt`, prompt embeddings or multimodal inputs) and neither sparse
+MLA (DSA) nor speculative decoding; hybrid models and DeepSeek-V4 run
+without prefix caching in any case. A group's blocks
 are its layers' only, each block the page the connector moves (a state's
 padding included; in DeepSeek-V4's packed blocks, each layer's real page,
 its padding unchecked), and the null block that pads a window's head is
@@ -486,19 +517,22 @@ handshakes, TENT's RPC server and `hp_tcp` bind there. So does
 address, while NIXL's handshake stays on the instance's side channel
 (`VLLM_NIXL_SIDE_CHANNEL_HOST`). The list holds the
 ranks of an engine, by TP rank; an MoE model's DP engines on one host share
-it, local DP rank by TP rank (`local_kv_rank`), and so must be launched
-together. Each rank's transfer engine serves TENT's metrics on the base port
-(`MC_TENT_CONF`'s `metrics/http_port`, else `TENT_METRICS_HTTP_PORT`, else
-9100) plus its local DP rank times the TP size plus its TP rank.
+it, host-local DP rank by TP rank (`local_kv_rank`), and so must be launched
+together: by one server, or by one multi-port supervisor, which tells each
+server it launches its place among the host's ranks
+(`VLLM_DP_SUPERVISED_RANK_LOCAL`, `VLLM_DP_SUPERVISED_SIZE_LOCAL`; not to be
+set by hand). Each rank's transfer engine serves TENT's metrics on the base
+port (`MC_TENT_CONF`'s `metrics/http_port`, else `TENT_METRICS_HTTP_PORT`,
+else 9100) plus its host-local DP rank times the TP size plus its TP rank.
 
 NIXL can also select exactly `["UCX"]` or `["LIBFABRIC"]` for CPU TCP
 transfers. Both require `rank_addresses` even for TP1; the selected IPv4
 address must identify one non-loopback interface without IPv4 aliases.
 UCX uses `tcp,self` and that interface. LIBFABRIC uses the direct `tcp`
 provider, IPv4 only, and requires its interface to be UP and RUNNING.
-Use the CPU image built with the corresponding plugins; the e2e harness
-selects them with `server.nixl_backend: ucx` or `libfabric` while retaining
-`mooncake` as its default.
+Use the CPU image built with the corresponding plugins; the harness in
+`tools/e2e` selects them with `server.nixl_backend: ucx` or `libfabric`
+while retaining `mooncake` as its default.
 
 Managed LIBFABRIC sets provider/interface policy before loading the native
 library. It requires `/opt/libfabric/etc/libfabric.conf` to be absent or
@@ -527,8 +561,11 @@ Every rank of the last pipeline stage logs its own KV (`kv_layout`,
 speculative decoding its own requests' drafts and accepted drafts each
 step (`spec_acceptance`), into
 `<log_path>[.dp<i>][.tp<r>]`, for its global DP rank `i` and TP rank `r`
-when not 0; its `kv_layout` record names both and its local DP rank. Under
-MoE DP the timing record and the joint steps stay in DP rank 0's logs. With
+when not 0; its `kv_layout` record names both and its host-local DP rank.
+A `kv_transfers` record names each transfer's peer rank and its plan (for a
+NIXL read, the descriptors selected and the count NIXL merges them into).
+Under MoE DP the timing record and the joint steps stay in DP rank 0's logs,
+also when a multi-port supervisor launched each rank's server. With
 several KV cache groups or a sliding window, `kv_events` also lists each
 request's new blocks by group (`allocated_groups`: the group, the place of
 the first block among the request's blocks of that group, and the blocks,
@@ -546,6 +583,15 @@ TRITON_CPU_BACKEND=1 vllm serve Qwen/Qwen3-235B-A22B --simulate-forward \
   --simulation-config '{"timing": "replay", "timing_args": {"path": "steps.jsonl"}}'
 ```
 
+The CPU image the examples here and the harness use is built from the
+repository root:
+
+```bash
+docker build -f docker/Dockerfile.cpu --target vllm-openai \
+  --build-arg VLLM_CPU_X86=true --build-arg ENABLE_AMX_FP8=0 \
+  -t vllm:cpu .
+```
+
 Ranks need no devices, so a layout larger than any one GPU host runs on a
 CPU host. Simulated workers share the host's cores instead of each taking a
 NUMA node (nor does a `NixlConnector` worker pin itself to each node's last
@@ -559,6 +605,16 @@ model needing one it lacks (decode context parallelism, NVFP4 or MXFP4
 weights, online FP8 quantization) fails to build there; DSA sparse MLA
 (DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
 deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
+
+## Testing end to end
+
+`tools/e2e` holds a local harness for simulated prefill/decode serving: it
+builds a topology of Docker containers joined by separate control and KV
+networks, serves a run behind [llm-d](https://llm-d.ai)'s router (Envoy, its
+endpoint picker and its disaggregation sidecar, without Kubernetes), and
+checks the result: every transferred byte, each rank's transfers and the
+router's choices against what the engines ran. `tools/e2e/topologies/example.yaml`
+and `tools/e2e/runs/example.yaml` document its options.
 
 ## Limitations
 

@@ -1,0 +1,8 @@
+state/
+results/
+__pycache__/
+# Local runs and topologies; each directory tracks one documented example.
+runs/*
+!runs/example.yaml
+topologies/*
+!topologies/example.yaml
