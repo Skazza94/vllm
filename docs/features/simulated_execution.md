@@ -112,8 +112,8 @@ parallelism (TP 1, up to 8 ranks, all on one host: launched by one server,
 or a server each by a multi-port supervisor,
 `--data-parallel-multi-port-external-lb`; ranks on other hosts are
 rejected). Pipeline and context parallelism and EPLB are rejected, and so are models or layouts AISimulate has no timing
-for. Speculative decoding is timed for DeepSeek-V3's and DeepSeek-V4's
-native single-module MTP only (`method: mtp`, the checkpoint's one MTP layer,
+for. Speculative decoding is timed for the native single-module MTP of
+DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as
 AISimulate's MTP depth: a decode step
 verifies k + 1 tokens a request and runs k target-shaped draft layers, the
@@ -444,8 +444,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   tokens and computes the last one again to sample; with
   bounded window replay on (a cache whose SWA spec sets `bounded_replay`,
   DeepSeek-V4.1's), NIXL loads N - 1 and decode computes the last.
-* Speculative decoding only as DeepSeek-V3's or DeepSeek-V4's native
-  single-module MTP (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
+* Speculative decoding only as the native single-module MTP of
+  DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 or Qwen3.5 (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
   tokens, the draft at the target's parallelism and precision) over
   `NixlConnector` (or `NixlPullConnector`), whose handshake checks the
   instances' transfer compatibility, the draft among it (a peer without

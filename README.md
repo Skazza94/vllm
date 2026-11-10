@@ -1,111 +1,287 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
+<div align="center">
+
+<h1>☕ vllm-decaf</h1>
+
+<p><strong>Real vLLM serving. Simulated compute. No GPU required.</strong></p>
+<p>Same beans. Same cup. Hold the GPU.</p>
+
+<p>
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#whats-in-the-cup">Features</a> ·
+  <a href="#why-decaf">Why Decaf?</a> ·
+  <a href="#timing-models">Timing models</a> ·
+  <a href="#first-brew">First brew</a> ·
+  <a href="#testing-locally">Testing locally</a> ·
+  <a href="#limitations">Limitations</a>
 </p>
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
-
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
-
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+</div>
 
 ---
 
-## About
+Decaf is real coffee: same beans, same cup, same ritual, with one active
+ingredient taken out. **vllm-decaf does the same for LLM serving.** It keeps
+vLLM's serving engine running and replaces model execution with simulated
+compute. Requests still queue, cache blocks still get allocated, and KV bytes
+still cross the network.
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+The result is a GPU-free environment for studying **disaggregated serving,
+KV transport, routing, and cache behaviour** on CPU-only machines.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+> vllm-decaf tries to follow upstream [vLLM](https://github.com/vllm-project/vllm)
+> and keeps its Apache-2.0 license. It is currently based on upstream `main`
+> at `v0.33.0rc0`.
 
-vLLM is fast with:
+## How it works
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+vllm-decaf is a **fork of [vLLM](https://github.com/vllm-project/vllm) with a
+simulated worker**. Models are built on PyTorch's `meta` device from their
+configuration, so model weights take no memory. The worker substitutes a
+timing estimate for each compute step; everything around it is vLLM's own
+code.
 
-vLLM is flexible and easy to use with:
+```mermaid
+flowchart LR
+    C["Client workload"] --> R["Router<br/>(llm-d, or any proxy)"]
+    R --> P["Prefill<br/>vLLM + simulated compute"]
+    R --> D["Decode<br/>vLLM + simulated compute"]
+    P ==>|"Real KV bytes<br/>NIXL / Mooncake"| D
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+    classDef serving fill:#f5ede4,stroke:#6f4e37,color:#35271e;
+    classDef engine fill:#e7f2ea,stroke:#2d6a4f,color:#183c2c;
+    class R serving;
+    class P,D engine;
+```
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+| Component | What runs |
+| :--- | :--- |
+| **Serving** | vLLM's API server, engine, scheduler and request lifecycle. |
+| **KV cache** | vLLM's block allocation, prefix reuse and eviction, with model- and rank-specific layouts. |
+| **Transport** | With real transfers, CPU buffers moved by vLLM's NIXL or Mooncake connector. |
+| **Routing** | Whatever you put in front: the servers speak vLLM's API and emit its metrics and KV events. |
+| **Model execution** | Simulated forward passes and token generation; step costs come from a timing provider. |
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+**The deployment runs live.** Change the network or the routing policy and the
+engines react: queues, cache hits and transfer completion feed back into the
+next scheduling decisions.
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+## What's in the cup
 
-## Getting Started
+- **The real engine.** Continuous batching, chunked prefill, prefix caching,
+  preemption and async scheduling are vLLM's, so a step's batch is the one a
+  GPU deployment would form.
+- **Step-level compute timing.** Each step is priced from its actual batch by
+  a timing provider: a GPU performance model, a formula, or a recording of a
+  real deployment.
+- **Real KV transfers for disaggregated prefill/decode.** KV caches are real
+  CPU buffers with the model's geometry, moved between instances by vLLM's
+  own `NixlConnector` or `MooncakeConnector`, over TCP backends (Mooncake's
+  TENT, UCX, libfabric), one NIC per rank if you want.
+- **Byte-level verification.** Prefill can fill its KV blocks with a
+  deterministic pattern and decode can check every byte it receives, with
+  prefix caching on or off.
+- **Many cache layouts.** Full and sliding-window attention, MLA, sparse MLA
+  with an indexer, DeepSeek-V4's packed caches, and hybrid models with Mamba2
+  or delta-net states.
+- **Parallelism as deployed.** Tensor parallelism (different sizes on prefill
+  and decode included), an MoE model's data-parallel attention with expert
+  parallelism (one server, or one per rank for an external router), and
+  native MTP speculative decoding.
+- **Router-ready.** vLLM's metrics and KV events come from the real engine,
+  so load-aware and prefix-aware routers see what they would see in
+  production. The harness in this repository runs unmodified
+  [llm-d](https://llm-d.ai).
+- **Offline what-if runs.** A single-process driver replays timed requests
+  and multi-turn sessions in simulated time, for sweeps that finish faster
+  than real time.
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+## Why Decaf?
+
+Other projects also take the GPU out of vLLM. They make different cuts, and
+which one fits depends on what you need to stay real. This is a feature
+comparison from each project's README at the time of writing; a dash means
+the README does not describe it.
+
+| | **vllm-decaf** | [vllm-vcr](https://github.com/neuralmagic/vllm-vcr) | [llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim) |
+| :--- | :--- | :--- | :--- |
+| **What it is** | vLLM itself, with the forward pass simulated | A mock engine core behind vLLM's real frontend | A standalone server that mimics vLLM's API |
+| **vLLM code that runs** | API server, engine, scheduler, KV cache manager, connectors | Frontend (tokenization, templates, API) | None (optional vLLM render server for tokenization) |
+| **Compute time** | Per step, from the batch the scheduler formed: GPU performance model, formula or recorded steps | Replay of a recorded trace, or a latency model | Configured time to first token and inter-token latency, scaled with load |
+| **KV cache** | vLLM's allocator, prefix cache and eviction | — | Tracked usage |
+| **KV events** | vLLM's own | — | Published for allocation and eviction |
+| **Prefill/decode transfer** | Real bytes, vLLM's NIXL or Mooncake connector, several TCP backends | Simulated KV bytes over NIXL | Transfer latency only |
+| **Transferred bytes checked** | Every byte, optionally | — | Not applicable |
+| **TP / DP / expert parallelism** | Yes, each rank with its own KV and NIC | — | — |
+| **Speculative decoding** | Native MTP | — | — |
+| **Model architecture matters** | Yes: cache geometry and timing follow the model | — | No (the name selects a tokenizer) |
+| **LoRA adapters** | No | — | Lifecycle and metrics |
+| **Failure injection** | No | — | Yes |
+
+
+**Pick vllm-decaf** when the question is about the serving stack itself:
+scheduling under load, cache reuse, what a router's choice does to the
+engines, or what KV transfers cost on a network. **Pick the others** when you
+need something lighter: llm-d-inference-sim to exercise control planes at
+scale with many cheap replicas, vllm-vcr to record a deployment and replay or
+inspect its traces.
+
+## Timing models
+
+A timing provider prices every step. Select it with `--simulation-config`:
+
+| `timing` | A step costs | Use |
+| :--- | :--- | :--- |
+| **`aisimulate`** | [AISimulate](https://github.com/ai-dynamo/aisimulate)'s estimate for that batch of the published model on a given GPU | The main provider: GPU step times without a GPU or a recording |
+| `linear` | A fixed cost plus per-token and per-request terms | Quick experiments and tests |
+| `replay` / `table` | What a recorded real deployment took for the same (or the nearest) batch | Reproducing a deployment you have measured |
+| `zero` | Nothing | Functional tests |
+
+### AISimulate
+
+`aisimulate` needs the optional AISimulate package, which the second image
+adds on top of the CPU one:
 
 ```bash
-uv pip install vllm
-vllm download-kernels  # precompiled kernels for faster startup
+docker build -f docker/Dockerfile.cpu --target vllm-openai \
+  --build-arg VLLM_CPU_X86=true --build-arg ENABLE_AMX_FP8=0 \
+  -t vllm:cpu .
+docker build -f docker/Dockerfile.aisim -t vllm:cpu-aisim .
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+It times the **published model** you name (`target_model`) at its published
+precision, on `gpu` `a100`, `h100`, `h200` or `b200`. A model or a layout
+AISimulate has no data for is refused at startup instead of being guessed.
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+| | Supported |
+| :--- | :--- |
+| **Model families** | Llama, Qwen2/2.5, Qwen3 (dense and MoE), Qwen3-VL (text), Qwen3.5 (dense and MoE), Mixtral, gpt-oss, Gemma4, MiniMax-M2, MiMo-V2-Flash, Llama-3.3-Nemotron-Super, Nemotron-H and Nemotron-3, DeepSeek-V3, DeepSeek-V3.2, DeepSeek-V4, GLM-5, Kimi-K2/K2.5, Kimi-K3 |
+| **Layouts** | Tensor parallelism (1, 2, 4 or 8) on one node; for MoE models, data-parallel attention with expert parallelism (up to 8 ranks on one host) |
+| **Speculative decoding** | The native single-module MTP of DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 (1 to 5 tokens) |
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+Anything else is refused at startup: pipeline and context parallelism, EPLB,
+tensor parallelism combined with data parallelism, and a single instance
+whose ranks are spread over several hosts (wide expert parallelism across
+nodes). Wide EP on one host is the supported data-parallel layout above, and
+separate instances, such as prefill and decode, can sit on different hosts.
 
-## Contributing
+Which of the supported models also move real KV, over which connector, is listed in the
+[documentation](docs/features/simulated_execution.md#real-kv-transfers).
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+## First brew
 
-## Citation
+You need Docker and an x86-64 Linux host. No GPU, no weights.
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+1. Build the image (once):
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+   ```bash
+   docker build -f docker/Dockerfile.cpu --target vllm-openai \
+     --build-arg VLLM_CPU_X86=true --build-arg ENABLE_AMX_FP8=0 \
+     -t vllm:cpu .
+   ```
+
+2. Fetch a model's **configuration and tokenizer** (not its weights):
+
+   ```bash
+   hf download Qwen/Qwen3-8B --exclude "*.safetensors" --local-dir ./qwen3-8b
+   ```
+
+3. Serve it. The image's entrypoint is `vllm serve`; `--simulate-forward`
+   takes the GPU out:
+
+   ```bash
+   docker run --rm -p 8000:8000 -e TRITON_CPU_BACKEND=1 \
+     -v "$PWD/qwen3-8b:/model:ro" vllm:cpu /model \
+     --served-model-name decaf \
+     --simulate-forward \
+     --kv-cache-memory-bytes 1073741824 \
+     --max-model-len 4096 \
+     --simulation-config '{"timing": "linear",
+                           "timing_args": {"fixed_us": 3000,
+                                           "prefill_us_per_token": 20,
+                                           "decode_us_per_req": 40}}'
+   ```
+
+4. Talk to it like any vLLM server:
+
+   ```bash
+   curl localhost:8000/v1/completions -H 'Content-Type: application/json' \
+     -d '{"model": "decaf", "prompt": "Same beans, same cup:", "max_tokens": 16}'
+   ```
+
+   The reply has real usage counts and timing; the text is filler, because
+   no model ran.
+
+For GPU step times, build `vllm:cpu-aisim` as above, use it in step 3 and
+swap the simulation config:
+
+```bash
+     --simulation-config '{"timing": "aisimulate",
+                           "timing_args": {"gpu": "h100",
+                                           "target_model": "Qwen/Qwen3-8B"}}'
 ```
 
-## Contact Us
+`--kv-cache-memory-bytes` is the KV budget of the deployment you model:
+prefix-cache hits and preemption depend on it. Any client works unchanged,
+including `vllm bench serve`. Prefill/decode pairs, real KV transfers, the
+offline driver and recording a real deployment are covered in the
+[documentation](docs/features/simulated_execution.md).
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+## Testing locally
 
-## Media Kit
+`tools/e2e` holds the harness this fork is validated with. It builds a
+topology of Docker containers joined by separate control and KV networks,
+serves a prefill/decode run behind unmodified llm-d (Envoy, the endpoint
+picker and the disaggregation sidecar, without Kubernetes), and checks the
+outcome. It needs Linux, Docker, Python 3.10+, and `ip`, `tc` and `nsenter`
+through passwordless `sudo`.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+```bash
+cd tools/e2e
+python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+
+.venv/bin/python -m harness up topologies/example.yaml
+.venv/bin/python -m harness pd runs/example.yaml
+.venv/bin/python -m harness down example
+```
+
+Before the first run, set `model` in
+[`runs/example.yaml`](tools/e2e/runs/example.yaml) to a directory with a
+model's configuration and tokenizer, and adapt the CPU sets, memory limits
+and subnets in [`topologies/example.yaml`](tools/e2e/topologies/example.yaml)
+to your host. Both files document every option; copy them to make your own.
+
+A run writes its evidence to `results/<name>-<timestamp>/`: client metrics,
+server and router logs, per-rank transfer records and `verdict.json`. It
+passes when the verdict's `problems` list is empty, which means, among other
+things, that every transferred byte matched and every request ran on the
+instances the router picked. `harness recheck <directory>` validates saved
+evidence again without starting anything.
+
+Use byte checking for correctness runs and turn it off for performance runs:
+writing and comparing patterns costs CPU time and memory bandwidth.
+
+## Limitations
+
+- **Tokens are filler.** Only their counts and timing mean something; KV
+  contents are synthetic.
+- **Latency is as good as the timing provider.** Scheduling, caching and
+  transfers run for real; compute time is an estimate. AISimulate covers the
+  models, GPUs and single-node layouts listed above, and its own
+  approximations apply.
+- **Real KV transfers currently focus on TCP stacks.** They run on the CPU
+  platform over TCP backends; RDMA is not covered yet, nor are pipeline and
+  context parallelism.
+- **Per-model scope.** Each cache layout is supported for specific
+  connectors and parallel layouts; unsupported combinations are refused at
+  startup.
+- **Memory.** Real transfers allocate every rank's KV buffers in host
+  memory.
+- **Not simulated.** LoRA adapters, pooling and diffusion models, and
+  speculative decoding other than native MTP with real transfers.
+
+The full list, with every supported model, connector and layout, is in
+[docs/features/simulated_execution.md](docs/features/simulated_execution.md).
+
+---
+
+<p align="center"><em>The packets are real. The caffeine is simulated.</em></p>
