@@ -240,7 +240,7 @@ cd tools/e2e
 python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 
 .venv/bin/python -m harness up topologies/example.yaml
-.venv/bin/python -m harness pd runs/example.yaml
+.venv/bin/python -m harness run runs/example.yaml
 .venv/bin/python -m harness down example
 ```
 

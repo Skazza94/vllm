@@ -3,7 +3,7 @@
 # KV on data0, HTTP on control.
 #
 #   python -m harness up topologies/example.yaml   # from tools/e2e/, first
-#   python -m harness pd runs/example.yaml
+#   python -m harness run runs/example.yaml
 #
 # Prefill and decode run `vllm serve` with simulated compute and real KV
 # transfers (MooncakeConnector over TENT's hp_tcp, bound to the node's KV

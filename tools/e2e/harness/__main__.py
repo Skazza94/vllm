@@ -1,4 +1,4 @@
-"""Command line: python -m harness {up,down,status,exec,pd,recheck,peak-prefill} ..."""
+"""Command line: python -m harness {up,down,status,exec,run,recheck,peak-prefill} ..."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("node")
     run.add_argument("argv", nargs=argparse.REMAINDER)
     prefill_decode = commands.add_parser(
-        "pd", help="a prefill/decode run of the vLLM simulator behind llm-d's router, in an up topology")
+        "run", help="a prefill/decode run of the vLLM simulator behind llm-d's router, in an up topology")
     prefill_decode.add_argument("run", help="the run config")
     recheck = commands.add_parser("recheck", help="a saved prefill/decode run's checks again (verdict-recheck.json)")
     recheck.add_argument("results", help="the run's results directory")
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "up":
         print(json.dumps(topology.up(specs.load(args.spec)), indent=2))
         return 0
-    if args.command == "pd":
+    if args.command == "run":
         print(json.dumps(pd.execute(pd.load(args.run)), indent=2))
         return 0
     if args.command == "peak-prefill":
