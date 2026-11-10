@@ -53,8 +53,12 @@ MODEL_NAME = "sim-pd"
 SERVER_PORT = 8000
 BOOTSTRAP_PORT = 8998
 HTTP_KEEP_ALIVE = 120  # seconds: the servers' HTTP keep-alive
-KV_EVENTS_PORT = 5557  # a server's KV-cache events (ZMQ PUB), for the router's precise prefix index
-KV_EVENTS_REPLAY_PORT = 5559  # and their replay (ZMQ ROUTER)
+# A server's KV-cache events (ZMQ PUB), for the router's precise prefix index,
+# and their replay (ZMQ ROUTER). DP rank r publishes on each port plus r (vLLM
+# offsets them; llm-d dials them by the endpoint's rank index), so the two
+# are further apart than an instance has ranks.
+KV_EVENTS_PORT = 5557
+KV_EVENTS_REPLAY_PORT = 5657
 PREFIX_INDEXES = ("approximate", "precise")
 DP_ROUTINGS = ("instance", "rank")
 DP_SUPERVISOR_PORT = 9256  # a per-rank instance's aggregated health (vLLM's default)
@@ -382,9 +386,11 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                              "the servers' prefix caches)")
         if run.server.block_size is None:
             raise ValueError("router.prefix_index: precise needs server.block_size (the index's block size)")
-        if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
-            raise ValueError("router.prefix_index: precise takes one engine per instance for now (a DP rank "
-                             "publishes its own events)")
+        for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+            if side.data_parallel_size > 1 and not rank_routed(run, side):
+                raise ValueError(f"router.prefix_index: precise needs router.dp_routing: rank for {role}'s "
+                                 f"{side.data_parallel_size} DP ranks (each rank publishes its own events and "
+                                 "holds its own cache; the index is of endpoints)")
         if run.router.epp_verbosity < 5:
             raise ValueError("router.prefix_index: precise needs router.epp_verbosity 5 (the index's lookups, "
                              "which the checks compare with the engines, are logged at that level)")
@@ -542,6 +548,17 @@ def rank_routed(run: Run, side: Side) -> bool:
     return run.router.dp_routing == "rank" and side.data_parallel_size > 1
 
 
+def container_identities(container: dict[str, str]) -> dict[str, dict]:
+    """Each node's container as Docker reports it: its image's id and name
+    and its mounts (sources mounted over the image's would be here)."""
+    found = {}
+    for node, name in sorted(container.items()):
+        inspected = json.loads(shell.run(["docker", "inspect", name]))[0]
+        found[node] = {"container": name, "image_id": inspected["Image"], "image": inspected["Config"]["Image"],
+                       "mounts": sorted(f"{m.get('Source')}:{m.get('Destination')}" for m in inspected["Mounts"])}
+    return found
+
+
 def kv_events_topic(control: str, endpoint_port: int) -> str:
     """The topic a server publishes its KV-cache events under, as llm-d's
     index reads it: the endpoint the router knows the instance by."""
@@ -681,6 +698,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
     (output / "servers.json").write_text(json.dumps(commands, indent=2) + "\n")
+    # And what it runs in: each node container's image, by id, and its mounts.
+    (output / "containers.json").write_text(json.dumps(container_identities(container), indent=2) + "\n")
     try:
         # Every instance (the startup timeout counted from the first).
         deadline = time.monotonic() + run.startup_timeout

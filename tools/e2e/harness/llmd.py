@@ -619,6 +619,32 @@ def instance_steps(output: Path, run: pd.Run) -> dict[str, tuple[str, list[str]]
     return found
 
 
+def prefill_priced_steps(output: Path, run: pd.Run) -> dict[str, list[str]]:
+    """Each prefill endpoint's priced steps, as step-log text, by its name.
+
+    An instance's are its ranks' logs. With per-rank routing an endpoint is
+    a DP rank, and an MoE model's ranks step jointly: DP rank 0 logs the
+    joint step, each request under its own rank (``dp_rank``), so a rank's
+    steps are the joint steps' requests of that rank, wherever logged."""
+    side = run.prefill
+    found: dict[str, list[str]] = {}
+    for dp, tp in side.ranks(side.tp(run.server)):
+        node = side.node_of(dp)
+        text = (output / side.step_log("prefill", dp, tp)).read_text()
+        if not pd.rank_routed(run, side):
+            found.setdefault(node, []).append(text)
+            continue
+        found.setdefault(endpoint_name(node, dp), [])
+        for record in pd._records(text):
+            step = record.get("step")
+            for request in (step.get("requests") or []) if isinstance(step, dict) else []:
+                owner = request.get("dp_rank")
+                owner = dp if owner is None else owner
+                found.setdefault(endpoint_name(node, owner), []).append(
+                    json.dumps({"step": {"requests": [request]}}) + "\n")
+    return found
+
+
 def routing_evidence(output: Path, run: pd.Run) -> dict:
     """What the router did with each request, from the client's results,
     Envoy's, the EPP's and the sidecar's logs and the instances' step logs.
@@ -806,7 +832,7 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
     if any(p.get("type") == "precise-prefix-cache-producer" for p in plugins):
         precise = precise_index_evidence(
             directory, named, set(handled), prefill_pick,
-            {name: texts for name, (role, texts) in instances.items() if role == "prefill"},
+            prefill_priced_steps(output, run),
             next((p.get("parameters") or {}).get("tokenProcessorConfig", {}).get("blockSizeTokens")
                  for p in plugins if p.get("type") == "precise-prefix-cache-producer"),
             run.workload.prefix_repetition is not None)
@@ -896,7 +922,8 @@ def precise_index_evidence(directory: Path, named: dict[str, dict], completions:
         elif body == "Produce completed" and record.get("x-request-id"):
             produced.setdefault(record["x-request-id"], []).append(record)
     for address, endpoint in named.items():
-        expected = f"tcp://{endpoint['address']}:{pd.KV_EVENTS_PORT}"
+        # A DP rank's events are on the port after the last one's (vLLM offsets it by the rank).
+        expected = f"tcp://{endpoint['address']}:{pd.KV_EVENTS_PORT + int(endpoint.get('rankIndex') or 0)}"
         if subscribers.get(endpoint["name"]) != expected:
             problems.append(f"the EPP did not subscribe to {endpoint['name']}'s KV-cache events at {expected} "
                             f"(it had {subscribers.get(endpoint['name'])!r})")

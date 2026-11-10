@@ -199,6 +199,34 @@ class RankRoutingTests(unittest.TestCase):
                                  "decode0-dp0": ("decode", ["decode0"]), "decode0-dp1": ("decode", ["decode1"])})
 
 
+class RankPricedStepsTests(unittest.TestCase):
+    """A rank-routed prefill endpoint's steps: its rank's requests in the
+    joint steps DP rank 0 logs."""
+
+    def test_joint_step_requests_belong_to_their_ranks_endpoint(self) -> None:
+        raw = run_config(dp_routing="rank")
+        raw["prefill"]["data_parallel_size"] = 2
+        run = load(raw).run
+        output = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shell.run(["rm", "-rf", str(output)]))
+
+        def request(name: str, rank: int | None, cached: int) -> dict:
+            return {"req_id": f"cmpl-{name}-0-abcd1234", "num_prompt_tokens": 128, "num_cached_tokens": cached,
+                    **({} if rank is None else {"dp_rank": rank})}
+        # Rank 0 logs the joint steps; rank 1's own log has none.
+        joint = [{"step": {"requests": [request("a", 0, 0), request("b", 1, 64)]}},
+                 {"step": {"requests": [request("c", 1, 0)]}}, {"kv_events": {}}]
+        (output / run.prefill.step_log("prefill", 0, 0)).write_text("".join(json.dumps(r) + "\n" for r in joint))
+        (output / run.prefill.step_log("prefill", 1, 0)).write_text(json.dumps({"kv_events": {}}) + "\n")
+        found = llmd.prefill_priced_steps(output, run)
+        ids = {name: [json.loads(line)["step"]["requests"][0]["req_id"][5:6] for text in texts
+                      for line in text.splitlines()] for name, texts in found.items()}
+        self.assertEqual(ids, {"prefill0-dp0": ["a"], "prefill0-dp1": ["b", "c"]})
+        # An instance-routed side keeps its ranks' logs whole, under its node.
+        whole = llmd.prefill_priced_steps(output, load(run_config()).run)
+        self.assertEqual(list(whole), ["prefill0"])
+
+
 class RankRoutingEvidenceTests(unittest.TestCase):
     """The routing evidence per rank: the rank the EPP picked ran the
     request."""
@@ -328,6 +356,25 @@ class PreciseIndexEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["index_blocks_at_pick"], {"total": 20, "max": 20})
         self.assertEqual(evidence["index"], {"admissions": 56, "evictions": 0, "lookup_requests": 2})
         self.assertEqual(evidence["subscribers"]["decode0"], "tcp://10.0.0.3:5557")
+
+    def test_a_ranks_events_are_on_its_own_port(self) -> None:
+        # Per-rank endpoints of one instance: rank r publishes on the events port plus r.
+        named = {f"10.0.0.1:{8000 + r}": {"name": f"prefill0-dp{r}", "address": "10.0.0.1", "port": str(8000 + r),
+                                          "rankIndex": r} for r in (0, 1, 2)}
+
+        def subscribed(ports: dict[int, int]) -> list[str]:
+            records = [{"body": "Ensured KV-events subscriber", "endpoint": f"default/prefill0-dp{r}",
+                        "zmq": f"tcp://10.0.0.1:{port}"} for r, port in ports.items()]
+            (self.directory / "x-gateway-epp.log").write_text("".join(json.dumps(r) + "\n" for r in records))
+            (self.directory / "epp-metrics.txt").write_text("llm_d_epp_kv_cache_index_admissions_total 0\n")
+            found = llmd.precise_index_evidence(self.directory, named, set(), {}, {}, 64, False)
+            return [p for p in found["problems"] if "did not subscribe" in p]
+
+        self.assertEqual(subscribed({0: 5557, 1: 5558, 2: 5559}), [])
+        # Every rank on rank 0's port: the index would hold one rank's cache under three names.
+        problems = subscribed({0: 5557, 1: 5557, 2: 5557})
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("prefill0-dp1's KV-cache events at tcp://10.0.0.1:5558", problems[0])
 
     def test_every_endpoint_is_subscribed_at_its_control_address(self) -> None:
         self.assertProblem(self.evidence(subscribers={"prefill0": "10.0.0.1", "decode0": "10.0.0.3"}),

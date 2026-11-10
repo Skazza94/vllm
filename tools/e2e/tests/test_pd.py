@@ -1933,7 +1933,7 @@ class PrefixCachingCheckTests(unittest.TestCase):
             events = json.loads(command[command.index("--kv-events-config") + 1])
             self.assertEqual(events, {
                 "enable_kv_cache_events": True, "publisher": "zmq", "endpoint": "tcp://*:5557",
-                "replay_endpoint": "tcp://*:5559", "topic": "kv@10.250.0.9:8000@sim-pd"})
+                "replay_endpoint": "tcp://*:5657", "topic": "kv@10.250.0.9:8000@sim-pd"})
         with self.assertRaisesRegex(ValueError, "needs the instance's endpoint"):
             pd.server_command(run, "prefill", ["10.1.0.1"])
         # An approximate index asks nothing of the servers.
@@ -1953,12 +1953,30 @@ class PrefixCachingCheckTests(unittest.TestCase):
             "needs server.enable_prefix_caching": changed(server={"timing": "zero"}),
             "needs server.block_size": changed(server={"timing": "zero", "enable_prefix_caching": True,
                                                        "block_size": None}),
-            "one engine per instance": changed(prefill={"node": "p", "kv_network": "data0", "data_parallel_size": 2}),
+            "needs router.dp_routing: rank for prefill's 2 DP ranks": changed(
+                prefill={"node": "p", "kv_network": "data0", "data_parallel_size": 2}),
+            "needs router.dp_routing: rank for decode's 4 DP ranks": changed(
+                decode={"node": "d", "kv_network": "data0", "data_parallel_size": 4}),
             "needs router.epp_verbosity 5": router(epp_verbosity=4),
         }
         for message, change in cases.items():
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 pd.parse(change, path)
+        # With a server a rank, the index is of ranks: allowed, and the replay port leaves room for them.
+        ranked = pd.parse({**router(dp_routing="rank"), "server": {**base["server"], "connector": "nixl"},
+                           "prefill": {"node": "p", "kv_network": "data0", "data_parallel_size": 8},
+                           "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 8}}, path)
+        self.assertTrue(pd.rank_routed(ranked, ranked.prefill) and ranked.router.prefix_index == "precise")
+        self.assertGreaterEqual(pd.KV_EVENTS_REPLAY_PORT - pd.KV_EVENTS_PORT, 64)
+
+    def test_a_runs_containers_are_saved_as_docker_reports_them(self) -> None:
+        inspected = json.dumps([{"Image": "sha256:abc", "Config": {"Image": "vllm:cpu-aisim"},
+                                 "Mounts": [{"Source": "/src/simulated", "Destination": "/opt/venv/x"}]}])
+        with mock.patch.object(pd.shell, "run", return_value=inspected) as run:
+            found = pd.container_identities({"prefill0": "t-prefill0"})
+        self.assertEqual(found, {"prefill0": {"container": "t-prefill0", "image_id": "sha256:abc",
+                                              "image": "vllm:cpu-aisim", "mounts": ["/src/simulated:/opt/venv/x"]}})
+        self.assertEqual(run.call_args.args[0], ["docker", "inspect", "t-prefill0"])
 
     def test_peak_prefill_throughput_is_an_unloaded_chunks(self) -> None:
         def step(tokens, seconds, *, cached=0, requests=1, decode=0, prefill=True):
@@ -2962,6 +2980,7 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
              patch.object(topology,"exec_in",return_value=""), \
              patch.object(pd.shell,"run",return_value=""), \
              patch.object(pd,"stop_services"),patch.object(pd,"_background"),patch.object(pd,"_wait"), \
+             patch.object(pd,"container_identities",return_value={}), \
              patch.object(pd,"_kv_addresses",side_effect=addresses), \
              patch.object(pd,"router_bytes",side_effect=[{"control":0,"kv":0},{"control":50,"kv":moved+500}]), \
              patch.object(pd,"router_ports",side_effect=[{},ports]), \
