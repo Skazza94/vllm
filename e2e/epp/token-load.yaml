@@ -1,0 +1,34 @@
+# llm-d's default P/D plugins without the prefix-cache affinity filter: prefill
+# goes to the instance with the fewest in-flight tokens, decode to the one
+# with the fewest active requests.
+#
+# This is NOT a prefix-blind control. llm-d's in-flight load counts only the
+# uncached part of each prompt on each instance (the EPP creates an
+# approximate prefix-cache producer for it when none is configured), and the
+# scorer adds the request's own uncached tokens there: an instance that holds
+# the prefix looks less loaded for that request. For a load-aware control
+# without any prefix signal see request-load.yaml; without load either,
+# random.yaml.
+plugins:
+  - type: always-disagg-pd-decider
+  - type: disagg-profile-handler
+    parameters:
+      deciders:
+        prefill: always-disagg-pd-decider
+  - type: prefill-filter
+  - type: decode-filter
+  - type: inflight-load-producer
+  - type: token-load-scorer
+  - type: active-request-scorer
+  - type: max-score-picker
+schedulingProfiles:
+  - name: prefill
+    plugins:
+      - pluginRef: prefill-filter
+      - pluginRef: token-load-scorer
+      - pluginRef: max-score-picker
+  - name: decode
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import inspect
 import json
+import math
 from pathlib import Path
 import time
 
@@ -212,6 +213,15 @@ class Router:
     metrics source are added to it either way."""
     epp_verbosity: int = 4
     sidecar_verbosity: int = 4
+    peak_prefill_throughput: float | None = None
+    """Tokens a second of one unloaded prefill chunk of
+    ``max_num_batched_tokens`` on a prefill instance, as llm-d defines its
+    prefix-cache affinity filter's ``peakPrefillThroughput`` (`harness
+    peak-prefill` prints a saved run's). Here it is a timing input derived
+    from the simulator's timing provider (the step's simulated cost), not a
+    measured GPU or end-to-end throughput. It replaces the llm-d guide's
+    value, calibrated for another fleet, in the default plugins; None keeps
+    that one, which the verdict then reports as uncalibrated."""
 
 
 @dataclass
@@ -228,6 +238,10 @@ class Run:
     expect_fragmentation: bool = False
     """Require byte-checked transfers whose blocks are scattered on both
     instances (a tight KV budget's reuse); the counts are reported anyway."""
+    expect_prefill_hit_requests: int | None = None
+    """Require at least this many requests to hit a cached prefix on their
+    prefill instance (prefix-aware routing keeps a prefix on the instances
+    that hold it); the counts are reported anyway (``prefix_routing``)."""
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     startup_timeout: float = 600.0
@@ -244,7 +258,8 @@ def parse(raw: dict, path: Path) -> Run:
     """A run config's contents, read from ``path`` (relative paths are its)."""
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
-             "expect_fragmentation", "server", "workload", "router", "startup_timeout"}
+             "expect_fragmentation", "expect_prefill_hit_requests", "server", "workload", "router",
+             "startup_timeout"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
     router_raw = raw.get("router")
@@ -264,6 +279,7 @@ def parse(raw: dict, path: Path) -> Run:
             client=raw["client"], control_network=raw["control_network"], router=router,
             kv_check=bool(raw.get("kv_check", True)),
             expect_fragmentation=raw.get("expect_fragmentation", False),
+            expect_prefill_hit_requests=raw.get("expect_prefill_hit_requests"),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             startup_timeout=float(raw.get("startup_timeout", 600)),
         )
@@ -286,6 +302,24 @@ def parse(raw: dict, path: Path) -> Run:
         raise ValueError(f"expect_fragmentation is true or false, not {run.expect_fragmentation!r}")
     if run.expect_fragmentation and not run.kv_check:
         raise ValueError("expect_fragmentation needs kv_check (it counts byte-checked transfers)")
+    expected_hits = run.expect_prefill_hit_requests
+    if expected_hits is not None:
+        if not isinstance(expected_hits, int) or isinstance(expected_hits, bool) or expected_hits < 1:
+            raise ValueError(f"expect_prefill_hit_requests is a positive integer, not {expected_hits!r}")
+        if not (run.server.enable_prefix_caching and run.kv_check):
+            raise ValueError("expect_prefill_hit_requests needs server.enable_prefix_caching and kv_check (it "
+                             "counts byte-checked prefix hits)")
+        if expected_hits > run.workload.num_prompts:
+            raise ValueError("expect_prefill_hit_requests is at most workload.num_prompts")
+    throughput = run.router.peak_prefill_throughput
+    if throughput is not None:
+        if isinstance(throughput, bool) or not isinstance(throughput, (int, float)) or not (
+                math.isfinite(throughput) and throughput > 0):
+            raise ValueError(f"router.peak_prefill_throughput is a positive, finite number of tokens a second, not "
+                             f"{throughput!r}")
+        if run.router.epp_plugins is not None:
+            raise ValueError("router.peak_prefill_throughput sets the default plugins' value: a run with "
+                             "router.epp_plugins sets it in that file")
     repetition = run.workload.prefix_repetition
     if repetition is not None:
         if not isinstance(repetition, dict) or set(repetition) != set(PREFIX_REPETITION_KEYS) or not all(
@@ -643,14 +677,7 @@ def recheck(output: str | Path) -> dict:
     from . import llmd  # it imports this module
 
     output = Path(output)
-    raw = json.loads((output / "run.json").read_text())
-    raw.pop("addresses", None)
-    router = Router(**raw["router"])
-    if router.epp_plugins is not None:
-        router.epp_plugins = Path(router.epp_plugins)
-    run = Run(**{**raw, "model": Path(raw["model"]), "router": router,
-                 "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
-                 "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
+    run = saved_run(output)
     ports = output / "router-ports.json"
     # Required evidence: anything but an object (a `null` document) has no
     # ports, a problem of `control_evidence`, never `check`'s caller without
@@ -670,6 +697,28 @@ def recheck(output: str | Path) -> dict:
     llmd.recheck(output, run, verdict)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
+
+
+def saved_run(output: str | Path) -> Run:
+    """A saved run's config (its ``run.json``)."""
+    raw = json.loads((Path(output) / "run.json").read_text())
+    raw.pop("addresses", None)
+    router = Router(**raw["router"])
+    if router.epp_plugins is not None:
+        router.epp_plugins = Path(router.epp_plugins)
+    return Run(**{**raw, "model": Path(raw["model"]), "router": router,
+                  "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
+                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
+
+
+def saved_peak_prefill_throughput(output: str | Path) -> dict:
+    """`peak_prefill_throughput` of a saved run's prefill instances."""
+    output = Path(output)
+    run = saved_run(output)
+    side = run.prefill
+    return peak_prefill_throughput(
+        [(output / side.step_log("prefill", dp, tp)).read_text() for dp, tp in side.ranks(side.tp(run.server))
+         if tp == 0], run.server.max_num_batched_tokens)
 
 
 def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], routers: dict[str, int],
@@ -921,6 +970,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                 "kv_bytes_spanned": _spanned_bytes(layout, checks) if layout else 0,
                 # Prefix hits compared in place, reconciled with the
                 # requests' admissions: no transfer moved them.
+                "hit_ids": {_base_request_id(c["req_id"]) for c in valid_hits if "req_id" in c},
                 "kv_hit_checks": len(valid_hits),
                 "kv_hit_blocks": sum(c["blocks"] for c in valid_hits),
                 "kv_bytes_hit_checked": sum(c["bytes"] for c in valid_hits),
@@ -1061,6 +1111,12 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     if run.server.speculative is not None:
         speculation = _speculation(bench, logs["decode"], run)
         problems.extend(speculation.pop("problems"))
+    prefix_routing = _prefix_routing(run, sides, ranks, bench) if prefix else None
+    if prefix_routing and run.expect_prefill_hit_requests is not None and (
+            prefix_routing["prefill"]["hit_requests"] < run.expect_prefill_hit_requests):
+        problems.append(f"{prefix_routing['prefill']['hit_requests']} request(s) hit a cached prefix at prefill, "
+                        f"fewer than the {run.expect_prefill_hit_requests} expected "
+                        f"(by owner: {prefix_routing['prefill']['by_owner']})")
     return {
         **({"transport": {"backend": nixl_backend(run.server), "tent_applicable": False}} if not uses_tent(run.server) else {}),
         "problems": problems,
@@ -1076,6 +1132,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                                                            for rank in per_tp)}
                         for role in sides} if prefix and per_tp else None,
         "fragmentation": per_tp[0]["fragmentation"] if per_tp else None,
+        "prefix_routing": prefix_routing,
         "transfers": sums,
         "router_bytes": routers,
         "control_network": {"bytes": control, "front_end_bytes": exempt,
@@ -1088,7 +1145,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         **({"idle_ranks": idle} if idle or any(side.instances for side in sides.values()) else {}),
         "dp_ranks": {role: [{"dp_rank": dp, "tp_rank": tp,
                              **{key: value for key, value in summary.items()
-                                if key not in ("requests", "checked_ids", "verified_ids", "allocated_ids")},
+                                if key not in ("requests", "checked_ids", "verified_ids", "allocated_ids", "hit_ids")},
                              "requests": len(summary["requests"])}
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
         "speculation": speculation,
@@ -2514,6 +2571,55 @@ def _group_evidence(layout: dict, checks: list[dict], records: list[dict]) -> li
             "reallocated_blocks": sum(len(held) > 1 for held in places.values()),
         })
     return evidence
+
+
+def _prefix_routing(run: Run, sides: dict[str, Side], ranks: dict, bench: dict) -> dict:
+    """Where requests found their prefix cached: per role, the requests
+    with a byte-checked prefix hit (TP rank 0's: every TP rank checks the
+    same requests) and their owners (an instance, or a DP rank). With the
+    workload's prefix groups, the most that can hit: each group's first
+    request finds nothing, wherever it goes; a group spread over I owners
+    misses once on each."""
+    found: dict = {}
+    for role, side in sides.items():
+        by_owner: dict[str, int] = {}
+        hit: set[str] = set()
+        for (dp, tp), summary in ranks[role].items():
+            if tp:
+                continue
+            owner = side.node_of(dp) if side.instances or side.data_parallel_size == 1 else f"{side.node}/dp{dp}"
+            by_owner[owner] = len(summary["hit_ids"])
+            hit |= summary["hit_ids"]
+        found[role] = {"hit_requests": len(hit), "by_owner": by_owner}
+    repetition = run.workload.prefix_repetition
+    completed = int(bench.get("completed") or 0)
+    found["ceiling"] = max(0, completed - repetition["num_prefixes"]) if repetition else None
+    found["expected_at_prefill"] = run.expect_prefill_hit_requests
+    return found
+
+
+def peak_prefill_throughput(steps: list[str], chunk: int) -> dict:
+    """llm-d's ``peakPrefillThroughput`` from a saved run's prefill step
+    logs, by the simulator's own timing (each step's simulated cost, not a
+    measurement of hardware): the tokens a second of an unloaded prefill
+    chunk of ``chunk`` tokens (the server's ``max_num_batched_tokens``) — a step of one
+    request, all of it prefill, nothing cached, exactly that many tokens.
+    The best such step's; ``steps`` counts them (0: the run had none, so
+    its prompts were shorter than a chunk)."""
+    rates = []
+    for text in steps:
+        for record in _records(text):
+            step, cost = record.get("step"), record.get("cost")
+            if not isinstance(step, dict) or not isinstance(cost, dict):
+                continue
+            requests = step.get("requests") or []
+            if (len(requests) == 1 and requests[0].get("is_prefill") and not requests[0].get("num_cached_tokens")
+                    and step.get("num_prefill_tokens") == chunk and not step.get("num_decode_tokens")):
+                seconds = float(cost.get("device_s") or 0) + float(cost.get("host_s") or 0)
+                if seconds > 0:
+                    rates.append(chunk / seconds)
+    return {"chunk_tokens": chunk, "steps": len(rates),
+            "tokens_per_second": round(max(rates), 1) if rates else None}
 
 
 def _prefix_caching_flags(run: Run) -> list[str]:

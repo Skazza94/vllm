@@ -1,0 +1,25 @@
+# A load-aware, prefix-blind picker: prefill and decode both go to the
+# instance with the fewest active requests. No token-load scorer, so the
+# prefix-discounted in-flight load (see token-load.yaml) plays no part. The
+# control that separates prefix awareness from load balancing.
+plugins:
+  - type: always-disagg-pd-decider
+  - type: disagg-profile-handler
+    parameters:
+      deciders:
+        prefill: always-disagg-pd-decider
+  - type: prefill-filter
+  - type: decode-filter
+  - type: active-request-scorer
+  - type: max-score-picker
+schedulingProfiles:
+  - name: prefill
+    plugins:
+      - pluginRef: prefill-filter
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker
+  - name: decode
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: active-request-scorer
+      - pluginRef: max-score-picker

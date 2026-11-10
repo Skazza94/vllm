@@ -1855,6 +1855,81 @@ class PrefixCachingCheckTests(unittest.TestCase):
         for message in messages:
             self.assertTrue(any(message in problem for problem in verdict["problems"]), verdict["problems"])
 
+    def test_prefix_routing_reports_where_requests_hit_and_may_expect_hits(self) -> None:
+        verdict = self.verdict()
+        self.assertEqual(verdict["problems"], [])
+        # Request b hit its prefix on both instances; no prefix groups in this workload, so no ceiling.
+        self.assertEqual(verdict["prefix_routing"], {
+            "prefill": {"hit_requests": 1, "by_owner": {"p": 1}}, "decode": {"hit_requests": 1, "by_owner": {"d": 1}},
+            "ceiling": None, "expected_at_prefill": None})
+        grouped_run = pd.Run(**{**PREFIX.__dict__, "workload": pd.Workload(
+            num_prompts=2, prefix_repetition={"prefix_len": 768, "suffix_len": 256, "num_prefixes": 1})})
+        self.assertEqual(self.verdict(run=grouped_run)["prefix_routing"]["ceiling"], 1)
+        met = pd.Run(**{**PREFIX.__dict__, "expect_prefill_hit_requests": 1})
+        self.assertEqual(self.verdict(run=met)["problems"], [])
+        unmet = pd.Run(**{**PREFIX.__dict__, "expect_prefill_hit_requests": 2})
+        verdict = self.verdict(run=unmet)
+        self.assertProblem(verdict, "1 request(s) hit a cached prefix at prefill, fewer than the 2 expected")
+        self.assertEqual(verdict["prefix_routing"]["expected_at_prefill"], 2)
+        # Without prefix caching there is nothing to report.
+        self.assertIsNone(pd.check({"completed": 2, "errors": []}, [GROUPS_LAYOUT + allocated("a", "b") + line(
+            kv_transfers={"send": {"count": 2, "bytes": 8}})], [GROUPS_LAYOUT], {"control": 1, "data0": 10},
+            RUN)["prefix_routing"])
+
+    def test_the_hit_expectation_and_the_calibration_are_validated(self) -> None:
+        base = {"name": "t", "topology": "t", "model": "m", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw"}, "prefill": {"node": "p", "kv_network": "data0"},
+                "decode": {"node": "d", "kv_network": "data0"},
+                "server": {"timing": "zero", "enable_prefix_caching": True}, "workload": {"num_prompts": 10}}
+        path = Path("/x/run.yaml")
+        run = pd.parse({**base, "expect_prefill_hit_requests": 7,
+                        "router": {"gateway": "gw", "peak_prefill_throughput": 46002.8}}, path)
+        self.assertEqual((run.expect_prefill_hit_requests, run.router.peak_prefill_throughput), (7, 46002.8))
+        cases = {
+            "a positive integer": {"expect_prefill_hit_requests": 0},
+            "a positive integer ": {"expect_prefill_hit_requests": True},
+            "a positive integer  ": {"expect_prefill_hit_requests": "7"},
+            "at most workload.num_prompts": {"expect_prefill_hit_requests": 11},
+            "needs server.enable_prefix_caching": {"expect_prefill_hit_requests": 7, "server": {"timing": "zero"}},
+            "needs server.enable_prefix_caching ": {"expect_prefill_hit_requests": 7, "kv_check": False},
+            "a positive, finite number of tokens": {"router": {"gateway": "gw", "peak_prefill_throughput": 0}},
+            "a positive, finite number of tokens ": {"router": {"gateway": "gw", "peak_prefill_throughput": "fast"}},
+            "a positive, finite number of tokens  ": {"router": {"gateway": "gw", "peak_prefill_throughput": -5.0}},
+            "a positive, finite number of tokens   ": {"router": {"gateway": "gw",
+                                                                   "peak_prefill_throughput": float("nan")}},
+            "a positive, finite number of tokens    ": {"router": {"gateway": "gw",
+                                                                    "peak_prefill_throughput": float("inf")}},
+            "a positive, finite number of tokens     ": {"router": {"gateway": "gw",
+                                                                     "peak_prefill_throughput": float("-inf")}},
+            "sets it in that file": {"router": {"gateway": "gw", "peak_prefill_throughput": 5.0,
+                                                "epp_plugins": "plugins.yaml"}},
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message.strip()):
+                pd.parse({**base, **change}, path)
+        # As a YAML file gives them.
+        for text in (".nan", ".inf", "-.inf"):
+            with self.subTest(yaml=text), tempfile.TemporaryDirectory() as directory:
+                spec_path = Path(directory) / "run.yaml"
+                spec_path.write_text(json.dumps(base).replace('"gateway": "gw"',
+                                                              f'"gateway": "gw", "peak_prefill_throughput": {text}'))
+                with self.assertRaisesRegex(ValueError, "a positive, finite number of tokens"):
+                    pd.load(spec_path)
+
+    def test_peak_prefill_throughput_is_an_unloaded_chunks(self) -> None:
+        def step(tokens, seconds, *, cached=0, requests=1, decode=0, prefill=True):
+            return line(step={"requests": [{"is_prefill": prefill, "num_cached_tokens": cached}] * requests,
+                              "num_prefill_tokens": tokens, "num_decode_tokens": decode},
+                        cost={"device_s": seconds, "host_s": 0.0})
+        logs = [step(2048, 0.05) + step(2048, 0.04) + step(2048, 0.01, cached=320) + step(2048, 0.01, requests=2)
+                + step(1024, 0.001) + step(2048, 0.01, decode=3) + step(2048, 0.0) + line(kv_events={}),
+                step(2048, 0.064)]
+        self.assertEqual(pd.peak_prefill_throughput(logs, 2048),
+                         {"chunk_tokens": 2048, "steps": 3, "tokens_per_second": 51200.0})
+        # Prompts shorter than a chunk: nothing to calibrate from.
+        self.assertEqual(pd.peak_prefill_throughput([step(448, 0.01)], 2048),
+                         {"chunk_tokens": 2048, "steps": 0, "tokens_per_second": None})
+
     def test_hits_are_checked_apart_from_transfers(self) -> None:
         verdict = self.verdict()
         self.assertEqual(verdict["problems"], [])

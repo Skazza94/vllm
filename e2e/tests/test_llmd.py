@@ -17,6 +17,9 @@ import yaml
 from harness import llmd, pd, shell, spec, topology
 
 
+E2E = Path(__file__).resolve().parent.parent
+
+
 def run_config(**router) -> dict:
     return {"name": "llmd-test", "topology": "llmd-1p1d", "model": "model",
             "prefill": {"node": "prefill0", "kv_network": "data0"},
@@ -184,6 +187,14 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("always-disagg-pd-decider", types)
         self.assertEqual(config["dataLayer"]["discovery"]["endpoints"]["pluginRef"], "file-discovery")
         self.assertEqual({p["name"] for p in config["schedulingProfiles"]}, {"prefill", "decode"})
+
+    def test_a_calibrated_peak_prefill_throughput_replaces_the_guides(self) -> None:
+        def throughput(config):
+            return next(p["parameters"]["peakPrefillThroughput"] for p in config["plugins"]
+                        if p["type"] == "prefix-cache-affinity-filter")
+        self.assertEqual(throughput(llmd.epp_config(self.llmd.router)), llmd.UNCALIBRATED_PEAK_PREFILL_THROUGHPUT)
+        self.llmd.router.peak_prefill_throughput = 46002.8
+        self.assertEqual(throughput(llmd.epp_config(self.llmd.router)), 46002.8)
 
     def test_custom_plugins_take_plugins_and_profiles_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -399,6 +410,63 @@ class EvidenceTests(unittest.TestCase):
     def test_unscraped_endpoints_fail(self) -> None:
         self.write(scored=False)
         self.assertProblem("never scored")
+
+    def test_a_picker_that_does_not_score_leaves_no_metrics_evidence(self) -> None:
+        # The random control: no max-score picker, so no scored-endpoints records to require.
+        self.llmd.router.epp_plugins = E2E / "epp" / "random.yaml"
+        self.write(scored=False)
+        result = llmd.routing_evidence(self.output, self.llmd.run)
+        self.assertEqual(result["problems"], [])
+        self.assertIsNone(result["evidence"]["metrics_seen_by_epp"])
+        self.assertIn("random-picker", result["evidence"]["plugins"])
+        self.assertEqual((result["evidence"]["uncalibrated"], result["evidence"]["peak_prefill_throughput"]), ({}, None))
+        # The token-load arm scores, so its evidence is required.
+        self.llmd.router.epp_plugins = E2E / "epp" / "token-load.yaml"
+        self.write(scored=False)
+        self.assertProblem("never scored")
+
+    def test_a_calibrated_run_is_not_reported_uncalibrated(self) -> None:
+        self.llmd.router.peak_prefill_throughput = 46002.8
+        self.write()
+        evidence = llmd.routing_evidence(self.output, self.llmd.run)["evidence"]
+        self.assertEqual((evidence["uncalibrated"], evidence["peak_prefill_throughput"]), ({}, [46002.8]))
+        # The saved config is the one the run's settings give: not another throughput's.
+        self.llmd.router.peak_prefill_throughput = 50000.0
+        self.assertProblem("saved EPP config is not the one")
+        self.llmd.router.peak_prefill_throughput = None
+        self.assertProblem("saved EPP config is not the one")
+
+    def test_the_affinity_filters_decisions_are_reported(self) -> None:
+        metrics = self.output / "llmd" / "epp-metrics.txt"
+        self.write()
+        self.assertIsNone(llmd.routing_evidence(self.output, self.llmd.run)["evidence"]["affinity_filter_decisions"])
+        name = "llm_d_epp_prefix_cache_affinity_filter_decisions_total"
+        metrics.write_text(f"# HELP {name} [ALPHA] decisions\n# TYPE {name} counter\n"
+                           f'{name}{{outcome="no_match",plugin_name="prefix-cache-affinity-filter"}} 81\n'
+                           f'{name}{{outcome="sticky",plugin_name="prefix-cache-affinity-filter"}} 3\n'
+                           f'{name}{{outcome="sticky",plugin_name="another"}} 2\n'
+                           f'other_total{{outcome="no_match"}} 9\n')
+        evidence = llmd.routing_evidence(self.output, self.llmd.run)["evidence"]
+        self.assertEqual(evidence["affinity_filter_decisions"], {"no_match": 81, "sticky": 5})
+        # A configuration without the filter has none to report.
+        self.llmd.router.epp_plugins = E2E / "epp" / "request-load.yaml"
+        self.write()
+        self.assertIsNone(llmd.routing_evidence(self.output, self.llmd.run)["evidence"]["affinity_filter_decisions"])
+
+    def test_the_control_plugin_files_are_valid_picker_configs(self) -> None:
+        for name, types in (("random", {"random-picker"}), ("token-load", {"token-load-scorer", "max-score-picker"}), ("request-load", {"active-request-scorer", "max-score-picker"})):
+            self.llmd.router.epp_plugins = E2E / "epp" / f"{name}.yaml"
+            config = llmd.epp_config(self.llmd.router)
+            found = {p["type"] for p in config["plugins"]}
+            with self.subTest(name=name):
+                self.assertTrue(types <= found, found)
+                # None names a prefix plugin. That alone does not make one prefix-blind: llm-d's token load
+                # discounts cached prefixes (the EPP creates the approximate producer for it), so the
+                # prefix-blind controls are the ones without the token-load scorer and its producer.
+                self.assertFalse({t for t in found if "prefix" in t})
+                self.assertEqual(not ({"token-load-scorer", "inflight-load-producer"} & found),
+                                 name in ("random", "request-load"))
+                self.assertEqual({p["name"] for p in config["schedulingProfiles"]}, {"prefill", "decode"})
 
     def test_client_and_router_counts_must_agree(self) -> None:
         self.write(completed=3)

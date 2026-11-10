@@ -70,11 +70,22 @@ SIDECAR_CONNECTOR = {"nixl": "nixlv2", "mooncake": "mooncake"}
 UNCALIBRATED_PEAK_PREFILL_THROUGHPUT = 33821
 
 
-def default_epp_plugins() -> dict:
+def default_epp_plugins(peak_prefill_throughput: float | None = None) -> dict:
     """llm-d v1.0's P/D router configuration
     (guides/pd-disaggregation/router/pd-disaggregation.values.yaml): every
     request disaggregated, prefill picked by prefix affinity and queued
-    prefill tokens, decode by active requests."""
+    prefill tokens, decode by active requests.
+
+    Two things about its prefix signal, as the pinned router has them:
+    - The token load is itself prefix-aware: the in-flight load counts only
+      the uncached part of each prompt on each endpoint, so an endpoint that
+      holds a request's prefix looks less loaded for it. The affinity filter
+      comes on top, and only for endpoints whose prefix score reaches its
+      ``affinityThreshold`` (0.80 by default): below it the filter keeps
+      every endpoint (its ``no_match`` outcome).
+    - The approximate producer matches in blocks of at least 64 tokens,
+      whatever the servers' block size (``approximateprefix`` clamps it): a
+      coarser granularity than a server's own cache with smaller blocks."""
 
     return {
         "plugins": [
@@ -85,7 +96,8 @@ def default_epp_plugins() -> dict:
             {"type": "approx-prefix-cache-producer", "parameters": {"maxPrefixTokensToMatch": 131072}},
             {"type": "inflight-load-producer"},
             {"type": "prefix-cache-affinity-filter",
-             "parameters": {"peakPrefillThroughput": UNCALIBRATED_PEAK_PREFILL_THROUGHPUT}},
+             "parameters": {"peakPrefillThroughput": UNCALIBRATED_PEAK_PREFILL_THROUGHPUT if (
+                 peak_prefill_throughput is None) else peak_prefill_throughput}},
             {"type": "token-load-scorer"},
             {"type": "active-request-scorer"},
             {"type": "max-score-picker"},
@@ -106,7 +118,7 @@ def epp_config(router: pd.Router) -> dict:
     """The EPP's config: the plugins, its endpoints from the file, their
     metrics scraped."""
 
-    plugins = default_epp_plugins() if router.epp_plugins is None else (
+    plugins = default_epp_plugins(router.peak_prefill_throughput) if router.epp_plugins is None else (
         yaml.safe_load(router.epp_plugins.read_text(encoding="utf-8")))
     if set(plugins) - {"plugins", "schedulingProfiles"}:
         raise ValueError("router.epp_plugins takes plugins and schedulingProfiles only")
@@ -693,12 +705,24 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
             received += 1
         else:
             problems.append(f"{request}: decode never received its KV ({CONSUMER_DONE})")
-    for address, endpoint in named.items():
+    saved_config = yaml.safe_load((directory / "epp-config.yaml").read_text())
+    plugins = saved_config["plugins"]
+    if run.router.epp_plugins is None and saved_config != epp_config(run.router):
+        # A run without its own plugins file ran the default ones, with its
+        # router's settings (its calibrated throughput).
+        problems.append("the saved EPP config is not the one the run's router settings give")
+    # The engines' metrics as the EPP used them are in its max-score picker's
+    # records: a configuration without that picker leaves no such evidence.
+    scoring = any(p.get("type") == "max-score-picker" for p in plugins)
+    for address, endpoint in named.items() if scoring else ():
         seen = scraped.get(endpoint["name"])
         if not seen or not seen.get("max_CacheNumBlocks"):
             problems.append(f"the EPP never scored {endpoint['name']} with its engine's metrics "
                             f"(cache blocks) from {address}")
-    plugins = yaml.safe_load((directory / "epp-config.yaml").read_text())["plugins"]
+    affinity = [p for p in plugins if p.get("type") == "prefix-cache-affinity-filter"]
+    metrics = directory / "epp-metrics.txt"
+    decisions = affinity_decisions(metrics.read_text(errors="replace")) if affinity and metrics.exists() else None
+    throughputs = [(p.get("parameters") or {}).get("peakPrefillThroughput") for p in affinity]
     return {"problems": pd._capped(problems, 5), "evidence": {
         "completion_requests": len(handled), "other_requests": len(others), "gateway": gateway,
         "sidecar_protocols": protocols, "routed": chosen, "pairs": dict(sorted(pairs.items())),
@@ -706,11 +730,35 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
                                  for name in (e["name"] for e in named.values()
                                               if e["labels"].get(ROLE_LABEL) == role)
                                  if name not in chosen[role]),
-        "metrics_seen_by_epp": scraped,
+        "metrics_seen_by_epp": scraped if scoring else None,
+        "plugins": [p.get("type") for p in plugins],
         "producer_released": released, "consumer_received": received,
+        # The llm-d guide's value (or the filter's own default, no value
+        # given) is another fleet's.
+        "peak_prefill_throughput": throughputs or None,
+        # What the affinity filter did (the EPP's own counter, read after
+        # the workload): only no_match means it never narrowed a choice, so
+        # the run did not exercise its stickiness or its load gate.
+        "affinity_filter_decisions": decisions,
         "uncalibrated": {"prefix-cache-affinity-filter.peakPrefillThroughput": UNCALIBRATED_PEAK_PREFILL_THROUGHPUT}
-        if any(p.get("type") == "prefix-cache-affinity-filter" for p in plugins) else {},
+        if any(t in (None, UNCALIBRATED_PEAK_PREFILL_THROUGHPUT) for t in throughputs) else {},
     }}
+
+
+AFFINITY_DECISIONS = re.compile(
+    r'^llm_d_epp_prefix_cache_affinity_filter_decisions_total\{(?P<labels>[^}]*)\}\s+(?P<count>[0-9.eE+]+)\s*$')
+
+
+def affinity_decisions(metrics: str) -> dict[str, int]:
+    """The prefix-cache affinity filter's decisions by outcome, from the
+    EPP's metrics text (summed over its instances)."""
+    found: dict[str, int] = {}
+    for line in metrics.splitlines():
+        match = AFFINITY_DECISIONS.match(line)
+        outcome = re.search(r'outcome="([^"]*)"', match["labels"]) if match else None
+        if outcome:
+            found[outcome[1]] = found.get(outcome[1], 0) + int(float(match["count"]))
+    return found
 
 
 def recheck(output: Path, run: pd.Run, verdict: dict) -> None:

@@ -1,4 +1,4 @@
-"""Command line: python -m harness {up,down,status,exec,pd,recheck} ..."""
+"""Command line: python -m harness {up,down,status,exec,pd,recheck,peak-prefill} ..."""
 
 from __future__ import annotations
 
@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
     prefill_decode.add_argument("run", help="the run config")
     recheck = commands.add_parser("recheck", help="a saved prefill/decode run's checks again (verdict-recheck.json)")
     recheck.add_argument("results", help="the run's results directory")
+    peak = commands.add_parser(
+        "peak-prefill", help="llm-d's peakPrefillThroughput (router.peak_prefill_throughput) from a saved run")
+    peak.add_argument("results", help="the run's results directory (prompts of at least max_num_batched_tokens)")
     args = parser.parse_args(argv)
 
     if args.command == "up":
@@ -37,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "pd":
         print(json.dumps(pd.execute(pd.load(args.run)), indent=2))
         return 0
+    if args.command == "peak-prefill":
+        found = pd.saved_peak_prefill_throughput(args.results)
+        print(json.dumps(found, indent=2))
+        return 0 if found["tokens_per_second"] else 1
     if args.command == "recheck":
         verdict = pd.recheck(args.results)
         print(json.dumps({"problems": verdict["problems"], "kv_bytes_checked": verdict["kv_bytes_checked"],
