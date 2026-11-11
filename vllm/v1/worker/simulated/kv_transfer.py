@@ -612,8 +612,8 @@ DSA_INDEXER_HEAD_SIZE = 132
 
 
 def _dsa_group_problems(kv_cache_config: KVCacheConfig) -> set[str]:
-    """A DSA model's groups as built: each layer's BF16 latent (the sparse
-    role) and, with an indexer, its uint8 keys and scales, MLA specs of one
+    """A DSA model's groups as built: each layer's latent, BF16 or packed
+    FP8 (the sparse role) and, with an indexer, its uint8 keys and scales, MLA specs of one
     block size; a group of several kinds holds these two roles only."""
     from vllm.v1.kv_cache_interface import SparseCacheRole
 
@@ -631,8 +631,14 @@ def _dsa_group_problems(kv_cache_config: KVCacheConfig) -> set[str]:
             roles.setdefault(role, []).append(name)
             if type(member) is not MLAAttentionSpec:
                 problems.add(f"DSA layer {name} of {type(member).__name__}")
-            elif role == SparseCacheRole.SPARSE and member.dtype != torch.bfloat16:
-                problems.add(f"DSA latent {name} of {member.dtype}, not BF16")
+            elif role == SparseCacheRole.SPARSE and not (
+                member.dtype == torch.bfloat16
+                or (member.dtype, member.cache_dtype_str) == (torch.uint8, "fp8_ds_mla")
+            ):
+                problems.add(
+                    f"DSA latent {name} of {member.dtype} ({member.cache_dtype_str}), "
+                    "not BF16 or packed FP8 (fp8_ds_mla)"
+                )
             elif role == SparseCacheRole.INDEXER and (
                 member.dtype != torch.uint8
                 or member.head_size != DSA_INDEXER_HEAD_SIZE

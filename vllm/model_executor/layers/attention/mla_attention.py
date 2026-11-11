@@ -361,7 +361,11 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType | str,
 ) -> CacheDType | str:
     backend_name = attn_backend.get_name()
-    if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+    # A CPU simulation stands in for FlashMLA sparse with its cache formats.
+    if backend_name in (
+        "FLASHMLA_SPARSE",
+        "CPU_SIMULATED_MLA_SPARSE",
+    ) and is_quantized_kv_cache(kv_cache_dtype):
         # The NVFP4 DS-MLA format is used as-is; any other quantized dtype
         # (fp8, fp8_e4m3, ...) is served via the fp8_ds_mla format.
         if kv_cache_dtype == "nvfp4_ds_mla":

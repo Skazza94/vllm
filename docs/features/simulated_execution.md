@@ -106,7 +106,11 @@ time it as the published model. `quant_modes` overrides the published
 precision, which
 records the target as modified. DeepSeek-V4 is timed with its packed FP8
 cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
-and its FP4 experts. A bundled config AISimulate would misread is given to
+and its FP4 experts. A DSA model's FP8 cache (DeepSeek-V3.2's, GLM-5's),
+under any of those FP8 names, is timed and recorded as the packed one too
+(`kv_cache_format: fp8_ds_mla`, the configured dtype beside it). GLM-5 on
+B200 has to name its cache (`fp8`, the GPU's default there, or `bfloat16`):
+`auto` is FP8 on that GPU and BF16 on a CPU host. A bundled config AISimulate would misread is given to
 it as a private normalized copy, the change and both configs' hashes in the
 `timing` record: MiMo-V2-Flash's `hybrid_layer_pattern`, which marks its
 sliding layers 1 where AISimulate reads global ones, is inverted. Startup
@@ -442,8 +446,9 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   other sparse-MLA (but DeepSeek-V4's, below), chunked local or RSWA
   attention models.
 * DeepSeek-V3.2's and GLM-5's sparse MLA (DSA), over either connector, its
-  latent cache BF16 (`auto` or `bfloat16`; an FP8 `fp8_ds_mla` latent is
-  refused): each attention layer's latent (576 wide) and, on the layers
+  latent cache BF16 (`auto` or `bfloat16`) or FlashMLA's packed FP8
+  (`fp8`, `fp8_e4m3` or `fp8_ds_mla`: 656 bytes a token): each attention
+  layer's latent (576 wide in BF16) and, on the layers
   holding an indexer (GLM-5's every few, by its config), the indexer's FP8
   keys and scales (132 bytes a token), pages of two sizes in one group, each
   layer its own region; the pattern checks cover each layer's page.
@@ -636,8 +641,9 @@ device-independent emulation kernel, NVFP4 experts the backend a GPU
 deployment tries first (or `--moe-backend`), per-tensor FP8 experts the
 Triton one. Weight quantization changes neither the KV cache nor what a
 transfer moves. A checkpoint that also declares a quantized KV cache takes
-that cache dtype, which the CPU platform's attention may refuse (MLA with
-`fp8_e4m3`): pass `--kv-cache-dtype` for the cache to serve. DSA sparse MLA
+that cache dtype as on its GPU: dense MLA keeps an FP8 cache (a byte an
+element), DSA sparse MLA FlashMLA's packed one (`fp8_ds_mla`, 656 bytes a
+token), whichever FP8 dtype is given. DSA sparse MLA
 (DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
 deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
 

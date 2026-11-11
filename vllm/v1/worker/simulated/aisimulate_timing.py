@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from vllm.config.simulation import DSA_FP8_CACHE_DTYPES
 from vllm.logger import init_logger
 from vllm.v1.worker.simulated.timing import (
     HostTimeModel,
@@ -582,20 +583,23 @@ class AisimulateTimingProvider:
             if unknown:
                 raise ValueError(f"Unknown quant_modes {sorted(unknown)}.")
             modes.update(quant_modes)
-        kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4)
-        # GLM-5's deployment on Blackwell (SM100) resolves `auto` to an FP8
-        # sparse-MLA cache (`fp8_ds_mla`), which AISimulate does not time:
-        # only an explicit BF16 cache is that GPU's timed deployment.
+        dsa = target_config.get("architectures") in (
+            ["DeepseekV32ForCausalLM"],
+            ["GlmMoeDsaForCausalLM"],
+        )
+        # GLM-5's `auto` cache is FP8 on a Blackwell GPU (SM100) and BF16 on
+        # this host: which one is served, and timed, has to be said.
         if (
             target_config.get("architectures") == ["GlmMoeDsaForCausalLM"]
             and system == "b200_sxm"
             and vllm_config.cache_config.cache_dtype == "auto"
         ):
             raise ValueError(
-                "GLM-5 on B200 resolves kv_cache_dtype auto to an FP8 sparse-MLA "
-                "cache, which the aisimulate timing provider does not time; pass "
-                "kv_cache_dtype bfloat16."
+                "GLM-5 on B200 resolves kv_cache_dtype auto to its packed FP8 "
+                "sparse-MLA cache on the GPU and to BF16 on this host: pass "
+                "kv_cache_dtype fp8 (the deployment's default) or bfloat16."
             )
+        kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4, dsa)
 
         nextn, speculation = self._speculation(vllm_config, target_config, topology)
 
@@ -964,10 +968,14 @@ class AisimulateTimingProvider:
         }
 
     @classmethod
-    def _kv_cache_mode(cls, vllm_config: "VllmConfig", v4: bool) -> tuple[str, str]:
+    def _kv_cache_mode(
+        cls, vllm_config: "VllmConfig", v4: bool, dsa: bool = False
+    ) -> tuple[str, str]:
         """The KV cache's effective format and AISimulate's KV mode for it.
         The provider is built before the model resolves `auto`: DeepSeek-V4's
-        is resolved here as its supported packed path does."""
+        is resolved here as its supported packed path does, and a DSA
+        model's FP8 cache, under any of its names, is FlashMLA's packed one
+        (a dense MLA's FP8 cache stays a byte an element)."""
         if v4:
             configured = vllm_config.cache_config.cache_dtype
             if configured not in V4_KV_CACHE_DTYPES:
@@ -976,6 +984,8 @@ class AisimulateTimingProvider:
                     f"packed FP8 cache (cache dtype {V4_KV_CACHE_DTYPES}), not "
                     f"{configured}."
                 )
+            return "fp8_ds_mla", "fp8"
+        if dsa and cls._kv_dtype(vllm_config) in DSA_FP8_CACHE_DTYPES:
             return "fp8_ds_mla", "fp8"
         dtype = cls._kv_dtype(vllm_config)
         mode = KV_CACHE_MODES.get(dtype)

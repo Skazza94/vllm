@@ -1253,10 +1253,13 @@ def test_real_transfers_take_a_dsa_group_of_its_latent_and_indexer_keys():
         )
 
     check_real_kv_groups(config(latent(), keys(), latent()), dsa=True)
+    packed = {"dtype": torch.uint8, "cache_dtype_str": "fp8_ds_mla"}
+    check_real_kv_groups(config(latent(**packed), keys(), latent(**packed)), dsa=True)
     with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
         check_real_kv_groups(config(latent(), keys()))
     for members, message in (
         ((latent(dtype=torch.float16), keys()), "not BF16"),
+        ((latent(dtype=torch.uint8, cache_dtype_str="fp8"), keys()), "not BF16"),
         ((latent(), keys(dtype=torch.bfloat16)), "not uint8 x 132"),
         ((latent(), keys(head_size=128)), "not uint8 x 132"),
         ((keys(), keys()), "no latent"),

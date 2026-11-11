@@ -174,17 +174,23 @@ class CpuPlatform(Platform):
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
         kv_cache_dtype = attn_selector_config.kv_cache_dtype
         if attn_selector_config.use_mla:
-            if kv_cache_dtype not in (None, "auto", "bfloat16", "float16"):
+            from vllm.config import get_current_vllm_config_or_none
+
+            # A simulation never runs the MLA kernels: the reference backend
+            # keeps its KV cache the same on every host, in any cache dtype
+            # the deployment's GPU serves.
+            config = get_current_vllm_config_or_none()
+            simulated = config is not None and config.simulation_config.simulate_forward
+            if not simulated and kv_cache_dtype not in (
+                None,
+                "auto",
+                "bfloat16",
+                "float16",
+            ):
                 raise ValueError(
                     f"--kv-cache-dtype {kv_cache_dtype} is not supported by "
                     "MLA attention on CPU."
                 )
-            from vllm.config import get_current_vllm_config_or_none
-
-            # A simulation never runs the MLA kernels: the reference backend
-            # keeps its KV cache the same on every host.
-            config = get_current_vllm_config_or_none()
-            simulated = config is not None and config.simulation_config.simulate_forward
             amx_available = (
                 not simulated
                 and cls.get_cpu_architecture() == CpuArchEnum.X86

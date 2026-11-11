@@ -1380,12 +1380,49 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
             config("indexer", {**raw, "index_n_heads": raw["index_n_heads"] * 2}),
             gpu="h200", target_model=target,
         )
+    # An FP8 cache, under any of its names, is FlashMLA's packed one, timed
+    # in one FP8 mode: the provider's estimate is the pinned estimator's.
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    step = sim_step(0, *[sim_req(f"d{i}", 1, 1024, 512) for i in range(8)])
+    estimates = set()
+    for alias in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+        packed = config(alias, kv_cache_dtype=alias)
+        q = provider(packed, gpu="h200", target_model=target)
+        b = q.assumptions()["aisimulate"]
+        assert (b["kv_cache_format"], b["config"]["kvcache_quant_mode"]) == (
+            "fp8_ds_mla", "fp8",
+        )
+        # What was configured stays on record beside the effective format.
+        assert b["kv_cache_dtype"] == packed.cache_config.cache_dtype
+        estimates.add(q.estimate(step).device_s * 1000)
+    (ms,) = estimates
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(**{**b["config"], "fallback_policy": "deny"})
+    )
+    assert b["config"]["kvcache_quant_mode"] == "fp8"
+    assert ms == pytest.approx(
+        direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+        rel=1e-9,
+    )
+    assert ms != pytest.approx(p.estimate(step).device_s * 1000, rel=1e-9)
     if local == "zai-org/GLM-5.2":
-        # On B200 its `auto` cache is FP8 sparse MLA, not timed; BF16 is.
-        with pytest.raises(ValueError, match="kv_cache_dtype bfloat16"):
+        # On B200 a GPU resolves its `auto` cache to FP8, this host to BF16:
+        # the cache is named, or already resolved by the checkpoint's sidecar.
+        with pytest.raises(ValueError, match="kv_cache_dtype fp8 .* or bfloat16"):
             provider(config("b200"), gpu="b200", target_model=target)
-        provider(config("b200-bf16", kv_cache_dtype="bfloat16"), gpu="b200",
-                 target_model=target)
+        formats = {
+            dtype: provider(
+                config(f"b200-{dtype}", kv_cache_dtype=dtype), gpu="b200",
+                target_model=target,
+            ).assumptions()["aisimulate"]["kv_cache_format"]
+            for dtype in ("bfloat16", "fp8", "fp8_e4m3")
+        }
+        assert formats == {
+            "bfloat16": "bfloat16", "fp8": "fp8_ds_mla", "fp8_e4m3": "fp8_ds_mla",
+        }
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")

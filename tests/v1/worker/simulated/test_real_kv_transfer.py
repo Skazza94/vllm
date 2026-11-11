@@ -2390,6 +2390,48 @@ def test_dsa_sparse_mla_builds_on_cpu_in_a_simulation_only(tmp_path, monkeypatch
             max_model_len=256, enforce_eager=True, block_size=64)
 
 
+def test_mla_keeps_a_quantized_cache_in_a_simulation(tmp_path, monkeypatch):
+    """A checkpoint that declares an FP8 KV cache starts as on its GPU: a
+    sparse MLA latent in FlashMLA's packed format (656 bytes a token), a
+    dense MLA latent a byte an element; the CPU kernels that take neither
+    never run."""
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    for name, config, cache_dtype, token_bytes in (
+        ("v32", DEEPSEEK_V32, "fp8_ds_mla", 656),
+        ("glm", GLM_5, "fp8_ds_mla", 656),
+        ("v3", DEEPSEEK_V3, "fp8", 576),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps(config))
+        llm = LLM(
+            model=str(directory), skip_tokenizer_init=True, dtype="bfloat16",
+            max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
+            max_num_batched_tokens=64, enable_prefix_caching=False,
+            enforce_eager=True, block_size=64, kv_cache_dtype="fp8",
+            simulation_config={"simulate_forward": True, "timing": "linear",
+                               "timing_args": {"fixed_us": 100}},
+        )
+        try:
+            (out,) = llm.generate(
+                [{"prompt_token_ids": [5] * 100}],
+                SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+                use_tqdm=False,
+            )
+            assert len(out.outputs[0].token_ids) == 2
+            engine = llm.llm_engine.engine_core.engine_core
+            runner = engine.model_executor.driver_worker.worker.model_runner
+            latents = [s for n, s in runner.get_kv_cache_spec().items()
+                       if not n.endswith("indexer.k_cache")]
+            assert {(s.cache_dtype_str, s.dtype, s.page_size_bytes) for s in latents} == {
+                (cache_dtype, torch.uint8, 64 * token_bytes)
+            }, name
+        finally:
+            del llm
+
+
 def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
     """DeepSeek-V3.2's and GLM-5's one MTP layer (its own latent and indexer
     keys) moves with the target's over NIXL: not over Mooncake, nor two MTP
@@ -2423,18 +2465,16 @@ def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
 
 def test_real_mode_takes_dsa_sparse_mla_with_a_bf16_latent(tmp_path_factory):
     """DeepSeek-V3.2's and GLM-5's sparse MLA over either connector, its
-    latent BF16 as the deployment keeps it (`auto`); an FP8 latent
-    (`fp8_ds_mla`) is refused, as are DeepSeek-V4's and other sparse MLA."""
+    latent BF16 as the deployment keeps it (`auto`) or FlashMLA's packed FP8
+    (any FP8 cache dtype); other sparse MLA is refused."""
     v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2", DEEPSEEK_V32)
     glm = write_model_dir(tmp_path_factory, "tiny-glm-5", GLM_5)
     kwargs = {"dtype": "bfloat16", "block_size": 64}
     for model in (v32, glm):
         for connector in ("NixlConnector", "MooncakeConnector"):
-            for dtype in ("auto", "bfloat16"):
+            for dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_ds_mla"):
                 engine_config(model, kv_transfer={"kv_connector": connector},
                               kv_cache_dtype=dtype, **kwargs)
-        with pytest.raises(ValueError, match="BF16 sparse-MLA latent cache"):
-            engine_config(model, kv_cache_dtype="fp8", **kwargs)
         # `auto` takes the model's dtype: a float16 model's latent is not BF16.
         with pytest.raises(ValueError, match="BF16 sparse-MLA latent cache"):
             engine_config(model, kv_cache_dtype="auto", dtype="float16", block_size=64)
@@ -3014,6 +3054,29 @@ def test_mla_backend_choice_is_cached_per_mode(monkeypatch, simulated_first):
             with set_current_vllm_config(config):
                 backend = get_attn_backend(LATENT, torch.bfloat16, "auto", use_mla=True)
             assert backend.get_name() == name, config.simulation_config.simulate_forward
+    finally:
+        _cached_get_attn_backend.cache_clear()
+
+
+def test_only_a_simulation_keeps_a_quantized_mla_cache_on_cpu():
+    """The CPU MLA kernels read no quantized cache: an ordinary run still
+    refuses one; a simulation, which runs no kernel, keeps the backend."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.simulation import SimulationConfig
+    from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+
+    _cached_get_attn_backend.cache_clear()
+    try:
+        for dtype in ("fp8", "fp8_e4m3"):
+            with (
+                set_current_vllm_config(VllmConfig()),
+                pytest.raises(ValueError, match="not supported by MLA attention on CPU"),
+            ):
+                get_attn_backend(LATENT, torch.bfloat16, dtype, use_mla=True)
+            simulated = VllmConfig(simulation_config=SimulationConfig(simulate_forward=True))
+            with set_current_vllm_config(simulated):
+                backend = get_attn_backend(LATENT, torch.bfloat16, dtype, use_mla=True)
+            assert backend.get_name() == "CPU_MLA"
     finally:
         _cached_get_attn_backend.cache_clear()
 

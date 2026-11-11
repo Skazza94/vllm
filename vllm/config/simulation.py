@@ -30,6 +30,8 @@ REAL_KV_MTP_DRAFTS = {
 REAL_KV_MTP_MAX_DEPTH = 5
 # Sparse MLA with a lightning indexer (DSA): DeepSeek-V3.2, GLM-5.
 DSA_MODEL_TYPES = ("deepseek_v32", "glm_moe_dsa")
+# Cache dtypes a DSA latent is kept packed for (FlashMLA's `fp8_ds_mla`).
+DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_ds_mla")
 
 
 @config
@@ -437,7 +439,8 @@ class SimulationConfig:
             and not v4
             and getattr(model.hf_text_config, "index_topk", None) is not None
         )
-        # DeepSeek-V3.2's sparse attention (DSA, GLM-5's too): a BF16 latent
+        # DeepSeek-V3.2's sparse attention (DSA, GLM-5's too): a latent, BF16
+        # or FlashMLA's packed FP8 (any FP8 dtype is served as `fp8_ds_mla`),
         # and an indexer key cache a layer, as the deployment keeps them.
         dsa = sparse_mla and getattr(model.hf_config, "model_type", None) in (
             DSA_MODEL_TYPES
@@ -446,10 +449,14 @@ class SimulationConfig:
             sparse_mla = False
             # `auto` takes the model's dtype: BF16 only when the model is.
             resolved = model.dtype if cache.cache_dtype == "auto" else cache.cache_dtype
-            if str(resolved).removeprefix("torch.") != "bfloat16":
+            if str(resolved).removeprefix("torch.") not in (
+                "bfloat16",
+                *DSA_FP8_CACHE_DTYPES,
+            ):
                 problems.append(
                     "a BF16 sparse-MLA latent cache (kv_cache_dtype auto of a "
-                    f"BF16 model, or bfloat16), not {cache.cache_dtype} "
+                    "BF16 model, or bfloat16) or its packed FP8 one "
+                    f"({', '.join(DSA_FP8_CACHE_DTYPES)}), not {cache.cache_dtype} "
                     f"({resolved})"
                 )
         if cache.enable_prefix_caching and (self.kv_pattern_fill or self.kv_pattern_check):
