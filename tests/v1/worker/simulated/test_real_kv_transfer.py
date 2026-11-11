@@ -845,6 +845,68 @@ def test_nvfp4_checkpoints_build_on_cpu_in_a_simulation_only(
                 load_format="dummy")
 
 
+@pytest.mark.parametrize("quantization", ["fp8", "fp8_per_tensor", "fp8_per_block"])
+def test_online_quantization_builds_on_cpu_in_a_simulation(
+    model_dir, moe_model_dir, monkeypatch, quantization
+):
+    """`--quantization fp8` quantizes the weights as they load. In a
+    simulation they load on the meta device: the layers end as the deployment
+    has them (FP8 weights), the CPU kernel's weight packing giving shapes
+    without data, and the KV cache is the unquantized model's."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # The MoE model first (see the NVFP4 test).
+    for source, methods in (
+        (moe_model_dir, {"OnlineLinearMethod", "OnlineMoEMethod"}),
+        (model_dir, {"OnlineLinearMethod"}),
+    ):
+        built, specs, dtype = simulated_build(source, quantization=quantization)
+        _, plain_specs, plain_dtype = simulated_build(source)
+        assert (specs, dtype) == (plain_specs, plain_dtype)
+        online = [b for b in built if b[0].endswith(tuple(methods))]
+        assert {m for m in methods if any(b[0].endswith(m) for b in online)} == methods
+        weights = {weight for b in online for weight in b[3:]}
+        kinds = {(kind, device) for _, kind, device in weights}
+        assert ("torch.float8_e4m3fn", "meta") in kinds, built
+        # The MoE model's router has 8 rows, fewer than a tile: the CPU
+        # kernel keeps such a weight transposed in fp32.
+        assert kinds <= {
+            ("torch.float8_e4m3fn", "meta"),
+            ("torch.float32", "meta"),
+        }, built
+        assert ("torch.float32", "meta") not in kinds or source == moe_model_dir
+
+
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        ((64, 128), torch.bfloat16),
+        ((64, 128), torch.float16),
+        ((32, 128), torch.float8_e4m3fn),
+        ((32, 64), torch.int8),
+        ((32, 64), torch.uint8),
+        ((4, 32, 64), torch.bfloat16),
+        ((4, 32, 64), torch.float8_e4m3fn),
+        # Fewer rows than a tile: transposed to fp32, not packed.
+        ((8, 64), torch.bfloat16),
+        ((8, 64), torch.float8_e4m3fn),
+    ],
+)
+def test_weight_packing_on_meta_gives_the_cpu_kernels_shape(shape, dtype):
+    """Online quantization packs weights for the CPU kernel as they load; on
+    the meta device the op answers with the shape and dtype the kernel would
+    give, without data."""
+    import vllm._custom_ops  # noqa: F401  (loads the op and its meta answer)
+
+    if not hasattr(torch.ops._C, "convert_weight_packed"):
+        pytest.skip("needs the CPU weight-packing kernel")
+    real = torch.ops._C.convert_weight_packed(torch.zeros(shape, dtype=dtype))
+    meta = torch.ops._C.convert_weight_packed(
+        torch.empty(shape, dtype=dtype, device="meta")
+    )
+    assert meta.is_meta
+    assert (meta.shape, meta.dtype) == (real.shape, real.dtype)
+
+
 def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     """V4's groups move over NIXL, which keeps each group's own blocks;
     Mooncake cannot pair its block sizes. Tensor parallelism or data-parallel

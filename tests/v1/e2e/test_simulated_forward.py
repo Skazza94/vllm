@@ -91,9 +91,6 @@ def test_simulate_forward_quantized_checkpoint(
     assert len(outputs[0][0]) == 3 + 4
 
 
-@pytest.mark.skipif(
-    current_platform.is_cpu(), reason="The CPU build has no FP8 quantization kernels."
-)
 def test_simulate_forward_online_quantization(
     monkeypatch: pytest.MonkeyPatch, vllm_runner: type[VllmRunner]
 ) -> None:

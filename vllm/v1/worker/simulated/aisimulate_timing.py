@@ -65,6 +65,8 @@ QUANT_MODES: dict[str | None, dict[str, str]] = {
         "fmha_quant_mode": "bfloat16",
     },
 }
+# Where vLLM's online quantization methods live (weights quantized at load).
+ONLINE_QUANT_MODULES = "vllm.model_executor.layers.quantization.online."
 # Quantizations whose modes are the checkpoint's own (`_inferred_modes`).
 INFERRED_QUANT_ALGOS = ("compressed-tensors", "nvfp4", "mixed_precision", "fp8")
 QUANT_MODE_FIELDS = (
@@ -1013,6 +1015,30 @@ class AisimulateTimingProvider:
                 )
             probes.append({"kind": kind, "metrics": sent, "ms": ms})
         return probes
+
+    def bind_model(self, model: Any) -> None:
+        """The weights timed are the published checkpoint's: a server that
+        quantizes layers itself as it loads them (`--quantization fp8`, an
+        online `--quantization-config`, alone or beside a quantized
+        checkpoint) runs another deployment, which is not timed as this one."""
+        online = sorted(
+            {
+                type(method).__name__
+                for module in model.modules()
+                if (method := getattr(module, "quant_method", None)) is not None
+                and type(method).__module__.startswith(ONLINE_QUANT_MODULES)
+            }
+        )
+        if online:
+            record = self._assumptions
+            raise ValueError(
+                "The aisimulate timing provider times the published "
+                f"{record['target_model']} "
+                f"({record['target_quantization'] or 'unquantized'} weights), not "
+                f"layers this server quantizes online ({', '.join(online)}): "
+                "serve the published checkpoint as it is, or use another "
+                "timing provider."
+            )
 
     def assumptions(self) -> dict[str, Any]:
         """What the step times rest on, for the step log."""

@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    cpu_simulated_forward,
     fp8_w8a8_moe_quant_config,
     fp8_w8a16_moe_quant_config,
 )
@@ -546,6 +547,22 @@ def select_fp8_moe_backend(
         raise NotImplementedError(
             "No FP8 MoE backend supports the deployment configuration."
         )
+
+    if cpu_simulated_forward():
+        # No CPU kernel runs this scheme (per-tensor or per-channel FP8). A
+        # CPU simulation builds the experts on the meta device and never runs
+        # them: the Triton backend, which keeps the weights' layout, stands in.
+        backend = (
+            Fp8MoeBackend.BATCHED_TRITON
+            if activation_format == mk.FusedMoEActivationFormat.BatchedExperts
+            else Fp8MoeBackend.TRITON
+        )
+        logger.info_once(
+            "Simulated forward builds FP8 experts for the '%s' MoE backend "
+            "and never runs them.",
+            backend.value,
+        )
+        return backend, backend_to_kernel_cls(backend)[0]
 
     return Fp8MoeBackend.NONE, None
 

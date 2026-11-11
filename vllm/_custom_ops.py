@@ -3642,6 +3642,24 @@ class CPUQuantAlgo(IntEnum):
     GPTQ = 1
 
 
+if hasattr(torch.ops._C, "convert_weight_packed"):
+
+    @register_fake("_C::convert_weight_packed")
+    def convert_weight_packed_fake(weight: torch.Tensor) -> torch.Tensor:
+        # A 2D weight of fewer than TILE_N (16) rows is transposed to fp32;
+        # else each row is VNNI-packed in place, int8 rows gaining an int32.
+        if weight.ndim == 2 and weight.size(0) < 16:
+            return torch.empty(
+                (weight.size(1), weight.size(0)),
+                dtype=torch.float32,
+                device=weight.device,
+            )
+        sizes = list(weight.shape)
+        if weight.dtype == torch.int8:
+            sizes[-1] += 4
+        return torch.empty(sizes, dtype=weight.dtype, device=weight.device)
+
+
 if hasattr(torch.ops._C, "convert_weight_packed_scale_zp"):
 
     @register_fake("_C::convert_weight_packed_scale_zp")

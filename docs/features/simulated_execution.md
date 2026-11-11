@@ -99,7 +99,10 @@ the one timed. The published precision is read from the target's full
 config, a ModelOpt checkpoint's `hf_quant_config.json` included: block FP8
 and MXFP4 experts by a fixed mapping; NVFP4, per-tensor FP8,
 compressed-tensors and mixed per-layer precision as AISimulate itself reads
-the checkpoint; any other is refused. `quant_modes` overrides the published
+the checkpoint; any other is refused. Layers the server quantizes itself
+(`--quantization fp8` or an online `--quantization-config`) are not the
+published weights: the provider refuses such a server at startup rather than
+time it as the published model. `quant_modes` overrides the published
 precision, which
 records the target as modified. DeepSeek-V4 is timed with its packed FP8
 cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
@@ -617,15 +620,21 @@ its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
 Layers still pick the CPU platform's attention backends and kernels, so a
-model needing one it lacks (decode context parallelism, online FP8
-quantization with `--quantization fp8`) fails to build there.
+model needing one it lacks (decode context parallelism) fails to build there.
 Weight formats do not: a checkpoint published with quantized weights (FP8,
 MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
 DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, the `-NVFP4` checkpoints) builds
-as published: serve it by its name, with no edited copy of its config. A
-format the CPU has no kernel for is built and never run: its linear layers
-take vLLM's device-independent emulation kernel, NVFP4 experts the backend a
-GPU deployment tries first (or `--moe-backend`). Weight quantization changes neither the KV cache nor what a
+as published: serve it by its name, with no edited copy of its config. And
+`--quantization` (`fp8`, `fp8_per_tensor`, `fp8_per_block`,
+`fp8_per_channel`, `mxfp8`, `int8_per_channel_weight_only`) quantizes
+the layers as they load, as on a GPU: they load on the meta device, so the
+layers end with the deployment's weight dtypes and no data (not `mxfp4`,
+whose emulation kernel needs the `amd-quark` package, nor `nvfp4_per_token`
+on an MoE model, which vLLM takes on a Blackwell GPU only). A format the CPU
+has no kernel for is built and never run: its linear layers take vLLM's
+device-independent emulation kernel, NVFP4 experts the backend a GPU
+deployment tries first (or `--moe-backend`), per-tensor FP8 experts the
+Triton one. Weight quantization changes neither the KV cache nor what a
 transfer moves. A checkpoint that also declares a quantized KV cache takes
 that cache dtype, which the CPU platform's attention may refuse (MLA with
 `fp8_e4m3`): pass `--kv-cache-dtype` for the cache to serve. DSA sparse MLA

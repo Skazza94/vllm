@@ -2002,6 +2002,55 @@ def test_a_quantization_without_modes_is_refused(fake_aisimulate):
         provider(engine_config("nvidia/Qwen3-30B-A3B-Other"))
 
 
+def online_method(name):
+    """A stand-in for one of vLLM's online quantization methods."""
+    cls = type(name, (), {})
+    cls.__module__ = "vllm.model_executor.layers.quantization.online.fp8"
+    return cls()
+
+
+def checkpoint_method():
+    cls = type("Fp8LinearMethod", (), {})
+    cls.__module__ = "vllm.model_executor.layers.quantization.fp8"
+    return cls()
+
+
+def built_model(*methods):
+    import torch
+
+    model = torch.nn.Module()
+    for i, method in enumerate(methods):
+        layer = torch.nn.Module()
+        layer.quant_method = method
+        model.add_module(f"layer{i}", layer)
+    model.add_module("plain", torch.nn.Module())
+    return model
+
+
+def test_layers_quantized_online_are_not_timed_as_the_published_weights(
+    fake_aisimulate,
+):
+    """`--quantization fp8` on a BF16 checkpoint (or an online config beside
+    a quantized one) serves weights the published target does not have: the
+    provider refuses the built model, where it would time the published
+    precision under another deployment's name."""
+    p = provider(engine_config())
+    p.bind_model(built_model(checkpoint_method(), None))
+    online = built_model(
+        online_method("Fp8PerTensorOnlineLinearMethod"),
+        online_method("Fp8PerTensorOnlineMoEMethod"),
+        checkpoint_method(),
+    )
+    with pytest.raises(ValueError) as error:
+        p.bind_model(online)
+    message = str(error.value)
+    assert "published Qwen/Qwen3-30B-A3B (unquantized weights)" in message
+    assert (
+        "quantizes online (Fp8PerTensorOnlineLinearMethod, "
+        "Fp8PerTensorOnlineMoEMethod)" in message
+    )
+
+
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 @pytest.mark.parametrize(
     "target, gpu, tp, quant, modes",
