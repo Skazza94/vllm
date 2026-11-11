@@ -122,6 +122,13 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(flag(fp8, role, "--kv-cache-dtype"), "fp8")
             self.assertEqual(flag(fp8, role, "--dtype"), "auto")  # the weights' unchanged
 
+    def test_online_quantization_reaches_both_servers_when_asked(self) -> None:
+        self.assertNotIn("--quantization", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
+        fp8 = pd.Run(**{**RUN.__dict__, "server": pd.Server(quantization="fp8")})
+        for role in ("prefill", "decode"):
+            command = pd.server_command(fp8, role, ["10.100.0.1"])
+            self.assertEqual(command[command.index("--quantization") + 1], "fp8")
+
     def test_a_multimodal_model_serves_its_language_model_only_when_asked(self) -> None:
         self.assertNotIn("--language-model-only", pd.server_command(RUN, "prefill", ["10.100.0.1"]))
         text = pd.Run(**{**RUN.__dict__, "server": pd.Server(language_model_only=True)})

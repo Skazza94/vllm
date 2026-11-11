@@ -145,6 +145,9 @@ class Server:
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
     """The KV cache dtype (--kv-cache-dtype, e.g. fp8); auto: the model's."""
+    quantization: str | None = None
+    """Weights quantized as the model loads (--quantization, e.g. fp8); None:
+    as published."""
     language_model_only: bool = False
     """A multimodal model served as its language model (--language-model-only):
     no modality, the encoders not built."""
@@ -644,6 +647,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "env", *(f"{name}={value}" for name, value in env.items()),
         VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(port),
         "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
+        *(["--quantization", s.quantization] if s.quantization else []),
         *(["--block-size", str(s.block_size)] if s.block_size is not None else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
@@ -696,7 +700,9 @@ def execute(run: Run, output: Path | None = None) -> dict:
         stop_services(name)
         topology.exec_in(name, ["sh", "-c", f"rm -rf {WORK}/logs {WORK}/results {WORK}/steps*.jsonl "
                                             f"&& mkdir -p {WORK}/logs"])
-        topology.exec_in(name, ["mkdir", "-p", MODEL_DIRECTORY])
+        # Only this run's model: a file the previous run's had and this
+        # one's lacks (a quantization sidecar) would be read as its own.
+        topology.exec_in(name, ["sh", "-c", f"rm -rf {MODEL_DIRECTORY} && mkdir -p {MODEL_DIRECTORY}"])
         shell.run(["docker", "cp", f"{run.model}/.", f"{name}:{MODEL_DIRECTORY}"])
     front.prepare(container)
 
