@@ -1,0 +1,119 @@
+# Prefill pods: vllm-decaf as the KV producer. The router sends each request's
+# prompt pass here; decode pulls the resulting KV cache over NIXL.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decaf-prefill
+  labels:
+    app: llm-d-pd
+    llm-d.ai/role: prefill
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llm-d-pd
+      llm-d.ai/role: prefill
+  template:
+    metadata:
+      labels:
+        app: llm-d-pd
+        llm-d.ai/role: prefill
+    spec:
+      containers:
+      - name: vllm-prefill
+        # vllm-decaf's CPU image with the AISimulate layer (docker/Dockerfile.cpu,
+        # docker/Dockerfile.aisim): build it and make it available to the cluster.
+        image: vllm:cpu-aisim
+        imagePullPolicy: IfNotPresent
+        # The image's entrypoint is `vllm serve`. The model is named as on a
+        # GPU: only its configuration and tokenizer are downloaded.
+        args:
+        - Qwen/Qwen3-8B
+        - --host=0.0.0.0
+        - --port=8000
+        # No GPU: the forward pass is simulated, each step priced by
+        # AISimulate for the published model on an H100. KV caches are real
+        # CPU buffers, moved between pods by vLLM's NIXL connector.
+        - --simulate-forward
+        - --simulation-config
+        - '{"clock": "real", "timing": "aisimulate", "timing_args": {"gpu": "h100"}, "kv_transfer_mode": "real"}'
+        - --kv-transfer-config
+        - '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"]}}'
+        # The modeled deployment's KV budget and limits.
+        - --kv-cache-memory-bytes=2147483648
+        - --block-size=16
+        - --max-model-len=4096
+        - --max-num-batched-tokens=2048
+        - --max-num-seqs=32
+        - --generation-config=vllm
+        - --enforce-eager
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        # vLLM's CPU kernels; a simulation never runs them, but layers pick them at build.
+        - name: TRITON_CPU_BACKEND
+          value: "1"
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        # vLLM's 5 s default closes idle connections the router reuses.
+        - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+          value: "120"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # KV transfers on the pod's address: NIXL's side channel and its
+        # Mooncake backend (TENT's TCP transport, hp_tcp).
+        - name: VLLM_HOST_IP
+          value: "$(POD_IP)"
+        - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+          value: "$(POD_IP)"
+        - name: NIXL_MOONCAKE_IP_ADDR
+          value: "$(POD_IP)"
+        - name: MC_USE_TENT
+          value: "1"
+        - name: MC_TENT_CONF
+          value: >-
+            {"rpc_server_hostname":"$(POD_IP)","transports":{"tcp":{"enable":false},"rdma":{"enable":false},"shm":{"enable":false},"gds":{"enable":false},"ascend_direct":{"enable":false},"hp_tcp":{"enable":true,"bind_address":"$(POD_IP)","advertise_address":"$(POD_IP)","rail_addresses":["$(POD_IP)"]}}}
+        # A gated model's configuration needs a token:
+        # - name: HF_TOKEN
+        #   valueFrom: {secretKeyRef: {name: hf-token, key: HF_TOKEN}}
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 60
+          periodSeconds: 5
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          limits:
+            memory: 12Gi
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi

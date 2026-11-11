@@ -12,6 +12,7 @@
   <a href="#timing-models">Timing models</a> ·
   <a href="#first-brew">First brew</a> ·
   <a href="#testing-locally">Testing locally</a> ·
+  <a href="#deploy-on-llm-d">Deploy on llm-d</a> ·
   <a href="#limitations">Limitations</a>
 </p>
 
@@ -258,6 +259,19 @@ evidence again without starting anything.
 
 Use byte checking for correctness runs and turn it off for performance runs:
 writing and comparing patterns costs CPU time and memory bandwidth.
+
+## Deploy on llm-d
+
+vllm-decaf drops into a Kubernetes [llm-d](https://llm-d.ai) deployment as
+its prefill and decode servers, with no GPU. llm-d's router and its
+disaggregation sidecar run unmodified: the picker reads the servers' real
+vLLM metrics, and decode pulls each request's KV cache from the prefill pod
+over the pod network.
+
+[`deploy/llm-d/`](deploy/llm-d/) has the two manifests, a prefill Deployment
+and a decode Deployment with llm-d's sidecar, and its
+[README](deploy/llm-d/README.md) walks through installing them next to
+llm-d's router.
 
 ## Limitations
 
