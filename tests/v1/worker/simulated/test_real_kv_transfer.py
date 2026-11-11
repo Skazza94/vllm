@@ -743,6 +743,108 @@ def test_non_gated_cpu_experts_build_only_in_a_simulation(
         )
 
 
+def simulated_build(directory, **kwargs):
+    """A simulated engine of the model in `directory`: what its layers were
+    built as, and its KV cache specs, after generating two tokens."""
+    from vllm import LLM, SamplingParams
+
+    def describe(model):
+        return sorted(
+            {
+                (
+                    type(module.quant_method).__name__,
+                    type(getattr(module.quant_method, "kernel", None)).__name__,
+                    getattr(
+                        getattr(module.quant_method, "nvfp4_backend", None),
+                        "value",
+                        None,
+                    ),
+                    *sorted(
+                        {
+                            (name, str(tensor.dtype), tensor.device.type)
+                            for name, tensor in module.named_parameters(recurse=False)
+                            if name in ("weight", "w13_weight")
+                        }
+                    ),
+                )
+                for module in model.modules()
+                if getattr(module, "quant_method", None) is not None
+            }
+        )
+
+    llm = LLM(
+        model=str(directory), skip_tokenizer_init=True, dtype="bfloat16",
+        max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
+        max_num_batched_tokens=64, enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={"simulate_forward": True, "timing": "linear",
+                           "timing_args": {"fixed_us": 100}},
+        **kwargs,
+    )
+    try:
+        (out,) = llm.generate(
+            [{"prompt_token_ids": [5] * 100}],
+            SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
+        )
+        assert len(out.outputs[0].token_ids) == 2
+        engine = llm.llm_engine.engine_core.engine_core
+        runner = engine.model_executor.driver_worker.worker.model_runner
+        specs = sorted(
+            (name, str(spec.dtype), spec.page_size_bytes)
+            for name, spec in runner.get_kv_cache_spec().items()
+        )
+        (built,) = llm.apply_model(describe)
+        return built, specs, str(llm.llm_engine.vllm_config.model_config.dtype)
+    finally:
+        del llm
+
+
+def test_nvfp4_checkpoints_build_on_cpu_in_a_simulation_only(
+    model_dir, moe_model_dir, tmp_path, monkeypatch
+):
+    """NVFP4 has no CPU kernel. A simulation builds a ModelOpt NVFP4
+    checkpoint as deployed and never runs it: its linear layers hold packed
+    FP4 weights (the device-independent emulation kernel standing in), its
+    experts those of the backend a GPU deployment tries first. Its KV cache
+    is the unquantized model's: weight quantization does not change what a
+    transfer moves. Outside a simulation the CPU platform refuses it."""
+    from vllm import LLM
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # The MoE model first: an in-process engine keeps the first one's
+    # parallel groups, and a dense model's have no expert-parallel group.
+    for name, source in (("moe", moe_model_dir), ("dense", model_dir)):
+        config = json.loads(Path(source, "config.json").read_text())
+        quantized = tmp_path / f"{name}-nvfp4"
+        quantized.mkdir()
+        (quantized / "config.json").write_text(json.dumps({
+            **config,
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        }))
+        built, specs, dtype = simulated_build(quantized)
+        _, plain_specs, plain_dtype = simulated_build(source)
+        assert (specs, dtype) == (plain_specs, plain_dtype)
+        linear = [b for b in built if b[0] == "ModelOptLinearMethod"]
+        assert linear and {b[1] for b in linear} == {"EmulationNvFp4LinearKernel"}
+        assert {b[3] for b in linear} == {("weight", "torch.uint8", "meta")}
+        experts = [b for b in built if b[0] == "ModelOptNvFp4FusedMoE"]
+        if name == "moe":
+            assert [(b[2], b[3]) for b in experts] == [
+                ("FLASHINFER_TRTLLM", ("w13_weight", "torch.uint8", "meta"))
+            ]
+        else:
+            assert not experts
+        with pytest.raises(
+            (ValueError, NotImplementedError),
+            match="NVFP4 linear layer|NvFp4 MoE backend",
+        ):
+            LLM(model=str(quantized), skip_tokenizer_init=True, dtype="bfloat16",
+                max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
+                enable_prefix_caching=False, enforce_eager=True,
+                load_format="dummy")
+
+
 def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     """V4's groups move over NIXL, which keeps each group's own blocks;
     Mooncake cannot pair its block sizes. Tensor parallelism or data-parallel

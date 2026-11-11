@@ -71,6 +71,17 @@ BUNDLED = {
     "deepseek-ai/DeepSeek-V3": DEEPSEEK_V3,
     "openai/gpt-oss-20b": GPT_OSS,
     "nvidia/Nemotron-H-Test": NEMOTRON_H,
+    # ModelOpt checkpoints: their quantization is in a sidecar only.
+    "nvidia/Qwen3-30B-A3B-NVFP4": QWEN3_MOE,
+    "nvidia/Qwen3-30B-A3B-FP8": QWEN3_MOE,
+    "nvidia/Qwen3-30B-A3B-Mixed": QWEN3_MOE,
+    "nvidia/Qwen3-30B-A3B-Other": QWEN3_MOE,
+}
+SIDECARS = {
+    "nvidia/Qwen3-30B-A3B-NVFP4": {"quantization": {"quant_algo": "NVFP4"}},
+    "nvidia/Qwen3-30B-A3B-FP8": {"quantization": {"quant_algo": "FP8"}},
+    "nvidia/Qwen3-30B-A3B-Mixed": {"quantization": {"quant_algo": "MIXED_PRECISION"}},
+    "nvidia/Qwen3-30B-A3B-Other": {"quantization": {"quant_algo": "W4A8_AWQ"}},
 }
 
 
@@ -119,7 +130,47 @@ def infer_quantization(raw):
         return {"quant_algo": "fp8_block", "quant_dynamic": True}
     if quant.get("quant_method") == "mxfp4":
         return {"quant_algo": "mxfp4"}
+    # A ModelOpt checkpoint's sidecar, which only the full config holds.
+    sidecar = (raw.get("hf_quant_config") or {}).get("quantization") or {}
+    if sidecar.get("quant_algo"):
+        return {"quant_algo": sidecar["quant_algo"].lower()}
     return {}
+
+
+def load_full_config(bundle):
+    """Stands in for AISimulate's loader: a bundled or snapshot config with
+    its quantization sidecar, as `hf_quant_config` and `quant_algo`."""
+
+    def load(model):
+        if os.path.isdir(model):
+            config, sidecar = (
+                os.path.join(model, "config.json"),
+                os.path.join(model, "hf_quant_config.json"),
+            )
+        else:
+            stem = os.path.join(bundle, model.replace("/", "--"))
+            config, sidecar = f"{stem}_config.json", f"{stem}_hf_quant_config.json"
+        with open(config) as f:
+            raw = json.load(f)
+        if os.path.isfile(sidecar):
+            with open(sidecar) as f:
+                raw["hf_quant_config"] = json.load(f)
+        raw.update(infer_quantization(raw))
+        return raw
+
+    return load
+
+
+def infer_quant_modes(raw):
+    """Stands in for AISimulate's reading of a full config's modes."""
+    algo = raw.get("quant_algo")
+    if algo == "nvfp4":
+        return {"gemm_quant_mode": "nvfp4", "moe_quant_mode": "nvfp4"}
+    if algo == "fp8":
+        return {"gemm_quant_mode": "fp8_static", "moe_quant_mode": "fp8"}
+    if algo == "mixed_precision":
+        return {"gemm_quant_mode": "fp8_block", "moe_quant_mode": "nvfp4"}
+    raise ValueError(f"Unsupported quant algorithm: {algo}")
 
 
 @pytest.fixture
@@ -138,6 +189,10 @@ def fake_aisimulate(tmp_path, monkeypatch):
     sdk.RustForwardPassPerfModel = FakeModel
     utils = types.ModuleType("aisimulate_core.sdk.utils")
     utils._infer_quantization_fields = infer_quantization
+    utils._load_model_config_from_model_path = load_full_config(str(configs))
+    models = types.ModuleType("aisimulate_core.sdk.models")
+    helpers = types.ModuleType("aisimulate_core.sdk.models.helpers")
+    helpers._infer_quant_modes_from_raw_config = infer_quant_modes
     # Every bundled config here is one the package lists as pre-downloaded.
     common = types.ModuleType("aisimulate_core.sdk.common")
     common.DefaultHFModels = set(BUNDLED)
@@ -146,8 +201,14 @@ def fake_aisimulate(tmp_path, monkeypatch):
         ("aisimulate_core.sdk", sdk),
         ("aisimulate_core.sdk.utils", utils),
         ("aisimulate_core.sdk.common", common),
+        ("aisimulate_core.sdk.models", models),
+        ("aisimulate_core.sdk.models.helpers", helpers),
     ):
         monkeypatch.setitem(sys.modules, name, module)
+    for name, sidecar in SIDECARS.items():
+        (configs / f"{name.replace('/', '--')}_hf_quant_config.json").write_text(
+            json.dumps(sidecar)
+        )
     FakeModel.instances = []
     monkeypatch.setattr(FakeModel, "readiness", "ready")
     monkeypatch.setattr(FakeModel, "source", "aic")
@@ -1909,3 +1970,64 @@ def test_deepseek_v4_mtp_does_not_run_on_cpu_outside_simulation():
 
     with pytest.raises(NotImplementedError, match="not implemented on CPU"):
         DeepSeekV4MTP(vllm_config=VllmConfig())
+
+
+@pytest.mark.parametrize(
+    "target, quant, modes",
+    [
+        ("nvidia/Qwen3-30B-A3B-NVFP4", "nvfp4", ("nvfp4", "nvfp4")),
+        ("nvidia/Qwen3-30B-A3B-FP8", "fp8", ("fp8_static", "fp8")),
+        ("nvidia/Qwen3-30B-A3B-Mixed", "mixed_precision", ("fp8_block", "nvfp4")),
+    ],
+)
+def test_a_sidecar_only_quantization_is_read_and_timed_as_the_checkpoints(
+    fake_aisimulate, target, quant, modes
+):
+    """A ModelOpt checkpoint may declare its quantization in
+    `hf_quant_config.json` only: it is read from the full config (never as
+    unquantized, timed BF16) and its modes are AISimulate's own reading;
+    attention stays BF16 and the KV mode the engine's cache dtype."""
+    p = provider(engine_config(target), gpu="b200")
+    config = fake_aisimulate.instances[0].config.kwargs
+    assert (config["gemm_quant_mode"], config["moe_quant_mode"]) == modes
+    assert config["fmha_quant_mode"] == "bfloat16"
+    assert config["kvcache_quant_mode"] == "bfloat16"
+    record = p.assumptions()["aisimulate"]
+    assert record["target_quantization"] == quant
+    assert f"({quant} weights)" in record["deployment"]
+
+
+def test_a_quantization_without_modes_is_refused(fake_aisimulate):
+    with pytest.raises(ValueError, match="does not map .*'w4a8_awq'"):
+        provider(engine_config("nvidia/Qwen3-30B-A3B-Other"))
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, gpu, tp, quant, modes",
+    [
+        ("nvidia/MiniMax-M2.5-NVFP4", "b200", 4, "nvfp4", ("nvfp4", "nvfp4")),
+        ("nvidia/Qwen3-235B-A22B-NVFP4", "b200", 8, "nvfp4", ("nvfp4", "nvfp4")),
+        # Quantization in the sidecar only: read as unquantized before.
+        ("nvidia/Llama-3.1-70B-Instruct-FP8", "h200", 4, "fp8", ("fp8_static", "fp8")),
+    ],
+)
+def test_modelopt_checkpoints_are_timed_with_their_own_precision(
+    tmp_path, target, gpu, tp, quant, modes
+):
+    """ModelOpt NVFP4 and per-tensor FP8 checkpoints, timed as published:
+    AISimulate's own reading of the full config, op-level estimates."""
+    raw = bundled_config(target)
+    p = provider(
+        real_engine_config(
+            tmp_path, target.replace("/", "--"), raw, tensor_parallel_size=tp
+        ),
+        gpu=gpu,
+    )
+    a = p.assumptions()["aisimulate"]
+    assert a["target_quantization"] == quant
+    assert (a["config"]["gemm_quant_mode"], a["config"]["moe_quant_mode"]) == modes
+    assert a["config"]["fmha_quant_mode"] == "bfloat16"
+    assert a["resolved_config"]["estimation_mode"] == "op_level"
+    step = sim_step(0, sim_req("a", 1024, 0, 1024), sim_req("b", 1, 512, 512))
+    assert p.estimate(step).device_s > 0

@@ -647,6 +647,21 @@ _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel | MMLinearKernel)
 _KernelConfigT = TypeVar("_KernelConfigT", bound=MMLinearLayerConfig)
 
 
+def _kernel_platform(
+    possible: dict[PlatformEnum, list[type[_KernelT]]],
+) -> PlatformEnum:
+    """The platform whose kernels of a format are tried: the current one. A
+    CPU simulation of a format without a CPU kernel builds the layer on the
+    meta device and never runs it, so it takes the CUDA platform's kernels, of
+    which the device-independent emulation one is supported here."""
+    if PlatformEnum.CPU not in possible and current_platform.is_cpu():
+        from vllm.model_executor.layers.fused_moe.config import cpu_simulated_forward
+
+        if cpu_simulated_forward():
+            return PlatformEnum.CUDA
+    return current_platform._enum
+
+
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
@@ -965,12 +980,12 @@ def init_mxfp8_linear_kernel(
         bmm_batch_size=bmm_batch_size,
     )
 
-    platform = current_platform._enum
+    platform = _kernel_platform(_POSSIBLE_MXFP8_KERNELS)
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
         possible = (
             [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
-            if current_platform.is_cuda()
+            if platform == PlatformEnum.CUDA
             else []
         )
     else:
@@ -1053,7 +1068,7 @@ def init_mxfp4_linear_kernel(
         activation_quant_key=activation_quant_key,
     )
 
-    platform = current_platform._enum
+    platform = _kernel_platform(_POSSIBLE_MXFP4_KERNELS)
     possible = list(_POSSIBLE_MXFP4_KERNELS.get(platform, []))
 
     # Apply --linear-backend filtering when set.
@@ -1110,7 +1125,7 @@ def init_mxfp6_linear_kernel(
 
     linear_backend = _get_linear_backend(quantization="mxfp6")
 
-    platform = current_platform._enum
+    platform = _kernel_platform(_POSSIBLE_MXFP6_KERNELS)
     possible = list(_POSSIBLE_MXFP6_KERNELS.get(platform, []))
 
     # Apply --linear-backend filtering when set.
@@ -1203,6 +1218,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     # batch-invariant CUTLASS implementation when available, otherwise fall
     # back to emulation. It overrides --linear-backend.
     force_kernel: type[NvFp4LinearKernel] | None = None
+    platform = _kernel_platform(_POSSIBLE_NVFP4_KERNELS)
+    # A CPU simulation never runs the kernel: the emulation one stands in for
+    # a weight-only (W4A16) layer's too.
+    simulated = platform != current_platform._enum
     quantization = "nvfp4_w4a16" if use_a16 else "nvfp4_w4a4"
     linear_backend = _get_linear_backend(quantization=quantization)
     if envs.VLLM_BATCH_INVARIANT:
@@ -1234,7 +1253,7 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                 reason,
             )
             force_kernel = EmulationNvFp4LinearKernel
-    elif linear_backend == "auto" and use_a16:
+    elif linear_backend == "auto" and use_a16 and not simulated:
         _cc = current_platform.get_device_capability()
         compute_capability = _cc.to_int() if _cc is not None else None
         # Weight-only: prefer FlashInfer CuTe-DSL W4A16 on SM100/103,
@@ -1260,9 +1279,8 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         return force_kernel(config)
 
     # Auto-select from registry (or --linear-backend filtered).
-    platform = current_platform._enum
     possible = list(_POSSIBLE_NVFP4_KERNELS.get(platform, []))
-    if use_a16:
+    if use_a16 and not simulated:
         possible = [kernel for kernel in possible if kernel in a16_kernels]
 
     # Apply --linear-backend filtering when set.

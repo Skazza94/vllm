@@ -95,7 +95,12 @@ model's published weight precision. The model's own Hugging Face id or a
 directory with `DERIVED.md`) must name it explicitly. The local model only
 holds the KV cache and serves the scheduler, so its KV and state geometry
 must match the target's bundled config, and the local KV cache precision is
-the one timed. `quant_modes` overrides the published precision, which
+the one timed. The published precision is read from the target's full
+config, a ModelOpt checkpoint's `hf_quant_config.json` included: block FP8
+and MXFP4 experts by a fixed mapping; NVFP4, per-tensor FP8,
+compressed-tensors and mixed per-layer precision as AISimulate itself reads
+the checkpoint; any other is refused. `quant_modes` overrides the published
+precision, which
 records the target as modified. DeepSeek-V4 is timed with its packed FP8
 cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
 and its FP4 experts. A bundled config AISimulate would misread is given to
@@ -612,11 +617,18 @@ its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
 Layers still pick the CPU platform's attention backends and kernels, so a
-model needing one it lacks (decode context parallelism, NVFP4 weights,
-online FP8 quantization with `--quantization fp8`) fails to build there.
-A checkpoint published with FP8 or MXFP4 weights (DeepSeek-V3's,
-DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's) builds as published: serve it
-by its name, with no edited copy of its config. DSA sparse MLA
+model needing one it lacks (decode context parallelism, online FP8
+quantization with `--quantization fp8`) fails to build there.
+Weight formats do not: a checkpoint published with quantized weights (FP8,
+MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
+DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, the `-NVFP4` checkpoints) builds
+as published: serve it by its name, with no edited copy of its config. A
+format the CPU has no kernel for is built and never run: its linear layers
+take vLLM's device-independent emulation kernel, NVFP4 experts the backend a
+GPU deployment tries first (or `--moe-backend`). Weight quantization changes neither the KV cache nor what a
+transfer moves. A checkpoint that also declares a quantized KV cache takes
+that cache dtype, which the CPU platform's attention may refuse (MLA with
+`fp8_e4m3`): pass `--kv-cache-dtype` for the cache to serve. DSA sparse MLA
 (DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
 deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
 

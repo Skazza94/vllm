@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    cpu_simulated_forward,
     nvfp4_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
@@ -262,6 +263,13 @@ def select_nvfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
+        if simulated:
+            logger.info_once(
+                "Simulated forward builds NvFp4 experts for the '%s' MoE backend "
+                "and never runs them.",
+                backend.value,
+            )
+            return backend, backend_to_kernel_cls(backend)[0]
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
@@ -271,6 +279,11 @@ def select_nvfp4_moe_backend(
                 return backend, k_cls
 
         raise ValueError(_make_log_unsupported(backend, reason))
+
+    # NvFP4 has no CPU kernel. A CPU simulation builds the experts on the meta
+    # device and never runs them, so it takes the backend a GPU deployment
+    # tries first (or the one requested) without asking for a kernel.
+    simulated = cpu_simulated_forward()
 
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
@@ -298,6 +311,11 @@ def select_nvfp4_moe_backend(
             )
         return _return_or_raise(
             requested_backend, config, weight_key, activation_key, activation_format
+        )
+
+    if simulated:
+        return _return_or_raise(
+            AVAILABLE_BACKENDS[0], config, weight_key, activation_key, activation_format
         )
 
     # Select kernels in order of backend.

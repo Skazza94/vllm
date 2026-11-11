@@ -65,6 +65,8 @@ QUANT_MODES: dict[str | None, dict[str, str]] = {
         "fmha_quant_mode": "bfloat16",
     },
 }
+# Quantizations whose modes are the checkpoint's own (`_inferred_modes`).
+INFERRED_QUANT_ALGOS = ("compressed-tensors", "nvfp4", "mixed_precision", "fp8")
 QUANT_MODE_FIELDS = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -320,15 +322,23 @@ def _offline_model(
     return snapshot.name, snapshot
 
 
-def _compressed_tensors_modes(target: str) -> dict[str, str]:
-    """A compressed-tensors checkpoint's GEMM and expert modes as AISimulate
-    infers them from its full config (BF16 where a layer kind is ignored)."""
-    from aisimulate_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+def _full_config(target: str) -> dict[str, Any]:
+    """The target's config as AISimulate loads it: with its quantization
+    sidecar (`hf_quant_config.json`), where a ModelOpt checkpoint keeps what
+    its `config.json` may not say."""
     from aisimulate_core.sdk.utils import _load_model_config_from_model_path
 
-    inferred = _infer_quant_modes_from_raw_config(
-        _load_model_config_from_model_path(target)
-    )
+    return _load_model_config_from_model_path(target)
+
+
+def _inferred_modes(target: str) -> dict[str, str]:
+    """A checkpoint's GEMM and expert modes as AISimulate infers them from its
+    full config (BF16 where a layer kind is left unquantized): a
+    compressed-tensors one's groups and ignore list, a ModelOpt one's NVFP4,
+    per-tensor FP8 or mixed per-layer precision."""
+    from aisimulate_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+
+    inferred = _infer_quant_modes_from_raw_config(_full_config(target))
 
     def name(key: str) -> str:
         value = inferred.get(key)
@@ -539,16 +549,19 @@ class AisimulateTimingProvider:
         )
         model, self._snapshot = _offline_model(target, bundled, timing_input)
         v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
-        quant = _infer_quantization_fields(target_config).get("quant_algo")
+        # The quantization of the full config: a ModelOpt checkpoint may
+        # declare it in its sidecar only, and would read as unquantized.
+        quant = _infer_quantization_fields(_full_config(model)).get("quant_algo")
         # V4's experts follow the raw config's `expert_dtype` (AISimulate's own
         # V4 override): FP4 experts with FP8 activations.
         expert_dtype = target_config.get("expert_dtype") if v4 else None
         modes = QUANT_MODES.get(quant) if not v4 else None
-        if quant == "compressed-tensors":
-            # Mixed per-layer precision (Kimi-K2.5's int4 experts beside BF16
-            # GEMMs): AISimulate's own reading of the checkpoint's groups and
-            # ignore list, sidecars included; attention BF16 as elsewhere.
-            modes = _compressed_tensors_modes(model)
+        if quant in INFERRED_QUANT_ALGOS:
+            # Per-checkpoint precision (Kimi-K2.5's int4 experts beside BF16
+            # GEMMs, a ModelOpt checkpoint's NVFP4 or FP8 layers): AISimulate's
+            # own reading of the checkpoint's groups, layers and ignore list,
+            # sidecars included; attention BF16 as elsewhere.
+            modes = _inferred_modes(model)
         if v4 and (quant, expert_dtype) == ("fp8_block", "fp4"):
             modes = {
                 "gemm_quant_mode": "fp8_block",
