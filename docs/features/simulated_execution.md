@@ -127,9 +127,11 @@ also times one prefill and one decode step: a target AISimulate lacks data
 for at those shapes fails before serving,
 but a later batch of another shape can still lack data and fail then.
 
-Supported layouts are pure tensor parallelism within one node (TP 1, 2, 4
+Supported layouts are tensor parallelism within one node (TP 1, 2, 4
 or 8) and an MoE model's local data-parallel attention with expert
-parallelism (TP 1, up to 8 ranks, all on one host: launched by one server,
+parallelism (each rank of TP 1, 2 or 4, timed as vLLM lays it out: attention
+on a rank's GPUs, the experts over all of them; up to 8 GPUs, all on one
+host: launched by one server,
 or a server each by a multi-port supervisor,
 `--data-parallel-multi-port-external-lb`; ranks on other hosts are
 rejected). Pipeline and context parallelism and EPLB are rejected, and so are models or layouts AISimulate has no timing
@@ -462,9 +464,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   keys and scales (132 bytes a token), pages of two sizes in one group, each
   layer its own region; the pattern checks cover each layer's page.
 * DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
-  with tensor parallelism or with data-parallel attention and expert
-  parallelism (not both: the simulator's AISimulate timing provider does not
-  time TP inside DP), each TP rank holding and moving the whole caches,
+  with tensor parallelism, alone or inside data-parallel attention with
+  expert parallelism, each TP rank holding and moving the whole caches,
   with prefix caching or without, its cache the packed FP8 one (`fp8_ds_mla`): its
   sliding windows, compressed latents, indexer keys and compressor states
   are KV cache groups packed into one allocation, each block all of one
@@ -508,7 +509,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
       Mooncake's proxy, else prefill's load balancer) names itself in its
       transfer parameters (NIXL: its engine id and side-channel port), and
       decode's load balancer picks its own, so the instances' DP sizes may
-      differ. With `--data-parallel-multi-port-external-lb` each rank has an
+      differ. A DP rank may be tensor-parallel itself (equal TP sizes on
+      both instances): each of its TP ranks moves its own KV, as above. With `--data-parallel-multi-port-external-lb` each rank has an
       API server of its own (the port plus its rank) and an external router
       picks the rank on both instances; this needs NIXL, as
       `MooncakeConnector`'s bootstrap server is one an instance.

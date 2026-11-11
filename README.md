@@ -86,8 +86,8 @@ next scheduling decisions.
   or delta-net states.
 - **Parallelism as deployed.** Tensor parallelism (different sizes on prefill
   and decode included), an MoE model's data-parallel attention with expert
-  parallelism (one server, or one per rank for an external router), and
-  native MTP speculative decoding.
+  parallelism (one server, or one per rank for an external router; tensor
+  parallelism inside each rank included), and native MTP speculative decoding.
 - **Router-ready.** vLLM's metrics and KV events come from the real engine,
   so load-aware and prefix-aware routers see what they would see in
   production. The harness in this repository runs unmodified
@@ -167,11 +167,11 @@ AISimulate has no data for is refused at startup instead of being guessed.
 | | Supported |
 | :--- | :--- |
 | **Model families** | Llama, Qwen2/2.5, Qwen3 (dense and MoE), Qwen3-VL (text), Qwen3.5 (dense and MoE), Mixtral, gpt-oss, Gemma4, MiniMax-M2, MiMo-V2-Flash, Llama-3.3-Nemotron-Super, Nemotron-H and Nemotron-3, DeepSeek-V3, DeepSeek-V3.2, DeepSeek-V4, GLM-5, Kimi-K2/K2.5, Kimi-K3 |
-| **Layouts** | Tensor parallelism (1, 2, 4 or 8) on one node; for MoE models, data-parallel attention with expert parallelism (up to 8 ranks on one host) |
+| **Layouts** | Tensor parallelism (1, 2, 4 or 8) on one node; for MoE models, data-parallel attention with expert parallelism, each rank on one GPU or tensor-parallel itself (up to 8 GPUs on one host) |
 | **Speculative decoding** | The native single-module MTP of DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 (1 to 5 tokens) |
 
 Anything else is refused at startup: pipeline and context parallelism, EPLB,
-tensor parallelism combined with data parallelism, and a single instance
+data parallelism of a dense model, and a single instance
 whose ranks are spread over several hosts (wide expert parallelism across
 nodes). Wide EP on one host is the supported data-parallel layout above, and
 separate instances, such as prefill and decode, can sit on different hosts.

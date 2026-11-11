@@ -909,8 +909,8 @@ def test_weight_packing_on_meta_gives_the_cpu_kernels_shape(shape, dtype):
 
 def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     """V4's groups move over NIXL, which keeps each group's own blocks;
-    Mooncake cannot pair its block sizes. Tensor parallelism or data-parallel
-    attention with expert parallelism (not both), with prefix caching or
+    Mooncake cannot pair its block sizes. Tensor parallelism, alone or inside
+    data-parallel attention with expert parallelism, with prefix caching or
     without, the packed FP8 cache."""
     v4 = {
         "dtype": "bfloat16",
@@ -925,6 +925,7 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
             {"tensor_parallel_size": 2},
             {"tensor_parallel_size": 4},
             dp_ep,
+            {**dp_ep, "tensor_parallel_size": 2},
             {"enable_prefix_caching": True},
         ):
             config = engine_config(
@@ -933,7 +934,6 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
             assert config.model_config.hf_config.model_type == "deepseek_v4"
     for kwargs, message in (
         ({"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "NixlConnector for DeepSeek-V4"),
-        ({**dp_ep, "tensor_parallel_size": 2}, "DeepSeek-V4 with tensor parallelism or"),
         ({"data_parallel_size": 2}, "MoE model's data-parallel attention"),
         ({"pipeline_parallel_size": 2}, "tensor parallelism and data-parallel attention at most"),
         ({"kv_cache_dtype": "bfloat16"}, "packed FP8 cache"),

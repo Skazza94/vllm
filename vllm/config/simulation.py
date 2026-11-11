@@ -433,13 +433,7 @@ class SimulationConfig:
                     f"NixlConnector for DeepSeek-V4, not {kv_transfer.kv_connector}"
                 )
             # Its caches are one replicated shard: each TP rank moves them
-            # whole. TP inside DP is left out: the aisimulate timing provider
-            # does not time it.
-            if sizes["TP"] > 1 and sizes["DP"] > 1:
-                problems.append(
-                    "DeepSeek-V4 with tensor parallelism or data-parallel "
-                    f"attention, not both (TP={sizes['TP']}, DP={sizes['DP']})"
-                )
+            # whole, inside a DP rank too.
             if cache.cache_dtype not in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla"):
                 problems.append(
                     f"DeepSeek-V4's packed FP8 cache, not {cache.cache_dtype}"

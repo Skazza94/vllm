@@ -44,9 +44,10 @@ GPU_SYSTEMS = {
     "h200": "h200_sxm",
     "b200": "b200_sxm",
 }
-# Tensor-parallel sizes of one modeled NVLink domain.
+# Tensor-parallel sizes of one modeled NVLink domain, and its GPUs: the
+# data-parallel ranks times each one's tensor-parallel size.
 TENSOR_PARALLEL_SIZES = (1, 2, 4, 8)
-MAX_LOCAL_DATA_PARALLEL = 8
+MAX_LOCAL_GPUS = 8
 # A published checkpoint's quantization (AISimulate's own inference from its
 # config) as the estimator's modes. Attention runs in BF16 in each.
 QUANT_MODES: dict[str | None, dict[str, str]] = {
@@ -498,12 +499,13 @@ class AisimulateTimingProvider:
     measured kernels; no analytical fallback) for the published deployment
     `target_model` on `gpu`. Host time is `host_us` per step.
 
-    Supported: pure tensor parallelism within one node (TP 1, 2, 4 or 8), or
+    Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), or
     an MoE model's local data-parallel attention with expert parallelism
-    (TP 1, 2 to 8 local DP ranks). Anything else is refused, as are pipeline
-    and context parallelism, EPLB and speculative decoding other than
-    DeepSeek-V3's or DeepSeek-V4's native single-module MTP. A multimodal
-    model is timed as its language model, served without multimodal inputs."""
+    (each rank tensor-parallel or not, up to 8 GPUs). Anything else is
+    refused, as are pipeline and context parallelism, EPLB and speculative
+    decoding other than DeepSeek-V3's or DeepSeek-V4's native single-module
+    MTP. A multimodal model is timed as its language model, served without
+    multimodal inputs."""
 
     def __init__(
         self,
@@ -797,8 +799,6 @@ class AisimulateTimingProvider:
                 problems.append(
                     "data parallelism without an MoE model's expert parallelism"
                 )
-            if tp > 1:
-                problems.append("tensor parallelism inside data parallelism")
             # All on this host, whether one server launched them or a
             # multi-port supervisor a server for each (`host_dp_ranks`).
             from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
@@ -806,10 +806,10 @@ class AisimulateTimingProvider:
             )
 
             local = host_dp_ranks(pc)[1]
-            if local != dp or dp > MAX_LOCAL_DATA_PARALLEL:
+            if local != dp or tp * dp > MAX_LOCAL_GPUS:
                 problems.append(
-                    f"{dp} data-parallel ranks ({local} local; "
-                    f"up to {MAX_LOCAL_DATA_PARALLEL}, all local)"
+                    f"{dp} data-parallel ranks of tensor parallelism {tp} "
+                    f"({local} local; up to {MAX_LOCAL_GPUS} GPUs, all local)"
                 )
         elif ep:
             problems.append("expert parallelism without data parallelism")
@@ -817,17 +817,18 @@ class AisimulateTimingProvider:
             problems.append(f"tensor parallelism {tp} (not {TENSOR_PARALLEL_SIZES})")
         if problems:
             raise ValueError(
-                "The aisimulate timing provider models pure tensor parallelism "
-                "or an MoE model's local data-parallel attention with expert "
-                f"parallelism, not {', '.join(problems)}."
+                "The aisimulate timing provider models tensor parallelism, alone "
+                "or inside an MoE model's local data-parallel attention with "
+                f"expert parallelism, not {', '.join(problems)}."
             )
         if dp > 1:
+            # As vLLM lays the experts out: over every GPU of every rank.
             return {
-                "tp": 1,
+                "tp": tp,
                 "pp": 1,
                 "attention_dp": dp,
                 "moe_tp_size": 1,
-                "moe_ep_size": dp,
+                "moe_ep_size": tp * dp,
             }
         if moe:
             return {

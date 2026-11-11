@@ -456,11 +456,11 @@ def test_an_unmapped_kv_cache_dtype_is_refused(fake_aisimulate):
         ({"data_parallel_size": 2}, "without an MoE model's expert parallelism"),
         (
             {
-                "data_parallel_size": 2,
+                "data_parallel_size": 4,
                 "enable_expert_parallel": True,
-                "tensor_parallel_size": 2,
+                "tensor_parallel_size": 4,
             },
-            "tensor parallelism inside data parallelism",
+            "4 data-parallel ranks of tensor parallelism 4 .*up to 8 GPUs",
         ),
         (
             {
@@ -570,6 +570,70 @@ def test_dp_attention_with_expert_parallelism_is_mapped(fake_aisimulate):
         config["moe_tp_size"],
         config["moe_ep_size"],
     ) == (1, 8, 1, 8)
+
+
+@pytest.mark.parametrize("tp, dp", [(2, 2), (2, 4), (4, 2)])
+def test_tensor_parallelism_inside_dp_spreads_the_experts_over_every_gpu(
+    fake_aisimulate, tp, dp
+):
+    """As vLLM lays them out with expert parallelism: attention on each
+    rank's `tp` GPUs, the experts over all `tp * dp`."""
+    provider(
+        engine_config(
+            tensor_parallel_size=tp, data_parallel_size=dp, enable_expert_parallel=True
+        )
+    )
+    config = fake_aisimulate.instances[0].config.kwargs
+    assert (
+        config["tp"],
+        config["attention_dp"],
+        config["moe_tp_size"],
+        config["moe_ep_size"],
+    ) == (tp, dp, 1, tp * dp)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target", ["Qwen/Qwen3-30B-A3B", "deepseek-ai/DeepSeek-V3"]
+)
+def test_the_real_package_times_tensor_parallelism_inside_dp(target):
+    """The provider's joint step of a TP-inside-DP server is the pinned
+    estimator's own for that layout, and not the one of DP ranks of one GPU."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    local = bundled_config(target)
+    layout = {"data_parallel_size": 2, "enable_expert_parallel": True}
+    p = provider(engine_config(target, local, tensor_parallel_size=2, **layout))
+    record = p.assumptions()["aisimulate"]
+    assert (record["source"], record["readiness"]) == ("aic", "ready")
+    resolved = record["resolved_config"]
+    assert (
+        resolved["tp"],
+        resolved["attention_dp"],
+        resolved["moe_tp_size"],
+        resolved["moe_ep_size"],
+        resolved["estimation_mode"],
+    ) == (2, 2, 1, 4, "op_level")
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            **{**p.config, "tp": 2, "attention_dp": 2, "moe_tp_size": 1, "moe_ep_size": 4}
+        )
+    )
+    step = sim_step(
+        0,
+        on_rank(sim_req("p", 1024, 0, 1024), 0),
+        on_rank(sim_req("d", 1, 4000, 3000), 1),
+    )
+    ranks = [
+        rank_metrics([r for r in step.requests if r.dp_rank == rank])
+        for rank in range(2)
+    ]
+    ms = p.estimate(step).device_s * 1000
+    assert ms == pytest.approx(direct.estimate_forward_pass_time_ms(ranks), rel=1e-9)
+    one_gpu_ranks = provider(engine_config(target, local, **layout))
+    assert ms != pytest.approx(one_gpu_ranks.estimate(step).device_s * 1000, rel=1e-3)
 
 
 def supervised(monkeypatch, rank, size):
