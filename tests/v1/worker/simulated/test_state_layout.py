@@ -350,6 +350,40 @@ def _check(stub, rank):
     return checker._compare("cmpl-b-0", expected)
 
 
+def test_a_cached_state_is_checked_at_its_blocks_place():
+    """Without prefix caching a request's state is its one block (place 0,
+    whatever index the read's metadata gives). With it (align mode) a state
+    is its block's: written and compared at the block's place among the
+    request's, under its content's identity."""
+    identity = "content|B4|n4|00"
+    producer = _stub(TOY, 0, 1)
+    NativeFiller(producer, 0, heads=((),))._write_block("cmpl-a-0", 0, 3, 2, identity)
+
+    def compare(place, identity_of):
+        consumer = _stub(TOY, 0, 1)
+        for row, source in zip(consumer.rows, producer.rows):
+            row.view[2] = source.view[2]
+        checker = NativeChecker(consumer, tp_rank=0, heads=((),))
+        checker._check_geometry = lambda: None
+        checker._coverage = lambda e, r: {"problems": [], "reads": []}
+        checker.posted["cmpl-a-0"] = [2]
+        checker.reads["cmpl-a-0"] = [[2]]
+        expected = SimpleNamespace(
+            remote_request_id="cmpl-a-0", block_ids=[[2]],
+            groups=[SimpleNamespace(group=0, block_ids=[2], first_logical_block=place)],
+        )
+        return checker._compare("cmpl-b-0", expected, identity_of)
+
+    ok = compare(3, lambda group, logical: identity)
+    assert ok["ok"] and ok["groups"][0]["pattern_first_block"] == 3, ok
+    assert ok["groups"][0]["pattern"] == sl.STATE_PATTERN
+    # Another place, or another content, is another state.
+    assert not compare(2, lambda group, logical: identity)["ok"]
+    assert not compare(3, lambda group, logical: "content|B4|n4|01")["ok"]
+    # Without prefix caching the place stays the request's one state's.
+    assert not compare(3, None)["ok"]
+
+
 def _receive(rank, local_tp, remote_tp, mutate=None):
     """A consumer rank's state as a native split / gather would deliver it
     (components in order, each from its producers), optionally mutated."""

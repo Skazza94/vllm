@@ -338,10 +338,11 @@ class SimulationConfig:
         ones, or an MoE model's data-parallel ranks with expert parallelism.
         Sliding-window layers, alone or beside full-attention ones, of which
         either connector moves each window's blocks only; Qwen gated
-        delta-net or Mamba2 layers (a hybrid model's) without prefix caching,
-        each request's state one block, over Mooncake or over NIXL with the
-        DS conv-state layout NIXL's state descriptors need. The native
-        connector stays in place."""
+        delta-net or Mamba2 layers (a hybrid model's), each request's state
+        one block or, with prefix caching, a state a block (the align mode
+        vLLM then sets), over Mooncake or over NIXL with the DS conv-state
+        layout NIXL's state descriptors need. The native connector stays in
+        place."""
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -427,8 +428,6 @@ class SimulationConfig:
                     "DeepSeek-V4 with tensor parallelism or data-parallel "
                     f"attention, not both (TP={sizes['TP']}, DP={sizes['DP']})"
                 )
-            if cache.enable_prefix_caching:
-                problems.append("DeepSeek-V4 without prefix caching")
             if cache.cache_dtype not in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla"):
                 problems.append(
                     f"DeepSeek-V4's packed FP8 cache, not {cache.cache_dtype}"
@@ -455,15 +454,10 @@ class SimulationConfig:
                 )
         if cache.enable_prefix_caching and (self.kv_pattern_fill or self.kv_pattern_check):
             # The pattern is then a block's content (its tokens and every
-            # earlier one, as prefix caching keys it): attention caches.
-            # A hybrid's states and DeepSeek-V4's caches are refused below
-            # and above; DSA's indexer cache and speculative drafts are not
-            # validated with it.
-            if dsa:
-                problems.append(
-                    "sparse MLA (DSA) without prefix caching for kv_pattern_fill "
-                    "and kv_pattern_check"
-                )
+            # earlier one, as prefix caching keys it): attention caches, a
+            # hybrid's states (the tokens a state has absorbed), DSA's
+            # latents and indexer keys and DeepSeek-V4's packed groups.
+            # Speculative drafts are not validated with it.
             if vllm_config.speculative_config is not None:
                 problems.append(
                     "no speculative decoding with prefix caching for "
@@ -487,13 +481,6 @@ class SimulationConfig:
                     "the DS conv-state layout for a hybrid model over NIXL "
                     "(VLLM_SSM_CONV_STATE_LAYOUT=DS)"
                 )
-        if model.is_hybrid and (
-            cache.enable_prefix_caching or cache.mamba_cache_mode != "none"
-        ):
-            # Align mode keeps a state per block, which is not modeled.
-            problems.append(
-                "a hybrid model without prefix caching (mamba_cache_mode none)"
-            )
         if vllm_config.speculative_config is not None:
             problems.extend(self._real_kv_mtp_problems(vllm_config))
         if self.kv_pattern_fill and kv_transfer.kv_role != "kv_producer":

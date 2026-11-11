@@ -406,8 +406,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   (NIXL: `local_first_block_indices`). Over NIXL a model of several groups
   is checked through NIXL's own selection: a group's block in each layer
   slot NIXL selects for it, a slot holding none of a shorter group's layers
-  moved and checked too (transfer-only, reported apart); and, without
-  prefix caching, hybrid models of Qwen's gated delta-net (Qwen3.5, served
+  moved and checked too (transfer-only, reported apart); and hybrid
+  models of Qwen's gated delta-net (Qwen3.5, served
   as its language model), of Kimi-K3's delta attention (KDA beside MLA,
   served as its language model; its SiTU experts the CPU platform builds
   only for a simulation) or of Mamba2 (`MambaMixer2`: Nemotron-H,
@@ -415,6 +415,12 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   for a simulation): each request's state is one block of its recurrent
   groups (`mamba_cache_mode` none), padded to the attention page, and
   prefill computes the prompt but its last token, which decode computes.
+  With prefix caching vLLM keeps a state a block instead (`mamba_cache_mode`
+  align): the state after the tokens up to the block's end, which a later
+  prompt sharing them reuses, earlier states' places null; the connector
+  moves the request's running state. The native runner copies a state from
+  block to block around the forward; a simulated step computes none and
+  copies none.
   `MooncakeConnector` moves the padded state pages. NIXL needs the DS
   conv-state layout (`VLLM_SSM_CONV_STATE_LAYOUT=DS`, set before startup)
   and moves each state as it selects it: the conv sub-projections and the
@@ -436,8 +442,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 * DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
   with tensor parallelism or with data-parallel attention and expert
   parallelism (not both: the simulator's AISimulate timing provider does not
-  time TP inside DP), each TP rank holding and moving the whole caches;
-  without prefix caching, its cache the packed FP8 one (`fp8_ds_mla`): its
+  time TP inside DP), each TP rank holding and moving the whole caches,
+  with prefix caching or without, its cache the packed FP8 one (`fp8_ds_mla`): its
   sliding windows, compressed latents, indexer keys and compressor states
   are KV cache groups packed into one allocation, each block all of one
   group's layers; NIXL moves whole blocks. Decode loads all N prompt
@@ -499,9 +505,14 @@ another request, so its pattern is its content's instead: the tokens up to
 the block's end, as prefix caching keys a full block. Prefix hits are then
 compared too, read-only, on both instances (`kind` hit, apart from the
 transferred blocks). Such a run takes token prompts only (no LoRA adapter,
-`cache_salt`, prompt embeddings or multimodal inputs) and neither sparse
-MLA (DSA) nor speculative decoding; hybrid models and DeepSeek-V4 run
-without prefix caching in any case. A group's blocks
+`cache_salt`, prompt embeddings or multimodal inputs) and no speculative
+decoding. A hybrid's state is its block's content
+too: the tokens it has absorbed, which stop one short of the prompt on a
+prefill instance (decode expects that). A hit ending inside a block is
+reported as outside the checks. Decode reuses a cached prefix of its own
+only where its pulls left one: not a sliding window's (the connector moves
+a window's last blocks only: DeepSeek-V4, Gemma4), and for a hybrid its
+attention blocks over NIXL, nothing over Mooncake. A group's blocks
 are its layers' only, each block the page the connector moves (a state's
 padding included; in DeepSeek-V4's packed blocks, each layer's real page,
 its padding unchecked), and the null block that pads a window's head is

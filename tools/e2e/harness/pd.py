@@ -135,9 +135,8 @@ class Server:
     block_size: int | None = 16
     """Tokens per KV block; None: the platform's (a hybrid model's)."""
     enable_prefix_caching: bool | None = None
-    """None: off with kv_check, else vLLM's default (on; a hybrid model's
-    real transfers need it off). On with kv_check, a block's pattern is its
-    content's, and prefix hits are checked too."""
+    """None: off with kv_check, else vLLM's default (on). On with kv_check,
+    a block's pattern is its content's, and prefix hits are checked too."""
     kv_cache_memory_bytes: int = 2 * 1024 ** 3
     max_model_len: int = 4096
     max_num_batched_tokens: int = 2048
@@ -267,6 +266,12 @@ class Run:
     """Require at least this many requests to hit a cached prefix on their
     prefill instance (prefix-aware routing keeps a prefix on the instances
     that hold it); the counts are reported anyway (``prefix_routing``)."""
+    expect_decode_prefix_hits: bool = True
+    """Whether decode is expected to reuse cached prefixes of its own in a
+    byte-checked run with prefix caching. False for a model whose pulls
+    leave decode nothing a later prompt can hit (sliding windows, of which
+    only the last blocks are pulled): decode must then show no hit at all,
+    so a surprise is a problem either way."""
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     startup_timeout: float = 600.0
@@ -284,7 +289,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     """A run config's contents, read from ``path`` (relative paths are its)."""
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
-             "expect_fragmentation", "expect_prefill_hit_requests", "server", "workload", "router",
+             "expect_fragmentation", "expect_prefill_hit_requests", "expect_decode_prefix_hits", "server", "workload", "router",
              "startup_timeout"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
@@ -306,6 +311,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
             kv_check=bool(raw.get("kv_check", True)),
             expect_fragmentation=raw.get("expect_fragmentation", False),
             expect_prefill_hit_requests=raw.get("expect_prefill_hit_requests"),
+            expect_decode_prefix_hits=raw.get("expect_decode_prefix_hits", True),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             startup_timeout=float(raw.get("startup_timeout", 600)),
         )
@@ -328,6 +334,11 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         raise ValueError(f"expect_fragmentation is true or false, not {run.expect_fragmentation!r}")
     if run.expect_fragmentation and not run.kv_check:
         raise ValueError("expect_fragmentation needs kv_check (it counts byte-checked transfers)")
+    if not isinstance(run.expect_decode_prefix_hits, bool):
+        raise ValueError(f"expect_decode_prefix_hits is true or false, not {run.expect_decode_prefix_hits!r}")
+    if not run.expect_decode_prefix_hits and not (run.server.enable_prefix_caching and run.kv_check):
+        raise ValueError("expect_decode_prefix_hits: false needs server.enable_prefix_caching and kv_check (it "
+                         "counts byte-checked prefix hits)")
     expected_hits = run.expect_prefill_hit_requests
     if expected_hits is not None:
         if not isinstance(expected_hits, int) or isinstance(expected_hits, bool) or expected_hits < 1:
@@ -1133,7 +1144,12 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                       for key in ("kv_hit_checks", "kv_hit_blocks", "kv_bytes_hit_checked")} for role in sides}
         if prefix:
             for role in sides:
-                if not (hit[role]["kv_hit_blocks"] and hit[role]["kv_bytes_hit_checked"]):
+                found = hit[role]["kv_hit_blocks"] and hit[role]["kv_bytes_hit_checked"]
+                if role == "decode" and not run.expect_decode_prefix_hits:
+                    if hit[role]["kv_hit_checks"]:
+                        problems.append(f"{at}decode showed {hit[role]['kv_hit_checks']} prefix hit(s), the run "
+                                        "expecting none (expect_decode_prefix_hits: false)")
+                elif not found:
                     problems.append(f"{at}{role} showed no checked prefix hit: the run did not exercise prefix "
                                     "caching")
         fragmentation = _fragmentation(
@@ -1213,13 +1229,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "kv_checks": per_tp[0]["kv_checks"] if per_tp else 0,
         "kv_bytes_checked": sum(rank["kv_bytes_checked"] for rank in per_tp),
         "kv_bytes_transfer_only": sum(rank.get("kv_bytes_transfer_only", 0) for rank in per_tp),
-        # TP rank 0's hit checks (every TP rank checks the same requests),
-        # every rank's bytes.
-        "prefix_hits": {role: {"kv_hit_checks": per_tp[0]["prefix_hits"][role]["kv_hit_checks"],
-                               "kv_hit_blocks": per_tp[0]["prefix_hits"][role]["kv_hit_blocks"],
-                               "kv_bytes_hit_checked": sum(rank["prefix_hits"][role]["kv_bytes_hit_checked"]
-                                                           for rank in per_tp)}
-                        for role in sides} if prefix and per_tp else None,
+        "prefix_hits": _prefix_hit_totals(ranks) if prefix and per_tp else None,
         "fragmentation": per_tp[0]["fragmentation"] if per_tp else None,
         "prefix_routing": prefix_routing,
         "transfers": sums,
@@ -1243,6 +1253,17 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
     }
+
+
+def _prefix_hit_totals(ranks: dict[str, dict[tuple[int, int], dict]]) -> dict[str, dict[str, int]]:
+    """A run's checked prefix hits by side: its TP rank 0's checks and blocks
+    (every TP rank checks the same requests), and the bytes of each of its
+    own (DP, TP) ranks once, whatever the other side's TP size."""
+
+    return {role: {"kv_hit_checks": sum(s["kv_hit_checks"] for (_, tp), s in of.items() if not tp),
+                   "kv_hit_blocks": sum(s["kv_hit_blocks"] for (_, tp), s in of.items() if not tp),
+                   "kv_bytes_hit_checked": sum(s["kv_bytes_hit_checked"] for s in of.values())}
+            for role, of in ranks.items()}
 
 
 def _speculation(bench: dict, decode: dict[tuple[int, int], list[dict]], run: Run) -> dict:
@@ -2938,9 +2959,14 @@ def _quote(part: str) -> str:
     return "'" + part.replace("'", "'\"'\"'") + "'"
 
 
+# The line a vLLM server logs when its engine dies at startup.
+ENGINE_FAILED = "Engine core initialization failed"
+
+
 def _wait(client: str, url: str, timeout: float, owner: str, log: str) -> None:
-    """Until ``url`` answers from the client node; a timeout reports the
-    tail of ``log`` in ``owner``."""
+    """Until ``url`` answers from the client node; a timeout, or a vLLM
+    server whose engine failed to start (its log says so), reports the tail
+    of ``log`` in ``owner``."""
 
     probe = ("import sys, urllib.request\n"
              "try:\n    urllib.request.urlopen(sys.argv[1], timeout=5); print('up')\n"
@@ -2949,6 +2975,9 @@ def _wait(client: str, url: str, timeout: float, owner: str, log: str) -> None:
     while time.monotonic() < deadline:
         if topology.exec_in(client, [PYTHON, "-c", probe, url]).strip() == "up":
             return
+        if topology.exec_in(owner, ["grep", "-c", "-m", "1", ENGINE_FAILED, log], check=False).strip() == "1":
+            tail = topology.exec_in(owner, ["tail", "-n", "30", log], check=False)
+            raise RuntimeError(f"the server behind {url} failed to start; {owner}:{log} ends with:\n{tail}")
         time.sleep(3)
     tail = topology.exec_in(owner, ["tail", "-n", "30", log], check=False)
     raise TimeoutError(f"{url} did not answer within {timeout:.0f} s; {owner}:{log} ends with:\n{tail}")

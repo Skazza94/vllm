@@ -560,14 +560,17 @@ def test_real_mode_allows_prefix_caching(model_dir, mla_model_dir):
             assert config.simulation_config.kv_pattern_check
 
 
-def test_pattern_checks_with_prefix_caching_refuse_dsa_and_mtp(tmp_path_factory):
-    """Not validated with content patterns: DSA's indexer cache, speculative
-    drafts (hybrids and DeepSeek-V4 are refused prefix caching anyway)."""
+def test_pattern_checks_with_prefix_caching_take_dsa_and_refuse_mtp(tmp_path_factory):
+    """A DSA layer's latent and indexer keys are its block's content like any
+    page; speculative drafts are not validated with content patterns."""
     check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
     v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-pc", DEEPSEEK_V32)
-    with pytest.raises(ValueError, match=r"sparse MLA \(DSA\) without prefix caching"):
-        engine_config(v32, check, dtype="bfloat16", block_size=64, enable_prefix_caching=True)
-    engine_config(v32, check, dtype="bfloat16", block_size=64)
+    for prefix_caching in (True, False):
+        config = engine_config(
+            v32, check, dtype="bfloat16", block_size=64,
+            enable_prefix_caching=prefix_caching,
+        )
+        assert config.cache_config.enable_prefix_caching is prefix_caching
     v3 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-pc", deepseek_v3(1))
     mtp = {"method": "mtp", "num_speculative_tokens": 1}
     with pytest.raises(ValueError, match="no speculative decoding with prefix caching"):
@@ -639,16 +642,16 @@ def hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs):
     for connector in ("NixlConnector", "NixlPullConnector"):
         config = engine_config(model_dir, kv_transfer={"kv_connector": connector}, **kwargs)
         assert config.cache_config.mamba_cache_mode == "none"
-        with pytest.raises(ValueError, match="hybrid model without prefix caching"):
-            engine_config(
-                model_dir,
-                kv_transfer={"kv_connector": connector},
-                enable_prefix_caching=True,
-                **kwargs,
-            )
+        cached = engine_config(
+            model_dir,
+            kv_transfer={"kv_connector": connector},
+            enable_prefix_caching=True,
+            **kwargs,
+        )
+        assert cached.cache_config.mamba_cache_mode == "align"
 
 
-def test_real_mode_takes_gdn_hybrids_over_mooncake_or_nixl_without_prefix_caching(
+def test_real_mode_takes_gdn_hybrids_over_mooncake_or_nixl(
     qwen3_5_model_dir, ds_conv_layout
 ):
     model_dir, kwargs = qwen3_5_model_dir, {"language_model_only": True}
@@ -656,11 +659,11 @@ def test_real_mode_takes_gdn_hybrids_over_mooncake_or_nixl_without_prefix_cachin
     config = engine_config(model_dir, kv_transfer=mooncake, **kwargs)
     assert config.model_config.is_hybrid
     assert config.cache_config.mamba_cache_mode == "none"
-    # A state per block (align mode) is not modeled, byte checks or not.
-    with pytest.raises(ValueError, match="hybrid model without prefix caching"):
-        engine_config(
-            model_dir, kv_transfer=mooncake, enable_prefix_caching=True, **kwargs
-        )
+    # Prefix caching keeps a state a block (align mode), as vLLM sets it.
+    cached = engine_config(
+        model_dir, kv_transfer=mooncake, enable_prefix_caching=True, **kwargs
+    )
+    assert cached.cache_config.mamba_cache_mode == "align"
     hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs)
 
 
@@ -706,7 +709,7 @@ def test_real_mode_takes_qwen3_5_native_mtp_over_nixl_only(
 
 
 @pytest.mark.parametrize("model", ["nemotron_h_model_dir", "nemotron_3_model_dir"])
-def test_real_mode_takes_mamba2_hybrids_over_mooncake_or_nixl_without_prefix_caching(
+def test_real_mode_takes_mamba2_hybrids_over_mooncake_or_nixl(
     model, request, ds_conv_layout
 ):
     model_dir = request.getfixturevalue(model)
@@ -714,8 +717,8 @@ def test_real_mode_takes_mamba2_hybrids_over_mooncake_or_nixl_without_prefix_cac
     config = engine_config(model_dir, kv_transfer=mooncake)
     assert config.model_config.is_hybrid
     assert config.cache_config.mamba_cache_mode == "none"
-    with pytest.raises(ValueError, match="hybrid model without prefix caching"):
-        engine_config(model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
+    cached = engine_config(model_dir, kv_transfer=mooncake, enable_prefix_caching=True)
+    assert cached.cache_config.mamba_cache_mode == "align"
     hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout)
 
 
@@ -743,8 +746,8 @@ def test_non_gated_cpu_experts_build_only_in_a_simulation(
 def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     """V4's groups move over NIXL, which keeps each group's own blocks;
     Mooncake cannot pair its block sizes. Tensor parallelism or data-parallel
-    attention with expert parallelism (not both), no prefix caching, the
-    packed FP8 cache."""
+    attention with expert parallelism (not both), with prefix caching or
+    without, the packed FP8 cache."""
     v4 = {
         "dtype": "bfloat16",
         "max_model_len": 4096,
@@ -753,7 +756,13 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
     }
     dp_ep = {"data_parallel_size": 2, "enable_expert_parallel": True}
     for connector in ("NixlConnector", "NixlPullConnector"):
-        for kwargs in ({}, {"tensor_parallel_size": 2}, {"tensor_parallel_size": 4}, dp_ep):
+        for kwargs in (
+            {},
+            {"tensor_parallel_size": 2},
+            {"tensor_parallel_size": 4},
+            dp_ep,
+            {"enable_prefix_caching": True},
+        ):
             config = engine_config(
                 v4_model_dir, kv_transfer={"kv_connector": connector}, **{**v4, **kwargs}
             )
@@ -763,7 +772,6 @@ def test_real_mode_takes_deepseek_v4_over_nixl(v4_model_dir):
         ({**dp_ep, "tensor_parallel_size": 2}, "DeepSeek-V4 with tensor parallelism or"),
         ({"data_parallel_size": 2}, "MoE model's data-parallel attention"),
         ({"pipeline_parallel_size": 2}, "tensor parallelism and data-parallel attention at most"),
-        ({"enable_prefix_caching": True}, "DeepSeek-V4 without prefix caching"),
         ({"kv_cache_dtype": "bfloat16"}, "packed FP8 cache"),
     ):
         with pytest.raises(ValueError, match=message):
@@ -1486,6 +1494,86 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
             assert set(experts.values()) == {(MoEActivation.RELU2_NO_MUL, (4, 32, 64))}
     finally:
         del llm
+
+
+@pytest.mark.parametrize(
+    "family, kwargs",
+    [
+        ("NEMOTRON_3", {}),
+        ("QWEN3_5_MOE", {"language_model_only": True}),
+        ("KIMI_K3", {}),
+    ],
+    ids=["nemotron-3", "qwen3.5", "kimi-k3"],
+)
+def test_a_hybrids_cached_states_are_reused_as_written(
+    family, kwargs, tmp_path, monkeypatch, ds_conv_layout
+):
+    """With prefix caching a hybrid keeps a state a block (align mode) and a
+    later prompt reuses the state cached at a block's end. The native step
+    copies states between blocks around the forward; this runner computes
+    none, so it must leave a cached state as the pattern wrote it: a prompt
+    sharing a prefix hits it, every state byte compared with its content's."""
+    from vllm import LLM, SamplingParams
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    config = globals()[family]
+    # Prompts of several blocks, whatever block the platform picks.
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    log = tmp_path / "steps.jsonl"
+    llm = LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=4096,
+        kv_cache_memory_bytes=64 * 1024**2,
+        max_num_batched_tokens=8192,
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "kv_pattern_fill": True,
+            "timing": "linear",
+            "timing_args": {"fixed_us": 100},
+            "log_path": str(log),
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+        **kwargs,
+    )
+    try:
+        engine = llm.llm_engine.engine_core.engine_core
+        groups = engine.scheduler.kv_cache_config.kv_cache_groups
+        states = [
+            i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        assert states
+        assert {groups[i].kv_cache_spec.mamba_cache_mode for i in states} == {"align"}
+        (block,) = {g.kv_cache_spec.block_size for g in groups}
+        params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False)
+        shared = [5] * (2 * block)
+        for tail in ([6] * 7, [7] * 5, [8] * (block + 3)):
+            llm.generate([{"prompt_token_ids": shared + tail}], params, use_tqdm=False)
+    finally:
+        del llm
+    records = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    checks = [r["kv_check"] for r in records if "kv_check" in r]
+    assert all(check["ok"] for check in checks), [c for c in checks if not c["ok"]][:1]
+    hits = [check for check in checks if check.get("kind") == "hit"]
+    # The second and third prompts each reuse a cached state of every group.
+    assert len(hits) == 2
+    for hit in hits:
+        compared = {g["group"]: g for g in hit["groups"]}
+        assert set(states) <= set(compared)
+        assert all(compared[i]["bytes"] > 0 for i in states)
 
 
 # A tiny Nemotron-3 whose state groups differ: 3 Mamba2 layers in groups of

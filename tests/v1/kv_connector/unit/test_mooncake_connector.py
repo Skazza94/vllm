@@ -3220,9 +3220,16 @@ def test_simulated_real_transfers_pair_unequal_tp_for_a_hybrid_over_nixl_only():
             assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, local, remote)
     # A larger producer whose attention replicates: admitted for a hybrid (K=2 on 4).
     assert simulated_tp_mismatch(nemotron, 2, 4, nixl_consumer=True) is None
+    # Prefix caching (a state a block) pairs the same sizes: a cached state
+    # is a rank's shard like the running one.
+    for attrs, heads in ((NEMOTRON_STATE, 2), (QWEN_STATE, 4)):
+        cached = _simulation_config(
+            hybrid=True, kv_heads=heads, text_attrs=attrs, prefix_caching=True
+        )
+        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2)):
+            assert simulated_tp_mismatch(cached, local, remote, nixl_consumer=True) is None
     for config, why in (
         (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE, speculative=SimpleNamespace(method="mtp")), "speculative"),
-        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE, prefix_caching=True), "prefix caching"),
         (_simulation_config(hybrid=True, mla=True, kv_heads=1, text_attrs=NEMOTRON_STATE), "MLA"),
         (_simulation_config(hybrid=True, kv_heads=2), "neither Mamba2 nor GDN"),
         # Mamba1's, or any state without the config this layout needs.

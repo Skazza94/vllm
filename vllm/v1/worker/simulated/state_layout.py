@@ -174,7 +174,7 @@ def layout_for(vllm_config) -> StateLayout | None:
 def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes, no
-    speculative decoding, no prefix caching, no MLA, and attention KV heads
+    speculative decoding, no MLA, and attention KV heads
     that split or replicate evenly on each side as NIXL maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
@@ -183,8 +183,6 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
         return "an MLA hybrid"
     if vllm_config.speculative_config is not None:
         return "speculative decoding"
-    if vllm_config.cache_config.enable_prefix_caching:
-        return "prefix caching"
     layout = layout_for(vllm_config)
     if layout is None:
         return "a recurrent state that is neither Mamba2 nor GDN (or has no known layout)"

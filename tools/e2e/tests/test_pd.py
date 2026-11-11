@@ -1837,6 +1837,37 @@ A_CHECK = checked("a", blocks=64, layers=2, bytes=64 * 8, groups=[group_check(0,
 B_CHECK = checked("b", blocks=16, layers=2, bytes=16 * 8, groups=[group_check(0, 48, 16)])
 
 
+class WaitTests(unittest.TestCase):
+    def test_a_server_whose_engine_failed_is_reported_at_once(self) -> None:
+        """A vLLM server that dies at startup never answers: its log's
+        failure line ends the wait, instead of the whole timeout."""
+        calls = []
+
+        def exec_in(container, command, **kwargs):
+            calls.append((container, command[0]))
+            if command[0] == "grep":
+                self.assertEqual((container, command[-2:]), ("prefill0", [pd.ENGINE_FAILED, "/e2e/logs/prefill.log"]))
+                return "1\n"
+            return "connection refused\n" if container == "client" else "ValueError: no such layout\n"
+
+        with mock.patch.object(pd.topology, "exec_in", exec_in), mock.patch.object(pd.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "failed to start; prefill0:/e2e/logs/prefill.log ends with:"
+                                                      "\nValueError: no such layout"):
+                pd._wait("client", "http://10.0.0.1:8000/health", 600, "prefill0", "/e2e/logs/prefill.log")
+        sleep.assert_not_called()
+        self.assertEqual([c[1] for c in calls if c[0] == "prefill0"], ["grep", "tail"])
+
+    def test_a_server_still_starting_is_waited_for(self) -> None:
+        answers = iter(["refused\n", "refused\n", "up\n"])
+
+        def exec_in(container, command, **kwargs):
+            return next(answers) if container == "client" else "0\n"
+
+        with mock.patch.object(pd.topology, "exec_in", exec_in), mock.patch.object(pd.time, "sleep") as sleep:
+            pd._wait("client", "http://10.0.0.1:8000/health", 600, "prefill0", "/e2e/logs/prefill.log")
+        self.assertEqual(sleep.call_count, 2)
+
+
 class PrefixCachingCheckTests(unittest.TestCase):
     def verdict(self, decode_checks=None, prefill_checks=None, prefill_events="", decode_events="",
                 run=PREFIX, moved=(64 + 16) * 8, prefill_admissions=PREFILL_ADMISSIONS,
@@ -1876,6 +1907,40 @@ class PrefixCachingCheckTests(unittest.TestCase):
         self.assertIsNone(pd.check({"completed": 2, "errors": []}, [GROUPS_LAYOUT + allocated("a", "b") + line(
             kv_transfers={"send": {"count": 2, "bytes": 8}})], [GROUPS_LAYOUT], {"control": 1, "data0": 10},
             RUN)["prefix_routing"])
+
+    def test_a_run_may_expect_no_prefix_hit_at_decode(self) -> None:
+        """A model whose pulls leave decode nothing to hit (clipped windows, a
+        hybrid over Mooncake) says so: no hit is then expected at decode, and
+        one found is a problem; prefill's hits are required either way."""
+        none = pd.Run(**{**PREFIX.__dict__, "expect_decode_prefix_hits": False})
+        # Decode pulls all of b's 64 blocks: no prefix of its own reused.
+        pulled_whole = {
+            "decode_checks": [A_CHECK, checked("b", blocks=64, layers=2, bytes=64 * 8, groups=[group_check(0, 0, 64)])],
+            "decode_admissions": (post("a", 0, blocks(101, 64)) + post("b", 0, blocks(301, 64))
+                                  + admit("a", "d", 1023, blocks(101, 64)) + admit("b", "d", 1023, blocks(301, 64))),
+            "moved": (64 + 64) * 8,
+        }
+        self.assertEqual(self.verdict(run=none, **pulled_whole)["problems"], [])
+        self.assertProblem(self.verdict(**pulled_whole), "decode showed no checked prefix hit")
+        self.assertProblem(self.verdict(run=none),
+                           "decode showed 1 prefix hit(s), the run expecting none (expect_decode_prefix_hits: false)")
+        self.assertProblem(self.verdict(run=none, prefill_checks=[], **pulled_whole),
+                           "prefill showed no checked prefix hit")
+        base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw"}, "prefill": {"node": "p", "kv_network": "data0"},
+                "decode": {"node": "d", "kv_network": "data0"},
+                "server": {"timing": "zero", "enable_prefix_caching": True}, "workload": {"num_prompts": 10}}
+        path = Path("/x/run.yaml")
+        self.assertTrue(pd.parse(base, path).expect_decode_prefix_hits)
+        self.assertFalse(pd.parse({**base, "expect_decode_prefix_hits": False}, path).expect_decode_prefix_hits)
+        for message, change in {
+            "true or false": {"expect_decode_prefix_hits": "no"},
+            "needs server.enable_prefix_caching and kv_check": {"expect_decode_prefix_hits": False,
+                                                                "server": {"timing": "zero"}},
+            "needs server.enable_prefix_caching and kv_check ": {"expect_decode_prefix_hits": False, "kv_check": False},
+        }.items():
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message.strip()):
+                pd.parse({**base, **change}, path)
 
     def test_the_hit_expectation_and_the_calibration_are_validated(self) -> None:
         base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
@@ -2063,6 +2128,24 @@ class PrefixCachingCheckTests(unittest.TestCase):
         # makes its 48-block check another's.
         shorter = PREFILL_ADMISSIONS.replace('"cmpl-b-0-p": 768', '"cmpl-b-0-p": 752')
         self.assertProblem(self.verdict(prefill_admissions=shorter), "not its admitted hit group 0: 47 block(s)")
+
+    def test_hit_bytes_count_each_of_a_sides_ranks_once(self) -> None:
+        """At unequal TP sizes a side's ranks are not the pairings: a
+        prefill rank feeding two decode ranks counts once, both prefill
+        ranks feeding one decode rank count."""
+        def side(tp_size, rank_bytes, dps=1):
+            return {(dp, tp): {"kv_hit_checks": 3, "kv_hit_blocks": 48, "kv_bytes_hit_checked": rank_bytes}
+                    for dp in range(dps) for tp in range(tp_size)}
+
+        for prefill_tp, decode_tp in ((1, 2), (2, 1)):
+            with self.subTest(prefill_tp=prefill_tp, decode_tp=decode_tp):
+                totals = pd._prefix_hit_totals({"prefill": side(prefill_tp, 800 // prefill_tp),
+                                                "decode": side(decode_tp, 800 // decode_tp)})
+                self.assertEqual(totals, {role: {"kv_hit_checks": 3, "kv_hit_blocks": 48, "kv_bytes_hit_checked": 800}
+                                          for role in ("prefill", "decode")})
+        # Requests are counted once for each DP rank that owns them.
+        self.assertEqual(pd._prefix_hit_totals({"prefill": side(2, 400, dps=2)})["prefill"],
+                         {"kv_hit_checks": 6, "kv_hit_blocks": 96, "kv_bytes_hit_checked": 1600})
 
     def test_a_request_served_from_hits_alone_is_consumed_once(self) -> None:
         """a pulled; b's prompt (1025 tokens) is a's and one more: decode

@@ -661,7 +661,8 @@ def check_real_kv_groups(
 ) -> None:
     """Refuse real KV transfers of other KV cache groups (chunked local or
     RSWA attention, attention sinks), and of Mamba states other than a
-    gated delta-net's or a Mamba2 mixer's in mamba_cache_mode none without
+    gated delta-net's or a Mamba2 mixer's (one block a request, or with
+    prefix caching a block a state: mamba_cache_mode align) without
     speculative blocks other than a native MTP's (`speculative_blocks`, its
     depth: scratch slots NIXL does not move), whose blocks follow other
     rules; DeepSeek-V4's (`v4`) groups too, of its own kinds."""
@@ -686,7 +687,6 @@ def check_real_kv_groups(
             other.add(type(spec).__name__)
         elif isinstance(spec, MambaSpec) and (
             spec.mamba_type not in states
-            or spec.mamba_cache_mode != "none"
             or spec.num_speculative_blocks != speculative_blocks
         ):
             other.add(
@@ -699,7 +699,7 @@ def check_real_kv_groups(
     if other:
         raise ValueError(
             "kv_transfer_mode real moves full and sliding-window attention KV, "
-            "gated delta-net and Mamba2 states (mamba_cache_mode none) only, not "
+            "gated delta-net and Mamba2 states only, not "
             f"{'; '.join(sorted(other))}."
         )
 
@@ -895,10 +895,21 @@ def kv_layout(
                 entry["transfer_bytes_per_block"] = transfer_block_bytes
             described.append(entry)
         record["groups"] = described
-        if any(spec.prefix_replay_tokens > 0 or isinstance(spec, MambaSpec)
-               for spec in specs.values()):
-            record["prefill_backoff"] = 1
+        if backoff := prefill_backoff(specs):
+            record["prefill_backoff"] = backoff
     return record
+
+
+def prefill_backoff(specs: dict[str, KVCacheSpec]) -> int:
+    """The trailing prompt tokens a producer of these layers does not
+    compute, the consumer computing them: a recurrent state's last (decode
+    derives the state after it), a bounded window replay's."""
+    return int(
+        any(
+            spec.prefix_replay_tokens > 0 or isinstance(spec, MambaSpec)
+            for spec in specs.values()
+        )
+    )
 
 
 def registered_block_bytes() -> int | None:

@@ -61,6 +61,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     kv_layout,
     layer_specs,
     packed_pages,
+    prefill_backoff,
     refuse_foreign_state_geometry,
     validate_state_peer,
     registered_block_bytes,
@@ -224,6 +225,16 @@ class SimulatedModelRunner(GPUModelRunner):
                 is_profiling=is_profiling,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
+            model_state = getattr(self, "model_state", None)
+            if getattr(model_state, "_align_mode", False):
+                # A hybrid with prefix caching: the native step copies each
+                # request's recurrent state to its new block before the
+                # forward and realigns it after sampling. This runner
+                # replaces the forward and that pre-copy, so the post-step
+                # copy would read a column the pre-copy never advanced and
+                # overwrite cached states. No state is computed here: none is
+                # copied either (the pattern checks write what both leave).
+                model_state._mamba_ctx = None
             logger.info(
                 "Initialized real KV cache for KV transfers: %d groups, %d "
                 "blocks, %d tensors on %s.",
@@ -295,7 +306,10 @@ class SimulatedModelRunner(GPUModelRunner):
         # With prefix caching, a block may hold another request's KV: its
         # pattern is its content's (each group's block size keys it).
         chains = (
-            TokenChains([group.kv_cache_spec.block_size for group in groups])
+            TokenChains(
+                [group.kv_cache_spec.block_size for group in groups],
+                backoff=prefill_backoff(layer_specs(groups)),
+            )
             if self.cache_config.enable_prefix_caching
             else None
         )

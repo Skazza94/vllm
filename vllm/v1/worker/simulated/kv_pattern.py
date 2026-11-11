@@ -28,10 +28,16 @@ block itself holds no request's KV and is neither filled nor checked.
 With prefix caching on, a block may hold KV computed for another request, so
 its pattern is seeded by its content instead (`TokenChains`): the request's
 tokens up to the block's end, which is what native prefix caching keys a full
-block by. Pages are written as their tokens land: the producer's prompt
-pages as they are allocated, the consumer's pages as its own steps complete
-them (generation included), so a page reused later holds what a request with
-that prefix expects. Prefix hits are compared read-only on both instances
+block by. A hybrid's recurrent state (`mamba_cache_mode` align, which
+prefix caching sets) is a block too: the state after the tokens up to its
+block's end, or after the request's last token inside it (the running
+state), at the block's place among the request's, earlier states null. The
+native runner's copies of a state from block to block are not run: a
+simulated forward writes no state, so the pattern written is what the copy
+and the forward would leave. Pages are written as their tokens land: the
+producer's prompt pages as they are allocated, the consumer's pages as its
+own steps complete them (generation included), so a page reused later holds
+what a request with that prefix expects. Prefix hits are compared read-only on both instances
 (`kind` hit), apart from the transferred blocks, after the step's own writes:
 the scheduler shares a block as soon as it schedules the tokens that fill it,
 so a hit may be a page another request writes in the same step (each write
@@ -381,9 +387,13 @@ class TokenChains:
     in its blocks, whichever request computed them; a partial block's names
     its tokens so far."""
 
-    def __init__(self, block_sizes: Sequence[int]) -> None:
+    def __init__(self, block_sizes: Sequence[int], backoff: int = 0) -> None:
         self.block_sizes = list(block_sizes)
         """Each KV cache group's."""
+        self.backoff = backoff
+        """The trailing prompt tokens a producer leaves to the consumer (a
+        hybrid's last one, a bounded window replay's): a pull's content ends
+        before them."""
         self.tokens: dict[str, list[int] | None] = {}
         self.prompt_lens: dict[str, int] = {}
         # Each request's full blocks' chained digests, by block size.
@@ -436,6 +446,15 @@ class TokenChains:
         size = self.block_sizes[group]
         n = min(size, max(0, self.prompt_lens.get(req_id, 0) - logical * size))
         return self.identity(req_id, group, logical, n)
+
+    def pulled_content(self, req_id: str, group: int, logical: int) -> str:
+        """A block as the consumer pulls it: the producer's prompt content,
+        which stops `backoff` tokens short of the consumer's prompt."""
+        size = self.block_sizes[group]
+        end = self.prompt_lens.get(req_id, 0) - self.backoff
+        return self.identity(
+            req_id, group, logical, min(size, max(0, end - logical * size))
+        )
 
 
 def _lifecycle_failure(req_id: str, kind: str, error: Exception) -> dict:
@@ -492,9 +511,9 @@ class _ContentPages:
     def _prefix_hits(self, req_id: str, num_computed_tokens: int) -> list[int]:
         """The full blocks of a request's prefix hit, by group; queued for
         comparison after the step's writes. A hit ending inside a block (a
-        partial hit, copied on write) is outside this lifecycle: native
-        caching shares one only for an aligned Mamba group, which prefix
-        caching here excludes."""
+        partial hit, copied on write) is outside this lifecycle and reported
+        as such: native caching shares one only for an aligned Mamba group
+        whose hits are finer than its blocks."""
         assert self.chains is not None
         sizes = self.chains.block_sizes
         if any(num_computed_tokens % size for size in sizes):
@@ -806,14 +825,15 @@ class _ConsumerPages(_ContentPages):
             chains.drop(req_id)
 
     def _compare_pull(self, req_id: str, expected: "_Expected") -> dict:
-        """A finished pull, against its blocks' prompt content."""
+        """A finished pull, against its blocks' content as the producer
+        computed it."""
         chains = self.chains
         assert chains is not None
         try:
             for group in expected.groups:
                 for offset, block in enumerate(group.block_ids):
                     if block != NULL_BLOCK_ID:
-                        chains.prompt_content(
+                        chains.pulled_content(
                             req_id, group.group, group.first_logical_block + offset
                         )
         except OutsideLifecycle as e:
@@ -824,7 +844,7 @@ class _ConsumerPages(_ContentPages):
         result = self._compare(
             req_id,
             expected,
-            lambda group, logical: chains.prompt_content(req_id, group, logical),
+            lambda group, logical: chains.pulled_content(req_id, group, logical),
         )
         return result
 
@@ -1790,10 +1810,14 @@ class NativeChecker(_ConsumerPages):
             # A state group moves its running slot only: NIXL drops a native
             # MTP's trailing scratch slots and keeps the one before them
             # (`blocks[:-k][-1:]`, the first). Its place is that slot's, not
-            # the index the consumer's clipped-read metadata gives (k).
+            # the index the consumer's clipped-read metadata gives (k). With
+            # prefix caching a state is its block's (align mode): the place
+            # the metadata gives, the producer's too.
             first = (
                 0
-                if selected and all(s.rows[row].state for row, _, _ in selected)
+                if identity_of is None
+                and selected
+                and all(s.rows[row].state for row, _, _ in selected)
                 else group.first_logical_block
             )
             payload = transfer_only = wrong_total = 0

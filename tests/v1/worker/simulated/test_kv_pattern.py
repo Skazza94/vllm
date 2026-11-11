@@ -939,9 +939,10 @@ def test_kv_layout_describes_a_padded_state_and_counts_storage_once():
     }
 
 
-def test_real_transfers_take_a_recurrent_layers_single_state_only():
+def test_real_transfers_take_a_recurrent_layers_state_only():
     """A gated delta-net's or a Mamba2 mixer's state, one block a request
-    (mamba_cache_mode none), without speculative blocks but a native MTP's."""
+    or (prefix caching: mamba_cache_mode align) a block a state, without
+    speculative blocks but a native MTP's."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -971,11 +972,15 @@ def test_real_transfers_take_a_recurrent_layers_single_state_only():
     check_real_kv_groups(config())
     check_real_kv_groups(config(mamba_type=MambaAttentionBackendEnum.MAMBA2))
     mamba2 = {"mamba_type": MambaAttentionBackendEnum.MAMBA2}
+    check_real_kv_groups(config(mamba_cache_mode="align"))
+    check_real_kv_groups(config(**mamba2, mamba_cache_mode="align"))
     for mamba, message in (
         ({"mamba_type": MambaAttentionBackendEnum.MAMBA1}, "MAMBA1"),
         ({"mamba_type": MambaAttentionBackendEnum.SHORT_CONV}, "SHORT_CONV"),
-        ({"mamba_cache_mode": "align"}, "GDN_ATTN, mamba_cache_mode align"),
-        ({**mamba2, "mamba_cache_mode": "align"}, "MAMBA2, mamba_cache_mode align"),
+        (
+            {"mamba_type": MambaAttentionBackendEnum.MAMBA1, "mamba_cache_mode": "align"},
+            "MAMBA1, mamba_cache_mode align",
+        ),
         ({"num_speculative_blocks": 1}, "1 speculative blocks"),
         ({**mamba2, "num_speculative_blocks": 1}, "1 speculative blocks"),
     ):
@@ -1393,6 +1398,34 @@ def test_a_pull_is_compared_when_its_request_runs():
     (result,) = checker.after_step(None)
     assert result["ok"], result
     assert result["blocks"] == 3 and "kind" not in result
+
+
+def test_a_pull_stops_where_the_producer_backed_off():
+    """A producer of recurrent states (or a bounded window replay) computes
+    the prompt but its last token: its last block names one token fewer than
+    the consumer's prompt, and a checker told of that backoff expects it."""
+    assert TokenChains([BLOCK]).backoff == 0
+    for backoff, ok in ((1, True), (0, False)):
+        prefill, decode, filler, _ = content_sides()
+        chains = TokenChains([BLOCK], backoff=backoff)
+        checker = PatternChecker(decode, chains=chains)
+        filler.after_update(step(new=[(PREFILL_ID, [3, 5, 6], PROMPT_A[:-1], 0, 9)]))
+        assert holds(prefill, 6, filler.chains, PREFILL_ID, 2, 1)
+        checker.before_step(pull([1, 2, 4], [3, 5, 6]))
+        transfer(prefill, decode, [(1, 3), (2, 5), (4, 6)])
+        checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        checker.before_step(step(new=[(DECODE_ID, [1, 2, 4], PROMPT_A, 9, 1)]))
+        (result,) = checker.after_step(None)
+        assert result["ok"] is ok, result
+        if not ok:
+            # Only the last block names the token the producer left out.
+            assert {block[1] for block in result["mismatched_blocks"]} == {2}
+    # The content a pull holds: the prompt's, short of the backoff.
+    chains = TokenChains([BLOCK], backoff=1)
+    chains.admit("a", PROMPT_A)
+    assert chains.pulled_content("a", 0, 2) == chains.identity("a", 0, 2, 1)
+    assert chains.pulled_content("a", 0, 1) == chains.identity("a", 0, 1, BLOCK)
+    assert chains.prompt_content("a", 0, 2) == chains.identity("a", 0, 2, 2)
 
 
 def test_a_pull_of_another_prompt_fails():
