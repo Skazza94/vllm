@@ -68,6 +68,24 @@ QUANT_MODES: dict[str | None, dict[str, str]] = {
 }
 # Where vLLM's online quantization methods live (weights quantized at load).
 ONLINE_QUANT_MODULES = "vllm.model_executor.layers.quantization.online."
+# Online quantization (`--quantization`) AISimulate times, on an unquantized
+# checkpoint: per-tensor FP8 weights with dynamic activations (its `fp8`),
+# 128-block FP8 (`fp8_block`); the methods the layers are then built with.
+ONLINE_QUANT_MODES: dict[str, tuple[dict[str, str], frozenset[str]]] = {
+    **dict.fromkeys(
+        ("fp8", "fp8_per_tensor"),
+        (
+            {"gemm_quant_mode": "fp8", "moe_quant_mode": "fp8"},
+            frozenset(
+                {"Fp8PerTensorOnlineLinearMethod", "Fp8PerTensorOnlineMoEMethod"}
+            ),
+        ),
+    ),
+    "fp8_per_block": (
+        {"gemm_quant_mode": "fp8_block", "moe_quant_mode": "fp8_block"},
+        frozenset({"Fp8PerBlockOnlineLinearMethod", "Fp8PerBlockOnlineMoEMethod"}),
+    ),
+}
 # Quantizations whose modes are the checkpoint's own (`_inferred_modes`).
 INFERRED_QUANT_ALGOS = ("compressed-tensors", "nvfp4", "mixed_precision", "fp8")
 QUANT_MODE_FIELDS = (
@@ -578,6 +596,18 @@ class AisimulateTimingProvider:
                 "modes."
             )
         modes = {**modes, "comm_quant_mode": "half"}
+        # Weights this server quantizes itself as it loads them, of an
+        # unquantized checkpoint: timed as that precision of the published
+        # model. (A quantized checkpoint names its own method in the same
+        # field; layers quantized online beside it are refused when built.)
+        online = vllm_config.model_config.quantization
+        self._online_methods: frozenset[str] = frozenset()
+        if quant is None and online in ONLINE_QUANT_MODES:
+            self._check_plain_online_quantization(vllm_config.model_config, online)
+            online_modes, self._online_methods = ONLINE_QUANT_MODES[online]
+            modes.update(online_modes)
+        else:
+            online = None
         if quant_modes:
             unknown = set(quant_modes) - set(QUANT_MODE_FIELDS)
             if unknown:
@@ -656,7 +686,7 @@ class AisimulateTimingProvider:
         from vllm import __version__ as vllm_version
 
         resolved = (diagnostics.get("provenance") or {}).get("config", {})
-        modified = bool(quant_modes)
+        modified = bool(quant_modes) or online is not None
         self._assumptions = {
             "provider": "aisimulate",
             "package_version": version,
@@ -687,6 +717,7 @@ class AisimulateTimingProvider:
                 else None
             ),
             "target_quantization": quant,
+            "online_quantization": online,
             "target_modified": modified,
             "local_config": local_config,
             "local_dtype": str(vllm_config.model_config.dtype).removeprefix("torch."),
@@ -719,6 +750,28 @@ class AisimulateTimingProvider:
             "host_us": host_us,
         }
         logger.info("AISimulate timing: %s", self._assumptions["deployment"])
+
+    @staticmethod
+    def _check_plain_online_quantization(model_config: Any, online: str) -> None:
+        """The modes are the shorthand's as vLLM resolves it alone, every
+        linear layer and every expert quantized its way: a
+        `--quantization-config` beside it (layers ignored, per-layer targets,
+        another weight or activation precision) is another deployment."""
+        from vllm.config.quantization import (
+            QuantizationConfigArgs,
+            resolve_quantization_config,
+        )
+
+        resolved = getattr(model_config, "quantization_config", None)
+        # `fp8` resolves to no config; one that sets nothing is the same.
+        plain = resolve_quantization_config(online, None) or QuantizationConfigArgs()
+        if (resolved or QuantizationConfigArgs()) == plain:
+            return
+        raise ValueError(
+            f"The aisimulate timing provider times --quantization {online} as "
+            "vLLM resolves it alone, not with a quantization_config of its own "
+            f"(ignored layers, targets or other precisions): {resolved}."
+        )
 
     @staticmethod
     def _topology(vllm_config: "VllmConfig") -> dict[str, Any]:
@@ -1027,27 +1080,36 @@ class AisimulateTimingProvider:
         return probes
 
     def bind_model(self, model: Any) -> None:
-        """The weights timed are the published checkpoint's: a server that
-        quantizes layers itself as it loads them (`--quantization fp8`, an
-        online `--quantization-config`, alone or beside a quantized
-        checkpoint) runs another deployment, which is not timed as this one."""
-        online = sorted(
-            {
-                type(method).__name__
-                for module in model.modules()
-                if (method := getattr(module, "quant_method", None)) is not None
-                and type(method).__module__.startswith(ONLINE_QUANT_MODULES)
-            }
-        )
-        if online:
+        """The weights timed are the built layers': the published
+        checkpoint's, or those of the online quantization the estimator was
+        configured for (`--quantization fp8`, `fp8_per_block`). Layers
+        quantized online any other way (another method, an online
+        `--quantization-config`, beside a quantized checkpoint) are another
+        deployment, which is not timed as this one."""
+        online = {
+            type(method).__name__
+            for module in model.modules()
+            if (method := getattr(module, "quant_method", None)) is not None
+            and type(method).__module__.startswith(ONLINE_QUANT_MODULES)
+        }
+        if online - self._online_methods:
             record = self._assumptions
+            timed = record["online_quantization"] or (
+                f"{record['target_quantization'] or 'unquantized'} weights"
+            )
             raise ValueError(
                 "The aisimulate timing provider times the published "
-                f"{record['target_model']} "
-                f"({record['target_quantization'] or 'unquantized'} weights), not "
-                f"layers this server quantizes online ({', '.join(online)}): "
-                "serve the published checkpoint as it is, or use another "
-                "timing provider."
+                f"{record['target_model']} ({timed}), not "
+                "layers this server quantizes online "
+                f"({', '.join(sorted(online - self._online_methods))}): it times "
+                f"--quantization {', '.join(sorted(ONLINE_QUANT_MODES))} of an "
+                "unquantized checkpoint only."
+            )
+        if self._online_methods and not online:
+            raise ValueError(
+                "The aisimulate timing provider was configured for online "
+                f"quantization ({self._assumptions['online_quantization']}), but "
+                "no layer of the built model is quantized online."
             )
 
     def assumptions(self) -> dict[str, Any]:

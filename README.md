@@ -137,6 +137,17 @@ A timing provider prices every step. Select it with `--simulation-config`:
 | `replay` / `table` | What a recorded real deployment took for the same (or the nearest) batch | Reproducing a deployment you have measured |
 | `zero` | Nothing | Functional tests |
 
+> [!IMPORTANT]
+> **vllm-decaf follows AISimulate.** A model, GPU, quantization, cache format
+> or parallel layout is supported only if it passes both the simulator's own
+> checks and the `aisimulate` provider: what AISimulate rejects, vllm-decaf
+> rejects too. With that provider, the server refuses to start instead of
+> guessing a number. The other providers do not consult AISimulate: they
+> remain for tests and for replaying your own measurements, and a
+> configuration that only runs with them is not a supported one. The
+> reverse does not hold either: not every layout AISimulate can time is
+> supported here yet.
+
 ### AISimulate
 
 `aisimulate` needs the optional AISimulate package, which the second image
@@ -277,6 +288,9 @@ llm-d's router.
 
 - **Tokens are filler.** Only their counts and timing mean something; KV
   contents are synthetic.
+- **AISimulate sets the scope.** A supported configuration is one the
+  `aisimulate` provider accepts; what AISimulate cannot time is rejected by
+  it, not approximated (see [Timing models](#timing-models)).
 - **Latency is as good as the timing provider.** Scheduling, caching and
   transfers run for real; compute time is an estimate. AISimulate covers the
   models, GPUs and single-node layouts listed above, and its own

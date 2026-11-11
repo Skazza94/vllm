@@ -100,9 +100,18 @@ config, a ModelOpt checkpoint's `hf_quant_config.json` included: block FP8
 and MXFP4 experts by a fixed mapping; NVFP4, per-tensor FP8,
 compressed-tensors and mixed per-layer precision as AISimulate itself reads
 the checkpoint; any other is refused. Layers the server quantizes itself
-(`--quantization fp8` or an online `--quantization-config`) are not the
-published weights: the provider refuses such a server at startup rather than
-time it as the published model. `quant_modes` overrides the published
+are not the published weights. Of an unquantized checkpoint,
+`--quantization fp8` (or `fp8_per_tensor`: per-tensor weights, dynamic
+activations) and `fp8_per_block` are timed as AISimulate's `fp8` and
+`fp8_block` precision of the published model, the target recorded as
+modified with its `online_quantization`. The shorthand is taken alone, as
+vLLM resolves it: every linear layer and every expert quantized its way.
+A `--quantization-config` beside it that changes anything (layers ignored,
+per-layer `targets`, another weight or activation precision) is refused
+before the model is built, and the built layers must be that method's. Any
+other online quantization (another method, `--quantization online` with a
+config, layers quantized beside a quantized checkpoint) is refused at
+startup rather than timed as another deployment. `quant_modes` overrides the published
 precision, which
 records the target as modified. DeepSeek-V4 is timed with its packed FP8
 cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)

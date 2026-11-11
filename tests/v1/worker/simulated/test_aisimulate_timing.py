@@ -2064,28 +2064,145 @@ def built_model(*methods):
     return model
 
 
-def test_layers_quantized_online_are_not_timed_as_the_published_weights(
-    fake_aisimulate,
-):
-    """`--quantization fp8` on a BF16 checkpoint (or an online config beside
-    a quantized one) serves weights the published target does not have: the
-    provider refuses the built model, where it would time the published
-    precision under another deployment's name."""
+def test_layers_quantized_online_are_timed_only_as_configured(fake_aisimulate):
+    """`--quantization fp8` on an unquantized checkpoint is timed as that
+    precision, the built layers checked against it; layers quantized online
+    any other way (another method, a config beside a quantized checkpoint)
+    are refused, where they would be timed under another deployment's name."""
     p = provider(engine_config())
+    assert p.assumptions()["aisimulate"]["online_quantization"] is None
     p.bind_model(built_model(checkpoint_method(), None))
-    online = built_model(
+    per_tensor = built_model(
         online_method("Fp8PerTensorOnlineLinearMethod"),
         online_method("Fp8PerTensorOnlineMoEMethod"),
         checkpoint_method(),
     )
     with pytest.raises(ValueError) as error:
-        p.bind_model(online)
+        p.bind_model(per_tensor)
     message = str(error.value)
     assert "published Qwen/Qwen3-30B-A3B (unquantized weights)" in message
     assert (
         "quantizes online (Fp8PerTensorOnlineLinearMethod, "
         "Fp8PerTensorOnlineMoEMethod)" in message
     )
+
+    def online(name):
+        from vllm.config.quantization import resolve_quantization_config
+
+        config = engine_config()
+        config.model_config.quantization = name
+        config.model_config.quantization_config = (
+            resolve_quantization_config(name, None)
+            if name in ("fp8_per_tensor", "fp8_per_block")
+            else None
+        )
+        return provider(config)
+
+    for name in ("fp8", "fp8_per_tensor"):
+        q = online(name)
+        record = q.assumptions()["aisimulate"]
+        assert (record["online_quantization"], record["target_modified"]) == (name, True)
+        q.bind_model(per_tensor)
+        # Another online method than the one timed, or none built.
+        with pytest.raises(ValueError, match="Fp8PerBlockOnlineLinearMethod"):
+            q.bind_model(built_model(online_method("Fp8PerBlockOnlineLinearMethod")))
+        with pytest.raises(ValueError, match="no layer of the built model"):
+            q.bind_model(built_model(checkpoint_method()))
+    online("fp8_per_block").bind_model(
+        built_model(online_method("Fp8PerBlockOnlineLinearMethod"))
+    )
+    # A method AISimulate has no mode for is not configured, and refused built.
+    unmapped = online("fp8_per_channel")
+    assert unmapped.assumptions()["aisimulate"]["online_quantization"] is None
+    with pytest.raises(ValueError, match="Fp8PtpcOnlineLinearMethod"):
+        unmapped.bind_model(built_model(online_method("Fp8PtpcOnlineLinearMethod")))
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_online_fp8_is_timed_only_as_the_plain_shorthand(tmp_path):
+    """Through vLLM's own argument resolution: the three shorthands alone
+    are timed; one with a `--quantization-config` of its own (experts
+    ignored, per-layer targets, another precision) quantizes other layers
+    than the modes say, and is refused before any layer is built."""
+    target = "Qwen/Qwen3-30B-A3B"
+    raw = bundled_config(target)
+    name = target.replace("/", "--")
+
+    def config(suffix, **kwargs):
+        return real_engine_config(tmp_path / suffix, name, raw, **kwargs)
+
+    for online, modes in (
+        ("fp8", ("fp8", "fp8")),
+        ("fp8_per_tensor", ("fp8", "fp8")),
+        ("fp8_per_block", ("fp8_block", "fp8_block")),
+    ):
+        for extra in ({}, {"quantization_config": {}}):
+            suffix = f"{online}-{len(extra)}"
+            (tmp_path / suffix).mkdir()
+            record = provider(
+                config(suffix, quantization=online, **extra), gpu="h100"
+            ).assumptions()["aisimulate"]
+            assert record["online_quantization"] == online
+            assert (
+                record["config"]["gemm_quant_mode"],
+                record["config"]["moe_quant_mode"],
+            ) == modes
+        for i, custom in enumerate((
+            {"ignore": ["*.experts"]},
+            {"moe": "fp8_per_channel"},
+            {"linear": {"weight": "fp8_per_tensor_static",
+                        "activation": "fp8_per_tensor_static"}},
+        )):
+            suffix = f"{online}-custom{i}"
+            (tmp_path / suffix).mkdir()
+            with pytest.raises(ValueError, match="not with a quantization_config"):
+                provider(
+                    config(suffix, quantization=online, quantization_config=custom),
+                    gpu="h100",
+                )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "target, online, modes",
+    [
+        ("Qwen/Qwen3-8B", "fp8", ("fp8", "fp8")),
+        ("Qwen/Qwen3-30B-A3B", "fp8", ("fp8", "fp8")),
+        ("Qwen/Qwen3-30B-A3B", "fp8_per_block", ("fp8_block", "fp8_block")),
+    ],
+)
+def test_online_fp8_is_timed_as_the_pinned_estimator_times_it(target, online, modes):
+    """Online FP8 of a published BF16 model: the estimator's FP8 modes, its
+    own estimate for them, and not the published precision's."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    from vllm.config.quantization import resolve_quantization_config
+
+    local = bundled_config(target)
+    published = provider(engine_config(target, local), gpu="h100")
+    config = engine_config(target, local)
+    config.model_config.quantization = online
+    config.model_config.quantization_config = (
+        None if online == "fp8" else resolve_quantization_config(online, None)
+    )
+    p = provider(config, gpu="h100")
+    record = p.assumptions()["aisimulate"]
+    assert (record["online_quantization"], record["target_modified"]) == (online, True)
+    assert (
+        record["config"]["gemm_quant_mode"], record["config"]["moe_quant_mode"]
+    ) == modes
+    step = sim_step(0, *[sim_req(f"d{i}", 1, 1024, 512) for i in range(8)])
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(**{**record["config"], "fallback_policy": "deny"})
+    )
+    ms = p.estimate(step).device_s * 1000
+    assert ms == pytest.approx(
+        direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+        rel=1e-9,
+    )
+    assert ms != pytest.approx(published.estimate(step).device_s * 1000, rel=1e-9)
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
