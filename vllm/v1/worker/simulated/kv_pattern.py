@@ -330,6 +330,7 @@ def head_map(
     tp_rank: int,
     tp_size: int,
     layer_totals: Mapping[str, int] | None = None,
+    packed_latent: bool = False,
 ) -> dict[str, tuple[tuple[int, ...], int]]:
     """Each attention layer's global KV heads and slab, from its own spec:
     one slot per KV head of plain states (`num_kv_heads`, `head_size`), the
@@ -337,8 +338,10 @@ def head_map(
     of tp > K: head r*K/tp, replicated); an MLA layer one latent, global
     head 0, on every rank. A layer whose page packs otherwise (head slots,
     packed content, compressed states), a state or a layer whose heads do
-    not match that sharding keeps its rank's pattern (absent). A layer's
-    total is `layer_totals`' where the model gives layers their own
+    not match that sharding keeps its rank's pattern (absent); with
+    `packed_latent` (sparse MLA: `rank_kv.sparse_mla`) a packed MLA latent of
+    a state a token is head 0 too, whole on every rank as the dense one. A
+    layer's total is `layer_totals`' where the model gives layers their own
     (`layer_total_heads`), else the model's `total_num_kv_heads`."""
     from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
@@ -347,8 +350,11 @@ def head_map(
         if (
             not isinstance(spec, AttentionSpec)
             or spec.num_head_slots is not None
-            or spec.state_content_bytes is not None
             or spec.tokens_per_state != 1
+        ):
+            continue
+        if spec.state_content_bytes is not None and not (
+            packed_latent and isinstance(spec, MLAAttentionSpec)
         ):
             continue
         if isinstance(spec, MLAAttentionSpec):

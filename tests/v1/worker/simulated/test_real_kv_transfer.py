@@ -1165,12 +1165,13 @@ def test_real_transfers_pair_plain_mla_at_unequal_tp(
 ):
     """Plain MLA (the tiny DeepSeek-V3): one latent, the same on every rank,
     pairs unequal sizes either way over either connector (NIXL exempts MLA
-    from its replicated-producer refusal). Sparse MLA (the tiny
-    DeepSeek-V3.2: an indexer cache beside the latent) waits for several
-    groups' checkpoint."""
+    from its replicated-producer refusal). So does sparse MLA (the tiny
+    DeepSeek-V3.2): its latent and its indexer's keys are each whole on
+    every rank too."""
     from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
         plain_mla,
         simulated_tp_mismatch,
+        sparse_mla,
     )
 
     mla = engine_config(mla_model_dir, tensor_parallel_size=local_tp)
@@ -1180,7 +1181,9 @@ def test_real_transfers_pair_plain_mla_at_unequal_tp(
     v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-tp", DEEPSEEK_V32)
     sparse = engine_config(v32, dtype="bfloat16", block_size=64, tensor_parallel_size=local_tp)
     assert sparse.model_config.use_mla and not plain_mla(sparse.model_config)
-    assert "plain attention or plain MLA only" in simulated_tp_mismatch(sparse, local_tp, remote_tp)
+    assert sparse_mla(sparse.model_config) and not sparse_mla(mla.model_config)
+    assert simulated_tp_mismatch(sparse, local_tp, remote_tp) is None
+    assert simulated_tp_mismatch(sparse, local_tp, remote_tp, nixl_consumer=True) is None
 
 # The tiny gpt-oss's 2 KV heads bound the local TP size at 2.
 @pytest.mark.parametrize("local_tp, remote_tp", [(2, 1), (1, 2), (1, 4), (2, 4)])

@@ -152,6 +152,20 @@ def plain_mla(model) -> bool:
     )
 
 
+def sparse_mla(model) -> bool:
+    """DeepSeek-V3.2's or GLM-5's sparse MLA (DSA): a latent and, on the
+    layers that have one, an indexer's key cache, each one cache held whole
+    by every rank, as plain MLA's latent is."""
+    from vllm.config.simulation import DSA_MODEL_TYPES
+
+    return (
+        model.use_mla
+        and not model.is_hybrid
+        and getattr(model.hf_config, "model_type", None) in DSA_MODEL_TYPES
+        and getattr(model.hf_text_config, "index_topk", None) is not None
+    )
+
+
 def simulated_tp_mismatch(
     vllm_config: VllmConfig,
     local_tp_size: int,
@@ -165,7 +179,8 @@ def simulated_tp_mismatch(
     window layers beside full ones included; no recurrent state or draft), or, over NIXL only, a hybrid of Mamba2 or GDN states (`state_layout.pairing_problem`),
     whose pattern is each KV head's
     (``kv_pattern.head_pattern``) wherever the connector re-shards it, or of
-    plain MLA (`plain_mla`: one latent, the same on every rank). NIXL's
+    plain MLA (`plain_mla`: one latent, the same on every rank) or sparse MLA
+    (`sparse_mla`: an indexer's keys beside it, the same on every rank too). NIXL's
     decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
     larger producer whose KV heads are replicated; MLA's latent is exempt."""
     sim = vllm_config.simulation_config
@@ -211,13 +226,13 @@ def simulated_tp_mismatch(
             )
         return None
     if (
-        (model.use_mla and not plain_mla(model))
+        (model.use_mla and not (plain_mla(model) or sparse_mla(model)))
         or model.is_hybrid
         or vllm_config.speculative_config is not None
     ):
         return (
-            "Simulated real KV transfers pair unequal TP sizes for plain attention "
-            "or plain MLA only (no sparse or compressed MLA, recurrent state "
+            "Simulated real KV transfers pair unequal TP sizes for plain attention, "
+            "plain or sparse MLA only (no compressed MLA, recurrent state "
             f"or draft), not {sizes}."
         )
     if (

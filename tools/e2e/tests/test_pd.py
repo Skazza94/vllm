@@ -3086,6 +3086,28 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
         self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120",started["decode"]["d"])
         self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":pd.nixl_backend(run.server),"tent_applicable":False})
 
+    def test_plans_of_a_group_of_two_page_sizes_are_checked_by_size(self):
+        # Sparse MLA: a latent's and an indexer's layers in one group, each
+        # whole on every rank (head 0), their pages of two sizes.
+        heads={"prefill":{0:[[0]]},"decode":{0:[[0]],1:[[0]]}}
+        sender=[{(0,0):0,(0,1):0}]
+        sources={0:[0],1:[0]}
+        slab=[(8,72)]
+        plan=[0,4,4,160,{"8":2,"72":2}]
+        entry=[160,0.01,0,4,1,0,plan]
+        args=((0,1),entry,plan,True,heads,sender,sources,slab)
+        self.assertEqual(pd._plan_problems(*args,max_descriptors=None),[])
+        plan[4]={"8":3,"72":1}
+        self.assertTrue(any("carried spans" in s for s in pd._plan_problems(*args,max_descriptors=None)))
+        del plan[4]
+        self.assertTrue(any("by size" in s for s in pd._plan_problems(*args,max_descriptors=None)))
+        regions=[[True,0,0,8],[True,0,0,72]]
+        args=((0,1),[160,0.01,0,4,1,1,regions],regions,False,heads,sender,sources,slab)
+        self.assertEqual(pd._plan_problems(*args),[])
+        self.assertTrue(pd._plan_problems((0,1),[160,0.01,0,4,1,1,regions[:1]],regions[:1],False,heads,sender,sources,slab))
+        wrong=[[True,0,0,8],[True,0,8,72]]
+        self.assertTrue(pd._plan_problems((0,1),[160,0.01,0,4,1,1,wrong],wrong,False,heads,sender,sources,slab))
+
     def test_tcp_large_descriptor_plan_keeps_exact_counts_and_bytes(self):
         heads={"decode":{0:[[0]]}}
         sender=[{(0,0):0}]

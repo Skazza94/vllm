@@ -1834,9 +1834,14 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                                     f"{group.get('global_heads')}, not head-v1 heads {want}")
                     mine_slabs.append(None)
                     continue
-                page = group.get("real_page_bytes") or group.get("block_bytes")
-                mine_slabs.append(page // len(want) if (
-                    isinstance(page, int) and page > 0 and page % len(want) == 0) else None)
+                # A group of several page sizes (sparse MLA: a latent's and an
+                # indexer's layers) has a slab for each.
+                pages = sorted({kind.get("real_page_bytes") or kind.get("page_bytes")
+                                for kind in group.get("kinds") or []}, key=str) or [
+                    group.get("real_page_bytes") or group.get("block_bytes")]
+                good = all(isinstance(page, int) and page > 0 and page % len(want) == 0 for page in pages)
+                each = tuple(page // len(want) for page in pages) if good else None
+                mine_slabs.append(each[0] if each and len(each) == 1 else each)
             slabs[(role, rank)] = tuple(mine_slabs) or (None,)
     distinct = set(slabs.values())
     gslabs = list(next(iter(distinct))) if len(distinct) == 1 else [None]
@@ -1845,7 +1850,7 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                         f"{ {f'{role}{rank}': (n[0] if len(set(n)) == 1 else n) for (role, rank), n in sorted(slabs.items())} }")
         gslabs = [None] * len(totals)
     slab = gslabs[0] if len(set(gslabs)) == 1 else gslabs
-    evidence["slab_bytes"] = slab
+    evidence["slab_bytes"] = list(slab) if isinstance(slab, tuple) else slab
 
     expected: dict[tuple[int, int], int] = {}
     unique = 0
@@ -2036,7 +2041,10 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
     if not carried:
         return [f"{at}a transfer, though decode takes none of its heads from it"]
     known = all(n is not None for n in slab)
-    spans = {len(c) * slab[g] for g, c in enumerate(by_group) if c and slab[g] is not None}
+    # A group's slabs: one, or one for each of its page sizes.
+    slabs = [n if isinstance(n, tuple) else (n,) for n in slab]
+    several = any(len(n) > 1 for n in slabs)
+    spans = {len(c) * n for g, c in enumerate(by_group) if c and slab[g] is not None for n in slabs[g]}
     if not plan:
         return [f"{at}a transfer of {entry[0]} bytes without its plan ({plan})"]
     if nixl:
@@ -2070,7 +2078,17 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
         if max_descriptors is not None and selected > max_descriptors:
             problems.append(f"{at}a READ of {selected} selected descriptors, more than the "
                             f"{NIXL_MAX_DESCRIPTORS} guard")
-        if known and len(spans) != 1:
+        if known and several:
+            # Descriptors of several sizes: the READ's own count of each.
+            sizes = plan[4] if len(plan) > 4 and isinstance(plan[4], dict) else None
+            counted = {int(size): n for size, n in (sizes or {}).items()}
+            if sizes is None:
+                problems.append(f"{at}a READ of several page sizes without its descriptors by size")
+            elif (set(counted) != spans or sum(counted.values()) != selected
+                  or sum(size * n for size, n in counted.items()) != int(entry[0])):
+                problems.append(f"{at}a READ of {entry[0]} bytes in {selected} selected descriptors of sizes "
+                                f"{counted}, not the carried spans {sorted(spans)} adding up to both")
+        elif known and len(spans) != 1:
             problems.append(f"{at}a READ whose groups carry different spans {sorted(spans)}: the exact bytes "
                             "need one common carried span per descriptor")
         elif known:
@@ -2088,15 +2106,18 @@ def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: 
     problems = []
     wants = []
     for g, c in enumerate(by_group):
-        if c:
-            want = [True, heads["prefill"][p][g].index(c[0]) * slab[g], heads["decode"][d][g].index(c[0]) * slab[g],
-                    len(c) * slab[g]]
+        for n in slabs[g] if c else ():
+            want = [True, heads["prefill"][p][g].index(c[0]) * n, heads["decode"][d][g].index(c[0]) * n,
+                    len(c) * n]
             if want not in wants:
                 wants.append(want)
     for region in plan:
         if list(region) not in wants:
             shown = wants[0] if len(wants) == 1 else wants
-            problems.append(f"{at}plan {list(region)}, not {shown} (heads {carried}, {slab[0]} bytes each)")
+            problems.append(f"{at}plan {list(region)}, not {shown} (heads {carried}, "
+                            f"{slabs[0][0] if not several else [list(n) for n in slabs]} bytes each)")
+    if several and sorted(map(list, plan)) != sorted(wants):
+        problems.append(f"{at}plan {[list(region) for region in plan]}, not a region for each of {wants}")
     return problems
 
 

@@ -491,6 +491,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           pattern is its own;
         * plain MLA (one latent a layer: DeepSeek-V3, Kimi-K2), the same
           page on every rank;
+        * sparse MLA (DeepSeek-V3.2, GLM-5), BF16 or packed FP8: the latent's
+          and the indexer's pages, each the same on every rank;
         * layers of different KV head counts (Gemma4's global layers beside
           its sliding ones), only where every layer's count is at least the
           larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
@@ -498,8 +500,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           whose state splits over both sizes and whose KV heads split or
           replicate evenly on each side;
 
-      and not for sparse MLA (DSA), DeepSeek-V4's caches, an MLA hybrid
-      (Kimi-K3) or speculative decoding. A NIXL decode instance refuses, as
+      and not for DeepSeek-V4's caches, an MLA hybrid (Kimi-K3) or
+      speculative decoding. A NIXL decode instance refuses, as
       NIXL does, a larger prefill instance whose KV heads are replicated
       (more ranks than KV heads); MLA's latent is exempt. A refused pair
       fails at the handshake;

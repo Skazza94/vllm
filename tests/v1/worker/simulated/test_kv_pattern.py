@@ -1753,6 +1753,16 @@ def test_global_heads_follow_vllm_sharding_layer_by_layer():
     # MLA: one latent, the same on every rank.
     mla = {"mla": MLAAttentionSpec(block_size=4, num_kv_heads=1, head_size=16, dtype=torch.uint8)}
     assert head_map(mla, 1, 3, 4) == {"mla": ((0,), 64)}
+    # A packed latent (FlashMLA's FP8 one) keeps its rank's pattern, but a
+    # sparse-MLA model's: whole on every rank, as the dense one.
+    packed = {
+        "mla": MLAAttentionSpec(
+            block_size=4, num_kv_heads=1, head_size=16, dtype=torch.uint8,
+            state_content_bytes=41,
+        )
+    }
+    assert head_map(packed, 1, 3, 4) == {}
+    assert head_map(packed, 1, 3, 4, packed_latent=True) == {"mla": ((0,), 4 * 41)}
     # A recurrent state keeps its rank's pattern.
     from vllm.v1.kv_cache_interface import MambaSpec
 

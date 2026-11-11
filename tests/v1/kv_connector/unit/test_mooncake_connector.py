@@ -3217,7 +3217,7 @@ def test_simulated_real_transfers_pair_unequal_tp_for_a_hybrid_over_nixl_only():
         assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=True) is None
         for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4), (8, 2)):
             assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None, (local, remote)
-            assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, local, remote)
+            assert "plain or sparse MLA only" in simulated_tp_mismatch(config, local, remote)
     # A larger producer whose attention replicates: admitted for a hybrid (K=2 on 4).
     assert simulated_tp_mismatch(nemotron, 2, 4, nixl_consumer=True) is None
     # Prefix caching (a state a block) pairs the same sizes: a cached state
@@ -3246,6 +3246,24 @@ def test_simulated_real_transfers_pair_unequal_tp_for_a_hybrid_over_nixl_only():
     assert "one dividing" in simulated_tp_mismatch(nemotron, 2, 3, nixl_consumer=True)
 
 
+def test_simulated_real_transfers_pair_unequal_tp_for_sparse_mla():
+    """DeepSeek-V3.2's and GLM-5's sparse MLA: the latent and the indexer's
+    keys are each whole on every rank, so unequal sizes pair either way over
+    either connector, as plain MLA's do; not with a draft."""
+    for model_type in ("deepseek_v32", "glm_moe_dsa"):
+        config = _simulation_config(mla=True, model_type=model_type, dsa=True)
+        config.model_config.hf_text_config.index_topk = 2048
+        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4)):
+            assert simulated_tp_mismatch(config, local, remote) is None
+            assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None
+        assert "one dividing" in simulated_tp_mismatch(config, 2, 3)
+    drafted = _simulation_config(
+        mla=True, model_type="deepseek_v32", dsa=True, speculative=SimpleNamespace(method="mtp")
+    )
+    drafted.model_config.hf_text_config.index_topk = 2048
+    assert "plain or sparse MLA only" in simulated_tp_mismatch(drafted, 2, 4)
+
+
 def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     assert simulated_tp_mismatch(_simulation_config(), 2, 2) is None
     # Plain attention: each head's pattern is its own, so a connector may
@@ -3254,8 +3272,8 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     assert simulated_tp_mismatch(_simulation_config(), 4, 2) is None
     assert "one dividing the other" in simulated_tp_mismatch(_simulation_config(), 2, 3)
     for config in (
-        # Sparse MLA (DeepSeek-V3.2, GLM-5): an indexer's cache beside the
-        # latent, `index_topk` present whatever its value, here or nested.
+        # A sparse-MLA config the simulator does not serve as DSA (no
+        # `index_topk` value, or DSA nested under another model type).
         _simulation_config(mla=True, model_type="deepseek_v32", dsa=True),
         _simulation_config(mla=True, model_type="kimi_k25", text_model_type="glm_moe_dsa", dsa=True),
         # DeepSeek-V4's compressed caches; a hybrid's (Kimi-K3's) states.
@@ -3265,7 +3283,7 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
         _simulation_config(hybrid=True),
         _simulation_config(speculative=SimpleNamespace(method="mtp")),
     ):
-        assert "plain attention or plain MLA only" in simulated_tp_mismatch(config, 2, 4)
+        assert "plain or sparse MLA only" in simulated_tp_mismatch(config, 2, 4)
         # Equal sizes pair as before.
         assert simulated_tp_mismatch(config, 2, 2) is None
     # NIXL's decode refuses a larger producer whose heads are replicated (K
@@ -3293,7 +3311,7 @@ def test_simulated_real_transfers_pair_unequal_tp_with_sliding_window_layers():
     ):
         for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (2, 8), (8, 2)):
             assert simulated_tp_mismatch(config, local, remote) is None
-    assert "plain attention or plain MLA only" in simulated_tp_mismatch(
+    assert "plain or sparse MLA only" in simulated_tp_mismatch(
         _simulation_config(hybrid=True, sliding_window=128), 2, 4
     )
     # Gemma4: sliding layers of 8 KV heads beside global layers of 2. Equal

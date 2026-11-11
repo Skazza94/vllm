@@ -32,7 +32,10 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import host_dp_ranks
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    host_dp_ranks,
+    sparse_mla,
+)
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.simulated.kv_pattern import (
     NativeChecker,
@@ -326,6 +329,7 @@ class SimulatedModelRunner(GPUModelRunner):
             tp.rank_in_group,
             tp.world_size,
             layer_total_heads(self.model_config, [n for names in layers for n in names]),
+            packed_latent=sparse_mla(self.model_config),
         )
         heads = None
         if sim.kv_pattern_fill or sim.kv_pattern_check:
