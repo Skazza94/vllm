@@ -1065,6 +1065,27 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
+def test_decode_context_parallelism_is_refused_on_cpu(mla_model_dir):
+    """The CPU attention backends keep no DCP cache: a simulation there says
+    so at startup, where the model would otherwise fail to build on an
+    assertion; simulated transfers or none, either way."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    def config(**kwargs):
+        return EngineArgs(
+            model=mla_model_dir, skip_tokenizer_init=True, dtype="bfloat16",
+            max_model_len=256, block_size=64, enforce_eager=True,
+            tensor_parallel_size=2,
+            simulation_config={"simulate_forward": True}, **kwargs,
+        ).create_engine_config()
+
+    config()
+    for kv_transfer in (None, {"kv_connector": "NixlConnector", "kv_role": "kv_producer",
+                               "kv_buffer_device": "cpu"}):
+        with pytest.raises(ValueError, match="does not support decode context parallelism"):
+            config(decode_context_parallel_size=2, kv_transfer_config=kv_transfer)
+
+
 def test_real_mode_allows_tensor_parallelism_and_dp_attention(
     model_dir, moe_model_dir
 ):

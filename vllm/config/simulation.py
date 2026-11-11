@@ -165,6 +165,16 @@ class SimulationConfig:
 
         if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
             raise ValueError("Simulated forward needs a CUDA-alike or CPU platform.")
+        if current_platform.is_cpu() and parallel.decode_context_parallel_size > 1:
+            # The CPU attention backends keep no DCP cache (CPU MLA turns it
+            # off, the others return no softmax LSE): the model would fail to
+            # build on an assertion.
+            raise ValueError(
+                "Simulated forward on CPU does not support decode context "
+                "parallelism (decode_context_parallel_size "
+                f"{parallel.decode_context_parallel_size}): the CPU attention "
+                "backends keep no DCP KV cache."
+            )
         if vllm_config.lora_config is not None:
             raise ValueError("Simulated forward does not support LoRA.")
         if vllm_config.weight_transfer_config is not None:

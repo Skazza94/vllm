@@ -624,8 +624,9 @@ the in-process executor) rather than the CPU platform's: an MLA model keeps
 its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
-Layers still pick the CPU platform's attention backends and kernels, so a
-model needing one it lacks (decode context parallelism) fails to build there.
+Layers still pick the CPU platform's attention backends and kernels, which
+keep no decode-context-parallel cache: `--decode-context-parallel-size` above
+1 is refused there at startup.
 Weight formats do not: a checkpoint published with quantized weights (FP8,
 MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
 DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, the `-NVFP4` checkpoints) builds
