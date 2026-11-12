@@ -1989,6 +1989,65 @@ class PrefixCachingCheckTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "a positive, finite number of tokens"):
                     pd.load(spec_path)
 
+    def test_a_mooncake_request_write_above_the_task_limit_is_refused(self) -> None:
+        """One request's write to one decode rank, estimated at one task a block
+        of a region (no block assumed contiguous), is refused above hp_tcp's
+        limit: once merged, a write above it is never admitted. Requests
+        sharing a write, or writes overlapping, depend on timing: accepted,
+        the verdict reports them."""
+        from harness import models
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        patch = mock.patch.object(models, "MODELS", root)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        def config(**fields) -> None:
+            (root / "org--name" / "main").mkdir(parents=True, exist_ok=True)
+            (root / "org--name" / "main" / "config.json").write_text(json.dumps(fields))
+
+        def run(input_len: int, decode_tp: int = 2, **server):
+            return pd.parse({
+                "name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
+                "router": {"gateway": "gw"}, "prefill": {"node": "p", "kv_network": "kv", "tensor_parallel_size": 2},
+                "decode": {"node": "d", "kv_network": "kv", "tensor_parallel_size": decode_tp},
+                "server": {"timing": "zero", "block_size": 16, **server},
+                "workload": {"input_len": input_len, "concurrency": 4}}, Path("/x/run.yaml"))
+
+        config(num_hidden_layers=36, num_key_value_heads=8)
+        self.assertEqual(pd.request_write_tasks(run(1808))[0], 36 * 113)
+        with self.assertRaisesRegex(ValueError, r"can be 4104 hp_tcp tasks \(36 layers x 1 region\(s\) x 114 "
+                                                r"blocks of 16 tokens for 1809, none joined\), above "
+                                                r"max_outstanding_tasks 4096.*max_outstanding_tasks: N\} \(N >= 4104\)"):
+            run(1809)
+        # A head slice (TP 2 -> 4) shortens each copy, not their number.
+        self.assertEqual(pd.request_write_tasks(run(1808, decode_tp=4))[0], 36 * 113)
+        with self.assertRaisesRegex(ValueError, "can be 4104 hp_tcp tasks"):
+            run(1809, decode_tp=4)
+        # Four concurrent requests may share a write of 4 x 4068 tasks, as
+        # timing decides: not refused.
+        self.assertEqual(run(1808, decode_tp=4).workload.concurrency, 4)
+        self.assertEqual(run(1809, hp_tcp_args={"max_outstanding_tasks": 16384}).server.hp_tcp_args,
+                         {"max_outstanding_tasks": 16384})
+        with self.assertRaisesRegex(ValueError, "above max_outstanding_tasks 4104"):
+            run(1825, hp_tcp_args={"max_outstanding_tasks": 4104})
+        # A limit MC_TENT_CONF replaces is unknown, and NIXL's READs are not
+        # this write: neither is checked.
+        run(1809, env={"MC_TENT_CONF": "{}"})
+        run(1809, connector="nixl")
+        # Sparse MLA: the latent's and the indexer keys' regions.
+        config(num_hidden_layers=61, kv_lora_rank=512, index_topk=2048)
+        self.assertEqual(pd.request_write_tasks(run(448, block_size=64))[0], 61 * 2 * 7)
+        with self.assertRaisesRegex(ValueError, r"61 layers x 2 region\(s\) x 34 blocks of 64 tokens"):
+            run(2176, block_size=64)
+        # The block size vLLM picks at startup, and a hybrid's states: unknown.
+        self.assertIsNone(pd.request_write_tasks(run(100000, block_size=None)))
+        for hybrid in ({"hybrid_override_pattern": "M*M"}, {"layer_types": ["full_attention", "linear_attention"]},
+                       {"text_config": {"layer_types": ["linear_attention"]}}, {"attn_type_list": [0, 1]}):
+            with self.subTest(hybrid=hybrid):
+                config(num_hidden_layers=36, num_key_value_heads=8, **hybrid)
+                self.assertIsNone(pd.request_write_tasks(run(100000)))
+
     def test_a_precise_prefix_index_needs_the_servers_events_and_render(self) -> None:
         base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
                 "router": {"gateway": "gw", "prefix_index": "precise", "epp_verbosity": 5},

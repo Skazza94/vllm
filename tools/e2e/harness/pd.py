@@ -166,8 +166,10 @@ class Server:
     completes). Mooncake's Python binding retries a refused transfer once,
     at once. A transfer of more tasks than max_outstanding_tasks (4096 by
     default) is always refused; a smaller one may be, while others' tasks are
-    outstanding. A connector's descriptors are not those tasks (TENT may
-    merge them), and staying under the task limit leaves the byte limits
+    outstanding: a Mooncake run whose unmerged one-request estimate is
+    larger is refused before it starts (`_check_write_tasks`). A connector's
+    descriptors are not those tasks (TENT may merge them), and staying under
+    the task limit leaves the byte limits
     (max_outstanding_bytes, max_transfer_bytes) and the transport's health
     to pass too. hp_tcp sends protocol headers and payloads separately. Small
     head-sliced tasks may be sensitive to Nagle/delayed-ACK interactions;
@@ -432,7 +434,69 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                              "name, a link per rank)")
         if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
             raise ValueError("unequal TP sizes without data parallelism")
+    if run.server.connector == "mooncake":
+        _check_write_tasks(run)
     return run
+
+
+def _check_write_tasks(run: Run) -> None:
+    """Refuses, before it starts, a Mooncake run whose unmerged estimate of
+    one request's write (`request_write_tasks`) is above hp_tcp's task
+    limit: a conservative policy. A write whose tasks, after the connector
+    and TENT merge contiguous blocks, are above the limit is always refused,
+    and the producer holds its blocks until their lease expires; the actual
+    write can be much smaller, so a run whose blocks merge may be refused
+    too. Several ready requests for one decode rank share a write, and
+    writes overlap, as timing decides: not estimated here, the verdict
+    reports them (`_hp_tcp_writes`)."""
+    limit = hp_tcp_task_limit(run.server)
+    bound = request_write_tasks(run)
+    if limit is None or bound is None or bound[0] <= limit:
+        return
+    raise ValueError(f"one request's Mooncake write can be {bound[0]} hp_tcp tasks ({bound[1]}), above "
+                     f"max_outstanding_tasks {limit}: a write of more tasks than that, once contiguous blocks "
+                     f"merge, is always refused, and the producer holds its blocks until their lease expires "
+                     f"(this estimate merges none: the run may merge enough). Raise it with server.hp_tcp_args: "
+                     f"{{max_outstanding_tasks: N}} (N >= {bound[0]}), or shorten the prompt")
+
+
+def request_write_tasks(run: Run) -> tuple[int, str] | None:
+    """An estimate of the tasks of one request's Mooncake write to one decode
+    rank, merging no blocks, with its terms; None where it is not known
+    before the run. An upper bound when the prompt is workload.input_len
+    tokens; a prefix_repetition prompt can exceed it (the server tokenizes
+    its joined text again: a block more seen), so there it is an estimate.
+    None without server.block_size, without the model's config, or for a
+    hybrid, whose state regions and block size vLLM sets at startup. The
+    connector copies each block of each registered region on its own
+    (mooncake_connector.py:2066-2105), joining only blocks contiguous on both
+    sides, and TENT only those too: which are is decided at run time, so none
+    are joined here. Regions: one a layer (its paged KV, or MLA's latent),
+    two for sparse MLA (latent and indexer keys); a head slice at unequal TP
+    sizes changes a copy's length, not the copies. Blocks: the prompt's at
+    server.block_size, which vLLM only raises."""
+    block = run.server.block_size
+    try:
+        config = json.loads((Path(run.model) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    source = {**config, **(config.get("text_config") or config.get("llm_config") or {})}
+    layers = source.get("num_hidden_layers")
+    if not isinstance(block, int) or not isinstance(layers, int) or _has_states(source):
+        return None
+    regions = 2 if source.get("index_topk") else 1
+    blocks = -(-run.workload.input_len // block)
+    return layers * regions * blocks, (f"{layers} layers x {regions} region(s) x {blocks} blocks of {block} tokens "
+                                       f"for {run.workload.input_len}, none joined")
+
+
+def _has_states(config: dict) -> bool:
+    """Whether a model config has recurrent-state (Mamba, linear attention)
+    layers beside its attention."""
+    kinds = set(config.get("layer_types") or []) | set(config.get("layers_block_type") or [])
+    return bool(kinds - {"full_attention", "sliding_attention", "attention"}) or any(
+        key in config for key in ("hybrid_override_pattern", "linear_attn_config", "ssm_state_size",
+                                  "mamba_num_heads")) or 0 in (config.get("attn_type_list") or [])
 
 
 SPECULATIVE_KEYS = {"method", "num_speculative_tokens", "acceptance_rates", "seed"}
