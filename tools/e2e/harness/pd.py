@@ -465,23 +465,30 @@ def _check_write_tasks(run: Run) -> None:
                      f"{{max_outstanding_tasks: N}} (N >= {bound[0]}), or shorten the prompt")
 
 
+# These model types use the simulated CPU attention or dense MLA backend.
+# Do not infer a startup layout for arbitrary model implementations.
+_PLAIN_STARTUP_MODELS = (
+    "llama", "mistral", "mixtral", "qwen2", "qwen2_moe", "qwen3", "qwen3_moe",
+    "minimax_m2", "deepseek_v2", "deepseek_v3",
+)
+
+
 def request_write_tasks(run: Run) -> tuple[int, str] | None:
     """An estimate of the tasks of one request's Mooncake write to one decode
     rank, merging no blocks, with its terms; None where it is not known
     before the run. An upper bound when the prompt is workload.input_len
     tokens; a prefix_repetition prompt can exceed it (the server tokenizes
     its joined text again: a block more seen), so there it is an estimate.
-    None without server.block_size, without the model's config, or for a
-    hybrid, whose state regions and block size vLLM sets at startup. The
     connector copies each block of each registered region on its own
     (mooncake_connector.py:2066-2105), joining only blocks contiguous on both
-    sides, and TENT only those too: which are is decided at run time, so none
-    are joined here. Regions: one a layer (its paged KV, or MLA's latent),
-    two for sparse MLA (latent and indexer keys); the layers the target's
-    and, with server.speculative, its one native MTP layer, whatever the
-    depth (the draft's KV is one more layer of the target's groups). A head
-    slice at unequal TP sizes changes a copy's length, not the copies.
-    Blocks: the prompt's at server.block_size, which vLLM only raises."""
+    sides. TENT can merge more. A head slice changes a copy's length, not
+    the count. Ordinary attention uses one region a layer (two for sparse
+    MLA), including one native MTP layer when requested, whatever its depth.
+    A known hybrid uses one raw page per state layer, separate from the
+    attention blocks. Skip hybrid align mode and draft scratch, whose
+    non-null state block counts are not inferred here. With no configured
+    size, use 16 only for known ordinary attention or dense MLA; leave
+    mixed layouts and startup-aligned hybrids unestimated."""
     block = run.server.block_size
     try:
         config = json.loads((Path(run.model) / "config.json").read_text())
@@ -489,14 +496,67 @@ def request_write_tasks(run: Run) -> tuple[int, str] | None:
         return None
     source = {**config, **(config.get("text_config") or config.get("llm_config") or {})}
     layers = source.get("num_hidden_layers")
-    if not isinstance(block, int) or not isinstance(layers, int) or _has_states(source):
+    if type(layers) is not int or layers < 1:
+        return None
+    tokens = run.workload.input_len
+    ordinary_dtype = run.server.kv_cache_dtype in ("auto", "bfloat16", "float16", "fp8", "fp8_e4m3", "fp8_e5m2")
+    if _has_states(source):
+        hybrid = _hybrid_write_layers(source, layers)
+        if (hybrid is None or type(block) is not int or block < 1 or not ordinary_dtype
+                or _prefix_caching_enabled(run) is not False or run.server.speculative is not None):
+            return None
+        attention, state = hybrid
+        # These hybrids use ordinary CPU attention or dense MLA: their
+        # backends keep the aligned page whole. The platform may raise this
+        # size, while with prefix caching off each state group has one page.
+        blocks = -(-tokens // block)
+        return attention * blocks + state, (f"{attention} attention layers x {blocks} blocks of {block} tokens "
+                                            f"for {tokens} + {state} state layers x 1 page, none joined")
+    startup = block is None
+    if startup:
+        if (source.get("model_type") not in _PLAIN_STARTUP_MODELS
+                or source.get("sliding_window") or source.get("per_layer_config") or source.get("index_topk")
+                or source.get("compress_ratios") or "sliding_attention" in (source.get("layer_types") or ())
+                or not ordinary_dtype):
+            return None
+        # The simulated CPU attention and dense MLA backends accept whole
+        # blocks in multiples of 16; the startup preference may be larger.
+        block = 16
+    if type(block) is not int or block < 1:
         return None
     regions = 2 if source.get("index_topk") else 1
     draft = 1 if run.server.speculative is not None else 0
-    blocks = -(-run.workload.input_len // block)
+    blocks = -(-tokens // block)
     named = f"{layers} layers" + (" + 1 MTP layer" if draft else "")
+    size_note = " (startup lower bound)" if startup else ""
     return (layers + draft) * regions * blocks, (f"{named} x {regions} region(s) x {blocks} blocks of {block} tokens "
-                                                 f"for {run.workload.input_len}, none joined")
+                                                 f"for {tokens}{size_note}, none joined")
+
+
+def _hybrid_write_layers(config: dict, layers: int) -> tuple[int, int] | None:
+    """Attention and state layers for hybrids with one region per page."""
+    if any(config.get(key) for key in ("index_topk", "compress_ratios", "per_layer_config", "sliding_window")):
+        return None
+    pattern = config.get("hybrid_override_pattern")
+    kinds = config.get("layer_types")
+    linear = config.get("linear_attn_config")
+    model_type = config.get("model_type")
+    if (model_type == "nemotron_h" and isinstance(pattern, str) and len(pattern) == layers
+            and set(pattern) <= set("M*E-")):
+        attention, state = pattern.count("*"), pattern.count("M")
+    elif (model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+          and isinstance(kinds, list) and len(kinds) == layers
+          and all(kind in ("full_attention", "linear_attention") for kind in kinds)):
+        attention, state = kinds.count("full_attention"), kinds.count("linear_attention")
+    elif model_type in ("kimi_k3", "kimi_linear") and isinstance(linear, dict):
+        kda = linear.get("kda_layers")
+        if (not isinstance(kda, list) or not all(type(index) is int and 1 <= index <= layers for index in kda)
+                or len(kda) != len(set(kda))):
+            return None
+        attention, state = layers - len(kda), len(kda)
+    else:
+        return None
+    return (attention, state) if attention and state else None
 
 
 def _has_states(config: dict) -> bool:
@@ -2852,12 +2912,15 @@ def peak_prefill_throughput(steps: list[str], chunk: int) -> dict:
             "tokens_per_second": round(max(rates), 1) if rates else None}
 
 
-def _prefix_caching_flags(run: Run) -> list[str]:
+def _prefix_caching_enabled(run: Run) -> bool | None:
     """The server's prefix caching: as set, else off for the byte checks
     (their request patterns), else vLLM's default."""
     enabled = run.server.enable_prefix_caching
-    if enabled is None:
-        enabled = False if run.kv_check else None
+    return False if enabled is None and run.kv_check else enabled
+
+
+def _prefix_caching_flags(run: Run) -> list[str]:
+    enabled = _prefix_caching_enabled(run)
     if enabled is None:
         return []
     return ["--enable-prefix-caching" if enabled else "--no-enable-prefix-caching"]

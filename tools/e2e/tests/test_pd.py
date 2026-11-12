@@ -2057,13 +2057,68 @@ class PrefixCachingCheckTests(unittest.TestCase):
         config(num_hidden_layers=61, kv_lora_rank=512, index_topk=2048, num_nextn_predict_layers=1)
         self.assertEqual(pd.request_write_tasks(run(448, block_size=64, speculative={
             **spec, "num_speculative_tokens": 1}))[0], 62 * 2 * 7)
-        # The block size vLLM picks at startup, and a hybrid's states: unknown.
+        # A mixed physical layout with a startup-selected size is unknown.
         self.assertIsNone(pd.request_write_tasks(run(100000, block_size=None)))
-        for hybrid in ({"hybrid_override_pattern": "M*M"}, {"layer_types": ["full_attention", "linear_attention"]},
-                       {"text_config": {"layer_types": ["linear_attention"]}}, {"attn_type_list": [0, 1]}):
-            with self.subTest(hybrid=hybrid):
-                config(num_hidden_layers=36, num_key_value_heads=8, **hybrid)
-                self.assertIsNone(pd.request_write_tasks(run(100000)))
+
+    def _parse_write_estimate(self, config: dict, input_len: int, kv_check: bool = True,
+                              **server) -> tuple[int, str] | None:
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "org--name" / "main"
+            model.mkdir(parents=True)
+            (model / "config.json").write_text(json.dumps(config))
+            with mock.patch.object(pd.models, "MODELS", Path(root)):
+                run = pd.parse({
+                    "name": "t", "topology": "t", "model": "org/name", "client": "c",
+                    "control_network": "control", "router": {"gateway": "gw"},
+                    "prefill": {"node": "p", "kv_network": "kv"},
+                    "decode": {"node": "d", "kv_network": "kv"},
+                    "server": {"timing": "zero", **server},
+                    "kv_check": kv_check, "workload": {"input_len": input_len},
+                }, Path(root) / "run.yaml")
+                return pd.request_write_tasks(run)
+
+    def test_hybrid_write_estimates_count_one_raw_page_per_state_layer(self) -> None:
+        # Use resolved attention block sizes here. A state page includes the
+        # convolution and temporal state, and is not split into token blocks.
+        cases = [
+            ("Mamba2", {"model_type": "nemotron_h", "num_hidden_layers": 52,
+                        "hybrid_override_pattern": "M" * 23 + "E" * 23 + "*" * 6},
+             2560, 2112, 35),
+            ("GDN", {"text_config": {"model_type": "qwen3_5_text", "num_hidden_layers": 64,
+                                    "layer_types": ["linear_attention"] * 48 + ["full_attention"] * 16}},
+             1024, 800, 80),
+            ("KDA", {"model_type": "kimi_linear", "num_hidden_layers": 93, "linear_attn_config": {
+                "kda_layers": [i for i in range(1, 93) if i % 4]}},
+             1024, 768, 117),
+        ]
+        for name, config, tokens, size, expected in cases:
+            with self.subTest(model=name):
+                self.assertEqual(self._parse_write_estimate(config, tokens, block_size=size)[0], expected)
+        with self.assertRaisesRegex(ValueError, r"80 hp_tcp tasks .*48 state layers x 1 page"):
+            self._parse_write_estimate(cases[1][1], 1024, block_size=800, hp_tcp_args={"max_outstanding_tasks": 79})
+
+    def test_hybrid_write_estimates_skip_unresolved_state_layouts(self) -> None:
+        config = {"model_type": "qwen3_5_text", "num_hidden_layers": 2,
+                  "layer_types": ["full_attention", "linear_attention"]}
+        for server in ({"block_size": None}, {"enable_prefix_caching": True}, {"kv_check": False}):
+            with self.subTest(server=server):
+                self.assertIsNone(self._parse_write_estimate(config, 1024, **server))
+        self.assertEqual(self._parse_write_estimate(config, 32, kv_check=False, enable_prefix_caching=False)[0], 3)
+        self.assertIsNone(self._parse_write_estimate({"num_hidden_layers": 2, "attn_type_list": [0, 1]}, 1024))
+        self.assertIsNone(self._parse_write_estimate(
+            {"model_type": "kimi_linear", "num_hidden_layers": 2,
+             "linear_attn_config": {"kda_layers": [0]}}, 1024))
+
+    def test_plain_startup_write_estimate_uses_the_simulated_block_lower_bound(self) -> None:
+        for config in ({"model_type": "qwen3", "num_hidden_layers": 36},
+                       {"model_type": "deepseek_v3", "num_hidden_layers": 36, "kv_lora_rank": 512}):
+            with self.subTest(config=config):
+                bound, terms = self._parse_write_estimate(config, 1808, block_size=None)
+                self.assertEqual(bound, 4068)
+                self.assertIn("16 tokens for 1808 (startup lower bound)", terms)
+                with self.assertRaisesRegex(ValueError, "4104 hp_tcp tasks"):
+                    self._parse_write_estimate(config, 1809, block_size=None)
+        self.assertIsNone(self._parse_write_estimate({"num_hidden_layers": 36}, 1809, block_size=None))
 
     def test_a_precise_prefix_index_needs_the_servers_events_and_render(self) -> None:
         base = {"name": "t", "topology": "t", "model": "org/name", "client": "c", "control_network": "control",
