@@ -142,9 +142,15 @@ AISimulate's MTP depth: a decode step
 verifies k + 1 tokens a request and runs k target-shaped draft layers, the
 full width even when a step drafted fewer; draft weights and KV, prefill
 draft work and host glue are omitted. Acceptance comes from
-`spec_acceptance_rates` and does not change a step's cost. The `timing`
-record names the target, the resolved estimator configuration and its
-data's vLLM version.
+`spec_acceptance_rates` and does not change a step's cost. The pinned
+AISimulate version has a cached-prefix timing limitation for plain-MLA context
+steps (not sparse MLA): in DeepSeek-V3 and Kimi-K3 probes, estimates decrease as
+an already-positive prefix grows with the new-token count fixed, while
+generation estimates increase. Prefix-cache hits, later prefill chunks and
+decode's resumed context step take this path; other plain-MLA models (Kimi-K2)
+likely share it, unmeasured. No timing correction is applied. The `timing`
+record lists such approximations, and names the target, the resolved
+estimator configuration and its data's vLLM version.
 
 `table` and `replay` read a recorded step log (see below). A `table` can also
 be written by hand, as JSONL records of

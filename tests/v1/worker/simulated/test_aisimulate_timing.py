@@ -354,6 +354,9 @@ def test_derived_and_native_published_targets(fake_aisimulate, tmp_path):
         "w4a16_mxfp4",
     )
     assert p.assumptions()["aisimulate"]["local_config"]["config_sha256"]
+    # GQA: no plain-MLA prefix approximation.
+    approximations = p.assumptions()["aisimulate"]["approximations"]
+    assert not any("cached-prefix timing limitation for plain-MLA" in a for a in approximations)
     # A BF16 copy must name its target; `-bf16` is never stripped.
     bf16 = {k: v for k, v in DEEPSEEK_V3.items() if k != "quantization_config"}
     derived = model_dir(tmp_path, "deepseek-ai--DeepSeek-V3-bf16", bf16, derived=True)
@@ -370,6 +373,8 @@ def test_derived_and_native_published_targets(fake_aisimulate, tmp_path):
     assert (
         "published deepseek-ai/DeepSeek-V3 (fp8_block weights)" in record["deployment"]
     )
+    # Plain MLA: its cached-prefix timing limitation is stated.
+    assert any("cached-prefix timing limitation for plain-MLA" in a for a in record["approximations"])
     # A directory without the canonical name names nothing.
     plain = str(tmp_path / "plain")
     (tmp_path / "plain").mkdir()
@@ -1438,6 +1443,8 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
     )
     for field in ("index_n_heads", "index_head_dim", "index_topk", "index_topk_freq"):
         assert a["compared_geometry"][field] == raw.get(field)
+    # Sparse MLA: not stated.
+    assert not any("cached-prefix timing limitation for plain-MLA" in x for x in a["approximations"])
     # Another indexer is not the target's.
     with pytest.raises(ValueError, match="index_n_heads"):
         provider(
@@ -1698,6 +1705,7 @@ def test_kimi_k3_is_timed_with_its_mla_modules(tmp_path, tp):
     )
     assert a["compared_geometry"]["linear_attn_config"] == text["linear_attn_config"]
     assert a["compared_geometry"]["kv_lora_rank"] == text["kv_lora_rank"]
+    assert any("cached-prefix timing limitation for plain-MLA" in x for x in a["approximations"])
 
     model = get_model(
         p.config["model"],

@@ -247,6 +247,16 @@ MTP_APPROXIMATIONS = [
 ]
 # A hybrid target's MTP (Qwen3.5): its native drafter is one full-attention
 # layer, priced as k layers of the target's mix of attention and delta-nets.
+# Plain-MLA context steps over a cached prefix (request 236's probe): in
+# DeepSeek-V3 and Kimi-K3 the estimates fall as a positive prefix grows with
+# the new tokens fixed, while generation estimates rise. Not corrected.
+MLA_PREFIX_APPROXIMATION = (
+    "the pinned AISimulate version has a cached-prefix timing limitation for "
+    "plain-MLA context steps: in DeepSeek-V3 and Kimi-K3 probes, estimates "
+    "decrease as an already-positive prefix grows with the new-token count "
+    "fixed; prefix-cache hits, later prefill chunks and decode's resumed "
+    "context step use this path; no timing correction is applied"
+)
 HYBRID_MTP_APPROXIMATION = (
     "the MTP drafter, a full-attention layer, is priced as the hybrid target's "
     "layers ((L + k) / L of its graph): its attention and delta-net mix, not "
@@ -572,6 +582,11 @@ class AisimulateTimingProvider:
         )
         model, self._snapshot = _offline_model(target, bundled, timing_input)
         v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
+        # Plain MLA: a latent (`kv_lora_rank`), no indexer, not V4's caches.
+        text = target_config.get("text_config") or target_config
+        plain_mla = (
+            bool(text.get("kv_lora_rank")) and "index_topk" not in text and not v4
+        )
         # The quantization of the full config: a ModelOpt checkpoint may
         # declare it in its sidecar only, and would read as unquantized.
         quant = _infer_quantization_fields(_full_config(model)).get("quant_algo")
@@ -743,6 +758,7 @@ class AisimulateTimingProvider:
             ),
             "approximations": APPROXIMATIONS
             + ([V4_APPROXIMATION] if v4 else [])
+            + ([MLA_PREFIX_APPROXIMATION] if plain_mla else [])
             + (MTP_APPROXIMATIONS if nextn else [])
             + (
                 [HYBRID_MTP_APPROXIMATION]
