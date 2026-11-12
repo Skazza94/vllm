@@ -420,6 +420,9 @@ class PreciseIndexEvidenceTests(unittest.TestCase):
         self.assertEqual(self.evidence(produced=produced, steps=steps)["warm"]["exact"], 1)
         self.assertEqual([llmd.reusable_tokens(b, p, 16) for b, p in ((28, 448), (28, 449), (20, 448), (0, 448),
                                                                       (1, 1), (1, 17))], [432, 448, 320, 0, 0, 16])
+        # With a drafter (MTP) vLLM drops the last matched block.
+        self.assertEqual([llmd.reusable_tokens(b, p, 64, eagle=True) for b, p in ((5, 448), (7, 448), (1, 448),
+                                                                                  (0, 448))], [256, 384, 0, 0])
 
     def test_cold_agreement_does_not_hide_wrong_warm_lookups(self) -> None:
         # Every lookup's matches emptied (the mutation of response 201): the cold one agrees, no warm one does.

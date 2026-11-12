@@ -833,6 +833,17 @@ class StepLogWriter:
         if results:
             self._f.flush()
 
+    def write_kv_writes(self, events: list[dict], step_index: int, t: float) -> None:
+        """Append the pages the consumer's byte checks materialized with
+        prefix caching in a step (one record each, `phase` step or
+        completion, with the step's index as `spec_acceptance` gives it):
+        not checks, received bytes or hits."""
+        for event in events:
+            rec = {"kv_write": {**event, "step_index": step_index}, "t": t}
+            self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        if events:
+            self._f.flush()
+
     def write_kv_events(
         self, events: dict[str, object], t: float, t_scheduled: float
     ) -> None:

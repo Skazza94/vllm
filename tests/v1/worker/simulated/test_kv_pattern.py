@@ -311,8 +311,14 @@ def test_step_records_leave_out_other_records(tmp_path):
     log.write_kv_layout({"layers": 2}, 0.5)
     log.write_kv_events({"finished": [DECODE_ID]}, 1.0, 0.9)
     log.write_kv_checks([{"req_id": DECODE_ID, "ok": True}], 1.0)
+    log.write_kv_writes([{"req_id": DECODE_ID, "phase": "completion", "group": 0,
+                          "logical_block": 1, "block_id": 7, "end": 9}], 12, 1.0)
     log.write_threads({1234: "Thread-1 (process_output_sockets)"}, 1.0)
     log.close()
+    records = [json.loads(line) for line in (tmp_path / "steps.jsonl").read_text().splitlines()]
+    # A materialized page names its step as spec_acceptance does.
+    (write,) = [r["kv_write"] for r in records if "kv_write" in r]
+    assert (write["step_index"], write["phase"], write["block_id"]) == (12, "completion", 7)
     with (tmp_path / "steps.jsonl").open("a") as f:
         f.write(json.dumps({"device_s": 0.01, "host_s": 0.0}) + "\n")
     assert load_step_log(str(tmp_path / "steps.jsonl")) == [{"device_s": 0.01, "host_s": 0.0}]
@@ -1543,6 +1549,156 @@ def test_a_page_completed_by_generation_is_reused_by_a_later_request():
     checker.after_update(c_step)
     (hit,) = checker.after_step(None)
     assert not hit["ok"] and hit["mismatched_blocks"][0][2] == 8
+
+
+# Speculative decoding (MTP) with prefix caching: a step schedules its bonus
+# token and k drafts; the drafts' tokens are known only once accepted.
+PROMPT_S = [10, 11, 12, 13, 14, 15]  # six tokens: one full page and two more
+
+
+def run_step(checker, s):
+    checker.before_step(s)
+    checker.after_update(s)
+
+
+def spec_start(checker):
+    """Decode computes A's six prompt tokens itself (no pull) and samples its
+    bonus token at position 6; page 0 is written, page 1 not yet."""
+    run_step(checker, step(new=[("a", [1, 7], PROMPT_S, 0, 6)]))
+    checker.sampled(["a"], [[20]])
+    checker.completed({"a": 6})
+    assert [(e["phase"], e["logical_block"]) for e in checker.take_write_events()] == [("step", 0)]
+    assert checker.after_step(None) == []
+
+
+def zero(views, block):
+    return all(int(view[block].abs().sum()) == 0 for view in views.values())
+
+
+def test_accepted_drafts_complete_a_page_written_before_the_request_ends():
+    """238's counterexample: A's step computes its bonus and two drafts
+    (positions 6-8), both accepted, and A ends with that step. The page they
+    complete (tokens 4-7) is written at acceptance, never from a draft
+    before it, and a later request's prefix hit on it compares equal; the
+    same page corrupted fails."""
+    _, decode, _, checker = content_sides()
+    spec_start(checker)
+    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    assert zero(decode, 7)  # drafts at 7-8: not written before acceptance
+    checker.sampled(["a"], [[21, 22, 23]])  # two accepted drafts and a bonus
+    checker.completed({"a": 9})  # computed 6 + 3, nothing rejected
+    events = checker.take_write_events()
+    assert [(e["phase"], e["logical_block"], e["block_id"]) for e in events] == [
+        ("completion", 1, 7)
+    ]
+    chain = PROMPT_S + [20, 21, 22, 23]
+    assert holds(decode, 7, checker.chains, "a", 1, BLOCK)
+    run_step(checker, step(finished=["a"]))
+    assert checker.after_step(None) == []
+    hit_step = step(new=[("b", [1, 7, 9], chain[:8] + [5, 5], 8, 2)])
+    run_step(checker, hit_step)
+    (hit,) = checker.after_step(None)
+    assert hit["kind"] == "hit" and hit["ok"] and hit["blocks"] == 2, hit
+    decode[LAYERS[0]][7][0] ^= 0xFF
+    run_step(checker, step(new=[("c", [1, 7, 10], chain[:8] + [6], 8, 1)]))
+    (hit,) = checker.after_step(None)
+    assert not hit["ok"] and hit["mismatched_blocks"][0][2] == 7
+
+
+def test_rejected_drafts_write_nothing_and_their_page_waits_for_accepted_tokens():
+    _, decode, _, checker = content_sides()
+    spec_start(checker)
+    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    checker.sampled(["a"], [[21]])  # both drafts rejected, a new bonus
+    checker.completed({"a": 7})  # computed 6 + 3 - 2 rejected
+    assert checker.take_write_events() == [] and zero(decode, 7)
+    # The next step computes the bonus at 7, completing page 1 with known tokens.
+    run_step(checker, step(cached=[("a", None, 7, 3, False)]))
+    events = checker.take_write_events()
+    assert [(e["phase"], e["logical_block"]) for e in events] == [("step", 1)]
+    assert holds(decode, 7, checker.chains, "a", 1, BLOCK)
+    assert checker.after_step(None) == []
+
+
+def test_a_page_ending_at_the_new_bonus_token_waits_for_its_kv():
+    """A seven-token prompt: page 1 ends at position 7, the sampled bonus
+    token, whose KV a later step computes."""
+    _, decode, _, checker = content_sides()
+    run_step(checker, step(new=[("a", [1, 7], PROMPT_S + [16], 0, 7)]))
+    checker.sampled(["a"], [[20]])
+    checker.completed({"a": 7})
+    assert [e["logical_block"] for e in checker.take_write_events()] == [0]
+    assert zero(decode, 7)
+    run_step(checker, step(cached=[("a", None, 7, 1, False)]))
+    assert [e["logical_block"] for e in checker.take_write_events()] == [1]
+    assert holds(decode, 7, checker.chains, "a", 1, BLOCK)
+
+
+def test_an_incomplete_prefill_writes_no_page_its_kv_does_not_hold():
+    """239's case: a 20-token prompt of which a step computes 4 and samples
+    nothing; its later pages stay untouched and its watermark at page 1."""
+    _, decode, _, checker = content_sides()
+    prompt = list(range(30, 50))
+    run_step(checker, step(new=[("a", [1, 2, 3, 4, 5], prompt, 0, 4)]))
+    checker.sampled(["a"], [[]])
+    checker.completed({"a": 4})
+    assert [e["logical_block"] for e in checker.take_write_events()] == [0]
+    assert all(zero(decode, b) for b in (2, 3, 4, 5))
+    assert checker.written["a"] == [1]
+    assert checker.after_step(None) == []
+
+
+def test_an_optimistic_counter_writes_nothing_past_the_known_tokens():
+    """Async scheduling counts the previous step's drafts as computed before
+    their rejection rolls it back: a scheduled range past the known tokens
+    writes only what they complete."""
+    _, decode, _, checker = content_sides()
+    spec_start(checker)
+    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    checker.sampled(["a"], [[21]])
+    checker.completed({"a": 7})
+    # The scheduler still counts 9 computed; the chain knows 8 tokens.
+    run_step(checker, step(cached=[("a", None, 9, 3, False)]))
+    assert [e["logical_block"] for e in checker.take_write_events()] == [1]
+    assert zero(decode, 8) and checker.written["a"] == [2]
+
+
+def test_a_completion_at_the_workers_endpoint_leaves_the_bonus_page():
+    """240's case at the checker: the scheduler counts 8 computed (two
+    rejected drafts unresolved) against an actual 6; the step computes 6-8
+    and rejects both drafts. The worker's endpoint, 7, leaves the page
+    ending at the new bonus token (position 7) untouched; the mirror's
+    arithmetic, 9, would write it. The runner's endpoint read is tested on a
+    real runner (`test_real_kv_transfer.py`)."""
+    _, decode, _, checker = content_sides()
+    spec_start(checker)  # 6 computed, the bonus at 6 known
+    run_step(checker, step(cached=[("a", [8], 8, 3, False)]))
+    assert checker.take_write_events() == []
+    checker.sampled(["a"], [[21]])  # both rejected; the new bonus at 7
+    checker.completed({"a": 7})
+    assert checker.take_write_events() == [] and zero(decode, 7)
+    checker.completed({"a": 9})
+    assert [e["logical_block"] for e in checker.take_write_events()] == [1]
+
+
+def test_a_resumed_request_restarts_its_watermark_at_its_new_table():
+    """Preempted and resumed with a new table and four computed tokens
+    (recomputing from there): known tokens beyond the recomputed frontier
+    write nothing until the worker computes them."""
+    _, decode, _, checker = content_sides()
+    spec_start(checker)
+    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    checker.sampled(["a"], [[21, 22, 23]])
+    checker.completed({"a": 9})
+    checker.take_write_events()
+    # Resumed: blocks 1 (its hit page 0), 10, 11; two tokens recomputed.
+    run_step(checker, step(cached=[("a", [1, 10, 11], 4, 2, True)]))
+    (hit,) = checker.after_step(None)
+    assert hit["kind"] == "hit" and hit["ok"]
+    assert checker.written["a"] == [1] and checker.take_write_events() == []
+    checker.sampled(["a"], [[]])
+    checker.completed({"a": 6})
+    assert checker.take_write_events() == [] and zero(decode, 10)
 
 
 def test_a_decode_hit_before_a_pull_is_checked_at_its_place():

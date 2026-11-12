@@ -835,7 +835,8 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
             prefill_priced_steps(output, run),
             next((p.get("parameters") or {}).get("tokenProcessorConfig", {}).get("blockSizeTokens")
                  for p in plugins if p.get("type") == "precise-prefix-cache-producer"),
-            run.workload.prefix_repetition is not None)
+            run.workload.prefix_repetition is not None,
+            eagle=run.server.speculative is not None)
         problems.extend(precise.pop("problems"))
     return {"problems": pd._capped(problems, 5), "evidence": {
         "completion_requests": len(handled), "other_requests": len(others), "gateway": gateway,
@@ -870,17 +871,22 @@ def _count(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def reusable_tokens(blocks: int, prompt: int, block_tokens: int) -> int:
+def reusable_tokens(blocks: int, prompt: int, block_tokens: int, eagle: bool = False) -> int:
     """The tokens of ``blocks`` cached blocks a prompt of ``prompt`` tokens
     can reuse: vLLM recomputes at least the last token for its logits, and
     in whole blocks (``KVCacheManager.get_computed_blocks``: at most
-    ``prompt - 1`` tokens, rounded down to a block)."""
-    return min(blocks * block_tokens, (max(prompt - 1, 0) // block_tokens) * block_tokens)
+    ``prompt - 1`` tokens, rounded down to a block). With a drafter
+    (``eagle``: EAGLE or MTP) vLLM drops the last matched block, after
+    looking one block past that bound (``kv_cache_coordinator.py``,
+    ``eagle_proof_margin``)."""
+    matched = max(blocks - 1, 0) if eagle else blocks
+    return min(matched * block_tokens, (max(prompt - 1, 0) // block_tokens) * block_tokens)
 
 
 def precise_index_evidence(directory: Path, named: dict[str, dict], completions: set[str],
                            prefill_pick: dict[str, str], prefill_steps: dict[str, list[str]],
-                           block_tokens: object, reuse_workload: bool = False) -> dict:
+                           block_tokens: object, reuse_workload: bool = False,
+                           eagle: bool = False) -> dict:
     """llm-d's precise prefix index against the engines it indexes, from the
     EPP's log (at TRACE: each request's lookup) and metrics and the prefill
     instances' step logs.
@@ -983,7 +989,7 @@ def precise_index_evidence(directory: Path, named: dict[str, dict], completions:
             continue
         blocks = (matches.get(picked) or {}).get("MatchedBlocks") or 0
         raw_blocks.append(blocks)
-        reusable = reusable_tokens(blocks, prompt, block_tokens)
+        reusable = reusable_tokens(blocks, prompt, block_tokens, eagle)
         if reusable == 0 and cached == 0:
             cold += 1
         else:

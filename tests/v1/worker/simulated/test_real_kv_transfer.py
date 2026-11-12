@@ -560,9 +560,13 @@ def test_real_mode_allows_prefix_caching(model_dir, mla_model_dir):
             assert config.simulation_config.kv_pattern_check
 
 
-def test_pattern_checks_with_prefix_caching_take_dsa_and_refuse_mtp(tmp_path_factory):
+def test_pattern_checks_with_prefix_caching_take_dsa_and_mtp_but_a_hybrids(
+    tmp_path_factory, ds_conv_layout
+):
     """A DSA layer's latent and indexer keys are its block's content like any
-    page; speculative drafts are not validated with content patterns."""
+    page; so are MTP's pages, written once accepted. A hybrid's speculative
+    state blocks are not validated with content patterns: refused with
+    checks, not without them."""
     check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
     v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-pc", DEEPSEEK_V32)
     for prefix_caching in (True, False):
@@ -573,9 +577,25 @@ def test_pattern_checks_with_prefix_caching_take_dsa_and_refuse_mtp(tmp_path_fac
         assert config.cache_config.enable_prefix_caching is prefix_caching
     v3 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-pc", deepseek_v3(1))
     mtp = {"method": "mtp", "num_speculative_tokens": 1}
-    with pytest.raises(ValueError, match="no speculative decoding with prefix caching"):
-        engine_config(v3, check, speculative_config=mtp, enable_prefix_caching=True)
+    for k in (1, 2):
+        engine_config(v3, check, speculative_config={**mtp, "num_speculative_tokens": k},
+                      enable_prefix_caching=True)
     engine_config(v3, check, speculative_config=mtp)
+    v32_mtp = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-mtp-pc",
+                              {**DEEPSEEK_V32, "num_nextn_predict_layers": 1})
+    engine_config(v32_mtp, check, speculative_config=mtp, dtype="bfloat16", block_size=64,
+                  enable_prefix_caching=True)
+    text = QWEN3_5_MOE["text_config"]
+    qwen = write_model_dir(
+        tmp_path_factory, "tiny-qwen3.5-mtp-pc",
+        {**QWEN3_5_MOE, "text_config": {**text, "mtp_num_hidden_layers": 1}},
+    )
+    with pytest.raises(ValueError, match="prefix caching .* on a hybrid model"):
+        engine_config(qwen, check, speculative_config=mtp, enable_prefix_caching=True,
+                      language_model_only=True)
+    # Without byte checks a hybrid's MTP with prefix caching is unchanged.
+    engine_config(qwen, speculative_config=mtp, enable_prefix_caching=True,
+                  language_model_only=True)
 
 
 def test_simulated_blocks_need_a_multiple_of_16(model_dir):
@@ -847,6 +867,36 @@ def test_nvfp4_checkpoints_build_on_cpu_in_a_simulation_only(
                 max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
                 enable_prefix_caching=False, enforce_eager=True,
                 load_format="dummy")
+
+
+def test_the_completion_endpoint_is_the_workers_count_not_the_cpu_mirror(
+    model_dir, monkeypatch
+):
+    """The pages accepted drafts complete are bounded by the worker's own
+    computed count, which `postprocess_sampled` corrects by the step's
+    rejected drafts, not by the CPU mirror the scheduler sets optimistically
+    (240): a real runner's state and input batch, the two deliberately
+    apart (7 against 8)."""
+    from vllm import LLM
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    llm = LLM(model=model_dir, skip_tokenizer_init=True, dtype="float32",
+              max_model_len=256, kv_cache_memory_bytes=8 * 1024**2,
+              enable_prefix_caching=False, enforce_eager=True,
+              simulation_config={"simulate_forward": True, "timing": "linear",
+                                 "timing_args": {"fixed_us": 100}})
+    try:
+        engine = llm.llm_engine.engine_core.engine_core
+        runner = engine.model_executor.driver_worker.worker.model_runner
+        batch = InputBatch.make_dummy(1, 3, runner.input_buffers)
+        state = int(batch.idx_mapping[0])
+        runner.req_states.num_computed_tokens.gpu[state] = 7
+        runner.req_states.num_computed_tokens_np[state] = 8
+        batch.num_computed_tokens_np[:] = 8
+        assert runner._kv_completion_endpoints(batch) == {batch.req_ids[0]: 7}
+    finally:
+        del llm
 
 
 def test_cpu_mxfp4_experts_take_kimi_k3s_in_a_simulation_only(monkeypatch):
@@ -2823,10 +2873,15 @@ def main():
     role, model, kwargs, out, memory = sys.argv[1:6]
     from vllm import LLM, SamplingParams
     producer = role == "producer"
+    kwargs = json.loads(kwargs)
+    # Optional: more simulation fields, and (consumer) a byte of the last page
+    # written at a step's completion flipped after the first request.
+    corrupt = kwargs.pop("corrupt_completion_page", False)
     simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
                   "timing": "linear", "timing_args": {"fixed_us": 100},
                   "log_path": out + ".steps",
-                  ("kv_pattern_fill" if producer else "kv_pattern_check"): True}
+                  ("kv_pattern_fill" if producer else "kv_pattern_check"): True,
+                  **kwargs.pop("simulation", {})}
     llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
               max_model_len=256, kv_cache_memory_bytes=int(memory), block_size=16,
               max_num_batched_tokens=64, enable_prefix_caching=True,
@@ -2836,7 +2891,7 @@ def main():
                   "kv_role": "kv_producer" if producer else "kv_consumer",
                   "kv_buffer_device": "cpu",
                   "kv_connector_extra_config": {"backends": ["Mooncake"]}},
-              **json.loads(kwargs))
+              **kwargs)
     prompts = json.loads(sys.argv[6])
     if producer:
         params = []
@@ -2863,12 +2918,23 @@ def main():
                                extra_args={"kv_transfer_params": params}),
                 use_tqdm=False)
             outputs.append(list(output.outputs[0].token_ids))
+            if corrupt and len(outputs) == 1:
+                with open(out + ".steps") as f:
+                    writes = [json.loads(line)["kv_write"] for line in f if '"kv_write"' in line]
+                block = [w for w in writes if w["phase"] == "completion"][-1]["block_id"]
+                engine = llm.llm_engine.engine_core.engine_core
+                runner = engine.model_executor.driver_worker.worker.model_runner
+                for view in runner._kv_checker.views.values():
+                    view[block][0] ^= 0xFF
+                corrupted = block
         with open(out, "w") as f:
-            json.dump({"outputs": outputs}, f)
+            json.dump({"outputs": outputs, "corrupted": corrupted if corrupt else None}, f)
     with open(out + ".steps") as f:
-        checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
+        lines = [json.loads(line) for line in f]
     with open(out + ".checks", "w") as f:
-        json.dump(checks, f)
+        json.dump([r["kv_check"] for r in lines if "kv_check" in r], f)
+    with open(out + ".writes", "w") as f:
+        json.dump([r["kv_write"] for r in lines if "kv_write" in r], f)
 
 if __name__ == "__main__":
     main()
@@ -2941,6 +3007,96 @@ def test_nixl_peers_check_prefix_hits_and_pages_completed_by_generation(model_di
     assert [c["blocks"] for c in pulls] == [3, 1]
     (hit,) = hits
     assert hit["groups"][0]["logical_blocks"] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "acceptance, corrupt",
+    [(1.0, False), (0.0, False), (1.0, True)],
+    ids=["accepted", "rejected", "accepted-corrupted"],
+)
+def test_nixl_peers_check_pages_completed_by_accepted_mtp_drafts(
+    tmp_path_factory, tmp_path, acceptance, corrupt
+):
+    """#6 on the native scheduler: DeepSeek-V3's native MTP (k 2) with prefix
+    caching on both instances. A (40 tokens) is pulled and decode generates
+    26 tokens; with every draft accepted, the pages its drafts complete are
+    written at the step's completion, before A finishes. B's prompt is A's,
+    24 of its generated tokens and 10 more: decode's genuine cache-manager
+    hit covers pages completed by accepted drafts and compares equal; with
+    every draft rejected only step writes occur and the hit still compares;
+    with a completion page's byte flipped after A, B's hit fails there."""
+    import socket
+    import subprocess
+    import sys
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    model = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-mtp-prefix", deepseek_v3(1))
+    a = [(7 * i) % 120 + 1 for i in range(40)]
+    b = a + [0] * 24 + [3] * 10
+    prompts, max_tokens = json.dumps([a, b]), json.dumps([26, 2])
+    spec = {"speculative_config": {"method": "mtp", "num_speculative_tokens": 2},
+            "simulation": {"spec_acceptance_rates": [acceptance]}}
+    consumer_kwargs = {**spec, "corrupt_completion_page": corrupt}
+    script = tmp_path / "peer.py"
+    script.write_text(NIXL_PREFIX_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+    producer = subprocess.Popen(
+        [sys.executable, str(script), "producer", model, json.dumps(spec), str(produced),
+         str(16 * 1024**2), prompts],
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, "the producer exited"
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        consumer = subprocess.run(
+            [sys.executable, str(script), "consumer", model, json.dumps(consumer_kwargs),
+             str(consumed), str(24 * 1024**2), prompts, str(produced), max_tokens],
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+            timeout=600, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        assert consumer.returncode == 0, consumer.stdout[-4000:]
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            producer.kill()
+    result = json.loads(consumed.read_text())
+    assert result["outputs"][0] == [0] * 26
+    c_checks = json.loads((tmp_path / "consumer.json.checks").read_text())
+    writes = json.loads((tmp_path / "consumer.json.writes").read_text())
+    a_id = next(c["req_id"] for c in c_checks if "kind" not in c)
+    completion = {w["logical_block"] for w in writes
+                  if w["req_id"] == a_id and w["phase"] == "completion"}
+    # Every write ends within known, computed tokens: A's are 40 + 26 - 1.
+    assert all(w["end"] <= 65 for w in writes if w["req_id"] == a_id), writes
+    (hit,) = [c for c in c_checks if c.get("kind") == "hit"]
+    hit_pages = set(hit["groups"][0]["logical_blocks"])
+    if acceptance:
+        # The cache manager's own hit (its replay margin respected) covers
+        # pages accepted drafts completed.
+        assert completion and completion & hit_pages, (completion, hit_pages)
+    else:
+        assert not completion
+    if corrupt:
+        assert not hit["ok"], hit
+        assert {m[2] for m in hit["mismatched_blocks"]} == {result["corrupted"]}
+    else:
+        assert all(c["ok"] for c in c_checks), c_checks
 
 
 def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):

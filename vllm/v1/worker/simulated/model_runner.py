@@ -693,6 +693,15 @@ class SimulatedModelRunner(GPUModelRunner):
         )
         if self._kv_checker is not None:
             self._kv_checker.sampled(output.req_ids, output.sampled_token_ids)
+            # The pages accepted drafts complete, written before the
+            # scheduler caches them.
+            self._kv_checker.completed(self._kv_completion_endpoints(input_batch))
+            if self.step_log is not None and (
+                writes := self._kv_checker.take_write_events()
+            ):
+                self.step_log.write_kv_writes(
+                    writes, pending.descriptor.step_index, self.clock.now()
+                )
 
         if self.step_log is not None and self._logs_steps:
             self.step_log.write(
@@ -839,6 +848,16 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.step_log.write(descriptor, cost, t_start, device_end, [])
             self._step_index += 1
         return None, None
+
+    def _kv_completion_endpoints(self, input_batch) -> dict[str, int]:
+        """Each request's computed tokens after this step, as the worker's
+        own state holds them once `postprocess_sampled` has applied the
+        step's query length and rejected drafts: not the CPU mirror
+        (`num_computed_tokens_np`), the scheduler's optimistic upper bound.
+        A sampled token's KV is a later step's, so it is not counted."""
+        rows = input_batch.idx_mapping[: input_batch.num_reqs]
+        computed = self.req_states.num_computed_tokens.gpu[rows].tolist()
+        return dict(zip(input_batch.req_ids, (int(c) for c in computed)))
 
     def _num_accepted(
         self, pending: _PendingStep, input_batch: InputBatch, num_drafts: np.ndarray

@@ -817,6 +817,7 @@ class _ConsumerPages(_ContentPages):
         for new in scheduler_output.scheduled_new_reqs:
             chains.admit(new.req_id, new.prompt_token_ids)
             self._track(new.req_id, new.block_ids, replace=True)
+            self._reset_written(new.req_id, new.num_computed_tokens)
             starts = self.pull_starts.pop(new.req_id, None)
             if starts is None:
                 self._prefix_hits(new.req_id, new.num_computed_tokens)
@@ -836,6 +837,7 @@ class _ConsumerPages(_ContentPages):
             resumed = req_id in cached.resumed_req_ids
             self._track(req_id, new_ids, replace=resumed)
             if resumed:
+                self._reset_written(req_id, cached.num_computed_tokens[index])
                 self._prefix_hits(req_id, cached.num_computed_tokens[index])
         for req_id in scheduler_output.finished_req_ids:
             if (expected := self.awaiting.pop(req_id, None)) is not None:
@@ -849,7 +851,14 @@ class _ConsumerPages(_ContentPages):
                 )
             self.tables.pop(req_id, None)
             self.pull_starts.pop(req_id, None)
+            self.written.pop(req_id, None)
             chains.drop(req_id)
+
+    def _reset_written(self, req_id: str, computed: int) -> None:
+        """A request's table set or replaced: its leading blocks up to its
+        computed tokens (prefix hits, pulled blocks) are not its to write."""
+        assert self.chains is not None
+        self.written[req_id] = [computed // size for size in self.chains.block_sizes]
 
     def _compare_pull(self, req_id: str, expected: "_Expected") -> dict:
         """A finished pull, against its blocks' content as the producer
@@ -876,32 +885,63 @@ class _ConsumerPages(_ContentPages):
         return result
 
     def after_update(self, scheduler_output: "SchedulerOutput") -> None:
-        """Write the pages this step's computed tokens complete (after the
-        runner zeroed the step's new blocks): each group's blocks whose last
-        token the step computes, full blocks of the request's content (its
-        computed tokens: a sampled token is computed by a later step). Then
-        compare the step's prefix hits."""
+        """Write the pages this step completes with tokens known before it
+        (after the runner zeroed the step's new blocks): each group's full
+        blocks from the request's watermark up to its computed tokens plus
+        the step's, no further than its known tokens (its prompt and accepted
+        samples: a draft's is not known yet). Then compare the step's prefix
+        hits, which may be pages written here."""
         chains = self.chains
         if chains is None:
             return
         computed = {new.req_id: new.num_computed_tokens for new in scheduler_output.scheduled_new_reqs}
         cached = scheduler_output.scheduled_cached_reqs
         computed.update(zip(cached.req_ids, cached.num_computed_tokens))
+        for req_id, start in computed.items():
+            if req_id not in self.written and req_id in self.tables:
+                self._reset_written(req_id, start)
+            end = start + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            self._materialize(req_id, end, "step")
+        self._verify_due()
+
+    def completed(self, endpoints: Mapping[str, int]) -> None:
+        """A step's accepted KV, once acceptance is known and before the
+        scheduler sees the step's output: each request's full blocks from
+        its watermark up to its computed tokens after the step (the worker's
+        own count, rejected drafts left out; a sampled token's KV is a later
+        step's), no further than its known tokens. These are the pages
+        accepted drafts complete, written before the scheduler can cache
+        them or free the request."""
+        if self.chains is None:
+            return
+        for req_id, endpoint in endpoints.items():
+            self._materialize(req_id, endpoint, "completion")
+
+    def take_write_events(self) -> list[dict]:
+        events, self.write_events = self.write_events, []
+        return events
+
+    def _materialize(self, req_id: str, end: int, phase: str) -> None:
+        """Write a request's full blocks of each group from its watermark up
+        to `end` tokens, capped at its known tokens. The watermark advances
+        over each block written (or null), never past one it could not
+        write. A step write is noted for that step's hit comparisons."""
+        chains = self.chains
+        assert chains is not None
+        table, written = self.tables.get(req_id), self.written.get(req_id)
+        if table is None or written is None:
+            return
+        tokens = chains.tokens.get(req_id)
+        limit = end if tokens is None else min(end, len(tokens))
         waiting = {
             block
             for expected in (*self.pending.values(), *self.awaiting.values())
             for block in expected.block_ids
         }
-        for req_id, start in computed.items():
-            end = start + scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            table = self.tables.get(req_id)
-            if table is None:
-                continue
-            for group, size in enumerate(chains.block_sizes):
-                for logical in range(start // size, min(end // size, len(table[group]))):
-                    block = table[group][logical]
-                    if block == NULL_BLOCK_ID:
-                        continue
+        for group, size in enumerate(chains.block_sizes):
+            for logical in range(written[group], min(limit // size, len(table[group]))):
+                block = table[group][logical]
+                if block != NULL_BLOCK_ID:
                     if block in waiting:
                         raise RuntimeError(
                             f"Request {req_id} would write block {block}, whose "
@@ -913,8 +953,13 @@ class _ConsumerPages(_ContentPages):
                         self.results.append(_lifecycle_failure(req_id, "write", e))
                         break
                     self._write_block(req_id, group, logical, block, identity)
-                    self._record_writes(req_id, [block])
-        self._verify_due()
+                    if phase == "step":
+                        self._record_writes(req_id, [block])
+                    self.write_events.append(
+                        {"req_id": req_id, "phase": phase, "group": group,
+                         "logical_block": logical, "block_id": block, "end": limit}
+                    )
+                written[group] = logical + 1
 
     def sampled(self, req_ids: Sequence[str], tokens: Sequence[Sequence[int]]) -> None:
         """The tokens this step sampled, each request's chain's next."""
@@ -956,6 +1001,8 @@ class PatternChecker(_ConsumerPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+    written: dict[str, list[int]] = field(default_factory=dict)
+    write_events: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._groups = group_views(self.views, self.groups)
@@ -1544,6 +1591,8 @@ class NativeChecker(_ConsumerPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+    written: dict[str, list[int]] = field(default_factory=dict)
+    write_events: list[dict] = field(default_factory=list)
     heads: tuple | None = None
     """Global KV heads, as the filler's: its spans are head patterns,
     whichever ranks NIXL reads them from."""

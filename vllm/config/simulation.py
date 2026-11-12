@@ -480,12 +480,15 @@ class SimulationConfig:
             # The pattern is then a block's content (its tokens and every
             # earlier one, as prefix caching keys it): attention caches, a
             # hybrid's states (the tokens a state has absorbed), DSA's
-            # latents and indexer keys and DeepSeek-V4's packed groups.
-            # Speculative drafts are not validated with it.
-            if vllm_config.speculative_config is not None:
+            # latents and indexer keys and DeepSeek-V4's packed groups. With
+            # speculative decoding a page is written once its tokens are known
+            # and their KV computed (drafts only once accepted). A hybrid's
+            # speculative state blocks, which align mode relocates, are not
+            # validated with it.
+            if vllm_config.speculative_config is not None and model.is_hybrid:
                 problems.append(
                     "no speculative decoding with prefix caching for "
-                    "kv_pattern_fill and kv_pattern_check"
+                    "kv_pattern_fill and kv_pattern_check on a hybrid model"
                 )
         if sparse_mla or model.is_attention_free:
             problems.append(

@@ -552,8 +552,14 @@ another request, so its pattern is its content's instead: the tokens up to
 the block's end, as prefix caching keys a full block. Prefix hits are then
 compared too, read-only, on both instances (`kind` hit, apart from the
 transferred blocks). Such a run takes token prompts only (no LoRA adapter,
-`cache_salt`, prompt embeddings or multimodal inputs) and no speculative
-decoding. A hybrid's state is its block's content
+`cache_salt`, prompt embeddings or multimodal inputs), and speculative
+decoding only for a model without recurrent states (MTP of DeepSeek-V3,
+DeepSeek-V3.2, GLM-5 or DeepSeek-V4): decode writes a block's content once
+its tokens are known and their KV computed, a draft's only once accepted,
+at the end of the step that accepted it (each such write a `kv_write`
+record, apart from the checks). A hybrid's speculative state blocks, which
+vLLM relocates with prefix caching, are not checked (its MTP with prefix
+caching runs without byte checks). A hybrid's state is its block's content
 too: the tokens it has absorbed, which stop one short of the prompt on a
 prefill instance (decode expects that). A hit ending inside a block is
 reported as outside the checks. Decode reuses a cached prefix of its own
