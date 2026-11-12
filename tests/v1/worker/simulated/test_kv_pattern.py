@@ -377,6 +377,48 @@ def test_mooncake_pulls_are_checked_by_the_shared_base_request_id(sides):
     assert result["remote_request_id"] == DECODE_ID
 
 
+@pytest.mark.parametrize(
+    "draft",
+    [
+        ("model.layers.2.self_attn.attn",),
+        ("model.layers.2.self_attn.attn", "model.layers.2.self_attn.indexer.k_cache"),
+    ],
+    ids=["mla", "sparse-mla"],
+)
+@pytest.mark.parametrize("fault", ["omitted", "corrupted"])
+def test_a_mooncake_pull_checks_the_mtp_draft_layer_with_the_target(draft, fault):
+    """A native MTP's draft KV (its latent, and a sparse draft's indexer
+    keys) is a layer of the target's groups: a Mooncake pull missing or
+    corrupting only it fails, naming only its layers."""
+    layers = (*LAYERS, *draft)
+
+    def all_caches():
+        return {name: torch.zeros(8, 2, 4, 8) for name in layers}
+
+    prefill, decode = block_views(all_caches(), 8), block_views(all_caches(), 8)
+    PatternFiller(prefill).after_update(new_request_step(PREFILL_ID, [3, 5, 6]))
+    pairs = [(1, 3), (2, 5), (4, 6)]
+
+    def pull(skip=(), flip=None):
+        checker = PatternChecker(decode)
+        checker.before_step(mooncake_step(DECODE_ID, [1, 2, 4]))
+        for layer in layers:
+            if layer not in skip:
+                for d_block, p_block in pairs:
+                    decode[layer][d_block].copy_(prefill[layer][p_block])
+        if flip is not None:
+            decode[flip][2][7] ^= 0xFF
+        (result,) = checker.after_step(KVConnectorOutput(finished_recving={DECODE_ID}))
+        return result
+
+    whole = pull()
+    assert whole["ok"] and whole["layers"] == len(layers), whole
+    for layer in draft:
+        bad = pull(skip=(layer,)) if fault == "omitted" else pull(flip=layer)
+        assert not bad["ok"] and bad["mismatched_bytes"] > 0
+        assert {block[0] for block in bad["mismatched_blocks"]} == {layer}
+
+
 def test_mooncake_requests_are_lifecycle_events():
     step = mooncake_step(DECODE_ID, [1, 2])
     step.scheduled_new_reqs = []

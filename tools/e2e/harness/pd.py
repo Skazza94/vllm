@@ -188,10 +188,11 @@ class Server:
     nixl_backend: str = "mooncake"
     """NIXL backend: mooncake (default), ucx or libfabric over CPU TCP."""
     speculative: dict | None = None
-    """Native MTP over NIXL: {method: mtp, num_speculative_tokens: k (1 to
-    5), acceptance_rates: [...], seed: 0}. Both instances take the same
-    speculative config (NIXL's handshake checks their transfer
-    compatibility, the draft among it). The rates are the
+    """Native MTP: {method: mtp, num_speculative_tokens: k (1 to 5),
+    acceptance_rates: [...], seed: 0}. Both instances take the same
+    speculative config: NIXL's handshake checks their transfer
+    compatibility, the draft among it; Mooncake does not (the simulator
+    takes it for DeepSeek-V3, DeepSeek-V3.2 and GLM-5). The rates are the
     simulator's per-position conditional acceptance probabilities (the last
     repeats), sampled with the seed: a run input, not a model's."""
 
@@ -385,11 +386,15 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     if run.router.dp_routing == "rank" and run.prefill.data_parallel_size == run.decode.data_parallel_size == 1:
         raise ValueError("router.dp_routing: rank needs a side with data_parallel_size > 1")
     if run.router.dp_routing == "rank" and run.server.connector != "nixl":
-        # A server a rank each starts Mooncake's bootstrap server on the one
-        # bootstrap port, and llm-d's sidecar asks that one port for a rank of
-        # its own choosing, whichever rank the EPP picked.
-        raise ValueError("router.dp_routing: rank needs server.connector: nixl (MooncakeConnector's bootstrap "
-                         "server is one an instance, not one a rank)")
+        # vLLM launches a Mooncake bootstrap server for each external-LB
+        # prefill server (mooncake_connector.py's should_launch_bootstrap_
+        # server), but llm-d v1.0's sidecar derives one bootstrap port from
+        # the prefill host and picks a rank from that server's map
+        # (connector_mooncake.go:49, 58-61), whichever endpoint the EPP
+        # picked. Prefill DP 1 with rank-routed decode ranks is not that
+        # case, and is not validated either.
+        raise ValueError("router.dp_routing: rank needs server.connector: nixl (llm-d's sidecar selects one "
+                         "Mooncake bootstrap server a prefill host, not one an endpoint)")
     if run.router.prefix_index not in PREFIX_INDEXES:
         raise ValueError(f"router.prefix_index is one of {', '.join(PREFIX_INDEXES)}, not "
                          f"{run.router.prefix_index!r}")
@@ -472,9 +477,11 @@ def request_write_tasks(run: Run) -> tuple[int, str] | None:
     (mooncake_connector.py:2066-2105), joining only blocks contiguous on both
     sides, and TENT only those too: which are is decided at run time, so none
     are joined here. Regions: one a layer (its paged KV, or MLA's latent),
-    two for sparse MLA (latent and indexer keys); a head slice at unequal TP
-    sizes changes a copy's length, not the copies. Blocks: the prompt's at
-    server.block_size, which vLLM only raises."""
+    two for sparse MLA (latent and indexer keys); the layers the target's
+    and, with server.speculative, its one native MTP layer, whatever the
+    depth (the draft's KV is one more layer of the target's groups). A head
+    slice at unequal TP sizes changes a copy's length, not the copies.
+    Blocks: the prompt's at server.block_size, which vLLM only raises."""
     block = run.server.block_size
     try:
         config = json.loads((Path(run.model) / "config.json").read_text())
@@ -485,9 +492,11 @@ def request_write_tasks(run: Run) -> tuple[int, str] | None:
     if not isinstance(block, int) or not isinstance(layers, int) or _has_states(source):
         return None
     regions = 2 if source.get("index_topk") else 1
+    draft = 1 if run.server.speculative is not None else 0
     blocks = -(-run.workload.input_len // block)
-    return layers * regions * blocks, (f"{layers} layers x {regions} region(s) x {blocks} blocks of {block} tokens "
-                                       f"for {run.workload.input_len}, none joined")
+    named = f"{layers} layers" + (" + 1 MTP layer" if draft else "")
+    return (layers + draft) * regions * blocks, (f"{named} x {regions} region(s) x {blocks} blocks of {block} tokens "
+                                                 f"for {run.workload.input_len}, none joined")
 
 
 def _has_states(config: dict) -> bool:
@@ -515,8 +524,6 @@ def _check_speculative(server: Server) -> None:
         raise ValueError(f"server.speculative.acceptance_rates: 1 to {k} probabilities in [0, 1]")
     if not isinstance(spec.get("seed", 0), int) or isinstance(spec.get("seed", 0), bool):
         raise ValueError("server.speculative.seed is an integer")
-    if server.connector != "nixl":
-        raise ValueError("server.speculative needs the nixl connector (its handshake checks the draft)")
 
 
 TENT_DEFAULT_MAX_OUTSTANDING_TASKS = 4096

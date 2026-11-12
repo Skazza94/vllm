@@ -28,6 +28,12 @@ REAL_KV_MTP_DRAFTS = {
     "glm_moe_dsa": "DeepseekV32MTPModel",
 }
 REAL_KV_MTP_MAX_DEPTH = 5
+# Those Mooncake moves too: its draft one more MLA layer of the target's
+# groups. Mooncake has no speculative-compatibility check (it refuses only a
+# producer layer the consumer lacks); both instances must share the config.
+# A hybrid's MTP is NIXL's: Mooncake would also move each state's k scratch
+# slots, which NIXL leaves.
+REAL_KV_MTP_MOONCAKE = ("deepseek_v3", "deepseek_v32", "glm_moe_dsa")
 # Sparse MLA with a lightning indexer (DSA): DeepSeek-V3.2, GLM-5.
 DSA_MODEL_TYPES = ("deepseek_v32", "glm_moe_dsa")
 # Cache dtypes a DSA latent is kept packed for (FlashMLA's `fp8_ds_mla`).
@@ -205,10 +211,12 @@ class SimulationConfig:
     @staticmethod
     def _real_kv_mtp_problems(vllm_config: "VllmConfig") -> list[str]:
         """Speculative decoding moves its draft's KV with the target's only as
-        DeepSeek-V3's or DeepSeek-V4's native single-module MTP over NIXL,
-        whose handshake checks the instances' transfer compatibility, the
-        draft among it: the checkpoint's one MTP layer, at the target's
-        parallelism and precision."""
+        a model's native single-module MTP (`REAL_KV_MTP_DRAFTS`): the
+        checkpoint's one MTP layer, at the target's parallelism and
+        precision; over NIXL, whose handshake checks the instances' transfer
+        compatibility, the draft among it, or over Mooncake for
+        `REAL_KV_MTP_MOONCAKE` (no such check: the instances' configs must
+        match)."""
         spec = vllm_config.speculative_config
         model = vllm_config.model_config
         kv_transfer = vllm_config.kv_transfer_config
@@ -248,14 +256,19 @@ class SimulationConfig:
             mismatches.append(
                 f"draft LM head quantization {spec.draft_lm_head_quantization}"
             )
-        if kv_transfer.kv_connector not in ("NixlConnector", "NixlPullConnector"):
-            mismatches.append(kv_transfer.kv_connector)
+        model_type = getattr(model.hf_config, "model_type", None)
+        if kv_transfer.kv_connector not in NIXL_CONNECTORS and not (
+            kv_transfer.kv_connector == "MooncakeConnector"
+            and model_type in REAL_KV_MTP_MOONCAKE
+        ):
+            mismatches.append(f"{kv_transfer.kv_connector} for {model_type}")
         if not mismatches:
             return []
         return [
-            "speculative decoding only as DeepSeek-V3's, DeepSeek-V4's or "
-            f"Qwen3.5's native single-module MTP (1 to {REAL_KV_MTP_MAX_DEPTH} tokens) "
-            f"over NIXL, not {', '.join(mismatches)}"
+            "speculative decoding only as a native single-module MTP (DeepSeek-V3, "
+            f"DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5; 1 to {REAL_KV_MTP_MAX_DEPTH} "
+            "tokens) over NIXL, or DeepSeek-V3's, DeepSeek-V3.2's or GLM-5's over "
+            f"Mooncake, not {', '.join(mismatches)}"
         ]
 
     def _verify_kv_transfer(self, vllm_config: "VllmConfig") -> None:

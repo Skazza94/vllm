@@ -672,7 +672,8 @@ def test_real_mode_takes_qwen3_5_native_mtp_over_nixl_only(
 ):
     """Qwen3.5's one MTP layer (`mtp_num_hidden_layers`) moves with the
     target's KV over NIXL in the DS layout, its states' speculative slots
-    left where they are: not over Mooncake, nor two MTP layers."""
+    left where they are: not over Mooncake (which would move them), with
+    byte checks or without, nor two MTP layers."""
     text = QWEN3_5_MOE["text_config"]
     one = write_model_dir(
         tmp_path_factory, "tiny-qwen3.5-mtp",
@@ -696,7 +697,10 @@ def test_real_mode_takes_qwen3_5_native_mtp_over_nixl_only(
                 "Qwen3_5MoeMTP"
             ]
     for model, kwargs, problem in (
-        (one, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
+        (one, {"kv_transfer": {"kv_connector": "MooncakeConnector"}},
+         "MooncakeConnector for qwen3_5_moe"),
+        (one, {"kv_transfer": {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"},
+               "simulation": {"kv_pattern_fill": True}}, "MooncakeConnector for qwen3_5_moe"),
         (one, {"speculative_config": mtp(6)}, "6 speculative tokens"),
         (two, {}, "2 MTP layers"),
     ):
@@ -947,12 +951,13 @@ def deepseek_v3(mtp_layers):
     return {**DEEPSEEK_V3, "num_nextn_predict_layers": mtp_layers}
 
 
-def test_real_mode_takes_native_single_module_mtp_over_nixl(
+def test_real_mode_takes_native_single_module_mtp_over_nixl_or_mooncake(
     tmp_path_factory, v4_model_dir, model_dir
 ):
     """DeepSeek-V3's and DeepSeek-V4's one MTP layer moves with the target's
-    KV over NIXL, whose handshake checks the speculative configuration; no
-    other speculative decoding, connector or draft."""
+    KV over NIXL, whose handshake checks the speculative configuration;
+    DeepSeek-V3's over Mooncake too, which does not (V4's caches are NIXL's),
+    with byte checks or without; no other speculative decoding or draft."""
     v3 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3", deepseek_v3(1))
     v3_two = write_model_dir(tmp_path_factory, "tiny-deepseek-v3-two", deepseek_v3(2))
     v4 = {
@@ -978,18 +983,54 @@ def test_real_mode_takes_native_single_module_mtp_over_nixl(
         assert config.speculative_config.draft_model_config.architectures == [
             "DeepSeekV4MTPModel"
         ]
+    mooncake = {"kv_connector": "MooncakeConnector"}
+    for simulation, role in (({}, "kv_consumer"), ({"kv_pattern_fill": True}, "kv_producer")):
+        for k in (1, 5):
+            config = engine_config(v3, simulation=simulation,
+                                   kv_transfer={**mooncake, "kv_role": role},
+                                   speculative_config=mtp(k))
+            assert config.speculative_config.draft_model_config.architectures == [
+                "DeepSeekMTPModel"
+            ]
+        with pytest.raises(ValueError, match="MooncakeConnector for deepseek_v4"):
+            engine_config(v4_model_dir, simulation=simulation,
+                          kv_transfer={**mooncake, "kv_role": role},
+                          speculative_config=mtp(), **v4)
     for model, kwargs, problem in (
-        (v3, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
         (v3, {"speculative_config": mtp(6)}, "6 speculative tokens"),
+        (v3_two, {"kv_transfer": mooncake}, "2 MTP layers"),
         # A checkpoint of two MTP layers, even at depth 1.
         (v3_two, {"speculative_config": mtp()}, "2 MTP layers"),
         (v3, {"speculative_config": mtp(kv_cache_dtype="fp8")}, "draft KV cache dtype fp8"),
         (model_dir, {"speculative_config": {"method": "ngram", "num_speculative_tokens": 2,
                                             "prompt_lookup_max": 2}}, "method ngram"),
+        (model_dir, {"kv_transfer": mooncake,
+                     "speculative_config": {"method": "ngram", "num_speculative_tokens": 2,
+                                            "prompt_lookup_max": 2}}, "method ngram"),
     ):
         kwargs.setdefault("speculative_config", mtp())
         with pytest.raises(ValueError, match=problem):
             engine_config(model, **kwargs)
+
+
+def test_mooncake_aligns_an_mtp_draft_layer_one_way_only():
+    """Why Mooncake MTP needs both instances' configs to match: its
+    producer (local) refuses a draft layer the consumer lacks, but a
+    consumer-only draft is left out of the transfer without an error."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+        TransferRegion,
+        _align_transfer_regions,
+    )
+
+    def regions(*names):
+        return [TransferRegion(name, i, 4096 * i, 1024, 1024) for i, name in enumerate(names)]
+
+    target = ("model.layers.0.self_attn.attn", "model.layers.1.self_attn.attn")
+    with_draft = (*target, "model.layers.2.self_attn.attn")
+    local, remote, error = _align_transfer_regions(regions(*with_draft), regions(*target))
+    assert (local, remote) == ([], []) and "has no matching consumer occurrence" in error
+    local, remote, error = _align_transfer_regions(regions(*target), regions(*with_draft))
+    assert error is None and [r.layer_name for r in local] == list(target)
 
 
 def test_packed_layers_resolve_their_own_specs_and_places():
@@ -2461,9 +2502,9 @@ def test_mla_keeps_a_quantized_cache_in_a_simulation(tmp_path, monkeypatch):
             del llm
 
 
-def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
+def test_real_mode_takes_dsa_native_mtp_over_nixl_or_mooncake(tmp_path_factory):
     """DeepSeek-V3.2's and GLM-5's one MTP layer (its own latent and indexer
-    keys) moves with the target's over NIXL: not over Mooncake, nor two MTP
+    keys) moves with the target's over NIXL or Mooncake: not two MTP
     layers."""
     kwargs = {"dtype": "bfloat16", "block_size": 64}
 
@@ -2475,7 +2516,7 @@ def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
                               {**config, "num_nextn_predict_layers": 1})
         two = write_model_dir(tmp_path_factory, f"tiny-{name}-mtp-two",
                               {**config, "num_nextn_predict_layers": 2})
-        for connector in ("NixlConnector", "NixlPullConnector"):
+        for connector in ("NixlConnector", "NixlPullConnector", "MooncakeConnector"):
             for k in (1, 5):
                 built = engine_config(one, kv_transfer={"kv_connector": connector},
                                       speculative_config=mtp(k), **kwargs)
@@ -2483,9 +2524,9 @@ def test_real_mode_takes_dsa_native_mtp_over_nixl_only(tmp_path_factory):
                     "DeepseekV32MTPModel"
                 ]
         for model, changes, problem in (
-            (one, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "not MooncakeConnector"),
             (one, {"speculative_config": mtp(6)}, "6 speculative tokens"),
             (two, {}, "2 MTP layers"),
+            (two, {"kv_transfer": {"kv_connector": "MooncakeConnector"}}, "2 MTP layers"),
         ):
             changes.setdefault("speculative_config", mtp())
             with pytest.raises(ValueError, match=problem):

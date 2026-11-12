@@ -1360,7 +1360,11 @@ class SpeculativeCheckTests(unittest.TestCase):
         self.assertNotIn("--speculative-config", plain)
         self.assertNotIn("spec_acceptance_rates", json.loads(plain[plain.index("--simulation-config") + 1]))
 
-    def test_only_native_mtp_over_nixl_with_valid_rates(self) -> None:
+    def test_only_native_mtp_with_valid_rates(self) -> None:
+        """Over either connector: the simulator decides which models' MTP
+        Mooncake moves (DeepSeek-V3, V3.2, GLM-5)."""
+        for connector in ("nixl", "mooncake"):
+            pd._check_speculative(pd.Server(connector=connector, speculative=self.SPEC))
         for spec, connector, message in (
             ({"method": "ngram"}, "nixl", "native MTP"),
             ({"num_speculative_tokens": 6}, "nixl", "native MTP"),
@@ -1369,7 +1373,7 @@ class SpeculativeCheckTests(unittest.TestCase):
             ({"acceptance_rates": [0.5] * 4}, "nixl", "1 to 3 probabilities"),
             ({"seed": "x"}, "nixl", "seed is an integer"),
             ({"draft": "x"}, "nixl", "server.speculative takes"),
-            ({}, "mooncake", "needs the nixl connector"),
+            ({"num_speculative_tokens": 6}, "mooncake", "native MTP"),
         ):
             with self.subTest(spec=spec, connector=connector):
                 with self.assertRaisesRegex(ValueError, message):
@@ -2040,6 +2044,19 @@ class PrefixCachingCheckTests(unittest.TestCase):
         self.assertEqual(pd.request_write_tasks(run(448, block_size=64))[0], 61 * 2 * 7)
         with self.assertRaisesRegex(ValueError, r"61 layers x 2 region\(s\) x 34 blocks of 64 tokens"):
             run(2176, block_size=64)
+        # A native MTP adds its one draft layer's regions, whatever its depth:
+        # DeepSeek-V3 at 67 blocks crosses the limit only with it.
+        config(num_hidden_layers=61, kv_lora_rank=512, num_nextn_predict_layers=1)
+        self.assertEqual(pd.request_write_tasks(run(1072))[0], 61 * 67)
+        spec = {"method": "mtp", "acceptance_rates": [0.8], "seed": 0}
+        for k in (1, 2):
+            with self.subTest(k=k), self.assertRaisesRegex(
+                    ValueError, r"can be 4154 hp_tcp tasks \(61 layers \+ 1 MTP layer x 1 region\(s\) x 67 blocks"):
+                run(1072, speculative={**spec, "num_speculative_tokens": k})
+        # A sparse draft's indexer keys too.
+        config(num_hidden_layers=61, kv_lora_rank=512, index_topk=2048, num_nextn_predict_layers=1)
+        self.assertEqual(pd.request_write_tasks(run(448, block_size=64, speculative={
+            **spec, "num_speculative_tokens": 1}))[0], 62 * 2 * 7)
         # The block size vLLM picks at startup, and a hybrid's states: unknown.
         self.assertIsNone(pd.request_write_tasks(run(100000, block_size=None)))
         for hybrid in ({"hybrid_override_pattern": "M*M"}, {"layer_types": ["full_attention", "linear_attention"]},
@@ -2099,6 +2116,12 @@ class PrefixCachingCheckTests(unittest.TestCase):
                            "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 8}}, path)
         self.assertTrue(pd.rank_routed(ranked, ranked.prefill) and ranked.router.prefix_index == "precise")
         self.assertGreaterEqual(pd.KV_EVENTS_REPLAY_PORT - pd.KV_EVENTS_PORT, 64)
+        # Over Mooncake llm-d's sidecar cannot pick a rank server's bootstrap server.
+        with self.assertRaisesRegex(ValueError, "selects one Mooncake bootstrap server a prefill host, not one an "
+                                                "endpoint"):
+            pd.parse({**router(dp_routing="rank"), "server": {**base["server"], "connector": "mooncake"},
+                      "prefill": {"node": "p", "kv_network": "data0", "data_parallel_size": 2},
+                      "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 2}}, path)
 
     def test_a_runs_containers_are_saved_as_docker_reports_them(self) -> None:
         inspected = json.dumps([{"Image": "sha256:abc", "Config": {"Image": "vllm:cpu-aisim"},

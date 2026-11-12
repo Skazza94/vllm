@@ -478,8 +478,13 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   tokens, the draft at the target's parallelism and precision) over
   `NixlConnector` (or `NixlPullConnector`), whose handshake checks the
   instances' transfer compatibility, the draft among it (a peer without
-  the MTP draft is refused): the MTP layer's KV is a layer of the target's
-  KV cache groups and moves with them. Drafts are not computed; their
+  the MTP draft is refused), or, for DeepSeek-V3, DeepSeek-V3.2 and GLM-5,
+  over `MooncakeConnector`, which has no such check (it refuses a producer
+  layer the consumer lacks, not a consumer-only draft or another depth):
+  both instances must run the same speculative configuration. The MTP
+  layer's KV is a layer of the target's KV cache groups and moves with
+  them. Qwen3.5's MTP stays NIXL's: Mooncake would also move each state's
+  k scratch slots, which NIXL leaves. Drafts are not computed; their
   acceptance follows `spec_acceptance_rates`.
 * One rank per instance, or:
     * tensor parallelism of the same size on both instances: each rank moves
