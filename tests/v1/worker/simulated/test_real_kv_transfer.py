@@ -849,6 +849,27 @@ def test_nvfp4_checkpoints_build_on_cpu_in_a_simulation_only(
                 load_format="dummy")
 
 
+def test_cpu_mxfp4_experts_take_kimi_k3s_in_a_simulation_only(monkeypatch):
+    """Kimi-K3's published checkpoint has MXFP4 experts with SiTU and grouped
+    sigmoid routing, which the CPU MXFP4 kernel does not run: a simulation
+    builds them and never runs them; outside one they stay refused."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.experts import cpu_moe
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
+
+    experts = cpu_moe.CPUExpertsMxfp4
+    for simulated in (False, True):
+        monkeypatch.setattr(cpu_moe, "cpu_simulated_forward", lambda: simulated)
+        assert experts._supports_activation(MoEActivation.SITU) is simulated
+        assert experts._supports_routing_method(
+            RoutingMethodType.DeepSeekV3, kMxfp4Static, None) is simulated
+        assert experts._supports_activation(MoEActivation.SILU)
+        assert experts._supports_routing_method(RoutingMethodType.DeepseekV4, kMxfp4Static, None)
+        assert not experts._supports_activation(MoEActivation.RELU2_NO_MUL)
+        assert not experts._supports_routing_method(RoutingMethodType.Llama4, kMxfp4Static, None)
+
+
 @pytest.mark.parametrize("quantization", ["fp8", "fp8_per_tensor", "fp8_per_block"])
 def test_online_quantization_builds_on_cpu_in_a_simulation(
     model_dir, moe_model_dir, monkeypatch, quantization

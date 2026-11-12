@@ -683,6 +683,11 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsModular):
             MoEActivation.SWIGLUOAI,
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
+        ) or (
+            # Kimi-K3's SiTU experts (its published MXFP4 checkpoint) only in a
+            # simulation, which builds them and never runs them.
+            activation == MoEActivation.SITU
+            and cpu_simulated_forward()
         )
 
     @staticmethod
@@ -712,7 +717,12 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsModular):
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
             RoutingMethodType.DeepseekV4,
-        ]
+        ] or (
+            # Kimi-K3's grouped sigmoid routing only in a simulation, which
+            # never runs these experts.
+            routing_method == RoutingMethodType.DeepSeekV3
+            and cpu_simulated_forward()
+        )
 
     @staticmethod
     def _supports_router_logits_dtype(

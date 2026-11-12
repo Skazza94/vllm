@@ -657,7 +657,7 @@ keep no decode-context-parallel cache: `--decode-context-parallel-size` above
 1 is refused there at startup.
 Weight formats do not: a checkpoint published with quantized weights (FP8,
 MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
-DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, the `-NVFP4` checkpoints) builds
+DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, Kimi-K3's, the `-NVFP4` checkpoints) builds
 as published: serve it by its name, with no edited copy of its config. And
 `--quantization` (`fp8`, `fp8_per_tensor`, `fp8_per_block`,
 `fp8_per_channel`, `mxfp8`, `int8_per_channel_weight_only`) quantizes
@@ -668,7 +668,8 @@ on an MoE model, which vLLM takes on a Blackwell GPU only). A format the CPU
 has no kernel for is built and never run: its linear layers take vLLM's
 device-independent emulation kernel, NVFP4 experts the backend a GPU
 deployment tries first (or `--moe-backend`), per-tensor FP8 experts the
-Triton one. Weight quantization changes neither the KV cache nor what a
+Triton one, and MXFP4 experts the CPU's MXFP4 backend, which takes Kimi-K3's
+SiTU activation and grouped sigmoid routing in a simulation only. Weight quantization changes neither the KV cache nor what a
 transfer moves. A checkpoint that also declares a quantized KV cache takes
 that cache dtype as on its GPU: dense MLA keeps an FP8 cache (a byte an
 element), DSA sparse MLA FlashMLA's packed one (`fp8_ds_mla`, 656 bytes a
