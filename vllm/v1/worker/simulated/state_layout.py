@@ -43,7 +43,7 @@ class Span:
 
 @dataclass(frozen=True)
 class StateLayout:
-    family: str  # "mamba2" or "gdn"
+    family: str  # "mamba2", "gdn" or "kda"
     components: tuple[tuple[str, int], ...]  # conv (name, global columns)
     conv_rows: int
     conv_itemsize: int
@@ -105,10 +105,31 @@ def _itemsize(dtype) -> int:
 def layout_from_config(
     text_config, conv_itemsize: int, ssm_itemsize: int
 ) -> StateLayout | None:
-    """The model's state from its config, None for a model that is neither
-    (Nemotron-H / Mamba2: `mamba_num_heads`, `mamba_head_dim`, `n_groups`,
-    `ssm_state_size`, `conv_kernel`; GDN: `linear_*`)."""
+    """The model's state from its config, None for a model that is none of
+    them (Nemotron-H / Mamba2: `mamba_num_heads`, `mamba_head_dim`, `n_groups`,
+    `ssm_state_size`, `conv_kernel`; GDN: `linear_*`; Kimi-K3's KDA: its
+    nested `linear_attn_config`, its conv `Q|K|V` and recurrent heads as
+    `MambaStateShapeCalculator.kda_state_shape` builds them, key heads the
+    value heads')."""
     get = lambda name: getattr(text_config, name, None)
+    kda = get("linear_attn_config")
+    if get("model_type") == "kimi_linear" and isinstance(kda, dict):
+        heads, dim = kda.get("num_heads"), kda.get("head_dim")
+        kernel = kda.get("short_conv_kernel_size")
+        if not (heads and dim and kernel):
+            return None
+        width = heads * dim
+        return StateLayout(
+            "kda",
+            (("Q", width), ("K", width), ("V", width)),
+            kernel - 1,
+            conv_itemsize,
+            heads,
+            dim * dim * ssm_itemsize,
+            (dim, dim),
+            ssm_itemsize,
+            (heads,),
+        )
     if get("linear_num_value_heads") is not None and get("linear_key_head_dim") is not None:
         key = get("linear_num_key_heads") * get("linear_key_head_dim")
         value = get("linear_num_value_heads") * get("linear_value_head_dim")
@@ -158,6 +179,15 @@ def layout_for(vllm_config) -> StateLayout | None:
     model = vllm_config.model_config
     text = model.hf_text_config
     cache = vllm_config.cache_config
+    if getattr(text, "model_type", None) == "kimi_linear":
+        # KDA's own rule (`kda_state_dtype`): conv the cache's dtype, the
+        # recurrent state FP32 unless asked for float32 or bfloat16.
+        conv, ssm = MambaStateDtypeCalculator.kda_state_dtype(
+            model.dtype,
+            getattr(cache, "mamba_cache_dtype", "auto"),
+            cache.mamba_ssm_cache_dtype,
+        )
+        return layout_from_config(text, _itemsize(conv), _itemsize(ssm))
     name = cache.mamba_ssm_cache_dtype
     if name == "auto":
         name = (
@@ -174,13 +204,24 @@ def layout_for(vllm_config) -> StateLayout | None:
 def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes, no
-    speculative decoding, no MLA, and attention KV heads
+    speculative decoding, no MLA (but Kimi-K3's, at decode TP4 from prefill
+    TP8 without prefix caching), and attention KV heads
     that split or replicate evenly on each side as NIXL maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
     model = vllm_config.model_config
     if model.use_mla:
-        return "an MLA hybrid"
+        # Kimi-K3 (KDA beside an MLA latent the same on every rank) at decode
+        # TP4 from prefill TP8 only: its attention blocks are then twice the
+        # producer's (each read as two), no GCD split of the producer's.
+        # Kimi-K3's text model is Kimi-Linear's (`kimi_linear`); real
+        # transfers admit its KDA class only (`check_real_kv_layers`).
+        if getattr(model.hf_text_config, "model_type", None) != "kimi_linear":
+            return "an MLA hybrid other than Kimi-K3"
+        if (local_tp, remote_tp) != (4, 8):
+            return "Kimi-K3 at TP sizes other than prefill TP8 to decode TP4"
+        if vllm_config.cache_config.enable_prefix_caching:
+            return "Kimi-K3 at unequal TP sizes with prefix caching"
     if vllm_config.speculative_config is not None:
         return "speculative decoding"
     layout = layout_for(vllm_config)
@@ -225,6 +266,7 @@ def check_spec(layout: StateLayout, spec, tp: int) -> list[str]:
     want_type = {
         "mamba2": MambaAttentionBackendEnum.MAMBA2,
         "gdn": MambaAttentionBackendEnum.GDN_ATTN,
+        "kda": MambaAttentionBackendEnum.GDN_ATTN,  # KDA inherits GDN's tag
     }[layout.family]
     if spec.mamba_type != want_type:
         problems.append(f"mamba_type {spec.mamba_type!r}, not {want_type!r}")

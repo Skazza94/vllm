@@ -176,8 +176,10 @@ def simulated_tp_mismatch(
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
     real KV transfers under simulated compute pair equal sizes, or unequal
     ones (one dividing the other) for a model of plain attention (sliding
-    window layers beside full ones included; no recurrent state or draft), or, over NIXL only, a hybrid of Mamba2 or GDN states (`state_layout.pairing_problem`),
-    whose pattern is each KV head's
+    window layers beside full ones included; no recurrent state or draft),
+    or, over NIXL only, a hybrid of Mamba2 or GDN states or Kimi-K3 at
+    decode TP4 from prefill TP8 (`state_layout.pairing_problem`), whose
+    pattern is each KV head's
     (``kv_pattern.head_pattern``) wherever the connector re-shards it, or of
     plain MLA (`plain_mla`: one latent, the same on every rank) or sparse MLA
     (`sparse_mla`: an indexer's keys beside it, the same on every rank too). NIXL's
@@ -221,8 +223,8 @@ def simulated_tp_mismatch(
         if problem is not None:
             return (
                 "Simulated real KV transfers pair unequal TP sizes for a hybrid model "
-                f"over NIXL only for Mamba2 or GDN states that split on both sides, not {sizes}: "
-                f"{problem}."
+                "over NIXL only for Mamba2 or GDN states that split on both sides, or "
+                f"Kimi-K3 from prefill TP8 to decode TP4, not {sizes}: {problem}."
             )
         return None
     if (

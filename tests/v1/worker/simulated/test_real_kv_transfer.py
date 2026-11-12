@@ -1317,6 +1317,109 @@ def test_real_transfers_pair_sliding_window_models_at_unequal_tp(
     assert (simulated_tp_mismatch(config, local_tp, remote_tp, nixl_consumer=True) is not None) == refused
 
 
+# The tiny Kimi-K3 with 8 KDA heads, so that TP 8 splits them.
+KIMI_K3_8_HEADS = {
+    **KIMI_K3,
+    "num_attention_heads": 8,
+    "linear_attn_config": {**KIMI_K3["linear_attn_config"], "num_heads": 8},
+}
+
+
+@pytest.mark.parametrize(
+    "local_tp, remote_tp", [(4, 8), (8, 4), (2, 4), (4, 2), (8, 16), (2, 8), (1, 8), (4, 16)]
+)
+def test_real_transfers_pair_kimi_k3_from_prefill_tp8_to_decode_tp4_over_nixl_only(
+    tmp_path_factory, ds_conv_layout, local_tp, remote_tp
+):
+    """The gate, byte checks off, whatever the peer's block sizes: NIXL's
+    decode TP4 pairs Kimi-K3's prefill TP8 without prefix caching; the
+    reverse and every other pair (TP16 -> TP8 included, whose states and
+    block sizes would split as evenly) are refused; Mooncake refuses any
+    unequal pair."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    k3 = write_model_dir(tmp_path_factory, "tiny-kimi-k3-8-heads", KIMI_K3_8_HEADS)
+    config = engine_config(k3, tensor_parallel_size=local_tp)
+    assert config.model_config.use_mla and config.model_config.is_hybrid
+    assert not (config.simulation_config.kv_pattern_fill or config.simulation_config.kv_pattern_check)
+    nixl = simulated_tp_mismatch(config, local_tp, remote_tp, nixl_consumer=True)
+    assert "recurrent state" in simulated_tp_mismatch(config, local_tp, remote_tp)
+    if (local_tp, remote_tp) != (4, 8):
+        assert nixl.endswith("Kimi-K3 at TP sizes other than prefill TP8 to decode TP4."), nixl
+        return
+    assert nixl is None
+    prefix = engine_config(k3, tensor_parallel_size=4, enable_prefix_caching=True)
+    assert simulated_tp_mismatch(prefix, 4, 8, nixl_consumer=True).endswith(
+        "Kimi-K3 at unequal TP sizes with prefix caching."
+    )
+
+
+def test_kimi_k3s_kda_state_dtypes_follow_kdas_own_rule(tmp_path_factory, ds_conv_layout):
+    """`kda_state_dtype`, as vLLM's configs resolve it: the conv state the
+    cache's dtype (the model's on auto), the recurrent state FP32 on auto
+    (not the conv's, as Mamba2 and GDN have it), else float32 or bfloat16
+    as asked; another refused."""
+    from vllm.v1.worker.simulated.state_layout import layout_for
+
+    k3 = write_model_dir(tmp_path_factory, "tiny-kimi-k3-dtypes", KIMI_K3)
+
+    def sizes(**cache):
+        layout = layout_for(engine_config(k3, dtype="bfloat16", **cache))
+        return layout.family, layout.conv_itemsize, layout.ssm_itemsize
+
+    assert sizes() == ("kda", 2, 4)
+    assert sizes(mamba_ssm_cache_dtype="bfloat16") == ("kda", 2, 2)
+    assert sizes(mamba_ssm_cache_dtype="float32") == ("kda", 2, 4)
+    assert sizes(mamba_cache_dtype="float32") == ("kda", 4, 4)
+    with pytest.raises(ValueError, match="KDA recurrent state supports only"):
+        sizes(mamba_ssm_cache_dtype="float16")
+
+
+def test_kimi_k3s_state_specs_are_its_kda_layout_field_by_field(ds_conv_layout):
+    """Kimi-K3's published KDA as its layer registers it (the native
+    `kda_state_shape` and `kda_state_dtype`, GDN's backend tag) is the
+    layout's at TP 4 and 8; another tag, a replicated state, a BF16
+    recurrent state, the SD conv orientation or a non-splitting TP each fail."""
+    import dataclasses
+
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+    )
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.simulated.state_layout import check_spec, layout_from_config
+
+    def spec(tp, ssm="auto"):
+        return MambaSpec(
+            block_size=1536,
+            shapes=MambaStateShapeCalculator.kda_state_shape(tp, 96, 128, conv_kernel_size=4),
+            dtypes=MambaStateDtypeCalculator.kda_state_dtype(torch.bfloat16, "auto", ssm),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        )
+
+    text = KimiLinearConfig(
+        num_hidden_layers=4,
+        linear_attn_config={
+            "num_heads": 96, "head_dim": 128, "short_conv_kernel_size": 4,
+            "kda_layers": [1, 2, 3], "full_attn_layers": [4],
+        },
+    )
+    layout = layout_from_config(text, 2, 4)
+    for tp in (4, 8):
+        assert check_spec(layout, spec(tp), tp) == []
+    mamba2 = dataclasses.replace(spec(4), mamba_type=MambaAttentionBackendEnum.MAMBA2)
+    assert any("mamba_type" in p for p in check_spec(layout, mamba2, 4))
+    assert check_spec(layout, dataclasses.replace(spec(4), tp_replicated=True), 4)
+    assert any("SSM element" in p for p in check_spec(layout, spec(4, ssm="bfloat16"), 4))
+    ds_conv_layout("SD")
+    assert any("conv shape" in p for p in check_spec(layout, spec(4), 4))
+    assert any("does not split" in p for p in check_spec(layout, spec(4), 64))
+
+
 def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
     monkeypatch, model_dir
 ):
@@ -1957,6 +2060,14 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
         filler = runner._kv_filler
         assert isinstance(filler, NativeFiller)
         s = filler.selection
+        if config is KIMI_K3:
+            # At equal TP too, K3's states follow its KDA layout (state-v1),
+            # every registered state spec being the layout's.
+            from vllm.v1.worker.simulated.state_layout import check_spec
+
+            assert s.layout is not None and s.layout.family == "kda"
+            specs = [g.kv_cache_spec for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
+            assert specs and all(check_spec(s.layout, spec, 1) == [] for spec in specs)
 
         # One deduplicated region a slot, each state region prepared as
         # three conv sub-projections and the SSM state.
@@ -2297,6 +2408,10 @@ def main():
                   "timing": "linear", "timing_args": {"fixed_us": 100}}
     kwargs = json.loads(kwargs)
     check = kwargs.pop("check", True)
+    prompt_len = kwargs.pop("prompt_len", 200)
+    # Consumer: a connector leaving a byte of a block's uncovered tail (one
+    # nonzero byte after NIXL's own zeroing of what it did not transfer).
+    dirty_tail = kwargs.pop("dirty_tail", False)
     simulation.update({"kv_pattern_fill": True} if producer
                       else {"kv_pattern_check": True, "log_path": out + ".steps"}
                       if check else {})
@@ -2320,7 +2435,24 @@ def main():
             "strides": [int(b) for b in worker.block_stride_per_layer],
             "lens": [int(b) for b in worker.block_len_per_layer],
             "num_blocks": int(worker.num_blocks)}
-    prompt = [{"prompt_token_ids": [5] * 200}]
+    prompt = [{"prompt_token_ids": [5] * prompt_len}]
+    dirtied = []
+    if dirty_tail:
+        import torch
+        zero = worker.post_process_device_kv_on_receive
+
+        def post_process(ratio, block_ids_list, *args, **kw):
+            zero(ratio, block_ids_list, *args, **kw)
+            for group, ids, covered in block_ids_list:
+                whole, part = divmod(covered, ratio)
+                if not part:
+                    continue
+                for name in worker.kv_cache_config.transfer_groups[group].layer_names:
+                    # The block's last byte: its last token's, never covered.
+                    worker.device_kv_caches[name][ids[whole]].view(-1).view(torch.uint8)[-1] = 1
+                    dirtied.append(name)
+
+        worker.post_process_device_kv_on_receive = post_process
     if producer:
         params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False,
                                 extra_args={"kv_transfer_params": {"do_remote_decode": True}})
@@ -2367,6 +2499,17 @@ def main():
             json.dump({**mine, "transfers": 0, "reads": len(reads)}, f)
         return
     local_handle = worker.src_xfer_handles_by_block_size[worker.block_size]
+    with open(out + ".steps") as f:
+        checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
+    if any(local != local_handle for _, local, *_ in transfers):
+        # READs at a smaller producer block size (NIXL's block-size ratio)
+        # use that size's local descriptors: not paired place by place.
+        handles = set(worker.src_xfer_handles_by_block_size.values())
+        assert all(op == "READ" and local in handles for op, local, *_ in transfers)
+        with open(out, "w") as f:
+            json.dump({**mine, "native": None, "ours": None, "checks": checks,
+                       "transfers": len(transfers), "dirtied": dirtied}, f)
+        return
     native = []
     for op, local, local_ids, remote_handle, remote_ids in transfers:
         assert (op, local) == ("READ", local_handle), (op, local)
@@ -2405,11 +2548,9 @@ def main():
                 r.view.shape[1]]
     if s is not None:
         ours = [spans[d] for d in s.order(dict(enumerate(block_ids)))]
-    with open(out + ".steps") as f:
-        checks = [json.loads(line)["kv_check"] for line in f if '"kv_check"' in line]
     with open(out, "w") as f:
         json.dump({**mine, "native": native, "ours": ours, "checks": checks,
-                   "transfers": len(transfers)}, f)
+                   "transfers": len(transfers), "dirtied": dirtied}, f)
 
 if __name__ == "__main__":
     main()
@@ -2851,6 +2992,51 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     # layers is moved, checked and counted apart.
     if config is MIMO_V2_FLASH_UNEQUAL:
         assert sum(g["transfer_only_bytes"] for g in check["groups"]) > 0
+
+
+@pytest.mark.parametrize("dirty", [False, True], ids=["zeroed", "dirty"])
+def test_nixl_peers_check_kimi_k3s_uncovered_latent_tail_at_a_block_size_ratio(tmp_path, dirty):
+    """The tiny Kimi-K3 from a producer of 128-token blocks into a consumer
+    of 256: NIXL reads each consumer block as two producer blocks. A
+    99-token prefill covers half of the consumer's one latent block, and
+    NIXL zeroes the other half on receive. The runner's own checker (the
+    native selection, per-READ coverage at that ratio) passes, counting
+    that half as zeroed bytes, and fails on one nonzero byte left in it."""
+    p, c = run_nixl_peers(
+        KIMI_K3, {"prompt_len": 100}, tmp_path,
+        consumer_kwargs={"prompt_len": 100, "block_size": 256, "dirty_tail": dirty},
+    )
+    assert c["transfers"] >= 1
+    (check,) = c["checks"]
+    assert check["coverage"]["problems"] == [], check["coverage"]
+    (latent,) = [g for g in check["groups"] if g["pattern"] == "head-v1"]
+    assert (latent["block_size_ratio"], latent["zeroed_bytes"]) == (2, latent["bytes"] // 2)
+    assert all(g["zeroed_bytes"] == 0 for g in check["groups"] if g is not latent)
+    if dirty:
+        assert c["dirtied"] == ["model.layers.3.self_attn"]
+        assert not check["ok"] and check["mismatched_bytes"] == 1, check
+    else:
+        assert c["dirtied"] == [] and check["ok"], check
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, check",
+    [(128, 192, True), (256, 128, False)],
+    ids=["not-a-divisor-checked", "larger-unchecked"],
+)
+def test_nixl_peers_refuse_kimi_k3_blocks_not_dividing_the_consumers(
+    tmp_path, producer, consumer, check
+):
+    """The peer validator's block-size rule alone (the TP pair is the
+    gate's), with byte checks on or off: a producer whose block size does
+    not divide the consumer's, or is larger, is refused at the handshake,
+    before any READ; a dividing one pairs (the uncovered-tail test)."""
+    p, c = run_nixl_peers(
+        KIMI_K3, {"prompt_len": 100, "block_size": producer}, tmp_path,
+        consumer_kwargs={"prompt_len": 100, "block_size": consumer, "check": check}, logs=True,
+    )
+    assert c["transfers"] == 0
+    assert f"has block size {producer}, not this instance's {consumer} or a divisor of it" in c["log"]
 
 
 @pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])

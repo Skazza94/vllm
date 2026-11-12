@@ -24,6 +24,20 @@ QWEN = SimpleNamespace(
     linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=48,
     linear_value_head_dim=128, linear_conv_kernel_dim=4,
 )
+# Kimi-K3's published KDA fields; its text config is Kimi-Linear's.
+K3_KDA = {
+    "num_heads": 96, "head_dim": 128, "short_conv_kernel_size": 4,
+    "kda_layers": [1, 2, 3], "full_attn_layers": [4],
+}
+# Decode TP4's MLA page: 1,536 tokens of a 576-wide BF16 latent, one head.
+K3_LATENT = 1536 * 576 * 2
+
+
+def _k3_config(**kda):
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
+    layers = {"kda_layers": [1, 2, 3], "full_attn_layers": [4]}
+    return KimiLinearConfig(num_hidden_layers=4, linear_attn_config={**layers, **kda} if kda else K3_KDA)
 
 
 def test_the_layouts_come_from_the_model_config_alone():
@@ -62,6 +76,26 @@ def test_element_sizes_are_resolved_as_the_native_allocation_resolves_them():
     # An "auto" SSM dtype takes the config's own, as the hybrid configs' verification does.
     own = SimpleNamespace(**vars(NEMOTRON), mamba_ssm_cache_dtype="float32")
     assert sizes(config(text=own)) == (2, 4)
+
+
+def test_kimi_k3s_kda_state_comes_from_its_linear_attn_config():
+    """KDA's conv is Q|K|V (each heads x head_dim columns, kernel - 1 rows),
+    its recurrent state a head_dim x head_dim matrix a head
+    (`kda_state_shape`). Per rank, BF16 conv and FP32 state: (27,648,
+    786,432) bytes at TP8, (55,296, 1,572,864) at TP4, as K3's runs log."""
+    from transformers import PretrainedConfig
+
+    k = sl.layout_from_config(_k3_config(), 2, 4)
+    assert k.family == "kda" and k.components == (("Q", 12288), ("K", 12288), ("V", 12288))
+    assert (k.conv_rows, k.ssm_heads, k.ssm_shape, k.ssm_head_bytes) == (3, 96, (128, 128), 128 * 128 * 4)
+    assert k.local_sizes(8) == (27648, 786432) and k.local_sizes(4) == (55296, 1572864)
+    assert [(s.offset, s.length) for s in k.spans(1, 8)] == [
+        (0, 9216), (9216, 9216), (18432, 9216), (27648, 786432)
+    ]
+    assert [s.length for s in k.spans(3, 4)] == [18432] * 3 + [1572864]
+    # Incomplete KDA fields, or the nested config under another model type: no layout.
+    assert sl.layout_from_config(_k3_config(num_heads=96), 2, 4) is None
+    assert sl.layout_from_config(PretrainedConfig(linear_attn_config=K3_KDA), 2, 4) is None
 
 
 def _spec(layout, tp, **over):
@@ -104,6 +138,7 @@ def test_a_registered_spec_must_be_the_layout_field_by_field():
     assert any("conv shape" in p for p in sl.check_spec(n, spec, 2))
     q = sl.layout_from_config(QWEN, 2, 4)
     assert any("mamba_type" in p for p in sl.check_spec(q, _spec(n, 2), 2))
+
 
 
 # ----- the pattern is the same bytes of the same global coordinates -----
@@ -305,6 +340,65 @@ def test_coverage_rejects_what_ownership_does_not_say():
     # Both READs posted, one still outstanding when the request is reported complete.
     pending = sl.coverage_problems(want, [_read(0, ok0), _read(1, ok1, done=False)])
     assert pending and "had not completed" in pending[0]
+
+
+def _k3_rows(rank):
+    """Decode TP4 rank `rank`'s selected rows as `NativeChecker._coverage`
+    describes them: an MLA layer's latent page (group 0, its one head) and a
+    KDA layer's spans (group 1)."""
+    k = sl.layout_from_config(_k3_config(), 2, 4)
+    latent = {
+        "region": 0, "offset": 0, "length": K3_LATENT, "state": False, "heads": (0,),
+        "span": None, "group": 0, "logical": True,
+    }
+    state = [
+        {
+            "region": 1, "offset": s.offset, "length": s.length, "state": True, "heads": None,
+            "span": s, "group": 1, "logical": True,
+        }
+        for s in k.spans(rank, 4)
+    ]
+    return k, latent, state
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_kimi_k3s_decode_rank_reads_its_latent_from_2r_and_each_kda_span_from_2r_and_2r_plus_1(rank):
+    """Prefill TP8 -> decode TP4: decode rank r takes the latent (whole
+    pages: one head) from producer 2r alone, and each of Q, K, V and the
+    recurrent state's halves from 2r and 2r + 1, once. A 2,047-token
+    prefill fills 3 producer blocks of 768 tokens, 2 decode blocks of
+    1,536: the last latent page read is its covered half (the cut a real
+    pair's checker makes: `test_nixl_peers_check_kimi_k3s_uncovered_latent_tail_at_a_block_size_ratio`)."""
+    k, latent, state = _k3_rows(rank)
+    mla = sl.expected_pieces([latent], [2, 3], rank, 4, 8, k, 1)
+    kda = sl.expected_pieces(state, [5], rank, 4, 8, k, 1)
+    first, second = 2 * rank, 2 * rank + 1
+    assert mla == {first: [(0, 2, 0, K3_LATENT), (0, 3, 0, K3_LATENT)]}
+    assert set(kda) == {first, second}
+    assert sorted(kda[first]) == [(1, 5, 0, 9216), (1, 5, 18432, 9216), (1, 5, 36864, 9216), (1, 5, 55296, 786432)]
+    assert sorted(kda[second]) == [
+        (1, 5, 9216, 9216), (1, 5, 27648, 9216), (1, 5, 46080, 9216), (1, 5, 55296 + 786432, 786432)
+    ]
+    cut = [(0, 2, 0, K3_LATENT), (0, 3, 0, K3_LATENT // 2)]
+    want = {first: cut + kda[first], second: kda[second]}
+    assert sl.coverage_problems(want, [_read(first, want[first]), _read(second, want[second])]) == []
+    v_of_second = sorted(kda[second])[2]
+    cases = {
+        "the latent from 2r + 1": [_read(first, kda[first]), _read(second, cut + kda[second])],
+        "the uncovered half read": [_read(first, mla[first] + kda[first]), _read(second, kda[second])],
+        "V missing from 2r + 1": [
+            _read(first, want[first]), _read(second, [p for p in kda[second] if p != v_of_second])
+        ],
+        "V from 2r instead of 2r + 1": [
+            _read(first, want[first] + [v_of_second]),
+            _read(second, [p for p in kda[second] if p != v_of_second]),
+        ],
+        "the recurrent state twice": [
+            _read(first, want[first]), _read(second, kda[second]), _read(first, [sorted(kda[first])[3]])
+        ],
+    }
+    for name, reads in cases.items():
+        assert sl.coverage_problems(want, reads), name
 
 
 # ----- mutations: the native side moves, the semantic pattern stays -----

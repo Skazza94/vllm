@@ -520,9 +520,18 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           blocks (kernel block = attention block); a backend with small
           fixed kernel blocks (FlashInfer's), where NIXL pairs blocks by
           their physical ratios instead, is not modelled;
+        * over NIXL only, Kimi-K3 from prefill TP 8 to decode TP 4,
+          without prefix caching: its delta-attention states (Q, K and V
+          conv components, the recurrent state FP32 unless
+          `--mamba-ssm-cache-dtype` says otherwise) split as the states
+          above, each decode rank's half of every component from its two
+          producers; its MLA latent, the same on every rank, from one of
+          them, each decode attention block (twice the prefill's tokens)
+          read as two prefill blocks, the uncovered half of a request's
+          last block zero, as NIXL leaves it;
 
-      and not for DeepSeek-V4's caches, an MLA hybrid (Kimi-K3) or
-      speculative decoding. A NIXL decode instance refuses, as
+      and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
+      other TP sizes, or speculative decoding. A NIXL decode instance refuses, as
       NIXL does, a larger prefill instance whose KV heads are replicated
       (more ranks than KV heads); MLA's latent is exempt. A refused pair
       fails at the handshake;
