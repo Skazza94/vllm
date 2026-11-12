@@ -561,18 +561,21 @@ def validate_state_peer(worker, layout) -> None:
     validated locally on each endpoint (`check_spec`, under the identical
     model/config assumption), not observed remotely. Replaces the equal-geometry
     guard (`refuse_foreign_state_geometry`) for eligible states; block sizes
-    are enforced here (equal) whether or not bytes are checked."""
+    are enforced here (equal, or the peer's a divisor of this instance's)
+    whether or not bytes are checked."""
     add = worker.add_remote_agent
 
     def add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1, *args, **kwargs):
-        # Equal block sizes, whether or not bytes are checked: NIXL's own
-        # block-size assertion for P TP > D TP is in its not-mamba branch, and
-        # the pattern checker (absent from performance runs) is not the guard.
-        if metadata.block_size != worker.block_size:
+        # Equal block sizes, or the producer's a divisor of this instance's
+        # (NIXL's block-size ratio: each attention block read as several, the
+        # states 1:1), whether or not bytes are checked: NIXL's own assertion
+        # for P TP > D TP is in its not-mamba branch, and the pattern checker
+        # (absent from performance runs) is not the guard.
+        if worker.block_size % metadata.block_size:
             raise ValueError(
                 f"A hybrid model's NIXL peer has block size {metadata.block_size}, not this "
-                f"instance's {worker.block_size}: pairs of unequal block sizes are not supported "
-                "(tokens per block would not correspond)."
+                f"instance's {worker.block_size} or a divisor of it: pairs of other block "
+                "sizes are not supported (tokens per block would not correspond)."
             )
         if not layout.divides(remote_tp_size):
             raise ValueError(
@@ -591,10 +594,15 @@ def validate_state_peer(worker, layout) -> None:
                 f"A hybrid model's NIXL peer registers {len(metadata.block_lens)} regions, "
                 f"not this instance's {len(local_lens)}."
             )
-        if remote_tp_size == worker.world_size and list(metadata.block_lens) != local_lens:
+        # Its regions' block lengths, at this instance's block size.
+        ratio = worker.block_size // metadata.block_size
+        if remote_tp_size == worker.world_size and [
+            length * ratio for length in metadata.block_lens
+        ] != local_lens:
             raise ValueError(
                 "A hybrid model's NIXL peer of equal TP holds its regions otherwise: "
-                f"block lengths {list(metadata.block_lens)}, not {local_lens}."
+                f"block lengths {list(metadata.block_lens)} at block size "
+                f"{metadata.block_size}, not {local_lens} at {worker.block_size}."
             )
         need = sum(want)
         regions = [i for i in worker._ssm_region_indices if metadata.block_lens[i] < need]
@@ -997,6 +1005,11 @@ class RequestedRead:
     first_logical_blocks: list[int]
     """Where each group's blocks start among the request's blocks (after a
     prefix hit, or a sliding window's head the connector does not read)."""
+    remote_engine_id: str | None = None
+    """The producer engine (NIXL)."""
+    remote_block_counts: list[int] | None = None
+    """The producer's blocks by group (NIXL): with a smaller producer block
+    size, the sub-blocks of this instance's blocks it covers."""
 
     @property
     def blocks(self) -> list[int]:
@@ -1032,6 +1045,8 @@ def requested_reads(metadata: object) -> list[RequestedRead]:
                     groups,
                     value.remote.request_id,
                     list(first) if first else [0] * len(groups),
+                    value.remote.engine_id,
+                    [len(group) for group in value.remote.block_ids],
                 )
             )
     return reads

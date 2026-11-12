@@ -22,6 +22,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     TokenChains,
     block_views,
     pattern,
+    row_pattern,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
     ReadsInFlight,
@@ -68,6 +69,16 @@ def recv_step(local, remote, computed=()):
         ),
     )
     return SimpleNamespace(kv_connector_metadata=metadata)
+
+
+def test_a_nixl_read_names_its_producer_and_its_blocks():
+    """The checker learns the producer engine (its block size) and how many
+    blocks it holds per group from NIXL's metadata, before the READ."""
+    from vllm.v1.worker.simulated.kv_transfer import requested_reads
+
+    (read,) = requested_reads(recv_step([3, 4], [7, 8, 9]).kv_connector_metadata)
+    assert (read.req_id, read.remote_request_id) == (DECODE_ID, PREFILL_ID)
+    assert (read.remote_engine_id, read.remote_block_counts) == ("prefill", [3])
 
 
 def transfer(prefill, decode, pairs):
@@ -2140,11 +2151,40 @@ def test_native_head_patterns_check_reads_from_any_tp_size():
     )
 
 
+def test_a_block_gathered_from_smaller_producer_blocks_is_their_heads_slabs():
+    """NIXL's block-size ratio R: a consumer block of R producer blocks
+    holds, head by head, the producer blocks' slabs in token order, and
+    zeros where the producer had no block (NIXL zeroes the uncovered tail)."""
+    from vllm.v1.worker.simulated.kv_pattern import NativeChecker
+
+    heads, slab = (0, 1), 8
+    producer = [row_pattern("cmpl-a-0", "L", b, 2 * slab, 0, None, heads) for b in (4, 5)]
+    gathered = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, 2))
+    for h in range(2):
+        assert torch.equal(
+            gathered[h * 2 * slab:(h + 1) * 2 * slab],
+            torch.cat([producer[0][h * slab:(h + 1) * slab], producer[1][h * slab:(h + 1) * slab]]),
+        )
+    tail = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, 1))
+    assert torch.equal(tail[:slab], producer[0][:slab]) and not tail[slab:2 * slab].any()
+    assert torch.equal(row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (1, 1)),
+                       row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads))
+    with pytest.raises(ValueError, match="needs head patterns"):
+        row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, None, (2, 2))
+    # The sub-blocks NIXL puts in a group's i-th block: b*R + k, clipped to
+    # the producer's blocks.
+    group = SimpleNamespace(remote_blocks=3)
+    assert [NativeChecker._sub_blocks(2, group, i) for i in range(3)] == [(2, 2), (2, 1), (2, 0)]
+    assert NativeChecker._sub_blocks(1, group, 5) == (1, 1)
+
+
 def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
     """`NativeChecker._check_geometry`: a split or gathered read (another
     source rank, several consumers, split local handles) is refused for rank
     patterns, as NIXL's selection is the local one, and admitted for head
-    patterns; a remote of another block size is refused either way."""
+    patterns; a remote of another block size is refused for rank patterns,
+    and for head patterns unless it divides this instance's (NIXL's
+    block-size ratio) without prefix caching."""
     from types import SimpleNamespace
 
     import pytest
@@ -2160,8 +2200,8 @@ def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
             src_xfer_handles_by_tp_ratio=split or {},
         )
 
-    def checker(w, heads):
-        return NativeChecker(SimpleNamespace(worker=w), heads=heads)
+    def checker(w, heads, chains=None):
+        return NativeChecker(SimpleNamespace(worker=w), heads=heads, chains=chains)
 
     with pytest.raises(ValueError, match="equal TP and block size"):
         checker(worker(split={(-2, 16): [1, 2]}), None)._check_geometry()
@@ -2169,6 +2209,11 @@ def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
     for heads in (None, (2, 3)):
         with pytest.raises(ValueError, match="block size"):
             checker(worker(block_sizes=(16, 32)), heads)._check_geometry()
+    with pytest.raises(ValueError, match="block size"):
+        checker(worker(block_sizes=(16, 8)), None)._check_geometry()
+    checker(worker(block_sizes=(16, 8)), (2, 3))._check_geometry()
+    with pytest.raises(ValueError, match="without prefix caching"):
+        checker(worker(block_sizes=(16, 8)), (2, 3), chains=object())._check_geometry()
 
 
 def test_native_group_heads_decide_the_selections_eligibility():

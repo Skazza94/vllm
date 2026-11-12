@@ -292,16 +292,32 @@ def row_pattern(
     tp_rank: int = 0,
     identity: str | None = None,
     heads: Sequence[int] | None = None,
+    sub_blocks: tuple[int, int] = (1, 1),
 ) -> torch.Tensor:
     """A selected span's expected bytes: with `heads` (the global heads every
     attention layer holds) its heads' slabs in order, each one's stream the
     same on any TP size, as a head-v1 layer's page; else (a state's span, or
-    a span its heads do not divide) the rank's pattern."""
-    if heads and size % len(heads) == 0:
+    a span its heads do not divide) the rank's pattern. `sub_blocks` (R,
+    covered): a block of R producer blocks (NIXL's block-size ratio), each
+    head's slab their R slabs in token order, those past the `covered` first
+    zero (NIXL zeroes what it did not transfer)."""
+    ratio, covered = sub_blocks
+    if heads and size % (len(heads) * ratio) == 0:
         base = identity if identity is not None else get_base_request_id(request_id)
-        slab = size // len(heads)
+        slab = size // len(heads) // ratio
         return torch.cat(
-            [_stream(f"{base}|h{head}|{name}|{logical_block}", slab) for head in heads]
+            [
+                _stream(f"{base}|h{head}|{name}|{logical_block * ratio + k}", slab)
+                if k < covered
+                else torch.zeros(slab, dtype=torch.uint8)
+                for head in heads
+                for k in range(ratio)
+            ]
+        )
+    if ratio > 1:
+        raise ValueError(
+            f"{name}: a block of {ratio} producer blocks needs head patterns "
+            f"({len(heads or ())} heads in {size} bytes)"
         )
     return pattern(request_id, name, logical_block, size, tp_rank, identity)
 
@@ -753,12 +769,17 @@ class _ExpectedGroup:
     """Its KV cache group."""
     first_logical_block: int
     block_ids: list[int]
+    remote_blocks: int | None = None
+    """The producer's blocks the read covers (NIXL), when known."""
 
 
 @dataclass
 class _Expected:
     remote_request_id: str
     groups: list[_ExpectedGroup]
+    remote_engine_id: str | None = None
+    """The producer engine (NIXL), whose block size may be a divisor of
+    this instance's."""
 
     @property
     def block_ids(self) -> list[int]:
@@ -1384,7 +1405,7 @@ class NativeSelection:
 
 def _expected_bytes(
     s, group: int, row: int, request_id: str, logical: int, tp_rank: int,
-    identity: str | None, heads,
+    identity: str | None, heads, sub_blocks: tuple[int, int] = (1, 1),
 ) -> torch.Tensor:
     """The expected bytes of a request's logical block in one selected span:
     a state span's from the layout's global coordinates (state-v1) when the
@@ -1399,6 +1420,7 @@ def _expected_bytes(
     return row_pattern(
         request_id, s.name(group, row), logical, r.view.shape[1], tp_rank,
         identity, None if r.state else _group_heads(heads, group),
+        (1, 1) if r.state else sub_blocks,
     )
 
 
@@ -1628,6 +1650,8 @@ class NativeChecker(_ConsumerPages):
                     read.remote_request_id,
                     read.first_logical_blocks,
                     read.block_ids,
+                    read.remote_engine_id,
+                    read.remote_block_counts,
                 )
 
     def expect(
@@ -1636,6 +1660,8 @@ class NativeChecker(_ConsumerPages):
         remote_request_id: str,
         first_logical_blocks: Sequence[int],
         block_ids: Sequence[Sequence[int]],
+        remote_engine_id: str | None = None,
+        remote_block_counts: Sequence[int] | None = None,
     ) -> None:
         """A read about to be posted into a request's own new blocks: their
         selected spans and padding take the sentinel."""
@@ -1654,8 +1680,9 @@ class NativeChecker(_ConsumerPages):
                     s.rows[row].view[block] = SENTINEL
                 for region in s.state_regions(selected) & set(s.padding):
                     s.padding[region].view[held] = SENTINEL
-            groups.append(_ExpectedGroup(group, first, list(ids)))
-        self.pending[req_id] = _Expected(remote_request_id, groups)
+            remote = None if remote_block_counts is None else remote_block_counts[index]
+            groups.append(_ExpectedGroup(group, first, list(ids), remote))
+        self.pending[req_id] = _Expected(remote_request_id, groups, remote_engine_id)
         self._record_pull_start(req_id, groups)
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
@@ -1682,15 +1709,18 @@ class NativeChecker(_ConsumerPages):
         """The selection is the local one: a remote read whole by the same
         rank, at the same block size. NIXL's other geometries (split reads,
         another block size) are refused, not assumed; with head patterns
-        (`heads`) any TP size's reads are checked, the block size's still
-        equal."""
+        (`heads`) any TP size's reads are checked, and a remote block size
+        dividing this instance's (NIXL's block-size ratio: each block
+        gathered from several remote ones, `_sub_blocks`) too, without
+        prefix caching."""
         w = self.selection.worker
         if self.heads is not None:
             sizes = set(w.src_xfer_handles_by_block_size) - {w.block_size}
-            if sizes:
+            if any(w.block_size % size for size in sizes) or (sizes and self.chains):
                 raise ValueError(
                     "Pattern checks of several KV cache groups over NIXL need a "
-                    f"remote of equal block size, not {sorted(sizes)}."
+                    "remote of equal block size, or one dividing this instance's "
+                    f"{w.block_size} without prefix caching, not {sorted(sizes)}."
                 )
             return
         other = {
@@ -1708,6 +1738,33 @@ class NativeChecker(_ConsumerPages):
                 f"block sizes {sorted(sizes)}, "
                 f"split reads {sorted(w.src_xfer_handles_by_tp_ratio)}."
             )
+
+    def _sub_block_pieces(self, by_producer, group, ratio, row_of) -> dict:
+        """Ownership's pieces of a group's attention blocks read at a
+        producer's smaller block size: NIXL writes block b's `covered`
+        sub-blocks (`_sub_blocks`) as the first covered/ratio of its page,
+        nothing to a block none covers; its states 1:1, as ownership says.
+        Only a page read whole from one producer splits so (NIXL does not
+        split head slices at a block-size ratio)."""
+        index = {b: i for i, b in enumerate(group.block_ids) if b != NULL_BLOCK_ID}
+        result = {}
+        for p, pieces in by_producer.items():
+            kept = []
+            for region, block, offset, length in pieces:
+                entry = row_of.get(region, {}).get((group.group, offset))
+                if entry is None or entry["state"]:
+                    kept.append((region, block, offset, length))
+                    continue
+                if length != entry["length"]:
+                    raise ValueError(
+                        f"region {region}: a {length}-byte share of a {entry['length']}-byte "
+                        f"page read at block-size ratio {ratio}"
+                    )
+                covered = self._sub_blocks(ratio, group, index[block])[1]
+                if covered:
+                    kept.append((region, block, offset, length * covered // ratio))
+            result[p] = kept
+        return result
 
     def _coverage(self, expected: "_Expected", records: list) -> dict:
         """Ownership against the request's READs (`sl.coverage_problems`),
@@ -1731,6 +1788,7 @@ class NativeChecker(_ConsumerPages):
         remote_tp = w.transfer_topo.get_engine_info(engines[0]).remote_tp_size
         local_tp = w.transfer_topo.tp_size
         kv_heads = w.transfer_topo.total_num_kv_heads
+        ratio = self._ratio(expected)
         want: dict[int, list] = {}
         owner: dict[tuple[int, int], int] = {}
         row_of: dict[int, dict] = {}
@@ -1762,6 +1820,13 @@ class NativeChecker(_ConsumerPages):
                 # Ownership the rows cannot express (heads a producer supplies
                 # that the page does not hold): a coverage problem, not a crash.
                 return {"problems": [f"group {group.group}: {error}"], "reads": []}
+            if ratio > 1:
+                try:
+                    expected_by_producer = self._sub_block_pieces(
+                        expected_by_producer, group, ratio, row_of
+                    )
+                except ValueError as error:
+                    return {"problems": [f"group {group.group}: {error}"], "reads": []}
             for p, pieces in expected_by_producer.items():
                 want.setdefault(p, []).extend(pieces)
         problems = []
@@ -1804,9 +1869,30 @@ class NativeChecker(_ConsumerPages):
             )
         return {"problems": problems[:8], "problem_count": len(problems), "reads": reads}
 
+    def _ratio(self, expected: _Expected) -> int:
+        """This instance's blocks per its producer's (NIXL's block-size
+        ratio), 1 when the producer is not known."""
+        w = self.selection.worker
+        topo = getattr(w, "transfer_topo", None)
+        engine = getattr(expected, "remote_engine_id", None)
+        if engine is None or topo is None:
+            return 1
+        info = topo.get_engine_info(engine)
+        return topo.block_size_ratio(info.remote_block_size)
+
+    @staticmethod
+    def _sub_blocks(ratio: int, group: _ExpectedGroup, index: int) -> tuple[int, int]:
+        """The producer blocks the read put in the group's `index`-th block:
+        (ratio, how many of its ratio sub-blocks the producer's blocks
+        cover), as NIXL pairs them (local block b, remote b*ratio + k)."""
+        if ratio == 1 or group.remote_blocks is None:
+            return ratio, ratio
+        return ratio, max(0, min(ratio, group.remote_blocks - index * ratio))
+
     def _compare(self, req_id: str, expected: _Expected, identity_of=None) -> dict:
         s = self.selection
         self._check_geometry()
+        ratio = self._ratio(expected)
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
@@ -1826,17 +1912,21 @@ class NativeChecker(_ConsumerPages):
                 and all(s.rows[row].state for row, _, _ in selected)
                 else group.first_logical_block
             )
-            payload = transfer_only = wrong_total = 0
+            payload = transfer_only = wrong_total = zeroed = 0
             for row, block, place in selected:
                 r = s.rows[row]
                 view = r.view
                 logical = first + places[place]
+                sub_blocks = self._sub_blocks(ratio, group, places[place])
                 want = _expected_bytes(
                     s, group.group, row, expected.remote_request_id, logical, self.tp_rank,
                     identity_of(group.group, logical) if identity_of else None, self.heads,
+                    sub_blocks,
                 )
                 wrong = int((view[block] != want).sum())
                 payload += view.shape[1]
+                if not r.state:
+                    zeroed += view.shape[1] * (ratio - sub_blocks[1]) // ratio
                 if r.region not in s.members[group.group]:
                     transfer_only += view.shape[1]
                 if wrong:
@@ -1884,6 +1974,14 @@ class NativeChecker(_ConsumerPages):
                     "descriptors": len(selected),
                     "bytes": payload,
                     "transfer_only_bytes": transfer_only,
+                    **(
+                        # A smaller producer block size: of these bytes, the
+                        # uncovered sub-blocks NIXL zeroes (checked zero,
+                        # never moved).
+                        {"block_size_ratio": ratio, "zeroed_bytes": zeroed}
+                        if ratio > 1
+                        else {}
+                    ),
                     "padding_bytes": padding,
                     "mismatched_bytes": wrong_total + padding_wrong,
                     "padding_mismatched_bytes": padding_wrong,

@@ -498,7 +498,17 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
         * over NIXL only, a hybrid of Mamba2 or gated delta-net states
           whose state splits over both sizes and whose KV heads split or
-          replicate evenly on each side;
+          replicate evenly on each side; where the two sizes give it
+          different attention block sizes (Nemotron-3-Nano: 1056 tokens at
+          TP 4, 2112 at TP 2), only a decode block size that is a multiple
+          of the prefill's, as NIXL supports: each decode block read as
+          several prefill blocks, the states one to one, each attention
+          page read whole from one producer (NIXL splits no head slice at
+          a block-size ratio), without prefix caching for byte checks.
+          This follows the simulated backend's FlashAttention-style kernel
+          blocks (kernel block = attention block); a backend with small
+          fixed kernel blocks (FlashInfer's), where NIXL pairs blocks by
+          their physical ratios instead, is not modelled;
 
       and not for DeepSeek-V4's caches, an MLA hybrid (Kimi-K3) or
       speculative decoding. A NIXL decode instance refuses, as

@@ -143,14 +143,21 @@ def test_the_peer_check_validates_the_aggregates_it_is_given():
     worker.block_size = 64
     ok = SimpleNamespace(ssm_sizes=TOY.local_sizes(2), block_lens=[512, 512], block_size=64)
     assert worker.add_remote_agent(ok, 0, 2) == "agent" and seen
-    # Unequal block sizes are refused in both directions (the validator is
-    # installed whatever the pattern flags; NIXL's own assertion for P TP > D TP
-    # is skipped for a mamba model).
-    for remote in (32, 128):
+    # A producer block size dividing this instance's pairs (NIXL's
+    # block-size ratio), its regions' lengths at that size; any other is
+    # refused (the validator is installed whatever the pattern flags; NIXL's
+    # own assertion for P TP > D TP is skipped for a mamba model).
+    smaller = SimpleNamespace(ssm_sizes=TOY.local_sizes(2), block_lens=[256, 256], block_size=32)
+    assert worker.add_remote_agent(smaller, 0, 2) == "agent"
+    half = SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[256, 256], block_size=32)
+    assert worker.add_remote_agent(half, 0, 1) == "agent"
+    with pytest.raises(ValueError, match="of equal TP holds its regions otherwise"):
+        worker.add_remote_agent(SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[512, 512], block_size=32), 0, 1)
+    for remote in (48, 128):
         other = SimpleNamespace(ssm_sizes=TOY.local_sizes(2), block_lens=[512, 512], block_size=remote)
-        with pytest.raises(ValueError, match="unequal block sizes"):
+        with pytest.raises(ValueError, match="or a divisor of it"):
             worker.add_remote_agent(other, 0, 2)
-        with pytest.raises(ValueError, match="unequal block sizes"):
+        with pytest.raises(ValueError, match="or a divisor of it"):
             worker.add_remote_agent(other, 0, 1)
     for bad, match in (
         (SimpleNamespace(ssm_sizes=TOY.local_sizes(1), block_lens=[512, 512], block_size=64), "holds its states otherwise"),

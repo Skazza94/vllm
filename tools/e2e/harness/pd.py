@@ -1475,7 +1475,9 @@ def _kinds_problems(group: dict) -> list[str]:
 
 def _spanned_bytes(layout: dict, checks: list[dict]) -> int:
     """The bytes a rank's successful byte checks span as the connector moves
-    them: their checked bytes, but a packed group's blocks whole."""
+    them: their checked bytes, but a packed group's blocks whole, and without
+    the sub-blocks a smaller producer block size left uncovered (NIXL zeroes
+    them; `zeroed_bytes`)."""
     by_group = {index: group for index, group in enumerate(layout.get("groups") or [])}
     total = 0
     for check in checks:
@@ -1489,7 +1491,8 @@ def _spanned_bytes(layout: dict, checks: list[dict]) -> int:
             group = by_group.get(g.get("group"), {})
             moved = group.get("transfer_bytes_per_block")
             packed = isinstance(moved, int) and not _packed_problems(group)
-            total += g["blocks"] * moved if packed else int(g.get("bytes") or 0)
+            total += g["blocks"] * moved if packed else (
+                int(g.get("bytes") or 0) - int(g.get("zeroed_bytes") or 0))
     return total
 
 
@@ -2273,7 +2276,9 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
                         problems.append(f"decode rank {d}: attention group {index} moved {group.get('bytes')} bytes "
                                         f"over {len(mine)} heads")
                         continue
-                    per_head = group["bytes"] // len(mine)
+                    # What the READs carried: the checked bytes but the
+                    # sub-blocks NIXL zeroed (a smaller producer block size).
+                    per_head = (group["bytes"] - int(group.get("zeroed_bytes") or 0)) // len(mine)
                     if d == 0:
                         unique["attention"] += per_head * kv_heads
                     totals["attention"] += group["bytes"]

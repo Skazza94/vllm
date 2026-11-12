@@ -2107,10 +2107,12 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
 def test_a_hybrid_peer_of_another_block_size_is_refused_whether_or_not_bytes_are_checked(
     flags, role, tmp_path, monkeypatch, ds_conv_layout
 ):
-    """The block-size equality the CP4 scope rests on is the peer validator's,
-    not the pattern checker's (absent from performance runs): an eligible
-    hybrid refuses a peer of a larger or a smaller block size at the handshake,
-    before NIXL's own (not-mamba) assertion could, in both directions."""
+    """The block sizes a hybrid pairs are the peer validator's, not the
+    pattern checker's (absent from performance runs): at the handshake, before
+    NIXL's own (not-mamba) assertion could, an eligible hybrid refuses a peer
+    of a larger block size, and one of a smaller size whose regions are not
+    this instance's at that size (a divisor's, NIXL's block-size ratio, pairs:
+    `test_state_native`)."""
     from vllm import LLM
     from vllm.distributed.kv_transfer import get_kv_transfer_group
 
@@ -2144,12 +2146,15 @@ def test_a_hybrid_peer_of_another_block_size_is_refused_whether_or_not_bytes_are
     )
     try:
         worker = get_kv_transfer_group().connector_worker
-        for remote in (worker.block_size * 2, worker.block_size // 2):
+        for remote, match in (
+            (worker.block_size * 2, "or a divisor of it"),
+            (worker.block_size // 2, "of equal TP holds its regions otherwise"),
+        ):
             peer = SimpleNamespace(
                 ssm_sizes=tuple(worker._mamba_ssm_size), block_lens=list(worker.block_len_per_layer),
                 block_size=remote,
             )
-            with pytest.raises(ValueError, match="unequal block sizes"):
+            with pytest.raises(ValueError, match=match):
                 worker.add_remote_agent(peer, 0, worker.world_size)
     finally:
         del llm

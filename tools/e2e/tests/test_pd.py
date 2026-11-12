@@ -3086,6 +3086,14 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
         self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120",started["decode"]["d"])
         self.assertEqual(json.loads((output/"transport.json").read_text()),{"backend":pd.nixl_backend(run.server),"tent_applicable":False})
 
+    def test_zeroed_sub_blocks_are_checked_but_not_moved(self):
+        # A decode block of two producer blocks, the second uncovered: NIXL
+        # zeroes it; the check compares it, the transfer never moved it.
+        layout={"groups":[{"block_size":2112}]}
+        checks=[{"groups":[{"group":0,"blocks":1,"bytes":1000,"zeroed_bytes":500,"block_size_ratio":2}]}]
+        self.assertEqual(pd._spanned_bytes(layout,checks),500)
+        self.assertEqual(pd._spanned_bytes(layout,[{"groups":[{"group":0,"blocks":1,"bytes":1000}]}]),1000)
+
     def test_plans_of_a_group_of_two_page_sizes_are_checked_by_size(self):
         # Sparse MLA: a latent's and an indexer's layers in one group, each
         # whole on every rank (head 0), their pages of two sizes.
