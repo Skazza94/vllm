@@ -1061,3 +1061,178 @@ def test_simulated_cpu_sparse_mla_dcp_keeps_native_head_limits(
             },
         )
     assert reason in capfd.readouterr().err
+
+
+def _tiny_dcp_llm(tmp_path, dcp: int, log_path, **kwargs):
+    """A tiny DeepSeek-V3 at TP2 and DCP `dcp`: one 16-token page, prefix
+    caching and chunked prefill on, its step log at `log_path`."""
+    from tests.v1.worker.simulated.test_real_kv_transfer import DEEPSEEK_V3
+    from vllm import LLM
+
+    (tmp_path / "config.json").write_text(json.dumps(DEEPSEEK_V3))
+    return LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=dcp,
+        block_size=16,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        max_model_len=256,
+        kv_cache_memory_bytes=1 << 28,
+        # A lone instance's rank owns every DCP-th token.
+        cp_kv_cache_interleave_size=1,
+        simulation_config={"simulate_forward": True, "log_path": str(log_path)},
+        **kwargs,
+    )
+
+
+def _step_rows(log_path, prompt_tokens: int) -> list[tuple[int, int, int]]:
+    """A prompt's (scheduled, computed, cached) rows from a step log, in step
+    order: its prefill chunks, then its decodes."""
+    from vllm.v1.worker.simulated.timing import load_step_log
+
+    return [
+        (
+            request["num_scheduled_tokens"],
+            request["num_computed_tokens"],
+            request["num_cached_tokens"],
+        )
+        for record in load_step_log(str(log_path))
+        for request in record["step"]["requests"]
+        if request["num_prompt_tokens"] == prompt_tokens
+    ]
+
+
+def _local_seq_lens(lengths: list[int], dcp: int) -> list[list[int]]:
+    """Each DCP rank's share of global KV lengths at interleave 1, the closed
+    form of vLLM's slot mapping (derived token ownership)."""
+    import torch
+
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+    return get_dcp_local_seq_lens(
+        torch.tensor(lengths, dtype=torch.int32), dcp, None, 1
+    ).tolist()
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "shared, new, hits",
+    [
+        # Ends on a DCP2 scheduler block: both layouts credit it.
+        (96, 5, {1: 96, 2: 96}),
+        # Page-aligned inside a DCP2 block: only DCP1 credits the page.
+        (112, 5, {1: 112, 2: 96}),
+        # Mid-page: DCP1 rounds down to the page, DCP2 to its block.
+        (122, 5, {1: 112, 2: 96}),
+    ],
+)
+def test_simulate_forward_cpu_dcp_prefix_cache_hit_alignment(
+    tmp_path, monkeypatch, shared, new, hits
+) -> None:
+    """Prefix hits land on the scheduler's block, DCP times the local page: a
+    hit that ends inside one is not credited at DCP2, and its tokens are
+    recomputed, whatever its page alignment."""
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # Every token of the warm prefix distinct, its suffixes diverging at
+    # `shared` (and in later blocks) from it.
+    warm = [i % 128 for i in range(128)]
+    prompt = warm[:shared] + [(shared + 100 + i) % 128 for i in range(new)]
+    params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False)
+    for dcp in (1, 2):
+        log = tmp_path / f"steps-dcp{dcp}.jsonl"
+        llm = _tiny_dcp_llm(tmp_path, dcp, log, max_num_batched_tokens=256)
+        try:
+            (first,) = llm.generate(
+                [{"prompt_token_ids": warm}], params, use_tqdm=False
+            )
+            (second,) = llm.generate(
+                [{"prompt_token_ids": prompt}], params, use_tqdm=False
+            )
+            assert [len(o.outputs[0].token_ids) for o in (first, second)] == [1, 1]
+        finally:
+            del llm
+            cleanup_dist_env_and_memory()
+        assert _step_rows(log, len(warm)) == [(len(warm), 0, 0)]
+        hit = hits[dcp]
+        assert _step_rows(log, len(prompt)) == [
+            (len(prompt) - hit, hit, hit)
+        ]
+        assert second.num_cached_tokens == hit
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+def test_simulate_forward_cpu_dcp_chunked_prefill(tmp_path, monkeypatch) -> None:
+    """Chunked prefill splits a prompt at the token budget alone, whatever the
+    DCP span: each rank computes its DCP-th tokens of every chunk, and the
+    chunks alone bound where they end."""
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    # Odd length: the last chunk ends mid-page and inside a DCP2 block.
+    prompt = [i % 128 for i in range(101)]
+    params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False)
+    shares = {}
+    for dcp in (1, 2):
+        log = tmp_path / f"steps-dcp{dcp}.jsonl"
+        llm = _tiny_dcp_llm(tmp_path, dcp, log, max_num_batched_tokens=40)
+        try:
+            (output,) = llm.generate(
+                [{"prompt_token_ids": prompt}], params, use_tqdm=False
+            )
+            assert len(output.outputs[0].token_ids) == 1
+        finally:
+            del llm
+            cleanup_dist_env_and_memory()
+        rows = _step_rows(log, len(prompt))
+        assert rows == [(40, 0, 0), (40, 40, 0), (21, 80, 0)]
+        shares[dcp] = _local_seq_lens([c + n for n, c, _ in rows], dcp)
+    assert shares[1] == [[40], [80], [101]]
+    assert shares[2] == [[20, 20], [40, 40], [51, 50]]
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+def test_simulate_forward_cpu_dcp_prefix_cache_chunked_prefill(
+    tmp_path, monkeypatch
+) -> None:
+    """A prefix hit inside a DCP block is recomputed in the first chunk: the
+    chunks that follow start from the scheduler's boundary, not from the
+    shared prefix's end."""
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    warm = [i % 128 for i in range(128)]
+    shared = 112
+    prompt = warm[:shared] + [(shared + 100 + i) % 128 for i in range(100)]
+    params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False)
+    hits = {1: 112, 2: 96}
+    for dcp in (1, 2):
+        log = tmp_path / f"steps-dcp{dcp}.jsonl"
+        llm = _tiny_dcp_llm(tmp_path, dcp, log, max_num_batched_tokens=40)
+        try:
+            (first,) = llm.generate(
+                [{"prompt_token_ids": warm}], params, use_tqdm=False
+            )
+            (second,) = llm.generate(
+                [{"prompt_token_ids": prompt}], params, use_tqdm=False
+            )
+            assert [len(o.outputs[0].token_ids) for o in (first, second)] == [1, 1]
+        finally:
+            del llm
+            cleanup_dist_env_and_memory()
+        assert _step_rows(log, len(warm)) == [
+            (40, 0, 0),
+            (40, 40, 0),
+            (40, 80, 0),
+            (8, 120, 0),
+        ]
+        hit = hits[dcp]
+        assert _step_rows(log, len(prompt)) == [
+            (40, hit, hit),
+            (40, hit + 40, 0),
+            (len(prompt) - hit - 80, hit + 80, 0),
+        ]
+        assert second.num_cached_tokens == hit
