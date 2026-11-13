@@ -3667,6 +3667,10 @@ def main():
     # page, write into a page it left (padding it did not move), or zero a
     # padding page it moved in every layer (its sentinel).
     corrupt = kwargs.pop("corrupt", None)
+    # Seconds a producer holds a request's blocks for its readers.
+    lease = kwargs.pop("kv_lease_duration", None)
+    extra = {"backends": ["Mooncake"],
+             **({"kv_lease_duration": lease} if lease else {})}
     simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
                   "timing": "linear", "timing_args": {"fixed_us": 100},
                   "log_path": out + ".steps"}
@@ -3684,7 +3688,7 @@ def main():
                   "kv_connector": "NixlConnector",
                   "kv_role": "kv_producer" if producer else "kv_consumer",
                   "kv_buffer_device": "cpu",
-                  "kv_connector_extra_config": {"backends": ["Mooncake"]}},
+                  "kv_connector_extra_config": extra},
               **kwargs)
 
     def geometry(worker):
@@ -3783,8 +3787,9 @@ if __name__ == "__main__":
 
 
 def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
-    """Run DCP_PEER's TP producer and consumer: their records, each rank's
-    step log records (`<role>` rank r), and the consumer's output."""
+    """Run DCP_PEER's TP producer and consumer (None: the producer alone):
+    their records, each rank's step log records (`<role>` rank r), and each
+    one's output."""
     import socket
     import subprocess
     import sys
@@ -3835,22 +3840,23 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
 
     tp = max(
         producer_kwargs.get("tensor_parallel_size", 1),
-        consumer_kwargs.get("tensor_parallel_size", 1),
+        (consumer_kwargs or {}).get("tensor_parallel_size", 1),
     )
+    producer_log = tmp_path / "producer.log"
     producer = subprocess.Popen(
         command("producer", producer_kwargs, produced, 8 * 1024**2),
         env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
-        stdout=subprocess.PIPE,
+        stdout=producer_log.open("w"),
         stderr=subprocess.STDOUT,
         text=True,
     )
     try:
         deadline = time.monotonic() + 600
         while not produced.exists():
-            assert producer.poll() is None, producer.stdout.read()[-4000:]
+            assert producer.poll() is None, producer_log.read_text()[-4000:]
             assert time.monotonic() < deadline, "no producer output"
             time.sleep(0.5)
-        consumer = subprocess.run(
+        consumer = consumer_kwargs and subprocess.run(
             command("consumer", consumer_kwargs, consumed, 12 * 1024**2, str(produced)),
             env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
             timeout=600,
@@ -3865,8 +3871,9 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
         finally:
             producer.kill()
     c = json.loads(consumed.read_text()) if consumed.exists() else {}
-    c["log"] = consumer.stdout
+    c["log"] = consumer.stdout if consumer else ""
     p = json.loads(produced.read_text())
+    p["log"] = producer_log.read_text()
     released = tmp_path / "producer.json.released"
     p["released"] = (
         json.loads(released.read_text())["released"] if released.exists() else None
@@ -3885,15 +3892,106 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
         return records
 
     p["logs"] = logs(produced, producer_kwargs.get("tensor_parallel_size", 1))
-    c["logs"] = logs(consumed, consumer_kwargs.get("tensor_parallel_size", 1))
+    c["logs"] = logs(consumed, (consumer_kwargs or {}).get("tensor_parallel_size", 1))
     return p, c
 
 
-def dcp_pages(rank, dcp, blocks, pages):
-    """A DCP rank's blocks' global pages, split into the handoff's (payload)
-    and those past it."""
-    held = [k * dcp + rank for k in range(blocks)]
-    return [g for g in held if g < pages], [g for g in held if g >= pages]
+def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16):
+    """What NIXL should do for consumer TP rank `rank` of a (TP, DCP) pair,
+    from page positions alone: its sources as vLLM maps them
+    (`TransferTopology.dcp_source_ranks`, `compute_tp_mapping`), the
+    producer ranks it reads (those holding pages it holds: a rank holds its
+    scheduler blocks' pages, DCP rank r every DCP-th from r, allocation
+    padding included), and its payload (pages under the handoff), moved
+    padding and untouched pages."""
+    (p_tp, p_dcp), (d_tp, d_dcp) = producer, consumer
+    d_rank = rank % d_dcp
+    if p_dcp == 1:
+        sources = [rank * p_tp // d_tp]
+    elif d_dcp <= p_dcp:
+        sources = [r for r in range(p_tp) if r % d_dcp == d_rank]
+    else:
+        sources = [d_rank % p_dcp]
+    pages = -(-prompt_len // page)
+    held = {k * d_dcp + d_rank for k in range(-(-prompt_len // (page * d_dcp)))}
+    remote_blocks = -(-prompt_len // (page * p_dcp))
+    reads = {}
+    for source in sources:
+        theirs = {k * p_dcp + source % p_dcp for k in range(remote_blocks)}
+        if held & theirs:
+            reads[source] = held & theirs
+    moved = set().union(*reads.values())
+    payload = {g for g in held if g < pages}
+    return {
+        "sources": sources,
+        "read_from": sorted(reads),
+        "payload": len(payload),
+        "padding": len(moved - payload),
+        "untouched": len(held - moved),
+        "payload_moved": payload <= moved,
+    }
+
+
+def assert_dcp_pair(p, c, producer, consumer, prompt_len):
+    """A DCP pair's run as `dcp_pair_expectation` predicts it: every rank's
+    geometry; each consumer rank's one check, ok, its pages split as
+    predicted, its READs exactly from the producer ranks holding its pages
+    (a mapped source holding none only notified), its checked bytes its read
+    ones; every producer rank released by its readers' notifications (no
+    lease expired, no notification after one)."""
+    assert c.get("tokens") == 2, c["log"][-4000:]
+    for role, side, (tp, dcp) in (("producer", p, producer), ("consumer", c, consumer)):
+        assert [r["dcp_size"] for r in side["ranks"]] == [dcp] * tp, role
+        assert [r["dcp_rank"] for r in side["ranks"]] == [r % dcp for r in range(tp)]
+        for r in side["ranks"]:
+            geometry = None if dcp == 1 else {
+                "size": dcp,
+                "rank": r["dcp_rank"],
+                "page_tokens": [16],
+                "scheduler_block_tokens": [16 * dcp],
+                "interleave": 16,
+            }
+            assert r["dcp"] == geometry, role
+    assert p["released"] is True
+    assert "Releasing expired KV blocks" not in p["log"], p["log"][-4000:]
+    for rank, records in p["logs"].items():
+        done = [
+            req
+            for r in records
+            if "kv_events" in r
+            for req in r["kv_events"].get("sends_done", [])
+        ]
+        assert done, f"producer rank {rank} logged no finished send"
+        leases = [r["kv_transfers"]["lease"] for r in records
+                  if "lease" in r.get("kv_transfers", {})]
+        assert not leases, (rank, leases)
+    for rank in range(consumer[0]):
+        want = dcp_pair_expectation(rank, producer, consumer, prompt_len)
+        assert want["payload_moved"], want
+        records = c["logs"][rank]
+        (check,) = [r["kv_check"] for r in records if "kv_check" in r]
+        assert check["ok"], check
+        loads = [
+            r["kv_transfers"]["load"]
+            for r in records
+            if "load" in r.get("kv_transfers", {})
+        ]
+        reads = [each for load in loads for each in load["each"]]
+        assert sorted(each[5] for each in reads) == want["read_from"], (want, reads)
+        assert all(each[0] > 0 for each in reads), reads
+        assert check["bytes"] == sum(load["bytes"] for load in loads), (check, loads)
+        if producer[1] == consumer[1] == 1:
+            assert "dcp" not in check, check
+            continue
+        assert check["dcp"] == {
+            "size": consumer[1],
+            "rank": rank % consumer[1],
+            "remote_size": producer[1],
+            "remote_num_tokens": prompt_len,
+        }
+        (group,) = check["groups"]
+        got = {k: group[f"{k}_blocks"] for k in ("payload", "padding", "untouched")}
+        assert got == {k: want[k] for k in got}, (group, want)
 
 
 @pytest.mark.parametrize(
@@ -3907,125 +4005,115 @@ def test_nixl_peers_move_mla_pages_by_global_position_under_dcp(
 ):
     """DeepSeek-V3's latent between TP2 instances over NIXL, decode context
     parallelism on either side or both (each side's DCP 1 or its TP, as vLLM
-    requires): every rank's blocks hold the global pages of its DCP rank
-    (rank r every DCP-th page from r), checked against the producer's
-    pattern of that page; the handoff's pages are payload, a later one
-    padding NIXL moved or left; each consumer rank reads from the producer
-    ranks NIXL's mapping names (a sharded producer: every rank holding part
-    of its slice); every rank completes, a rank with no page by the
-    notify-only path; every producer rank releases the request. 64 tokens are
-    4 pages of 16, 70 tokens 5 (an odd count), 10 tokens one."""
+    requires), as `assert_dcp_pair` predicts it from page positions: every
+    rank's blocks hold the global pages of its DCP rank, checked against the
+    producer's pattern of that page; the handoff's pages are payload, a later
+    one padding NIXL moved (both sides holding it) or left; each consumer
+    rank reads exactly the producer ranks holding its pages, a rank of none
+    by the notify-only path; every producer rank is released by its readers.
+    64 tokens are 4 pages of 16, 70 tokens 5 (an odd count), 10 tokens one."""
     with open(Path(mla_model_dir) / "config.json") as f:
         config = json.load(f)
-    tp = 2
+    sides = [(2, producer_dcp), (2, consumer_dcp)]
     p, c = run_dcp_peers(
         config,
-        {
-            "tensor_parallel_size": tp,
-            "decode_context_parallel_size": producer_dcp,
-            "prompt_len": prompt_len,
-        },
-        {
-            "tensor_parallel_size": tp,
-            "decode_context_parallel_size": consumer_dcp,
-            "prompt_len": prompt_len,
-        },
+        *(
+            {
+                "tensor_parallel_size": tp,
+                "decode_context_parallel_size": dcp,
+                "prompt_len": prompt_len,
+            }
+            for tp, dcp in sides
+        ),
         tmp_path,
     )
-    assert c.get("tokens") == 2, c["log"][-4000:]
-    pages = -(-prompt_len // 16)
-    for role, side, dcp in (
-        ("producer", p, producer_dcp),
-        ("consumer", c, consumer_dcp),
-    ):
-        assert [r["dcp_size"] for r in side["ranks"]] == [dcp] * tp, role
-        assert [r["dcp_rank"] for r in side["ranks"]] == [r % dcp for r in range(tp)], (
-            role
-        )
-        for r in side["ranks"]:
-            if dcp > 1:
-                assert r["dcp"] == {
-                    "size": dcp,
-                    "rank": r["dcp_rank"],
-                    "page_tokens": [16],
-                    "scheduler_block_tokens": [16 * dcp],
-                    "interleave": 16,
-                }, role
-            else:
-                assert r["dcp"] is None, role
-    # Every producer rank released the request (all its readers notified it).
+    assert_dcp_pair(p, c, *sides, prompt_len)
+
+
+@pytest.fixture(scope="module")
+def mla4_model_dir(tmp_path_factory):
+    """The tiny DeepSeek-V3 with four attention heads: shardable to TP4."""
+    directory = tmp_path_factory.mktemp("tiny-deepseek-v3-4-heads")
+    config = {**DEEPSEEK_V3, "num_attention_heads": 4, "num_key_value_heads": 4}
+    (directory / "config.json").write_text(json.dumps(config))
+    return str(directory)
+
+
+@pytest.mark.parametrize(
+    "producer, consumer",
+    [
+        ((1, 1), (2, 2)),
+        ((4, 1), (2, 2)),
+        ((2, 1), (4, 4)),
+        ((2, 2), (4, 4)),
+        ((4, 4), (2, 2)),
+        ((4, 4), (2, 1)),
+        ((2, 2), (4, 1)),
+        ((2, 2), (1, 1)),
+    ],
+    ids=[
+        "p-tp1_d-tp2-dcp2",
+        "p-tp4_d-tp2-dcp2",
+        "p-tp2_d-tp4-dcp4",
+        "p-tp2-dcp2_d-tp4-dcp4",
+        "p-tp4-dcp4_d-tp2-dcp2",
+        "p-tp4-dcp4_d-tp2",
+        "p-tp2-dcp2_d-tp4",
+        "p-tp2-dcp2_d-tp1",
+    ],
+)
+@pytest.mark.parametrize("prompt_len", [70, 10], ids=["odd", "one-page"])
+def test_nixl_peers_move_mla_pages_under_dcp_at_unequal_tp(
+    mla4_model_dir, tmp_path, producer, consumer, prompt_len
+):
+    """Decode context parallelism over NIXL at unequal TP sizes, one pair for
+    each branch of vLLM's mapping: a replicated producer of a smaller or a
+    larger TP (its unchosen replicas only notified), a consumer finer than a
+    replicated or a sharded producer, a producer finer than a sharded
+    consumer, and replicated consumers reading 1, 2 or 4 shards; each as
+    `assert_dcp_pair` predicts it from page positions."""
+    with open(Path(mla4_model_dir) / "config.json") as f:
+        config = json.load(f)
+    p, c = run_dcp_peers(
+        config,
+        *(
+            {
+                "tensor_parallel_size": tp,
+                "decode_context_parallel_size": dcp,
+                "prompt_len": prompt_len,
+            }
+            for tp, dcp in (producer, consumer)
+        ),
+        tmp_path,
+    )
+    assert_dcp_pair(p, c, producer, consumer, prompt_len)
+
+
+def test_a_producer_released_by_its_lease_logs_the_expiry(mla_model_dir, tmp_path):
+    """A producer whose reader never comes frees the request's blocks when
+    its lease expires: a finished send, as a notified release logs too,
+    beside the expiry (`lease`) that tells them apart."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    p, _ = run_dcp_peers(
+        config,
+        {
+            "tensor_parallel_size": 2,
+            "decode_context_parallel_size": 2,
+            "prompt_len": 64,
+            "kv_lease_duration": 2,
+        },
+        None,
+        tmp_path,
+    )
     assert p["released"] is True
+    assert "Releasing expired KV blocks" in p["log"]
     for rank, records in p["logs"].items():
-        done = [
-            req
-            for r in records
-            if "kv_events" in r
-            for req in r["kv_events"].get("sends_done", [])
-        ]
-        assert done, f"producer rank {rank} logged no finished send"
-    for rank in range(tp):
-        records = c["logs"][rank]
-        checks = [r["kv_check"] for r in records if "kv_check" in r]
-        assert len(checks) == 1, checks
-        (check,) = checks
-        assert check["ok"], check
-        dcp_rank = rank % consumer_dcp
-        loads = [
-            r["kv_transfers"]["load"]
-            for r in records
-            if "load" in r.get("kv_transfers", {})
-        ]
-        # Each READ: [bytes, seconds, before, descriptors, end, peer, plan].
-        peers = sorted({each[5] for load in loads for each in load["each"]})
-        moved = sum(load["bytes"] for load in loads)
-        # NIXL's sources (`compute_tp_mapping`, equal TP): a replicated
-        # producer's same rank; a sharded one, every rank whose slice falls
-        # in this rank's (all of them for a replicated consumer, else its own).
-        sources = (
-            [rank]
-            if producer_dcp == 1
-            else list(range(tp))
-            if consumer_dcp == 1
-            else [dcp_rank]
-        )
-        if consumer_dcp == 1 and producer_dcp == 1:
-            assert "dcp" not in check, check
-            assert check["bytes"] == moved and peers == sources, (check, loads)
-            continue
-        assert check["dcp"] == {
-            "size": consumer_dcp,
-            "rank": dcp_rank,
-            "remote_size": producer_dcp,
-            "remote_num_tokens": prompt_len,
-        }
-        (group,) = check["groups"]
-        payload, past = dcp_pages(
-            dcp_rank, consumer_dcp, len(check["block_ids"]), pages
-        )
-        assert group["payload_blocks"] == len(payload), (group, payload)
-        assert group["padding_blocks"] + group["untouched_blocks"] == len(past), (
-            group,
-            past,
-        )
-        # Checked bytes are the moved ones: payload and moved padding.
-        assert check["bytes"] == moved, (check, loads)
-        assert (
-            check["bytes"]
-            == (group["payload_blocks"] + group["padding_blocks"])
-            * group["block_bytes"]
-        )
-        if payload or group["padding_blocks"]:
-            assert peers and set(peers) <= set(sources), (peers, sources)
-        else:
-            # Nothing to move (one page, a DCP1 producer, rank 1): the
-            # notify-only path, no READ. Equal DCP sizes move a padding
-            # page there (NIXL slices without the handoff's page count).
-            assert not loads, loads
-        if prompt_len == 10 and dcp_rank == 1:
-            assert group["payload_blocks"] == 0
-            assert group["padding_blocks"] == (
-                1 if producer_dcp == consumer_dcp else 0
-            ), group
+        events = [r.get("kv_events", {}) for r in records]
+        assert any(e.get("sends_done") for e in events), rank
+        leases = [r["kv_transfers"]["lease"] for r in records
+                  if "lease" in r.get("kv_transfers", {})]
+        assert sum(lease["expired"] for lease in leases) == 1, (rank, leases)
 
 
 @pytest.mark.parametrize(
@@ -4074,56 +4162,6 @@ def test_nixl_peers_dcp_checks_find_a_changed_page(
         assert (group["padding_blocks"], group["untouched_blocks"]) == (1, 0), bad
         layers = {m[0] for m in bad["mismatched_blocks"]}
         assert len(layers) == min(group["layers"], 16), bad
-
-
-@pytest.mark.parametrize(
-    "producer, consumer, check",
-    [
-        ((2, 2), (1, 1), True),
-        ((2, 2), (1, 1), False),
-        ((1, 1), (2, 2), True),
-        ((1, 1), (2, 2), False),
-    ],
-    ids=[
-        "p-tp2-dcp2_d-tp1-checks",
-        "p-tp2-dcp2_d-tp1",
-        "p-tp1_d-tp2-dcp2-checks",
-        "p-tp1_d-tp2-dcp2",
-    ],
-)
-def test_nixl_peers_refuse_dcp_at_unequal_tp(
-    mla_model_dir, tmp_path, producer, consumer, check
-):
-    """Decode context parallelism pairs equal TP sizes: the consumer's
-    handshake refuses another, before any READ, when either side has DCP
-    (the producer's from its metadata), checks on or off."""
-    with open(Path(mla_model_dir) / "config.json") as f:
-        config = json.load(f)
-    p, c = run_dcp_peers(
-        config,
-        {
-            "tensor_parallel_size": producer[0],
-            "decode_context_parallel_size": producer[1],
-            "prompt_len": 64,
-        },
-        {
-            "tensor_parallel_size": consumer[0],
-            "decode_context_parallel_size": consumer[1],
-            "prompt_len": 64,
-            "check": check,
-        },
-        tmp_path,
-    )
-    log = c["log"]
-    assert "pair decode context parallelism" in log, log[-4000:]
-    assert f"local TP {consumer[0]} and remote TP {producer[0]}" in log, log[-4000:]
-    loads = [
-        r
-        for records in c["logs"].values()
-        for r in records
-        if "load" in r.get("kv_transfers", {})
-    ]
-    assert not loads, loads
 
 
 @pytest.mark.parametrize(
@@ -4200,6 +4238,32 @@ def dcp_engine_config(model, **kwargs):
             **kwargs,
         }
     ).create_engine_config()
+
+
+def test_dcp_pairs_tp_sizes_one_dividing_the_other(mla4_model_dir):
+    """With decode context parallelism on either side, the consumer pairs a
+    producer of a TP size dividing its own or a multiple of it (NIXL maps
+    each DCP slice to the ranks holding it) and refuses any other, before
+    any READ; without DCP the rule is the one of plain MLA."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    config = dcp_engine_config(mla4_model_dir, decode_context_parallel_size=2)
+    for remote_tp, remote_dcp in ((1, 1), (2, 2), (4, 1), (4, 4), (8, 8)):
+        assert (
+            simulated_tp_mismatch(
+                config, 2, remote_tp, nixl_consumer=True, remote_dcp_size=remote_dcp
+            )
+            is None
+        ), (remote_tp, remote_dcp)
+    for remote_tp, remote_dcp in ((3, 1), (3, 3), (5, 5)):
+        refusal = simulated_tp_mismatch(
+            config, 2, remote_tp, nixl_consumer=True, remote_dcp_size=remote_dcp
+        )
+        assert refusal is not None, (remote_tp, remote_dcp)
+        assert "TP sizes one dividing the other" in refusal
+        assert f"local TP 2 and remote TP {remote_tp}" in refusal
 
 
 def test_dcp1_consumer_of_a_dcp_producer_refuses_data_and_expert_parallelism(

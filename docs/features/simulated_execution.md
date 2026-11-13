@@ -565,8 +565,12 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 * No pipeline or prefill context parallelism, nor data parallelism of dense
   models (independent engines).
 * Decode context parallelism for a dense MLA model over NIXL's pull
-  connector, at equal TP sizes, each instance's DCP 1 or its TP size, prefix
-  caching off. A DCP rank's blocks are the global pages vLLM gives it (rank
+  connector, each instance's DCP 1 or its TP size, the TP sizes one dividing
+  the other, prefix caching off. A decode rank reads the producer ranks NIXL
+  maps to its DCP slice: a replicated producer's one rank, or each sharded
+  rank whose pages fall in its slice (one, several, or all of them for a
+  replicated consumer); a mapped rank holding none of its pages is only
+  notified. A DCP rank's blocks are the global pages vLLM gives it (rank
   r every DCP-th page from r, the interleave NIXL resolves to the page), and
   are filled and checked as those pages. The pages under the producer's
   handoff are the payload; a later page (allocation padding) is moved by
@@ -583,7 +587,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
   (which slices no page by DCP rank), NIXL's push connector, prefix caching,
   speculative decoding, pipeline, prefill context or data parallelism,
-  expert parallelism and unequal TP sizes, on either side.
+  expert parallelism and TP sizes neither of which divides the other, on
+  either side.
 * Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
   forced to the CPU MLA kernel's 16.
 

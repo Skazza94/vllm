@@ -3386,11 +3386,11 @@ DSV3_CONFIG = {"model_type": "deepseek_v3", "kv_lora_rank": 512, "qk_rope_head_d
                "num_hidden_layers": 61}
 
 
-def dcp_layout(rank: int, dcp: int, page: int = 16) -> str:
+def dcp_layout(rank: int, dcp: int, page: int = 16, tp: int = 2) -> str:
     """A rank's layout record, with its resolved decode context parallelism."""
     geometry = ({"size": dcp, "rank": rank % dcp, "page_tokens": [page],
                  "scheduler_block_tokens": [page * dcp], "interleave": page} if dcp > 1 else None)
-    return line(kv_layout={"tp_rank": rank, "tp_size": 2, "block_bytes": 10, "bytes": 1600,
+    return line(kv_layout={"tp_rank": rank, "tp_size": tp, "block_bytes": 10, "bytes": 1600,
                            "groups": [{"kind": "MLAAttentionSpec", "sliding_window": None, "block_size": page,
                                        "layers": 1, "block_bytes": 10}],
                            "decode_context_parallel": geometry})
@@ -3448,6 +3448,10 @@ class DecodeContextParallelTests(unittest.TestCase):
         switched = {"prefill": {"decode_context_parallel_size": 2, "kv_network": "kv"},
                     "decode": {"decode_context_parallel_size": 1, "kv_network": "kv"}}
         self.assertEqual(self.run_of(**switched).decode.kv_network, "kv")
+        # Unequal TP sizes, one dividing the other, on one switched network.
+        unequal = self.run_of(prefill={"tensor_parallel_size": 4, "decode_context_parallel_size": 4,
+                                       "kv_network": "kv"}, decode={"kv_network": "kv"})
+        self.assertEqual((unequal.prefill.tp(unequal.server), unequal.decode.tp(unequal.server)), (4, 2))
         with self.assertRaisesRegex(ValueError, "one switched network for both instances"):
             self.run_of(prefill={"decode_context_parallel_size": 2}, decode={"decode_context_parallel_size": 1})
         cases = {
@@ -3455,8 +3459,10 @@ class DecodeContextParallelTests(unittest.TestCase):
             "positive integer": {"decode": {"decode_context_parallel_size": 0}},
             "mooncake connector": {"server": {"timing": "zero", "connector": "mooncake",
                                               "tensor_parallel_size": 2}},
-            "TP 1 and 2": {"prefill": {"tensor_parallel_size": 1, "kv_network": "data0"},
-                           "decode": {"kv_network": "data0"}},
+            "must divide one another, not 3 and 2": {"prefill": {"tensor_parallel_size": 3, "kv_network": "data0"},
+                                                     "decode": {"kv_network": "data0"}},
+            "unequal TP sizes need one switched network": {"prefill": {"tensor_parallel_size": 1,
+                                                                       "kv_network": ["data0"]}},
             "prefix caching": {"server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
                                           "enable_prefix_caching": True}},
             "prefix caching ": {"kv_check": False},
@@ -3472,16 +3478,33 @@ class DecodeContextParallelTests(unittest.TestCase):
                 self.run_of(config)
 
     def test_dcp_sources_follow_nixls_mapping(self) -> None:
-        self.assertEqual([pd.dcp_sources(r, 2, 1, 2) for r in range(2)], [[0], [1]])
-        self.assertEqual([pd.dcp_sources(r, 2, 2, 1) for r in range(2)], [[0, 1], [0, 1]])
-        self.assertEqual([pd.dcp_sources(r, 2, 2, 2) for r in range(2)], [[0], [1]])
-        self.assertEqual([pd.dcp_sources(r, 4, 4, 4) for r in range(4)], [[0], [1], [2], [3]])
+        # (decode TP, prefill TP, prefill DCP, decode DCP) -> each decode
+        # rank's sources, as vLLM's `dcp_source_ranks` / `compute_tp_mapping` give them.
+        cases = {
+            (2, 2, 1, 2): [[0], [1]],
+            (2, 2, 2, 1): [[0, 1], [0, 1]],
+            (2, 2, 2, 2): [[0], [1]],
+            (4, 4, 4, 4): [[0], [1], [2], [3]],
+            (2, 1, 1, 2): [[0], [0]],  # replicated producer, smaller TP
+            (2, 4, 1, 2): [[0], [2]],  # replicated producer, larger TP
+            (4, 2, 1, 4): [[0], [0], [1], [1]],  # consumer finer by 4
+            (4, 2, 2, 4): [[0], [1], [0], [1]],  # both sharded, consumer finer
+            (2, 4, 4, 2): [[0, 2], [1, 3]],  # both sharded, producer finer
+            (2, 4, 4, 1): [[0, 1, 2, 3], [0, 1, 2, 3]],  # replicated consumer
+            (4, 2, 2, 1): [[0, 1]] * 4,
+            (1, 2, 2, 1): [[0, 1]],
+        }
+        for (decode_tp, prefill_tp, prefill_dcp, decode_dcp), sources in cases.items():
+            with self.subTest(decode_tp=decode_tp, prefill_tp=prefill_tp, prefill_dcp=prefill_dcp,
+                              decode_dcp=decode_dcp):
+                self.assertEqual([pd.dcp_sources(r, decode_tp, prefill_tp, prefill_dcp, decode_dcp)
+                                  for r in range(decode_tp)], sources)
 
     PERFORMANCE = {"kv_check": False, "server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
                                                  "enable_prefix_caching": False}}
 
     def audit(self, decode: dict, prefill: dict | None = None, prefill_dcp: int = 1, decode_dcp: int = 2,
-              checks: bool = True, unread: frozenset = frozenset()):
+              checks: bool = True, unread: frozenset = frozenset(), prefill_blocks: int | None = None):
         # A coarser consumer reads across ranks: one switched network.
         network = {"kv_network": "kv"} if prefill_dcp > decode_dcp else {}
         run = self.run_of(prefill={"decode_context_parallel_size": prefill_dcp, **network},
@@ -3491,7 +3514,10 @@ class DecodeContextParallelTests(unittest.TestCase):
         def records(text: str) -> list[dict]:
             return [json.loads(x) for x in text.splitlines() if x]
 
-        held = line(kv_events={"allocated": {"cmpl-a-0-p": [1]}}) + line(kv_events={"sends_done": ["cmpl-a-0-p"]})
+        # 70 tokens: the producer's blocks of 16 x its DCP tokens.
+        blocks = prefill_blocks if prefill_blocks is not None else -(-70 // (16 * prefill_dcp))
+        held = (line(kv_events={"allocated": {"cmpl-a-0-p": list(range(1, blocks + 1))}})
+                + line(kv_events={"sends_done": ["cmpl-a-0-p"]}))
         prefill = prefill or {r: dcp_layout(r, prefill_dcp) + held for r in range(2)}
         logs = {"prefill": {(0, r): records(t) for r, t in prefill.items()},
                 "decode": {(0, r): records(t) for r, t in decode.items()}}
@@ -3639,6 +3665,130 @@ class DecodeContextParallelTests(unittest.TestCase):
         for message, verdict in cases.items():
             with self.subTest(message=message):
                 self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
+
+    def unequal(self, producer: tuple[int, int], consumer: tuple[int, int], prompt: int = 70,
+                checks: bool = True, change=None) -> dict:
+        """A complete verdict of one request of `prompt` tokens (16-token pages)
+        from prefill (TP, DCP) `producer` to decode `consumer` on one switched
+        network, every rank's records as NIXL's mapping and the pages each
+        rank holds call for; `change(prefill, decode, tents)` edits them."""
+        (p_tp, p_dcp), (d_tp, d_dcp) = producer, consumer
+        run = self.run_of(prefill={"tensor_parallel_size": p_tp, "decode_context_parallel_size": p_dcp,
+                                   "kv_network": "kv"},
+                          decode={"tensor_parallel_size": d_tp, "decode_context_parallel_size": d_dcp,
+                                  "kv_network": "kv"},
+                          workload={"num_prompts": 1, "input_len": prompt},
+                          **({} if checks else self.PERFORMANCE))
+        pages = -(-prompt // 16)
+        p_blocks, d_blocks = -(-prompt // (16 * p_dcp)), -(-prompt // (16 * d_dcp))
+        prefill = [dcp_layout(r, p_dcp, tp=p_tp) + line(kv_events={"allocated": {
+            "cmpl-a-0-p": list(range(1, p_blocks + 1))}}) + stepped("a", "p", 0, prompt, prompt)
+            + line(kv_events={"sends_done": ["cmpl-a-0-p"]}) for r in range(p_tp)]
+        decode, tents = [], {"prefill": [{"tent_registered_buffer_bytes": 1600}] * p_tp, "decode": []}
+        for d in range(d_tp):
+            mine = {k * d_dcp + d % d_dcp for k in range(d_blocks)}
+            moved = set()
+            records = dcp_layout(d, d_dcp, tp=d_tp) + dcp_pull("a", d_blocks, prompt)
+            for source in pd.dcp_sources(d, d_tp, p_tp, p_dcp, d_dcp):
+                common = mine & {k * p_dcp + source % p_dcp for k in range(p_blocks)}
+                if common:
+                    records += dcp_read(source, 10 * len(common))
+                    moved |= common
+            payload = len({g for g in mine if g < pages})
+            if checks:
+                check = dcp_check("a", d, d_dcp, p_dcp, prompt, d_blocks, payload, len(moved) - payload)
+                check["groups"][0]["first_logical_block"] = 0
+                records += line(kv_check=check)
+            decode.append(records)
+            tent = {"tent_registered_buffer_bytes": 1600}
+            tents["decode"].append({**tent, "tent_read_bytes_total": 10 * len(moved)} if moved else tent)
+        if change:
+            change(prefill, decode, tents)
+        return pd.check({"completed": 1, "errors": [""]}, prefill, decode, {"control": 1, "kv": 10_000}, run,
+                        tents)
+
+    def test_unequal_tp_pairs_pass_the_complete_verdict_by_nixls_mapping(self) -> None:
+        # Decode ranks 2 and 3 of a TP4 consumer have no producer rank of
+        # their index; a replicated consumer reads both sharded producers.
+        for producer, consumer in (((2, 1), (4, 4)), ((2, 2), (4, 1))):
+            for checks in (True, False):
+                with self.subTest(producer=producer, consumer=consumer, checks=checks):
+                    verdict = self.unequal(producer, consumer, checks=checks)
+                    self.assertEqual(verdict["problems"], [])
+                    sources = verdict["dcp"]["ranks"]
+                    want = [pd.dcp_sources(d, 4, 2, producer[1], consumer[1]) for d in range(4)]
+                    self.assertEqual([sources[d]["sources"] for d in range(4)], want)
+                    self.assertEqual(verdict["dcp"]["page_tokens"], 16)
+        # One page: each replicated consumer rank reads producer 0 only;
+        # producer 1, mapped, holds no page it holds and is only notified.
+        verdict = self.unequal((2, 2), (4, 1), prompt=10)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual({d: verdict["dcp"]["ranks"][d]["peers"] for d in range(4)}, {d: [0] for d in range(4)})
+
+    def test_a_producers_blocks_are_its_steps_allocations_combined(self) -> None:
+        # Chunked prefill logs each chunk's new blocks; a resumed request's
+        # blocks replace its earlier ones. The READs a finer consumer's
+        # pages call for follow the producer's whole allocation.
+        def allocated(blocks: int) -> str:
+            return line(kv_events={"allocated": {"cmpl-a-0-p": list(range(1, blocks + 1))}})
+
+        def chunked(prefill, decode, tents):
+            for r, records in enumerate(prefill):
+                blocks = len(json.loads(records.splitlines()[1])["kv_events"]["allocated"]["cmpl-a-0-p"])
+                prefill[r] = records.replace(allocated(blocks), "".join(
+                    line(kv_events={"allocated": {"cmpl-a-0-p": [k]}}) for k in range(1, blocks + 1)))
+
+        def resumed(prefill, decode, tents):
+            for r, records in enumerate(prefill):
+                blocks = len(json.loads(records.splitlines()[1])["kv_events"]["allocated"]["cmpl-a-0-p"])
+                prefill[r] = records.replace(allocated(blocks), allocated(blocks) + line(kv_events={
+                    "resumed": ["cmpl-a-0-p"], "allocated": {"cmpl-a-0-p": list(range(50, 50 + blocks))}}))
+
+        for producer in ((2, 1), (2, 2)):
+            for change in (chunked, resumed):
+                for checks in (True, False):
+                    with self.subTest(producer=producer, change=change.__name__, checks=checks):
+                        verdict = self.unequal(producer, (4, 4), checks=checks, change=change)
+                        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(pd._allocated_blocks([json.loads(x) for x in (
+            allocated(2) + line(kv_events={"allocated": {"cmpl-a-0-p": [3]}})
+            + line(kv_events={"resumed": ["cmpl-a-0-p"], "allocated": {"cmpl-a-0-p": [7, 8]}})).splitlines()]),
+            {"cmpl-a-0-p": 2})
+
+    def test_unequal_tp_verdicts_reject_wrong_traffic_and_releases(self) -> None:
+        def drop_read(prefill, decode, tents):
+            # Producer 1 holds pages 1, 3 and 5 of 70 tokens; the rank's 1 and 3.
+            assert dcp_read(1, 20) in decode[2]
+            decode[2] = decode[2].replace(dcp_read(1, 20), "")
+
+        def notified_reads(prefill, decode, tents):
+            decode[3] += dcp_read(1, 10)
+
+        def unreleased(prefill, decode, tents):
+            prefill[1] = prefill[1].replace(line(kv_events={"sends_done": ["cmpl-a-0-p"]}), "")
+
+        def expired(prefill, decode, tents):
+            prefill[0] += line(kv_transfers={"lease": {"expired": 1, "late_notifications": 0}})
+
+        def other_page(prefill, decode, tents):
+            decode[1] = decode[1].replace('"block_size": 16', '"block_size": 32')
+
+        def silent(prefill, decode, tents):
+            tents["decode"][2] = None
+
+        cases = [
+            ("decode rank 2 read {0: 1} (READs by producer rank), not the {0: 1, 1: 1}", drop_read, 70),
+            ("decode rank 3 read {0: 1, 1: 1} (READs by producer rank), not the {0: 1}", notified_reads, 10),
+            ("prefill rank 1 finished sending 0 of the 1 request(s)", unreleased, 70),
+            ("prefill rank 0 released 1 request(s) by lease expiry", expired, 70),
+            ("the pair's ranks record page sizes", other_page, 70),
+            ("decode's TENT metrics did not answer", silent, 70),
+        ]
+        for message, change, prompt in cases:
+            for checks in (True, False):
+                with self.subTest(message=message, checks=checks):
+                    problems = self.unequal((2, 2), (4, 1), prompt=prompt, checks=checks, change=change)["problems"]
+                    self.assertTrue(any(message in p for p in problems), problems)
 
     def test_a_sharded_producers_ranks_all_feed_a_replicated_consumer(self) -> None:
         # Producer DCP2 to consumer DCP1: each consumer rank holds every page,

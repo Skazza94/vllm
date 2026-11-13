@@ -472,12 +472,12 @@ def plain_mla_of(model: Path) -> bool:
 
 def _check_dcp(run: Run) -> None:
     """Decode context parallelism on either side: each side's DCP 1 or its TP
-    size (vLLM's rule over NIXL), a dense MLA model at equal TP sizes over
-    NIXL's pull connector, one instance a side without data parallelism, no
-    speculative decoding, prefix caching off; a decode rank reading several
-    producer ranks (prefill DCP above decode's) needs one switched KV
-    network, as at unequal TP sizes. The simulator checks the same scope at
-    startup and at the handshake."""
+    size (vLLM's rule over NIXL), a dense MLA model over NIXL's pull
+    connector, one instance a side without data parallelism, no speculative
+    decoding, prefix caching off; at TP sizes one dividing the other, which,
+    unequal, need one switched KV network (`parse`), as does a sharded
+    producer read by a coarser consumer at equal sizes. The simulator checks
+    the same scope at startup and at the handshake."""
     dcps = {role: side.decode_context_parallel_size for role, side in
             (("prefill", run.prefill), ("decode", run.decode))}
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
@@ -493,8 +493,6 @@ def _check_dcp(run: Run) -> None:
     if run.server.connector != "nixl":
         problems.append(f"the {run.server.connector} connector (NIXL's pull connector only: Mooncake's "
                         "slices no page by DCP rank)")
-    if run.prefill.tp(run.server) != run.decode.tp(run.server):
-        problems.append(f"TP {run.prefill.tp(run.server)} and {run.decode.tp(run.server)} (equal sizes only)")
     if run.prefill.instances or run.decode.instances or max(
             run.prefill.data_parallel_size, run.decode.data_parallel_size) > 1:
         problems.append("several instances or data parallelism")
@@ -1301,14 +1299,17 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     ownership: dict[str, dict[int, int]] = {"producers": {}, "consumers": {}}
     owners_by_tp: list[dict[str, dict[str, set[int]]]] = []
     hetero = None
-    if tp_size is None:
+    dcp = None
+    if dcp_pair:
+        # Each decode rank, with the producer ranks NIXL maps its DCP slice
+        # to, at equal TP sizes or not.
+        dcp = _dcp_audit(run, sizes, logs, unread)
+        problems.extend(dcp.pop("problems"))
+        hetero = {"sources": dcp.pop("sources"), "received": dcp.pop("received")}
+    elif tp_size is None:
         # Each decode rank, with the producer ranks the native pairing gives it.
         hetero = _hetero_tp(run, sizes, logs, ranks, ports, unwritten)
         problems.extend(hetero.pop("problems"))
-    dcp = None
-    if dcp_pair:
-        dcp = _dcp_audit(run, sizes, logs, unread)
-        problems.extend(dcp.pop("problems"))
     for tp in range(sizes["decode"] if hetero else tp_size):
         at = where(None, tp)
         first = hetero["sources"][tp][0] if hetero else tp
@@ -1988,17 +1989,22 @@ def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | No
     return totals, None
 
 
-def dcp_sources(rank: int, tp: int, prefill_dcp: int, decode_dcp: int) -> list[int]:
-    """The producer ranks a decode rank reads from at equal TP sizes, as
-    NIXL's `compute_tp_mapping` maps them: a replicated producer (DCP 1) its
-    same rank; a sharded one, the ranks whose slices fall in this rank's
-    (`dcp_source_ranks`): all of them for a replicated consumer, else the
-    one of its DCP rank."""
+def dcp_sources(rank: int, decode_tp: int, prefill_tp: int, prefill_dcp: int, decode_dcp: int) -> list[int]:
+    """The producer ranks NIXL maps decode TP rank `rank` to under decode
+    context parallelism (`compute_tp_mapping`, `TransferTopology.dcp_source_ranks`;
+    each side's DCP 1 or its TP, the DCP rank the TP rank modulo DCP): a
+    replicated producer (DCP 1) its rank `rank * prefill_tp // decode_tp`;
+    a sharded one, for a consumer DCP at most the producer's, every rank r
+    with r % decode DCP == the consumer's DCP rank (all of them for a
+    replicated consumer), else (a finer consumer) the one rank of its DCP
+    rank modulo the producer's DCP. A source holding none of the rank's
+    pages is only notified (no READ)."""
+    dcp_rank = rank % decode_dcp
     if prefill_dcp == 1:
-        return [rank]
-    # A sharded consumer at most as fine as the producer (each side's DCP 1
-    # or its TP): the producer ranks of its DCP rank.
-    return [r for r in range(tp) if r % decode_dcp == rank % decode_dcp]
+        return [rank * prefill_tp // decode_tp]
+    if decode_dcp <= prefill_dcp:
+        return [r for r in range(prefill_tp) if r % decode_dcp == dcp_rank]
+    return [dcp_rank % prefill_dcp]
 
 
 def _dcp_notify_only(group: dict) -> bool:
@@ -2026,9 +2032,24 @@ def _dcp_pulls(records: list[dict]) -> tuple[dict[str, int], dict[str, int], set
     return held, prompts, done
 
 
+def _allocated_blocks(records: list[dict]) -> dict[str, int]:
+    """Each request's blocks as a rank's steps allocated them: a new
+    request's, then the blocks each later step adds (a chunk's, a decode
+    token's), a resumed request's replacing its earlier ones."""
+    held: dict[str, int] = {}
+    for record in records:
+        events = record.get("kv_events") or {}
+        for request in events.get("resumed") or []:
+            held[request] = 0
+        for request, blocks in (events.get("allocated") or {}).items():
+            held[request] = held.get(request, 0) + len(blocks)
+    return held
+
+
 def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = frozenset()) -> dict:
-    """Decode context parallelism at equal TP sizes (`_check_dcp`), each
-    rank's DCP rank its TP rank modulo the side's DCP size: every rank's
+    """Decode context parallelism (`_check_dcp`), each rank's DCP rank its TP
+    rank modulo the side's DCP size, its producer ranks NIXL's mapping
+    (`dcp_sources`), at equal TP sizes or not: every rank's
     resolved geometry in its layout (one page size, the scheduler block DCP
     pages, the interleave the page); each decode check's global pages (DCP
     rank r's blocks pages k * DCP + r), those under the producer's handoff
@@ -2046,31 +2067,46 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
     problems: list[str] = []
     tp = sizes["decode"]
     dcps = {"prefill": run.prefill.decode_context_parallel_size, "decode": run.decode.decode_context_parallel_size}
-    pages: dict[tuple[str, int], int | None] = {}
+    # Every page size a rank records (its group's block size, its DCP
+    # geometry's page): one for the pair, whichever ranks hold it.
+    recorded: dict[int, list[str]] = {}
     for role in ("prefill", "decode"):
         for rank in range(sizes[role]):
             layout = next((r["kv_layout"] for r in logs[role].get((0, rank), []) if "kv_layout" in r), None)
             geometry = (layout or {}).get("decode_context_parallel")
+            for group in (layout or {}).get("groups") or []:
+                if isinstance(group.get("block_size"), int):
+                    recorded.setdefault(group["block_size"], []).append(f"{role} rank {rank}")
+            for value in ((geometry or {}).get("page_tokens") or [])[:1]:
+                if isinstance(value, int):
+                    recorded.setdefault(value, []).append(f"{role} rank {rank}")
             dcp = dcps[role]
             if dcp == 1:
                 if geometry is not None:
                     problems.append(f"{role} rank {rank} logged decode context parallelism {geometry}, not none")
-                pages[(role, rank)] = None
                 continue
-            page = (geometry or {}).get("page_tokens") or [None]
-            want = {"size": dcp, "rank": rank % dcp, "page_tokens": page[:1],
-                    "scheduler_block_tokens": [page[0] * dcp] if isinstance(page[0], int) else None,
-                    "interleave": page[0]}
-            if geometry != want or not isinstance(page[0], int):
+            own = (geometry or {}).get("page_tokens") or [None]
+            want = {"size": dcp, "rank": rank % dcp, "page_tokens": own[:1],
+                    "scheduler_block_tokens": [own[0] * dcp] if isinstance(own[0], int) else None,
+                    "interleave": own[0]}
+            if geometry != want or not isinstance(own[0], int):
                 problems.append(f"{role} rank {rank}'s decode context parallelism is {geometry}, not {want}")
-            pages[(role, rank)] = page[0] if isinstance(page[0], int) else None
     prefill_dcp, decode_dcp = dcps["prefill"], dcps["decode"]
-    evidence: dict = {"dcp": dcps, "ranks": {}}
+    common = sorted(recorded)
+    if len(common) != 1:
+        problems.append(f"the pair's ranks record page sizes {recorded or 'none'}, not one")
+    page = common[0] if len(common) == 1 else None
+    # Each producer rank's blocks of each request, as its steps allocated them.
+    produced = {rank: {_base_request_id(request): blocks for request, blocks in
+                       _allocated_blocks(logs["prefill"].get((0, rank), [])).items()}
+                for rank in range(sizes["prefill"])}
+    evidence: dict = {"dcp": dcps, "page_tokens": page, "ranks": {}}
     accepted: list[int] = []
+    pairing: dict[str, dict[int, object]] = {"sources": {}, "received": {}}
     for rank in range(tp):
         records = logs["decode"].get((0, rank), [])
         dcp_rank = rank % decode_dcp
-        sources = dcp_sources(rank, tp, prefill_dcp, decode_dcp)
+        sources = dcp_sources(rank, tp, sizes["prefill"], prefill_dcp, decode_dcp)
         loads = [r["kv_transfers"]["load"] for r in records if "load" in (r.get("kv_transfers") or {})]
         reads = [each for load in loads for each in load.get("each") or []]
         for load in loads:
@@ -2093,7 +2129,6 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
                           and all(_dcp_notify_only(g) for g in c["groups"]))
         totals = {"payload": 0, "padding": 0, "untouched": 0, "padding_bytes": 0, "untouched_bytes": 0}
         miscounted = False
-        page = next((p for p in (pages.get(("decode", rank)), pages.get(("prefill", rank))) if p), None)
         for check in (r["kv_check"] for r in records if "kv_check" in r):
             if "error" in check:
                 continue
@@ -2137,6 +2172,25 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
         elif not payload_blocks * block_bytes <= moved <= sum(held.values()) * block_bytes:
             problems.append(f"decode rank {rank} read {moved} bytes, not between its {payload_blocks} payload "
                             f"page(s) and its {sum(held.values())} block(s) of {block_bytes} bytes")
+        # The READs its pulls call for: one from each source holding some of
+        # the pages its blocks hold (allocation padding included); a source
+        # holding none is only notified.
+        wanted: dict[int, int] = {}
+        for request, blocks in held.items():
+            mine = {k * decode_dcp + dcp_rank for k in range(blocks)}
+            for source in sources:
+                theirs = produced.get(source, {}).get(_base_request_id(request), 0)
+                if mine & {k * prefill_dcp + source % prefill_dcp for k in range(theirs)}:
+                    wanted[source] = wanted.get(source, 0) + 1
+        got: dict[int, int] = {}
+        for each in reads:
+            if each and int(each[0] or 0) > 0 and len(each) > 5 and type(each[5]) is int:
+                got[each[5]] = got.get(each[5], 0) + 1
+        if got != wanted:
+            problems.append(f"decode rank {rank} read {dict(sorted(got.items()))} (READs by producer rank), not the "
+                            f"{dict(sorted(wanted.items()))} its pulls' pages call for")
+        pairing["sources"][rank] = sources
+        pairing["received"][rank] = moved
         if unfinished := sorted(set(held) - done):
             problems.append(f"decode rank {rank} finished {len(set(held) & done)} of its {len(held)} pull(s): "
                             f"{unfinished[0]}")
@@ -2160,7 +2214,15 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
         if held - done:
             problems.append(f"prefill rank {rank} finished sending {len(held & done)} of the {len(held)} "
                             "request(s) it held")
-    return {**evidence, "problems": problems}
+        # A finished send is also logged for a request its lease released:
+        # released by its readers' notifications only, none after a lease.
+        leases = [(r.get("kv_transfers") or {}).get("lease") or {} for r in records]
+        expired = sum(int(lease.get("expired") or 0) for lease in leases)
+        late = sum(int(lease.get("late_notifications") or 0) for lease in leases)
+        if expired or late:
+            problems.append(f"prefill rank {rank} released {expired} request(s) by lease expiry, with {late} "
+                            "notification(s) after one: not by its readers' notifications")
+    return {**evidence, **pairing, "problems": problems}
 
 
 def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,

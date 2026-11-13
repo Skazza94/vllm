@@ -200,8 +200,9 @@ def dcp_pair_refusal(local_dcp_size: int, remote_dcp_size: int, problems) -> str
     return (
         "Simulated real KV transfers pair decode context parallelism (local DCP "
         f"{local_dcp_size}, remote DCP {remote_dcp_size}) for a dense MLA model "
-        "over equal tensor parallelism alone on both sides, without speculative "
-        f"decoding or prefix caching, not with {', '.join(problems)}."
+        "over tensor parallelism alone on both sides, TP sizes one dividing the "
+        "other, without speculative decoding or prefix caching, not with "
+        f"{', '.join(problems)}."
     )
 
 
@@ -236,7 +237,9 @@ def simulated_tp_mismatch(
     decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
     larger producer whose KV heads are replicated; MLA's latent is exempt.
     Decode context parallelism on either side (`remote_dcp_size` the peer's,
-    from NIXL's handshake) pairs equal TP sizes, this instance in
+    from NIXL's handshake) pairs TP sizes one dividing the other (NIXL maps
+    each decode rank's DCP slice to the producer ranks holding it,
+    `TransferTopology.dcp_source_ranks`), this instance in
     `dcp_scope_problems`'s scope whatever its own DCP size (the peer's
     scope is checked from its NIXL metadata, `simulated_scope`)."""
     sim = vllm_config.simulation_config
@@ -245,7 +248,10 @@ def simulated_tp_mismatch(
     local_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     if local_dcp_size > 1 or remote_dcp_size > 1:
         problems = dcp_scope_problems(vllm_config, transfers=True)
-        if local_tp_size != remote_tp_size:
+        larger, smaller = max(local_tp_size, remote_tp_size), min(
+            local_tp_size, remote_tp_size
+        )
+        if larger % smaller:
             problems.append(f"local TP {local_tp_size} and remote TP {remote_tp_size}")
         if problems:
             return dcp_pair_refusal(local_dcp_size, remote_dcp_size, problems)

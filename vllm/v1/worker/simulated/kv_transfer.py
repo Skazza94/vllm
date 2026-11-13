@@ -413,7 +413,8 @@ def completed_transfers(
     seconds before it (NIXL: posting it; Mooncake: from its requests' blocks
     being ready to the write starting), descriptors and end (Mooncake, on
     time.monotonic()), and the transfers that failed (Mooncake: each one's
-    bytes, descriptors and start, `failed_each`)."""
+    bytes, descriptors and start, `failed_each`); a NIXL producer's requests
+    released by their lease's expiry and notifications after it (`lease`)."""
     if kv_output is None:
         return None
     meta = kv_output.kv_connector_worker_meta
@@ -473,6 +474,18 @@ def completed_transfers(
             ]
             if not nixl and failed_each:
                 transfers["send"]["failed_each"] = [list(f) for f in failed_each]
+        if nixl and (
+            expired := (
+                len(data["num_kv_expired_reqs"]),
+                len(data["num_notifications_after_expiry"]),
+            )
+        ) != (0, 0):
+            # A producer's blocks released by its lease, not its readers'
+            # notifications, and notifications that came after it.
+            transfers["lease"] = {
+                "expired": expired[0],
+                "late_notifications": expired[1],
+            }
         if not nixl and data.get("zero_payload"):
             # Consumer ranks a replicated producer answered without writing.
             transfers.setdefault(
