@@ -134,8 +134,20 @@ on a rank's GPUs, the experts over all of them; up to 8 GPUs, all on one
 host: launched by one server,
 or a server each by a multi-port supervisor,
 `--data-parallel-multi-port-external-lb`; ranks on other hosts are
-rejected). Pipeline and context parallelism and EPLB are rejected, and so are models or layouts AISimulate has no timing
-for. Speculative decoding is timed for the native single-module MTP of
+rejected). Decode context parallelism is timed for a dense MLA model
+(DeepSeek-V3's attention) inside its tensor-parallel group, without data
+parallelism: AISimulate takes the requests' global context lengths and prices
+each rank's share of the decode KV and the merge of the partial outputs, for
+vLLM's default merge (`dcp_comm_backend` `ag_rs`, `dcp_q_replicate` off;
+other settings are rejected, GLM-5's defaults among them, which apply only
+with DCP on). On the CPU platform the CPU MLA backend keeps vLLM's DCP
+bookkeeping, whose kernels a simulation never runs: each DCP rank caches its
+share of every request's tokens, the scheduler's blocks spanning DCP times the
+local ones. It is supported there for one instance, over tensor parallelism
+alone, without a KV connector; other models (sparse or compressed MLA,
+hybrids, attention without MLA, whose CPU backend returns no softmax LSE) are
+rejected. Pipeline and prefill context parallelism and EPLB are rejected, and
+so are models or layouts AISimulate has no timing for. Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as
 AISimulate's MTP depth: a decode step

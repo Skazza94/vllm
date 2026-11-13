@@ -449,8 +449,7 @@ def test_an_unmapped_kv_cache_dtype_is_refused(fake_aisimulate):
     "parallel, problem",
     [
         ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
-        ({"prefill_context_parallel_size": 2}, "context parallelism"),
-        ({"decode_context_parallel_size": 2}, "context parallelism"),
+        ({"prefill_context_parallel_size": 2}, "prefill context parallelism"),
         ({"enable_eplb": True}, "EPLB"),
         ({"nnodes": 2}, "several nodes"),
         ({"tensor_parallel_size": 3}, "tensor parallelism 3"),
@@ -1494,6 +1493,106 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
         assert formats == {
             "bfloat16": "bfloat16", "fp8": "fp8_ds_mla", "fp8_e4m3": "fp8_ds_mla",
         }
+
+
+def dcp_engine_config(tmp_path, local, dcp, **kwargs):
+    """A BF16 local copy of a published MLA model at TP2 and DCP `dcp`."""
+    raw = {
+        k: v for k, v in bundled_config(local).items() if k != "quantization_config"
+    }
+    return real_engine_config(
+        tmp_path / f"dcp{dcp}-{len(kwargs)}",
+        local.replace("/", "--"),
+        raw,
+        derived=True,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=dcp,
+        **kwargs,
+    )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_the_real_package_times_dense_mla_decode_context_parallelism(tmp_path):
+    """DeepSeek-V3 at DCP2 is the pinned estimator's own DCP2 profile, given
+    the requests' global lengths (it stripes the decode KV and adds the
+    merge itself): a cached-context prefill chunk and decodes of odd
+    contexts. DCP1 keeps the profile without a DCP size."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    target = "deepseek-ai/DeepSeek-V3"
+    p = provider(
+        dcp_engine_config(tmp_path, target, 2), gpu="h200", target_model=target
+    )
+    record = p.assumptions()["aisimulate"]
+    assert (record["source"], record["readiness"]) == ("aic", "ready")
+    assert record["resolved_config"]["estimation_mode"] == "op_level"
+    assert (p.config["dcp"], p.config["worker_type"]) == (2, "aggregated")
+    assert record["decode_context_parallel"] == {
+        "size": 2,
+        "interleave": 1,
+        "comm_backend": "ag_rs",
+        "q_replicate": False,
+    }
+    assert all(probe["ms"] > 0 for probe in record["startup_probes"])
+    one = provider(
+        dcp_engine_config(tmp_path, target, 1), gpu="h200", target_model=target
+    )
+    assert one.config["dcp"] is None
+    assert one.assumptions()["aisimulate"]["decode_context_parallel"] is None
+    direct = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(**p.config)
+    )
+    for step in (
+        sim_step(0, sim_req("chunk", 512, 1001, 2000), sim_req("d", 1, 1023, 1000)),
+        sim_step(1, *[sim_req(f"d{i}", 1, 3001 + i, 3000) for i in range(4)]),
+    ):
+        ms = p.estimate(step).device_s * 1000
+        assert ms == pytest.approx(
+            direct.estimate_forward_pass_time_ms(rank_metrics(list(step.requests))),
+            rel=1e-9,
+        )
+        assert ms != pytest.approx(one.estimate(step).device_s * 1000, rel=1e-3)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "variant, problem",
+    [
+        ({"dcp_comm_backend": "a2a"}, "dcp_comm_backend a2a"),
+        ({"dcp_q_replicate": True}, "dcp_q_replicate"),
+    ],
+)
+def test_dcp_merge_variants_the_estimator_cannot_set_are_refused(
+    tmp_path, variant, problem
+):
+    """The estimator's forward-pass config sets the DCP size alone, pricing
+    vLLM's default merge: another merge is refused, not timed as it."""
+    config = dcp_engine_config(tmp_path, "deepseek-ai/DeepSeek-V3", 2, **variant)
+    with pytest.raises(ValueError, match=problem):
+        provider(config, gpu="h200", target_model="deepseek-ai/DeepSeek-V3")
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+def test_glm_5s_dcp_defaults_leave_it_timed_without_dcp(tmp_path):
+    """GLM-5 sets the a2a merge and Q replication even without DCP: they
+    apply only when DCP is on, so GLM-5 at DCP1 is timed as before."""
+    raw = {
+        k: v
+        for k, v in bundled_config("zai-org/GLM-5.2").items()
+        if k != "quantization_config"
+    }
+    config = real_engine_config(
+        tmp_path, "zai-org--GLM-5.2", raw, derived=True, tensor_parallel_size=8
+    )
+    assert (
+        config.parallel_config.dcp_comm_backend,
+        config.parallel_config.dcp_q_replicate,
+    ) == ("a2a", True)
+    p = provider(config, gpu="h200", target_model="zai-org/GLM-5.2-FP8")
+    assert p.config["dcp"] is None
+    assert p.assumptions()["aisimulate"]["decode_context_parallel"] is None
 
 
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")

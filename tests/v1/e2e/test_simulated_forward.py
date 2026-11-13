@@ -563,3 +563,148 @@ def test_simulate_forward_cpu_hybrid_prefix_cache_multi_rank(
             for _ in range(2)
         ]
     assert hits == [0, 4 * block_size]
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+def test_simulate_forward_cpu_decode_context_parallel(tmp_path, monkeypatch) -> None:
+    """A dense MLA model at TP2 and DCP2 keeps vLLM's DCP bookkeeping under a
+    simulated forward on CPU: each rank its DCP rank and its layers' DCP
+    merge setup, the scheduler's blocks spanning twice the tokens of the
+    local ones, as many of them (each rank caches half of every request's
+    tokens, in a virtual cache),
+    and the requests finish. At DCP1 the CPU MLA backend keeps its own
+    attributes."""
+    from tests.v1.worker.simulated.test_real_kv_transfer import DEEPSEEK_V3
+    from vllm import LLM
+    from vllm.distributed import cleanup_dist_env_and_memory
+
+    def _dcp_rank_state(worker) -> dict:
+        """A rank's DCP identity, its KV cache layout and its MLA layers' DCP
+        setup (defined here: sent to the workers by value)."""
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size
+
+        runner = worker.model_runner
+        layers = [m for m in runner.model.modules() if isinstance(m, MLAAttention)]
+        (group,) = runner.kv_cache_config.kv_cache_groups
+        return {
+            "dcp": [runner.dcp_size, runner.dcp_rank],
+            # Local blocks, and the token span the scheduler's block covers.
+            "blocks": [
+                runner.kv_cache_config.num_blocks,
+                group.kv_cache_spec.block_size,
+                resolve_dcp_kv_block_size(group.kv_cache_spec, runner.dcp_size),
+            ],
+            # Lists: a set in an RPC result never comes back.
+            "layers": sorted(
+                {
+                    (
+                        layer.impl.dcp_world_size,
+                        layer.impl.dcp_rank,
+                        layer.impl.cp_kv_cache_interleave_size,
+                        layer.impl.can_return_lse_for_decode,
+                        layer.impl.need_to_return_lse_for_decode,
+                        layer.dcp_manager is not None,
+                    )
+                    for layer in layers
+                }
+            ),
+        }
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    (tmp_path / "config.json").write_text(json.dumps(DEEPSEEK_V3))
+    params = SamplingParams(max_tokens=8, ignore_eos=True, detokenize=False)
+    states = {}
+    for dcp in (1, 2):
+        llm = LLM(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            simulate_forward=True,
+            tensor_parallel_size=2,
+            decode_context_parallel_size=dcp,
+            kv_cache_memory_bytes=1 << 28,
+            max_model_len=256,
+        )
+        try:
+            outputs = llm.generate(
+                [{"prompt_token_ids": list(range(101))}] * 2, params, use_tqdm=False
+            )
+            assert [len(o.outputs[0].token_ids) for o in outputs] == [8, 8]
+            states[dcp] = llm.collective_rpc(_dcp_rank_state)
+        finally:
+            del llm
+            cleanup_dist_env_and_memory()
+    assert [s["dcp"] for s in states[1]] == [[1, 0], [1, 0]]
+    assert [s["dcp"] for s in states[2]] == [[2, 0], [2, 1]]
+    assert [s["layers"] for s in states[1]] == [[(1, 0, 1, False, False, False)]] * 2
+    assert [s["layers"] for s in states[2]] == [
+        [(2, 0, 1, True, True, True)],
+        [(2, 1, 1, True, True, True)],
+    ]
+    num_blocks, block_size, _ = states[1][0]["blocks"]
+    assert [s["blocks"] for s in states[1]] == [
+        [num_blocks, block_size, block_size]
+    ] * 2
+    assert [s["blocks"] for s in states[2]] == [
+        [num_blocks, block_size, 2 * block_size]
+    ] * 2
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "model, kwargs, problem",
+    [
+        # GQA at a layout vLLM itself allows: DCP <= TP / KV heads.
+        ("gpt-oss", {}, "a model other than dense MLA"),
+        ("deepseek-v3.2", {}, "a model other than dense MLA"),
+        (
+            "deepseek-v3",
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": "kv_consumer",
+                }
+            },
+            "the NixlConnector connector",
+        ),
+        (
+            "deepseek-v3",
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "OffloadingConnector",
+                    "kv_role": "kv_both",
+                }
+            },
+            "the OffloadingConnector connector",
+        ),
+    ],
+)
+def test_simulated_cpu_decode_context_parallel_scope(
+    tmp_path, model, kwargs, problem
+) -> None:
+    """Simulated DCP on CPU is a dense MLA model's, over TP alone, without a
+    KV connector."""
+    from tests.v1.worker.simulated.test_real_kv_transfer import (
+        DEEPSEEK_V3,
+        DEEPSEEK_V32,
+        GPT_OSS,
+    )
+    from vllm.engine.arg_utils import EngineArgs
+
+    config = {
+        "gpt-oss": {**GPT_OSS, "num_key_value_heads": 1},
+        "deepseek-v3": DEEPSEEK_V3,
+        "deepseek-v3.2": DEEPSEEK_V32,
+    }[model]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    args = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        max_model_len=256,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        simulation_config={"simulate_forward": True},
+        **kwargs,
+    )
+    with pytest.raises(ValueError, match=problem):
+        args.create_engine_config()

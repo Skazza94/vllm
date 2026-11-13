@@ -25,7 +25,8 @@ Key design points:
   ``v_head_dim=512`` and ``block_size=16`` today; the platform layer
   forces ``block_size=16`` for MLA models.
 * Simulated execution never runs these kernels: it keeps chunked prefill
-  and prefix caching, and its blocks may be any multiple of 16.
+  and prefix caching, its blocks may be any multiple of 16, and it keeps
+  decode context parallelism's bookkeeping.
 """
 
 from typing import ClassVar
@@ -164,8 +165,19 @@ class CPUMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self._pad_v = False
 
         # Distributed / context-parallel bookkeeping expected by the parent.
-        self.dcp_world_size = 1
-        self.cp_kv_cache_interleave_size = 1
+        if _simulated() and self.dcp_world_size > 1:
+            # Decode context parallelism as vLLM sets it up (`__new__` set the
+            # DCP group's size and rank): the kernels, which would merge the
+            # partial outputs by their LSE, never run in a simulation.
+            config = get_current_vllm_config_or_none()
+            self.cp_kv_cache_interleave_size = (
+                config.parallel_config.cp_kv_cache_interleave_size
+            )
+            self.can_return_lse_for_decode = True
+            self.need_to_return_lse_for_decode = True
+        else:
+            self.dcp_world_size = 1
+            self.cp_kv_cache_interleave_size = 1
 
     # ------------------------------------------------------------------
     # Decode (MQA)

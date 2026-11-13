@@ -172,15 +172,7 @@ class SimulationConfig:
         if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
             raise ValueError("Simulated forward needs a CUDA-alike or CPU platform.")
         if current_platform.is_cpu() and parallel.decode_context_parallel_size > 1:
-            # The CPU attention backends keep no DCP cache (CPU MLA turns it
-            # off, the others return no softmax LSE): the model would fail to
-            # build on an assertion.
-            raise ValueError(
-                "Simulated forward on CPU does not support decode context "
-                "parallelism (decode_context_parallel_size "
-                f"{parallel.decode_context_parallel_size}): the CPU attention "
-                "backends keep no DCP KV cache."
-            )
+            self._verify_cpu_decode_context_parallel(vllm_config)
         if vllm_config.lora_config is not None:
             raise ValueError("Simulated forward does not support LoRA.")
         if vllm_config.weight_transfer_config is not None:
@@ -207,6 +199,45 @@ class SimulationConfig:
         for load_config in load_configs:
             load_config.load_format = "dummy"
             load_config.device = "meta"
+
+    @staticmethod
+    def _verify_cpu_decode_context_parallel(vllm_config: "VllmConfig") -> None:
+        """Decode context parallelism on CPU: a dense MLA model's (the CPU MLA
+        backend keeps vLLM's DCP bookkeeping under a simulated forward, which
+        never runs its kernels), over tensor parallelism alone, one instance.
+        The CPU GQA backend returns no softmax LSE and has no DCP cache."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
+
+        parallel = vllm_config.parallel_config
+        problems = []
+        if not plain_mla(vllm_config.model_config):
+            problems.append(
+                "a model other than dense MLA (sparse or compressed MLA, a "
+                "hybrid, or attention without MLA)"
+            )
+        for name, size in (
+            ("pipeline parallelism", parallel.pipeline_parallel_size),
+            ("prefill context parallelism", parallel.prefill_context_parallel_size),
+            ("data parallelism", parallel.data_parallel_size),
+        ):
+            if size > 1:
+                problems.append(f"{name} {size}")
+        if parallel.enable_expert_parallel:
+            problems.append("expert parallelism")
+        if vllm_config.speculative_config is not None:
+            problems.append("speculative decoding")
+        if vllm_config.kv_transfer_config is not None:
+            problems.append(
+                f"the {vllm_config.kv_transfer_config.kv_connector} connector"
+            )
+        if problems:
+            raise ValueError(
+                "Simulated forward on CPU supports decode context parallelism "
+                f"(decode_context_parallel_size "
+                f"{parallel.decode_context_parallel_size}) for a dense MLA model "
+                "over tensor parallelism alone, without a KV connector, not "
+                f"with {', '.join(problems)}."
+            )
 
     @staticmethod
     def _real_kv_mtp_problems(vllm_config: "VllmConfig") -> list[str]:

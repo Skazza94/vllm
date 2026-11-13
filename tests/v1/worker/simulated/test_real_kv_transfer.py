@@ -1177,10 +1177,9 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_decode_context_parallelism_is_refused_on_cpu(mla_model_dir):
-    """The CPU attention backends keep no DCP cache: a simulation there says
-    so at startup, where the model would otherwise fail to build on an
-    assertion; simulated transfers or none, either way."""
+def test_decode_context_parallelism_on_cpu_is_one_instances(mla_model_dir):
+    """A dense MLA model's DCP on CPU is a single instance's: a NIXL instance
+    with it, simulated transfers or real, is refused at startup."""
     from vllm.engine.arg_utils import EngineArgs
 
     def config(**kwargs):
@@ -1191,11 +1190,15 @@ def test_decode_context_parallelism_is_refused_on_cpu(mla_model_dir):
             simulation_config={"simulate_forward": True}, **kwargs,
         ).create_engine_config()
 
-    config()
-    for kv_transfer in (None, {"kv_connector": "NixlConnector", "kv_role": "kv_producer",
-                               "kv_buffer_device": "cpu"}):
-        with pytest.raises(ValueError, match="does not support decode context parallelism"):
-            config(decode_context_parallel_size=2, kv_transfer_config=kv_transfer)
+    parallel = config(decode_context_parallel_size=2).parallel_config
+    assert parallel.decode_context_parallel_size == 2
+    nixl = {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer",
+        "kv_buffer_device": "cpu",
+    }
+    with pytest.raises(ValueError, match="without a KV connector, not with the Nixl"):
+        config(decode_context_parallel_size=2, kv_transfer_config=nixl)
 
 
 def test_real_mode_allows_tensor_parallelism_and_dp_attention(

@@ -511,11 +511,14 @@ class AisimulateTimingProvider:
 
     Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), or
     an MoE model's local data-parallel attention with expert parallelism
-    (each rank tensor-parallel or not, up to 8 GPUs). Anything else is
-    refused, as are pipeline and context parallelism, EPLB and speculative
-    decoding other than DeepSeek-V3's or DeepSeek-V4's native single-module
-    MTP. A multimodal model is timed as its language model, served without
-    multimodal inputs."""
+    (each rank tensor-parallel or not, up to 8 GPUs); decode context
+    parallelism of a dense MLA model inside its tensor-parallel group,
+    without data parallelism, with vLLM's default merge (`ag_rs`, no Q
+    replication). Anything else is refused, as are pipeline and prefill
+    context parallelism, EPLB and speculative decoding other than
+    DeepSeek-V3's or DeepSeek-V4's native single-module MTP. A multimodal
+    model is timed as its language model, served without multimodal
+    inputs."""
 
     def __init__(
         self,
@@ -560,6 +563,7 @@ class AisimulateTimingProvider:
                 "modality, no multimodal embeddings)."
             )
         topology = self._topology(vllm_config)
+        dcp = self._decode_context_parallel(vllm_config)
         target, local_config = self._target(vllm_config, target_model)
         bundled = os.path.join(
             os.path.dirname(aisimulate_core.__file__),
@@ -662,7 +666,8 @@ class AisimulateTimingProvider:
             "worker_type": worker_type,
             "backend_version": backend_version,
             **topology,
-            "dcp": None,
+            # None, not 1, without DCP: another identity of the estimator's.
+            "dcp": dcp["size"] if dcp else None,
             "cp_size": 1,
             "enable_eplb": False,
             "nextn": nextn,
@@ -742,6 +747,7 @@ class AisimulateTimingProvider:
             "kv_cache_format": kv_format,
             "expert_dtype": expert_dtype,
             "startup_probes": probes,
+            "decode_context_parallel": dcp,
             "speculation": speculation,
             "kv_cache_mode_note": (
                 "an FP16 KV cache is timed as BF16 (two bytes; an approximation)"
@@ -792,14 +798,52 @@ class AisimulateTimingProvider:
         )
 
     @staticmethod
+    def _decode_context_parallel(vllm_config: "VllmConfig") -> dict[str, Any] | None:
+        """Decode context parallelism as AISimulate prices it, None without:
+        a dense MLA model's, inside its tensor-parallel group. The estimator
+        takes the requests' global context lengths and stripes the decode
+        KV, adding the merge collectives; its forward-pass config sets the
+        DCP size alone, so it prices vLLM's default merge (all-gather and
+        reduce-scatter, the query all-gathered), and no other."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
+
+        pc = vllm_config.parallel_config
+        dcp = pc.decode_context_parallel_size
+        if dcp == 1:
+            return None
+        problems = []
+        if not plain_mla(vllm_config.model_config):
+            problems.append("a model other than dense MLA")
+        if pc.data_parallel_size > 1:
+            problems.append(f"data parallelism {pc.data_parallel_size}")
+        if pc.dcp_comm_backend != "ag_rs":
+            problems.append(f"dcp_comm_backend {pc.dcp_comm_backend}")
+        if pc.dcp_q_replicate:
+            problems.append("dcp_q_replicate")
+        if problems:
+            raise ValueError(
+                f"The aisimulate timing provider times decode context parallelism "
+                f"(decode_context_parallel_size {dcp}) for a dense MLA model "
+                "with dcp_comm_backend ag_rs and dcp_q_replicate off, the "
+                "estimator's forward-pass config setting the DCP size alone, "
+                f"not with {', '.join(problems)}."
+            )
+        return {
+            "size": dcp,
+            "interleave": pc.cp_kv_cache_interleave_size,
+            "comm_backend": pc.dcp_comm_backend,
+            "q_replicate": bool(pc.dcp_q_replicate),
+        }
+
+    @staticmethod
     def _topology(vllm_config: "VllmConfig") -> dict[str, Any]:
         """The parallel layout, refused outside the supported scope."""
         pc = vllm_config.parallel_config
         problems = []
         if pc.pipeline_parallel_size > 1:
             problems.append("pipeline parallelism")
-        if pc.prefill_context_parallel_size > 1 or pc.decode_context_parallel_size > 1:
-            problems.append("context parallelism")
+        if pc.prefill_context_parallel_size > 1:
+            problems.append("prefill context parallelism")
         if pc.enable_eplb:
             problems.append("EPLB")
         if pc.nnodes > 1:
