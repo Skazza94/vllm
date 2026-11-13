@@ -172,7 +172,9 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
     KV moves (`transfers`): dense MLA, or sparse MLA with AISimulate in one
     instance. Both use tensor parallelism alone (no pipeline, prefill context
     or data parallelism, no expert parallelism) and no speculative decoding.
-    Transfers also require prefix caching off."""
+    Prefix caching is admitted with transfers too (its byte checks need the
+    same setting on both endpoints: their pages' patterns are content-seeded
+    exactly when it is on)."""
     parallel = vllm_config.parallel_config
     problems = []
     model = vllm_config.model_config
@@ -203,8 +205,6 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
         problems.append("expert parallelism")
     if vllm_config.speculative_config is not None:
         problems.append("speculative decoding")
-    if transfers and vllm_config.cache_config.enable_prefix_caching:
-        problems.append("prefix caching")
     return problems
 
 
@@ -213,7 +213,7 @@ def dcp_pair_refusal(local_dcp_size: int, remote_dcp_size: int, problems) -> str
         "Simulated real KV transfers pair decode context parallelism (local DCP "
         f"{local_dcp_size}, remote DCP {remote_dcp_size}) for a dense MLA model "
         "over tensor parallelism alone on both sides, TP sizes one dividing the "
-        "other, without speculative decoding or prefix caching, not with "
+        "other, without speculative decoding, not with "
         f"{', '.join(problems)}."
     )
 

@@ -202,8 +202,8 @@ class SimulationConfig:
 
     def _verify_cpu_decode_context_parallel(self, vllm_config: "VllmConfig") -> None:
         """Decode context parallelism on CPU over tensor parallelism alone.
-        Dense MLA can run in one instance or with real NIXL pull transfers and
-        prefix caching off; the handshake checks the peer's DCP. Sparse MLA
+        Dense MLA can run in one instance or with real NIXL pull transfers,
+        prefix caching on or off; the handshake checks the peer's DCP. Sparse MLA
         requires AISimulate and one instance. Neither backend runs attention
         kernels under a simulated forward. CPU GQA has no DCP path."""
         from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
@@ -224,7 +224,7 @@ class SimulationConfig:
                 f"(decode_context_parallel_size "
                 f"{parallel.decode_context_parallel_size}) over tensor parallelism "
                 "alone: dense MLA in one instance or with real NixlConnector "
-                "pull transfers and prefix caching off; sparse MLA only in one "
+                "pull transfers; sparse MLA only in one "
                 f"instance with AISimulate, not with {', '.join(problems)}."
             )
 

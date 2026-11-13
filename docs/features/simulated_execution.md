@@ -572,7 +572,7 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   models (independent engines).
 * Decode context parallelism for a dense MLA model over NIXL's pull
   connector, each instance's DCP 1 or its TP size, the TP sizes one dividing
-  the other, prefix caching off. A decode rank reads the producer ranks NIXL
+  the other. A decode rank reads the producer ranks NIXL
   maps to its DCP slice: a replicated producer's one rank, or each sharded
   rank whose pages fall in its slice (one, several, or all of them for a
   replicated consumer); a mapped rank holding none of its pages is only
@@ -587,11 +587,16 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   rank with an empty native READ selection takes NIXL's notify-only path
   and reads nothing; a rank whose blocks all lie past the handoff may still
   read allocation padding. Each rank's `kv_layout` record holds its resolved DCP
-  geometry. NIXL's handshake checks the peer's DCP, TP and page size. When
+  geometry. With prefix caching, a hit is credited per scheduler block
+  (DCP pages) and a decode rank pulls only its pages past its hit, NIXL
+  offsetting its slice by it. Pages are then checked by their content, and
+  a page past the prompt (padding) by its place and the content it follows;
+  the byte checks need the same prefix-caching setting on both instances.
+  NIXL's handshake checks the peer's DCP, TP and page size. When
   either side has DCP, it also checks both instances' scope, including the
   side of DCP 1: this instance's from its config, the producer's from its
   NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
-  (which slices no page by DCP rank), NIXL's push connector, prefix caching,
+  (which slices no page by DCP rank), NIXL's push connector,
   speculative decoding, pipeline, prefill context or data parallelism,
   expert parallelism and TP sizes neither of which divides the other, on
   either side.

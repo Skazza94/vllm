@@ -3662,6 +3662,9 @@ def main():
     producer = role == "producer"
     kwargs = json.loads(kwargs)
     prompt_len = kwargs.pop("prompt_len")
+    # Requests run in order on both instances (a later one may hit an
+    # earlier one's cached pages): their token ids.
+    prompts = kwargs.pop("prompts", None) or [[5] * prompt_len]
     check = kwargs.pop("check", True)
     # Consumer: after NIXL reports a read done, change one byte of a payload
     # page, write into a page it left (padding it did not move), or zero a
@@ -3698,14 +3701,17 @@ def main():
                 "dcp_size": runner.dcp_size, "dcp_rank": runner.dcp_rank}
 
     ranks = llm.collective_rpc(geometry)
-    prompt = [{"prompt_token_ids": [5] * prompt_len}]
     if producer:
         handoff = {"kv_transfer_params": {"do_remote_decode": True}}
         params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False,
                                 extra_args=handoff)
-        (output,) = llm.generate(prompt, params, use_tqdm=False)
+        handoffs = []
+        for ids in prompts:
+            (output,) = llm.generate([{"prompt_token_ids": ids}], params,
+                                     use_tqdm=False)
+            handoffs.append(output.kv_transfer_params)
         with open(out + ".tmp", "w") as f:
-            json.dump({"ranks": ranks, "params": output.kv_transfer_params}, f)
+            json.dump({"ranks": ranks, "params": handoffs}, f)
         os.rename(out + ".tmp", out)
         # A producer frees a request's blocks once every reader notified it:
         # its engine steps until nothing is left to clean up.
@@ -3772,14 +3778,17 @@ def main():
         assert any(llm.collective_rpc(install, args=(mode, target)))
     with open(sys.argv[6]) as f:
         remote = json.load(f)
-    params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
-                            extra_args={"kv_transfer_params": remote["params"]})
-    (output,) = llm.generate(prompt, params, use_tqdm=False)
+    tokens = []
+    for ids, handoff in zip(prompts, remote["params"]):
+        params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
+                                extra_args={"kv_transfer_params": handoff})
+        (output,) = llm.generate([{"prompt_token_ids": ids}], params,
+                                 use_tqdm=False)
+        tokens.append(len(output.outputs[0].token_ids))
     corrupted = llm.collective_rpc(
         lambda worker: getattr(worker.model_runner, "_dcp_corrupted", None))
     with open(out, "w") as f:
-        json.dump({"ranks": ranks, "tokens": len(output.outputs[0].token_ids),
-                   "corrupted": corrupted}, f)
+        json.dump({"ranks": ranks, "tokens": tokens, "corrupted": corrupted}, f)
 
 if __name__ == "__main__":
     main()
@@ -3896,14 +3905,29 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
     return p, c
 
 
-def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16):
+def dcp_scheduler_hit(prompts, i, dcp, page=16):
+    """vLLM's prefix hit for the `i`th request of `prompts` (run in order) on
+    an instance of DCP `dcp`: the longest prefix shared with an earlier
+    request, at most all its tokens but the last, credited per scheduler
+    block (`page * dcp` tokens)."""
+    ids, shared = prompts[i], 0
+    for earlier in prompts[:i]:
+        n = 0
+        while n < min(len(ids), len(earlier)) and ids[n] == earlier[n]:
+            n += 1
+        shared = max(shared, n)
+    return min(shared, len(ids) - 1) // (page * dcp) * (page * dcp)
+
+
+def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16, hit=0):
     """What NIXL should do for consumer TP rank `rank` of a (TP, DCP) pair,
     from page positions alone: its sources as vLLM maps them
     (`TransferTopology.dcp_source_ranks`, `compute_tp_mapping`), the
-    producer ranks it reads (those holding pages it holds: a rank holds its
+    producer ranks it reads (those holding pages it pulls: a rank holds its
     scheduler blocks' pages, DCP rank r every DCP-th from r, allocation
-    padding included), and its payload (pages under the handoff), moved
-    padding and untouched pages."""
+    padding included; it pulls those past its prefix hit of `hit` tokens),
+    and its payload (pages under the handoff), moved padding and untouched
+    pages."""
     (p_tp, p_dcp), (d_tp, d_dcp) = producer, consumer
     d_rank = rank % d_dcp
     if p_dcp == 1:
@@ -3913,7 +3937,9 @@ def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16):
     else:
         sources = [d_rank % p_dcp]
     pages = -(-prompt_len // page)
-    held = {k * d_dcp + d_rank for k in range(-(-prompt_len // (page * d_dcp)))}
+    first = hit // (page * d_dcp)
+    blocks = -(-prompt_len // (page * d_dcp))
+    held = {k * d_dcp + d_rank for k in range(first, blocks)}
     remote_blocks = -(-prompt_len // (page * p_dcp))
     reads = {}
     for source in sources:
@@ -3925,6 +3951,7 @@ def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16):
     return {
         "sources": sources,
         "read_from": sorted(reads),
+        "first": first,
         "payload": len(payload),
         "padding": len(moved - payload),
         "untouched": len(held - moved),
@@ -3932,14 +3959,19 @@ def dcp_pair_expectation(rank, producer, consumer, prompt_len, page=16):
     }
 
 
-def assert_dcp_pair(p, c, producer, consumer, prompt_len):
-    """A DCP pair's run as `dcp_pair_expectation` predicts it: every rank's
-    geometry; each consumer rank's one check, ok, its pages split as
-    predicted, its READs exactly from the producer ranks holding its pages
-    (a mapped source holding none only notified), its checked bytes its read
-    ones; every producer rank released by its readers' notifications (no
-    lease expired, no notification after one)."""
-    assert c.get("tokens") == 2, c["log"][-4000:]
+def assert_dcp_pair(p, c, producer, consumer, prompts):
+    """A DCP pair's run of `prompts` (a prompt length: one request of it), in
+    order on both instances, as `dcp_pair_expectation` predicts each from
+    page positions: every rank's geometry; each consumer rank's checks, one a
+    request, ok, each pull starting past its prefix hit, its pages split as
+    predicted, its READs exactly from the producer ranks holding its pages (a
+    mapped source holding none only notified), its checked bytes its read
+    ones; each request's prefix hit (`dcp_scheduler_hit`) checked on both
+    instances, ok; every producer rank released by its readers'
+    notifications (no lease expired, no notification after one)."""
+    if isinstance(prompts, int):
+        prompts = [[5] * prompts]
+    assert c.get("tokens") == [2] * len(prompts), c["log"][-4000:]
     for role, side, (tp, dcp) in (("producer", p, producer), ("consumer", c, consumer)):
         assert [r["dcp_size"] for r in side["ranks"]] == [dcp] * tp, role
         assert [r["dcp_rank"] for r in side["ranks"]] == [r % dcp for r in range(tp)]
@@ -3954,6 +3986,18 @@ def assert_dcp_pair(p, c, producer, consumer, prompt_len):
             assert r["dcp"] == geometry, role
     assert p["released"] is True
     assert "Releasing expired KV blocks" not in p["log"], p["log"][-4000:]
+    for role, side, (tp, dcp) in (("producer", p, producer), ("consumer", c, consumer)):
+        for rank in range(tp):
+            records = side["logs"][rank]
+            checks = [r["kv_check"] for r in records if "kv_check" in r]
+            hits = [x for x in checks if x.get("kind") == "hit"]
+            want = [
+                dcp_scheduler_hit(prompts, i, dcp) // (16 * dcp)
+                for i in range(len(prompts))
+            ]
+            assert all(h["ok"] for h in hits), (role, rank, hits)
+            assert [h["blocks"] for h in hits] == [w for w in want if w], (
+                role, rank, hits, want)
     for rank, records in p["logs"].items():
         done = [
             req
@@ -3961,37 +4005,49 @@ def assert_dcp_pair(p, c, producer, consumer, prompt_len):
             if "kv_events" in r
             for req in r["kv_events"].get("sends_done", [])
         ]
-        assert done, f"producer rank {rank} logged no finished send"
+        assert len(done) == len(prompts), f"producer rank {rank} sends {done}"
         leases = [r["kv_transfers"]["lease"] for r in records
                   if "lease" in r.get("kv_transfers", {})]
         assert not leases, (rank, leases)
     for rank in range(consumer[0]):
-        want = dcp_pair_expectation(rank, producer, consumer, prompt_len)
-        assert want["payload_moved"], want
         records = c["logs"][rank]
-        (check,) = [r["kv_check"] for r in records if "kv_check" in r]
-        assert check["ok"], check
+        checks = [r["kv_check"] for r in records
+                  if "kv_check" in r and r["kv_check"].get("kind") != "hit"]
+        assert len(checks) == len(prompts), checks
         loads = [
             r["kv_transfers"]["load"]
             for r in records
             if "load" in r.get("kv_transfers", {})
         ]
         reads = [each for load in loads for each in load["each"]]
-        assert sorted(each[5] for each in reads) == want["read_from"], (want, reads)
         assert all(each[0] > 0 for each in reads), reads
-        assert check["bytes"] == sum(load["bytes"] for load in loads), (check, loads)
-        if producer[1] == consumer[1] == 1:
-            assert "dcp" not in check, check
-            continue
-        assert check["dcp"] == {
-            "size": consumer[1],
-            "rank": rank % consumer[1],
-            "remote_size": producer[1],
-            "remote_num_tokens": prompt_len,
-        }
-        (group,) = check["groups"]
-        got = {k: group[f"{k}_blocks"] for k in ("payload", "padding", "untouched")}
-        assert got == {k: want[k] for k in got}, (group, want)
+        assert sum(x["bytes"] for x in checks) == sum(
+            load["bytes"] for load in loads
+        ), (checks, loads)
+        read_from = []
+        for i, (ids, check) in enumerate(zip(prompts, checks)):
+            hit = dcp_scheduler_hit(prompts, i, consumer[1])
+            want = dcp_pair_expectation(
+                rank, producer, consumer, len(ids), hit=hit
+            )
+            assert want["payload_moved"], want
+            read_from += want["read_from"]
+            assert check["ok"], check
+            if producer[1] == consumer[1] == 1:
+                assert "dcp" not in check, check
+                continue
+            assert check["dcp"] == {
+                "size": consumer[1],
+                "rank": rank % consumer[1],
+                "remote_size": producer[1],
+                "remote_num_tokens": len(ids),
+            }
+            (group,) = check["groups"]
+            assert group["first_logical_block"] == want["first"], (group, want)
+            got = {k: group[f"{k}_blocks"] for k in ("payload", "padding", "untouched")}
+            assert got == {k: want[k] for k in got}, (i, group, want)
+        peers = sorted(each[5] for each in reads)
+        assert peers == sorted(read_from), (read_from, reads)
 
 
 @pytest.mark.parametrize(
@@ -4089,6 +4145,58 @@ def test_nixl_peers_move_mla_pages_under_dcp_at_unequal_tp(
     assert_dcp_pair(p, c, producer, consumer, prompt_len)
 
 
+# Two requests sharing a prefix, run in order (distinct tokens): a 64-token
+# prompt, all of it shared by a 70-token one, ends on a scheduler block of
+# 16-token pages at DCP 1, 2 and 4; two 70-token prompts sharing 48 tokens
+# end inside a DCP2 block (32 tokens credited) and a DCP4 one (none).
+SHARED_ON_BLOCK = [list(range(1, 65)), list(range(1, 65)) + list(range(90, 96))]
+SHARED_INSIDE_BLOCK = [
+    list(range(1, 49)) + list(range(100, 122)),
+    list(range(1, 49)) + list(range(60, 82)),
+]
+
+
+@pytest.mark.parametrize(
+    "producer, consumer",
+    [((2, 1), (2, 2)), ((2, 2), (2, 1)), ((2, 2), (2, 2)), ((2, 1), (4, 4)),
+     ((4, 4), (2, 2))],
+    ids=["p-dcp1_d-dcp2", "p-dcp2_d-dcp1", "p-dcp2_d-dcp2", "p-tp2_d-tp4-dcp4",
+         "p-tp4-dcp4_d-tp2-dcp2"],
+)
+@pytest.mark.parametrize(
+    "prompts", [SHARED_ON_BLOCK, SHARED_INSIDE_BLOCK], ids=["on-block", "inside-block"]
+)
+def test_nixl_peers_move_mla_pages_under_dcp_with_prefix_caching(
+    mla4_model_dir, tmp_path, producer, consumer, prompts
+):
+    """Prefix caching on both instances of a DCP pair over NIXL: the second
+    request hits the first one's cached pages on each instance, credited per
+    scheduler block (page x DCP tokens), and checked by content; the consumer
+    pulls only the pages past its hit, NIXL offsetting each rank's slice by
+    it, each page checked by its content (padding by its padding identity),
+    as `assert_dcp_pair` predicts from page positions. The shared prefix on
+    a block leaves decode rank 1 of a DCP2 consumer of a DCP1 producer only
+    untouched padding to pull (its producer only notified), and moves that
+    padding from a DCP2 producer."""
+    with open(Path(mla4_model_dir) / "config.json") as f:
+        config = json.load(f)
+    p, c = run_dcp_peers(
+        config,
+        *(
+            {
+                "tensor_parallel_size": tp,
+                "decode_context_parallel_size": dcp,
+                "prompt_len": len(prompts[0]),
+                "prompts": prompts,
+                "enable_prefix_caching": True,
+            }
+            for tp, dcp in (producer, consumer)
+        ),
+        tmp_path,
+    )
+    assert_dcp_pair(p, c, producer, consumer, prompts)
+
+
 def test_a_producer_released_by_its_lease_logs_the_expiry(mla_model_dir, tmp_path):
     """A producer whose reader never comes frees the request's blocks when
     its lease expires: a finished send, as a notified release logs too,
@@ -4147,7 +4255,7 @@ def test_nixl_peers_dcp_checks_find_a_changed_page(
         },
         tmp_path,
     )
-    assert c.get("tokens") == 2, c["log"][-4000:]
+    assert c.get("tokens") == [2], c["log"][-4000:]
     corrupted = [x for x in c["corrupted"] if x]
     assert len(corrupted) == 1 and corrupted[0][0] == mode, c["corrupted"]
     _, page, block = corrupted[0]
@@ -4165,7 +4273,7 @@ def test_nixl_peers_dcp_checks_find_a_changed_page(
 
 
 @pytest.mark.parametrize(
-    "producer_dcp, consumer_dcp, prefix_side, check",
+    "producer_dcp, consumer_dcp, ep_side, check",
     [
         (1, 2, "producer", True),
         (1, 2, "producer", False),
@@ -4173,16 +4281,16 @@ def test_nixl_peers_dcp_checks_find_a_changed_page(
         (2, 1, "consumer", False),
     ],
     ids=[
-        "p-dcp1-prefix_d-dcp2-checks",
-        "p-dcp1-prefix_d-dcp2",
-        "p-dcp2_d-dcp1-prefix-checks",
-        "p-dcp2_d-dcp1-prefix",
+        "p-dcp1-ep_d-dcp2-checks",
+        "p-dcp1-ep_d-dcp2",
+        "p-dcp2_d-dcp1-ep-checks",
+        "p-dcp2_d-dcp1-ep",
     ],
 )
-def test_nixl_peers_refuse_prefix_caching_at_the_dcp1_endpoint(
-    mla_model_dir, tmp_path, producer_dcp, consumer_dcp, prefix_side, check
+def test_nixl_peers_refuse_expert_parallelism_at_the_dcp1_endpoint(
+    mla_model_dir, tmp_path, producer_dcp, consumer_dcp, ep_side, check
 ):
-    """Prefix caching is off on both sides of a pair with decode context
+    """Expert parallelism is off on both sides of a pair with decode context
     parallelism, including the endpoint of DCP 1, whose own startup has
     nothing to refuse: the consumer refuses at the handshake, before any
     READ, a producer's from the scope its NIXL metadata states, its own from
@@ -4194,7 +4302,7 @@ def test_nixl_peers_refuse_prefix_caching_at_the_dcp1_endpoint(
             "tensor_parallel_size": 2,
             "decode_context_parallel_size": dcp,
             "prompt_len": 64,
-            "enable_prefix_caching": role == prefix_side,
+            "enable_expert_parallel": role == ep_side,
         }
         for role, dcp in (("producer", producer_dcp), ("consumer", consumer_dcp))
     }
@@ -4202,7 +4310,7 @@ def test_nixl_peers_refuse_prefix_caching_at_the_dcp1_endpoint(
     p, c = run_dcp_peers(config, sides["producer"], sides["consumer"], tmp_path)
     log = c["log"]
     assert "pair decode context parallelism" in log, log[-4000:]
-    problem = "the peer's prefix caching" if prefix_side == "producer" else "prefix"
+    problem = "the peer's expert parallelism" if ep_side == "producer" else "expert"
     assert f"not with {problem}" in log, log[-4000:]
     loads = [
         r
@@ -4320,7 +4428,7 @@ def agent_metadata(**changes):
         (2, (16, 2), {}, "kernel blocks a block"),
         (2, (16, 1), {"physical_blocks_per_logical_kv_block": 2}, "kernel blocks"),
         (1, (16, 1), {"dcp_size": 2, "block_size": 32}, "block size"),
-        (2, (16, 1), {"simulated_scope": ["prefix caching"]}, "the peer's prefix"),
+        (2, (16, 1), {"simulated_scope": ["expert parallelism"]}, "the peer's expert"),
         (1, (16, 1), {"dcp_size": 2, "simulated_scope": None}, "no simulated scope"),
         (1, (16, 2), {"block_size": 32, "simulated_scope": None}, None),
     ],
@@ -4330,7 +4438,7 @@ def agent_metadata(**changes):
         "local-kernel-blocks",
         "remote-kernel-blocks",
         "remote-dcp-block-size",
-        "peer-prefix-caching",
+        "peer-expert-parallelism",
         "peer-scope-unknown",
         "no-dcp",
     ],
@@ -4381,7 +4489,7 @@ def test_dcp_peer_scope_survives_metadata_schema_evolution(mla_model_dir):
     old_schema = dataclasses.make_dataclass(
         "NixlAgentMetadata", [spec(f) for f in old_fields]
     )
-    new = agent_metadata(dcp_size=2, simulated_scope=["prefix caching"])
+    new = agent_metadata(dcp_size=2, simulated_scope=["expert parallelism"])
     old = old_schema(**{f.name: getattr(new, f.name) for f in old_fields})
     encode = msgspec.msgpack.Encoder().encode
 
@@ -4395,7 +4503,7 @@ def test_dcp_peer_scope_survives_metadata_schema_evolution(mla_model_dir):
     dcp1 = dcp_engine_config(mla_model_dir)
     decode = msgspec.msgpack.Decoder(NixlAgentMetadata).decode
     for scope, problem in ((None, "no simulated scope"), ([], None), (
-        ["prefix caching"], "the peer's prefix caching"
+        ["expert parallelism"], "the peer's expert parallelism"
     )):
         payload = encode(dataclasses.replace(new, simulated_scope=scope))
         refusal = dcp_peer_refusal(dcp2, 2, (16, 1), 2, decode(payload))
@@ -4464,26 +4572,15 @@ def test_nixl_peers_refuse_another_page_size_under_dcp(
             },
             "the NixlPushConnector connector",
         ),
-        (
-            {
-                "kv_transfer_config": {
-                    "kv_connector": "NixlConnector",
-                    "kv_role": "kv_consumer",
-                    "kv_buffer_device": "cpu",
-                },
-                "enable_prefix_caching": True,
-            },
-            r"not with prefix caching\.",
-        ),
     ],
-    ids=["mooncake", "nixl-push", "prefix-caching"],
+    ids=["mooncake", "nixl-push"],
 )
-def test_real_transfers_with_dcp_refuse_other_connectors_and_prefix_caching(
+def test_real_transfers_with_dcp_refuse_other_connectors(
     mla_model_dir, kwargs, problem
 ):
-    """Real transfers with decode context parallelism: NIXL's pull connector,
-    prefix caching off; Mooncake's connector, which slices no page by DCP
-    rank, and NIXL's push connector are refused, as is prefix caching."""
+    """Real transfers with decode context parallelism: NIXL's pull connector
+    only; Mooncake's connector, which slices no page by DCP rank, and NIXL's
+    push connector are refused."""
     from vllm.engine.arg_utils import EngineArgs
 
     with pytest.raises(ValueError, match=problem):

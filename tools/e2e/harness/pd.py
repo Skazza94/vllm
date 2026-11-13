@@ -474,7 +474,8 @@ def _check_dcp(run: Run) -> None:
     """Decode context parallelism on either side: each side's DCP 1 or its TP
     size (vLLM's rule over NIXL), a dense MLA model over NIXL's pull
     connector, one instance a side without data parallelism, no speculative
-    decoding, prefix caching off; at TP sizes one dividing the other, which,
+    decoding, prefix caching on or off (one setting for both instances, as
+    the byte checks need); at TP sizes one dividing the other, which,
     unequal, need one switched KV network (`parse`), as does a sharded
     producer read by a coarser consumer at equal sizes. The simulator checks
     the same scope at startup and at the handshake."""
@@ -498,8 +499,6 @@ def _check_dcp(run: Run) -> None:
         problems.append("several instances or data parallelism")
     if run.server.speculative is not None:
         problems.append("speculative decoding")
-    if _prefix_caching_enabled(run) is not False:
-        problems.append("prefix caching (off: server.enable_prefix_caching false, or kv_check)")
     if not plain_mla_of(run.model):
         problems.append("the model's attention (a dense MLA model only)")
     if dcps["prefill"] > dcps["decode"] and not (
@@ -1832,11 +1831,14 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                 # Decode context parallelism: a rank holds the request's
                 # scheduler blocks (DCP pages each), its payload pages
                 # reconciled with the handoff in `_dcp_audit`.
+                # With prefix caching the pull starts past decode's own hit,
+                # at its posted first block (`_pull_plans`).
                 dcp = int((check.get("dcp") or {}).get("size") or 1)
                 held = sum(int(g.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
-                if held != -(-tokens // (spec["block_size"] * dcp)):
-                    problems.append(f"{request}'s group {g['group']} holds {held} blocks, not the "
-                                    f"cdiv({tokens}, {spec['block_size']} * DCP {dcp}) of its prompt")
+                if g["first_logical_block"] + held != -(-tokens // (spec["block_size"] * dcp)):
+                    problems.append(f"{request}'s group {g['group']} holds {held} blocks from "
+                                    f"{g['first_logical_block']}, not the rest of the cdiv({tokens}, "
+                                    f"{spec['block_size']} * DCP {dcp}) of its prompt")
             elif window is None:
                 hit = g["first_logical_block"] if prefix else 0
                 if g["blocks"] != -(-tokens // spec["block_size"]) - hit:
@@ -1849,11 +1851,15 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                     problems.append(f"{request}'s window group {g['group']} pulled {g['blocks']} blocks, "
                                     f"more than its window's {bound}")
                 clipped[g["group"]] += g["first_logical_block"] > 0
-            # A pull posts no entry for a group it pulls nothing of.
+            # A pull posts no entry for a group it pulls nothing of. A DCP
+            # check's blocks are its moved pages: its pull's are every
+            # block it holds (untouched padding included).
+            counted = (sum(int(g.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
+                       if "payload_blocks" in g else g["blocks"])
             if plan is not None and plan.get(g["group"], (tokens // spec["block_size"], 0) if skipped else None) != (
-                    g["first_logical_block"], g["blocks"]):
+                    g["first_logical_block"], counted):
                 first, blocks = plan.get(g["group"]) or (None, 0)
-                problems.append(f"{request}'s group {g['group']} checked {g['blocks']} block(s) from "
+                problems.append(f"{request}'s group {g['group']} checked {counted} block(s) from "
                                 f"{g['first_logical_block']}, not the pull's {blocks} from {first}")
     for index, spec in enumerate(groups):
         window = spec.get("sliding_window")
@@ -2121,7 +2127,11 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
                             f"{sources}: {unnamed[0][:6]}")
         peers = sorted({each[5] for each in reads if len(each) > 5 and type(each[5]) is int})
         moved = sum(int(load.get("bytes") or 0) for load in loads)
-        valid = [r["kv_check"] for r in records if "kv_check" in r and "error" not in r["kv_check"]]
+        # Transfer checks only: a prefix hit's (`kind: hit`) holds cached
+        # bytes, no transfer's (`_hit_problems`).
+        transfers = [r["kv_check"] for r in records
+                     if "kv_check" in r and r["kv_check"].get("kind") in (None, "transfer")]
+        valid = [c for c in transfers if "error" not in c]
         checked = sum(int(c.get("bytes") or 0) for c in valid)
         if run.kv_check and checked != moved:
             problems.append(f"decode rank {rank} checked {checked} bytes, not the {moved} it read")
@@ -2129,9 +2139,12 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
                           and all(_dcp_notify_only(g) for g in c["groups"]))
         totals = {"payload": 0, "padding": 0, "untouched": 0, "padding_bytes": 0, "untouched_bytes": 0}
         miscounted = False
-        for check in (r["kv_check"] for r in records if "kv_check" in r):
-            if "error" in check:
-                continue
+        held, prompts, done = _dcp_pulls(records)
+        # Each pull's blocks as posted (past decode's own prefix hit): its
+        # first place and count, all the request's blocks without a plan.
+        plans = _pull_plans(records)
+        spans = {request: plans.get(request, {}).get(0, (0, blocks)) for request, blocks in held.items()}
+        for check in valid:
             found = check.get("dcp") or {}
             tokens = found.get("remote_num_tokens")
             if {key: found.get(key) for key in ("size", "rank", "remote_size")} != {
@@ -2140,20 +2153,27 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
                                 f"parallelism {found}, not size {decode_dcp} rank {dcp_rank} from size {prefill_dcp}")
                 continue
             for group in check.get("groups") or []:
-                held = sum(int(group.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
+                count = sum(int(group.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
+                first = int(group.get("first_logical_block") or 0)
                 handoff = -(-tokens // page) if page else None
-                payload = sum(1 for k in range(held) if handoff is not None and k * decode_dcp + dcp_rank < handoff)
+                payload = sum(1 for k in range(first, first + count)
+                              if handoff is not None and k * decode_dcp + dcp_rank < handoff)
                 if group.get("payload_blocks") != payload:
                     miscounted = True
                     problems.append(f"decode rank {rank}'s check of {check.get('req_id')} has "
                                     f"{group.get('payload_blocks')} payload page(s), not the {payload} of its "
-                                    f"{held} block(s) under the handoff's {handoff} page(s)")
+                                    f"{count} block(s) from {first} under the handoff's {handoff} page(s)")
+                posted = spans.get(check.get("req_id"))
+                if posted is not None and posted != (first, count):
+                    miscounted = True
+                    problems.append(f"decode rank {rank}'s check of {check.get('req_id')} covers {count} block(s) "
+                                    f"from {first} (payload, moved and untouched padding), not its pull's "
+                                    f"{posted[1]} from {posted[0]}")
                 totals["payload"] += int(group.get("payload_blocks") or 0)
                 totals["padding"] += int(group.get("padding_blocks") or 0)
                 totals["untouched"] += int(group.get("untouched_blocks") or 0)
                 totals["padding_bytes"] += int(group.get("padding_bytes") or 0)
                 totals["untouched_bytes"] += int(group.get("untouched_bytes") or 0)
-        held, prompts, done = _dcp_pulls(records)
         layout = next((r["kv_layout"] for r in records if "kv_layout" in r), None) or {}
         groups = layout.get("groups") or []
         block_bytes = (int(groups[0]["block_bytes"]) * int(groups[0]["layers"])
@@ -2166,18 +2186,24 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
             if not blocks or tokens is None or not page:
                 problems.append(f"decode rank {rank}'s pull of {request} logged no allocated blocks, prompt or page")
                 continue
-            payload_blocks += sum(1 for k in range(blocks) if k * decode_dcp + dcp_rank < -(-tokens // page))
+            first, count = spans[request]
+            if first + count != -(-tokens // (page * decode_dcp)):
+                problems.append(f"decode rank {rank}'s pull of {request} posts {count} block(s) from {first}, not "
+                                f"the rest of its cdiv({tokens}, {page} * DCP {decode_dcp}) scheduler blocks")
+            payload_blocks += sum(1 for k in range(first, first + count)
+                                  if k * decode_dcp + dcp_rank < -(-tokens // page))
+        pulled = sum(count for _, count in spans.values())
         if block_bytes is None:
             problems.append(f"decode rank {rank}'s layout is not one group of pages: {groups}")
-        elif not payload_blocks * block_bytes <= moved <= sum(held.values()) * block_bytes:
+        elif not payload_blocks * block_bytes <= moved <= pulled * block_bytes:
             problems.append(f"decode rank {rank} read {moved} bytes, not between its {payload_blocks} payload "
-                            f"page(s) and its {sum(held.values())} block(s) of {block_bytes} bytes")
+                            f"page(s) and its {pulled} pulled block(s) of {block_bytes} bytes")
         # The READs its pulls call for: one from each source holding some of
         # the pages its blocks hold (allocation padding included); a source
         # holding none is only notified.
         wanted: dict[int, int] = {}
-        for request, blocks in held.items():
-            mine = {k * decode_dcp + dcp_rank for k in range(blocks)}
+        for request, (first, count) in spans.items():
+            mine = {k * decode_dcp + dcp_rank for k in range(first, first + count)}
             for source in sources:
                 theirs = produced.get(source, {}).get(_base_request_id(request), 0)
                 if mine & {k * prefill_dcp + source % prefill_dcp for k in range(theirs)}:
@@ -3000,13 +3026,16 @@ def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dic
     groups = layout.get("groups")
     if not groups:
         return ["the layout lists no KV cache groups to check prefix hits by"], []
+    # Decode context parallelism: a scheduler block, a hit's unit, spans DCP
+    # pages, one a rank.
+    scale = int((layout.get("decode_context_parallel") or {}).get("size") or 1)
     problems: list[str] = []
     expected: dict[str, list[dict[int, list[tuple[int, int]]]]] = {}
     for request, adms in admissions.items():
         for admission in adms:
             pull, table = admission["pull"], admission["table"]
             for group, (first, blocks) in (pull or {}).items():
-                size = groups[group]["block_size"] if 0 <= group < len(groups) else None
+                size = (groups[group]["block_size"] * scale) if 0 <= group < len(groups) else None
                 if table.get(group, [])[first:first + len(blocks)] != blocks:
                     problems.append(f"{request}'s pull of group {group} ({len(blocks)} block(s) from {first}) is "
                                     "not its blocks there when admitted")
@@ -3016,7 +3045,7 @@ def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dic
             want = {}
             for group, spec in enumerate(groups):
                 count = (pull.get(group, (0, []))[0] if pull is not None
-                         else admission["computed"] // spec["block_size"])
+                         else admission["computed"] // (spec["block_size"] * scale))
                 row = table.get(group, [])
                 places = [(place, row[place]) for place in range(min(count, len(row))) if row[place]]
                 if places:

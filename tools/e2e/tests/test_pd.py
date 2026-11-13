@@ -3463,11 +3463,13 @@ class DecodeContextParallelTests(unittest.TestCase):
                                                      "decode": {"kv_network": "data0"}},
             "unequal TP sizes need one switched network": {"prefill": {"tensor_parallel_size": 1,
                                                                        "kv_network": ["data0"]}},
-            "prefix caching": {"server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
-                                          "enable_prefix_caching": True}},
-            "prefix caching ": {"kv_check": False},
             "data parallelism": {"decode": {"data_parallel_size": 2}},
         }
+        # Prefix caching, one setting for both instances: checked or not.
+        for change in ({"server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
+                                   "enable_prefix_caching": True}}, {"kv_check": False}):
+            with self.subTest(prefix=change):
+                self.assertEqual(self.run_of(**change).decode.decode_context_parallel_size, 2)
         for message, change in cases.items():
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message.strip()):
                 self.run_of(**change)
@@ -3531,7 +3533,7 @@ class DecodeContextParallelTests(unittest.TestCase):
         self.assertEqual([audit["ranks"][r]["payload_blocks"] for r in range(2)], [3, 2])
         unfinished = line(kv_events={"allocated": {"cmpl-a-0-d": [1, 2, 3]}, "reads_posted": ["cmpl-a-0-d"]})
         cases = {
-            "decode rank 1 read 10 bytes, not between its 2 payload page(s) and its 3 block(s)": {
+            "decode rank 1 read 10 bytes, not between its 2 payload page(s) and its 3 pulled block(s)": {
                 1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(1, 10)},
             "decode rank 0 read 0 bytes, not between its 3 payload page(s)": {
                 0: dcp_layout(0, 2) + dcp_pull("a", 3, 70)},
@@ -3790,6 +3792,106 @@ class DecodeContextParallelTests(unittest.TestCase):
                     problems = self.unequal((2, 2), (4, 1), prompt=prompt, checks=checks, change=change)["problems"]
                     self.assertTrue(any(message in p for p in problems), problems)
 
+    def prefixed(self, checks: bool = True, change=None) -> dict:
+        """A complete verdict, prefix caching on, of two 70-token requests
+        (16-token pages) from prefill TP2/DCP1 to decode TP2/DCP2, b sharing
+        a's first 64 tokens: prefill hits 4 pages; decode hits two scheduler
+        blocks (2 of each rank's blocks) and pulls one, page 4 on rank 0
+        (payload), page 5 on rank 1 (padding its producer does not hold:
+        untouched, the producer only notified)."""
+        run = self.run_of(server={"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
+                                  "enable_prefix_caching": True},
+                          workload={"num_prompts": 2, "input_len": 70}, **({} if checks else {"kv_check": False}))
+
+        def rid(request, side):
+            return f"cmpl-{request}-0-{side}"
+
+        def admitted(request, side, computed, ids):
+            return line(kv_events={"allocated": {rid(request, side): ids}, "admitted": {rid(request, side): computed},
+                                   "allocated_groups": {rid(request, side): [{"group": 0, "first": 0, "blocks": ids}]}})
+
+        def posted(request, first, ids):
+            return line(kv_events={"allocated": {rid(request, "d"): ids}, "reads_posted": [rid(request, "d")],
+                                   "allocated_groups": {rid(request, "d"): [
+                                       {"group": 0, "first": first, "blocks": ids[first:]}]}})
+
+        def hit_check(request, side, ids):
+            return {"req_id": rid(request, side), "kind": "hit", "blocks": len(ids), "bytes": 10 * len(ids),
+                    "groups": [{"group": 0, "logical_blocks": list(range(len(ids))), "block_ids": ids,
+                                "blocks": len(ids), "bytes": 10 * len(ids), "mismatched_bytes": 0,
+                                "written_this_step": []}], "mismatched_bytes": 0, "ok": True}
+
+        def transfer_check(request, rank, first, count, payload):
+            check = dcp_check(request, rank, 2, 1, 70, count, payload)
+            check["groups"][0]["first_logical_block"] = first
+            return check
+
+        prefill = [dcp_layout(r, 1) + admitted("a", "p", 0, blocks(1, 5)) + stepped("a", "p", 0, 70, 70)
+                   + admitted("b", "p", 64, blocks(1, 4) + [206]) + stepped("b", "p", 64, 6, 70)
+                   + (line(kv_check=hit_check("b", "p", blocks(1, 4))) if checks else "")
+                   + line(kv_events={"sends_done": [rid("a", "p"), rid("b", "p")]}) for r in range(2)]
+        a_ids, b_ids = blocks(101, 3), blocks(101, 2) + [301]
+        # a: rank 0 pages 0, 2, 4; rank 1 pages 1, 3 (page 5 untouched). b:
+        # past the hit, rank 0 page 4; rank 1 page 5, untouched.
+        reads = {0: [dcp_read(0, 30), dcp_read(0, 10)], 1: [dcp_read(1, 20), ""]}
+        payloads = {0: (3, 1), 1: (2, 0)}
+        decode = []
+        for d in range(2):
+            records = (dcp_layout(d, 2) + posted("a", 0, a_ids) + admitted("a", "d", 69, a_ids)
+                       + stepped("a", "d", 69, 1, 70) + reads[d][0] + line(kv_events={"reads_done": [rid("a", "d")]})
+                       + posted("b", 2, b_ids) + admitted("b", "d", 69, b_ids)
+                       + stepped("b", "d", 69, 1, 70) + reads[d][1] + line(kv_events={"reads_done": [rid("b", "d")]}))
+            if checks:
+                records += (line(kv_check=transfer_check("a", d, 0, 3, payloads[d][0]))
+                            + line(kv_check=hit_check("b", "d", blocks(101, 2)))
+                            + line(kv_check=transfer_check("b", d, 2, 1, payloads[d][1])))
+            decode.append(records)
+        tent = {"tent_registered_buffer_bytes": 1600}
+        tents = {"prefill": [tent, tent], "decode": [{**tent, "tent_read_bytes_total": 40},
+                                                      {**tent, "tent_read_bytes_total": 20}]}
+        if change:
+            change(prefill, decode, tents)
+        return pd.check({"completed": 2, "errors": ["", ""]}, prefill, decode,
+                        {"control": 1, "data0": 200, "data1": 200}, run, tents)
+
+    def test_a_prefix_hit_leaves_its_pages_out_of_the_pull_and_the_transfer_accounting(self) -> None:
+        for checks in (True, False):
+            with self.subTest(checks=checks):
+                verdict = self.prefixed(checks=checks)
+                self.assertEqual(verdict["problems"], [])
+                ranks = verdict["dcp"]["ranks"]
+                self.assertEqual([ranks[d]["reads"] for d in range(2)], [2, 1])
+                if checks:
+                    # The hit's cached bytes are not transferred ones.
+                    self.assertEqual([ranks[d]["untouched"] for d in range(2)], [0, 2])
+                    self.assertEqual(verdict["kv_bytes_checked"], 60)
+
+        def hit_page_read(prefill, decode, tents):
+            decode[0] += dcp_read(0, 10)
+            tents["decode"][0]["tent_read_bytes_total"] = 50
+
+        def pull_before_hit(prefill, decode, tents):
+            decode[1] = decode[1].replace('"first": 2, "blocks": [301]', '"first": 1, "blocks": [102, 301]')
+
+        def hit_per_page(prefill, decode, tents):
+            decode[0] = decode[0].replace('"logical_blocks": [0, 1], "block_ids": [101, 102]',
+                                          '"logical_blocks": [0, 1, 2, 3], "block_ids": [101, 102, 103, 104]')
+
+        cases = [
+            ("decode rank 0 read {0: 3} (READs by producer rank), not the {0: 2}", hit_page_read, False),
+            ("decode rank 0 read {0: 3} (READs by producer rank), not the {0: 2}", hit_page_read, True),
+            # Pulling page 3 too: producer rank 1 holds it, a READ is missing.
+            ("decode rank 1 read {1: 1} (READs by producer rank), not the {1: 2}", pull_before_hit, False),
+            ("covers 1 block(s) from 2 (payload, moved and untouched padding), not its pull's 2 from 1",
+             pull_before_hit, True),
+            ("hit check covers group 0: 4 block(s) 0:101..3:104, not its admitted hit group 0: 2 block(s)",
+             hit_per_page, True),
+        ]
+        for message, change, checks in cases:
+            with self.subTest(message=message, checks=checks):
+                problems = self.prefixed(checks=checks, change=change)["problems"]
+                self.assertTrue(any(message in p for p in problems), problems)
+
     def test_a_sharded_producers_ranks_all_feed_a_replicated_consumer(self) -> None:
         # Producer DCP2 to consumer DCP1: each consumer rank holds every page,
         # read from both producer ranks.
@@ -3819,4 +3921,4 @@ class DecodeContextParallelTests(unittest.TestCase):
         self.assertEqual(problems(0, 9, 0), [])
         self.assertEqual(problems(1, 8, 1), [])
         bad = problems(1, 8, 0)
-        self.assertTrue(any("holds 8 blocks, not the cdiv(1060, 64 * DCP 2)" in p for p in bad), bad)
+        self.assertTrue(any("holds 8 blocks from 0, not the rest of the cdiv(1060, 64 * DCP 2)" in p for p in bad), bad)

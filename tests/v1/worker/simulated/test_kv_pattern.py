@@ -2527,3 +2527,107 @@ def test_native_per_group_heads_check_a_gemma_like_split_and_gather():
     for group in range(2):
         s.rows[group].view[2] = split(group)
     assert NativeChecker(s, tp_rank=1, heads=None) is not None
+
+
+# Decode context parallelism with prefix caching: a rank's block k holds
+# global page k * DCP + rank, its content the tokens of that page.
+
+
+def test_a_page_past_the_content_has_a_padding_identity():
+    """A page starting at or past a content's end (allocation padding) is
+    named by its place and the content it follows, reading no token past
+    that end; a payload page keeps its strict identity. Producer and
+    consumer name the same padding alike: at page 16, DCP2, rank 1 and 70
+    tokens, local block 2 is page 5, from token 80."""
+    chains = TokenChains([16])
+    chains.admit("a", list(range(70)))
+    padding = chains.prompt_content("a", 0, 5)
+    assert padding.startswith("content|B16|pad|i5|")
+    assert chains.pulled_content("a", 0, 5) == padding
+    assert chains.prompt_content("a", 0, 6) != padding
+    assert chains.prompt_content("a", 0, 4) == chains.identity("a", 0, 4, 6)
+    other = TokenChains([16])
+    other.admit("b", list(range(69)) + [99])
+    assert other.prompt_content("b", 0, 5) != padding
+    with pytest.raises(ValueError, match="tokens up to 80 are unknown"):
+        chains.identity("a", 0, 4, 16)
+    # A producer's chain already ends at its handoff (NIXL truncates its
+    # prompt); the consumer's original prompt stops `backoff` short of it.
+    producer, consumer = TokenChains([4]), TokenChains([4], backoff=1)
+    producer.admit("p", list(range(9)))
+    consumer.admit("d", list(range(10)))
+    assert producer.prompt_content("p", 0, 3) == consumer.pulled_content("d", 0, 3)
+    assert producer.prompt_content("p", 0, 2) == consumer.pulled_content("d", 0, 2)
+
+
+def test_a_dcp_ranks_blocks_are_its_global_pages():
+    """A DCP rank's block k is global page k * DCP + rank; its leading blocks
+    `tokens` fill are those whose pages end by then. DCP 1 is the plain
+    count."""
+    views = block_views(caches(8), 8)
+    rank1 = PatternChecker(views, chains=TokenChains([16]), dcp_size=2, dcp_rank=1)
+    assert [rank1._page(k) for k in range(3)] == [1, 3, 5]
+    assert [rank1._full_blocks(t, 16) for t in (16, 31, 32, 64, 95, 96)] == [
+        0, 0, 1, 2, 2, 3]
+    rank0 = PatternChecker(views, chains=TokenChains([16]), dcp_size=2, dcp_rank=0)
+    assert [rank0._full_blocks(t, 16) for t in (15, 16, 48, 64)] == [0, 1, 2, 2]
+    plain = PatternChecker(views, chains=TokenChains([16]))
+    assert [plain._full_blocks(t, 16) for t in (15, 16, 70)] == [0, 1, 4]
+
+
+def test_a_dcp_producers_pages_and_hits_follow_global_pages():
+    """A DCP2 rank-1 producer fills each block with its global page's content
+    (padding past the prompt included); a later request's hit, credited per
+    scheduler block (two pages), is compared by content and never rewritten;
+    a corrupted cached page fails the next hit, unrepaired; a hit ending
+    inside a scheduler block is outside the lifecycle."""
+    chains = TokenChains([BLOCK])
+    prefill = block_views(caches(12), 12)
+    filler = PatternFiller(prefill, chains=chains, dcp_size=2, dcp_rank=1)
+    prompt_a = list(range(100, 110))  # 10 tokens: pages 0-2, rank 1 holds 1 and 3
+    filler.after_update(step(new=[("a", [1, 2], prompt_a, 0, 10)]))
+    assert filler.take_results() == []
+    assert holds(prefill, 1, chains, "a", 1, BLOCK)
+    padding = chains.prompt_content("a", 0, 3)
+    assert padding.startswith(f"content|B{BLOCK}|pad|i3|")
+    assert all(
+        torch.equal(view[2], pattern("a", layer, 3, view.shape[1], identity=padding))
+        for layer, view in prefill.items()
+    )
+    # B shares A's first scheduler block (8 tokens: pages 0 and 1).
+    before = {layer: view[1].clone() for layer, view in prefill.items()}
+    filler.after_update(step(new=[("b", [1, 5], prompt_a[:8] + [7, 7], 8, 2)]))
+    (hit,) = filler.take_results()
+    assert hit["kind"] == "hit" and hit["ok"], hit
+    assert hit["blocks"] == 1 and hit["groups"][0]["logical_blocks"] == [0]
+    assert all(torch.equal(view[1], before[layer]) for layer, view in prefill.items())
+    prefill[LAYERS[0]][1][0] ^= 0xFF
+    filler.after_update(step(new=[("c", [1, 6], prompt_a[:8] + [1, 1], 8, 2)]))
+    (hit,) = filler.take_results()
+    assert not hit["ok"] and hit["mismatched_blocks"] == [[LAYERS[0], 1, 1, 1]], hit
+    assert not torch.equal(prefill[LAYERS[0]][1], before[LAYERS[0]])
+    # A hit of one page is half a scheduler block.
+    filler.after_update(step(new=[("d", [1, 7], prompt_a[:4] + [3] * 6, 4, 6)]))
+    (refused,) = filler.take_results()
+    assert not refused["ok"] and "ends inside a block of [8] tokens" in refused["error"]
+
+
+def test_a_dcp_consumer_writes_only_its_full_global_pages():
+    """A DCP2 rank-1 consumer's own steps write a block once its global page
+    is full of known tokens, never a page past them (padding), and never
+    the blocks of its prefix hit."""
+    chains = TokenChains([BLOCK])
+    decode = block_views(caches(12), 12)
+    checker = PatternChecker(decode, chains=chains, dcp_size=2, dcp_rank=1)
+    prompt = list(range(100, 114))  # 14 tokens: pages 0-3, rank 1 holds 1 and 3
+    checker.before_step(step(new=[("a", [1, 2], prompt, 0, 14)]))
+    checker.after_update(step(new=[("a", [1, 2], prompt, 0, 14)]))
+    written = {(e["logical_block"], e["block_id"]) for e in checker.take_write_events()}
+    assert written == {(0, 1)}  # page 1 (tokens 4-7); page 3 (12-15) is not full
+    assert holds(decode, 1, chains, "a", 1, BLOCK)
+    assert bool((decode[LAYERS[0]][2] == SENTINEL).all())
+    # B hits A's first scheduler block: its block 0 is not B's to write.
+    checker.before_step(step(new=[("b", [1, 3], prompt[:8] + [5] * 8, 8, 8)]))
+    checker.after_update(step(new=[("b", [1, 3], prompt[:8] + [5] * 8, 8, 8)]))
+    events = checker.take_write_events()
+    assert {(e["req_id"], e["block_id"]) for e in events} == {("b", 3)}, events

@@ -454,16 +454,9 @@ class TokenChains:
     def identity(self, req_id: str, group: int, logical: int, n: int) -> str:
         """The content of a group's logical block holding its first `n`
         tokens."""
-        tokens = self.tokens.get(req_id)
         size = self.block_sizes[group]
         end = logical * size + n
-        if tokens is None or end > len(tokens):
-            known = "no prompt token ids" if tokens is None else f"{len(tokens)} known"
-            raise OutsideLifecycle(
-                f"request {req_id}'s tokens up to {end} are unknown ({known})"
-            )
-        if n == 0:
-            return f"content|B{size}|n0|i{logical}"
+        tokens = self._known(req_id, end)
         full = self._full.setdefault((req_id, size), [])
         while len(full) < logical + (n == size):
             k = len(full)
@@ -474,20 +467,46 @@ class TokenChains:
             digest = _digest(full[logical - 1] if logical else b"", tokens[logical * size : end])
         return f"content|B{size}|n{n}|{digest.hex()}"
 
-    def prompt_content(self, req_id: str, group: int, logical: int) -> str:
-        """A block as the producer computes it: its prompt tokens."""
+    def _known(self, req_id: str, end: int) -> list[int]:
+        """A request's tokens, known up to `end`; raises OutsideLifecycle."""
+        tokens = self.tokens.get(req_id)
+        if tokens is None or end > len(tokens):
+            known = "no prompt token ids" if tokens is None else f"{len(tokens)} known"
+            raise OutsideLifecycle(
+                f"request {req_id}'s tokens up to {end} are unknown ({known})"
+            )
+        return tokens
+
+    def padding(self, req_id: str, group: int, logical: int, end: int) -> str:
+        """A block starting at or past a content's end (`end` tokens: an
+        allocation's padding, or a block awaiting tokens): its place and the
+        content it follows, read no further than that end."""
         size = self.block_sizes[group]
-        n = min(size, max(0, self.prompt_lens.get(req_id, 0) - logical * size))
-        return self.identity(req_id, group, logical, n)
+        self._known(req_id, end)
+        if end == 0:
+            return f"content|B{size}|pad|i{logical}|empty"
+        last = (end - 1) // size
+        before = self.identity(req_id, group, last, end - last * size)
+        return f"content|B{size}|pad|i{logical}|{before}"
+
+    def prompt_content(self, req_id: str, group: int, logical: int) -> str:
+        """A block as the producer computes it: its prompt tokens (native
+        NIXL truncates a producer's prompt to its handoff)."""
+        return self._content(req_id, group, logical, self.prompt_lens.get(req_id, 0))
 
     def pulled_content(self, req_id: str, group: int, logical: int) -> str:
         """A block as the consumer pulls it: the producer's prompt content,
         which stops `backoff` tokens short of the consumer's prompt."""
-        size = self.block_sizes[group]
         end = self.prompt_lens.get(req_id, 0) - self.backoff
-        return self.identity(
-            req_id, group, logical, min(size, max(0, end - logical * size))
-        )
+        return self._content(req_id, group, logical, end)
+
+    def _content(self, req_id: str, group: int, logical: int, end: int) -> str:
+        """A block of a content of `end` tokens: its tokens, or, past the
+        end, its padding identity."""
+        size = self.block_sizes[group]
+        if logical * size >= end:
+            return self.padding(req_id, group, logical, end)
+        return self.identity(req_id, group, logical, min(size, end - logical * size))
 
 
 def _lifecycle_failure(req_id: str, kind: str, error: Exception) -> dict:
@@ -508,6 +527,10 @@ class _ContentPages:
     chains: "TokenChains | None"
     tables: dict[str, list[list[int]]]
     results: list[dict]
+    # Decode context parallelism: a rank's block k holds global page
+    # `dcp_page(k)`, the content's tokens [page * size, (page + 1) * size).
+    dcp_size: int = 1
+    dcp_rank: int = 0
     # This step's writes (block: writing request) and the prefix hits to
     # compare once they are done.
     step_writes: dict[int, str]
@@ -523,6 +546,15 @@ class _ContentPages:
     ) -> tuple[int, int, list]:
         """(bytes compared, bytes wrong, mismatched entries)."""
         raise NotImplementedError
+
+    def _page(self, logical: int) -> int:
+        """A block's global page (its content's block of page tokens)."""
+        return dcp_page(logical, self.dcp_size, self.dcp_rank)
+
+    def _full_blocks(self, tokens: int, size: int) -> int:
+        """This rank's leading blocks whose global pages `tokens` fill."""
+        pages = tokens // size
+        return max(0, (pages - self.dcp_rank - 1) // self.dcp_size + 1)
 
     def take_results(self) -> list[dict]:
         results, self.results = self.results, []
@@ -548,7 +580,8 @@ class _ContentPages:
         as such: native caching shares one only for an aligned Mamba group
         whose hits are finer than its blocks."""
         assert self.chains is not None
-        sizes = self.chains.block_sizes
+        # A scheduler block spans DCP pages.
+        sizes = [size * self.dcp_size for size in self.chains.block_sizes]
         if any(num_computed_tokens % size for size in sizes):
             self.results.append(
                 _lifecycle_failure(
@@ -560,7 +593,10 @@ class _ContentPages:
                     ),
                 )
             )
-        hits = [num_computed_tokens // size for size in sizes]
+        hits = [
+            self._full_blocks(num_computed_tokens, size)
+            for size in self.chains.block_sizes
+        ]
         self.hits_due.append((req_id, hits))
         return hits
 
@@ -592,7 +628,9 @@ class _ContentPages:
                     continue
                 size = self.chains.block_sizes[group]
                 try:
-                    identity = self.chains.identity(req_id, group, logical, size)
+                    identity = self.chains.identity(
+                        req_id, group, self._page(logical), size
+                    )
                 except OutsideLifecycle as e:
                     self.results.append(_lifecycle_failure(req_id, "hit", e))
                     return
@@ -683,7 +721,7 @@ def _fill_identity(filler, req_id: str, group: int, logical: int) -> str | None:
     prompt content's; raises OutsideLifecycle."""
     if filler.chains is None:
         return None
-    return filler.chains.prompt_content(req_id, group, logical)
+    return filler.chains.prompt_content(req_id, group, filler._page(logical))
 
 
 @dataclass
@@ -890,7 +928,9 @@ class _ConsumerPages(_ContentPages):
         """A request's table set or replaced: its leading blocks up to its
         computed tokens (prefix hits, pulled blocks) are not its to write."""
         assert self.chains is not None
-        self.written[req_id] = [computed // size for size in self.chains.block_sizes]
+        self.written[req_id] = [
+            self._full_blocks(computed, size) for size in self.chains.block_sizes
+        ]
 
     def _compare_pull(self, req_id: str, expected: "_Expected") -> dict:
         """A finished pull, against its blocks' content as the producer
@@ -902,7 +942,9 @@ class _ConsumerPages(_ContentPages):
                 for offset, block in enumerate(group.block_ids):
                     if block != NULL_BLOCK_ID:
                         chains.pulled_content(
-                            req_id, group.group, group.first_logical_block + offset
+                            req_id,
+                            group.group,
+                            self._page(group.first_logical_block + offset),
                         )
         except OutsideLifecycle as e:
             return {
@@ -912,7 +954,9 @@ class _ConsumerPages(_ContentPages):
         result = self._compare(
             req_id,
             expected,
-            lambda group, logical: chains.pulled_content(req_id, group, logical),
+            lambda group, logical: chains.pulled_content(
+                req_id, group, self._page(logical)
+            ),
         )
         return result
 
@@ -971,7 +1015,9 @@ class _ConsumerPages(_ContentPages):
             for block in expected.block_ids
         }
         for group, size in enumerate(chains.block_sizes):
-            for logical in range(written[group], min(limit // size, len(table[group]))):
+            # Full pages only (completed payload, never padding).
+            stop = min(self._full_blocks(limit, size), len(table[group]))
+            for logical in range(written[group], stop):
                 block = table[group][logical]
                 if block != NULL_BLOCK_ID:
                     if block in waiting:
@@ -980,7 +1026,9 @@ class _ConsumerPages(_ContentPages):
                             "pulled bytes are not compared yet."
                         )
                     try:
-                        identity = chains.identity(req_id, group, logical, size)
+                        identity = chains.identity(
+                            req_id, group, self._page(logical), size
+                        )
                     except OutsideLifecycle as e:
                         self.results.append(_lifecycle_failure(req_id, "write", e))
                         break
@@ -1152,7 +1200,7 @@ class PatternChecker(_ConsumerPages):
         `identity_of(group, logical)`: a block's content (prefix caching)."""
         written = self.destinations.take(req_id) if self.destinations else None
         if self.dcp_size > 1 or expected.remote_dcp_size > 1:
-            return _compare_dcp_reads(self, req_id, expected, written)
+            return _compare_dcp_reads(self, req_id, expected, written, identity_of)
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
@@ -1219,15 +1267,20 @@ def _dcp_block(view: torch.Tensor, block_id: int, want: torch.Tensor, written: b
 
 
 def _compare_dcp_reads(
-    checker, req_id: str, expected: "_Expected", written: list[set[int]] | None
+    checker,
+    req_id: str,
+    expected: "_Expected",
+    written: list[set[int]] | None,
+    identity_of=None,
 ) -> dict:
     """A read with decode context parallelism on either side, each local block
     against its global page (`dcp_page`): the pages of the producer's
     handoff (its tokens over this rank's page size) are the payload, each one
     NIXL must write; a later page is the producer's allocation padding. A
     block NIXL wrote (`written`, its READs' destinations by group) must hold
-    its page's pattern; any other, the sentinel: untouched padding, counted
-    apart. Payload and written padding are the bytes checked."""
+    its page's pattern (with prefix caching, its content's: `identity_of`,
+    padding's included); any other, the sentinel: untouched padding,
+    counted apart. Payload and written padding are the bytes checked."""
     if expected.remote_num_tokens is None or checker.page_tokens is None:
         return {
             "req_id": req_id,
@@ -1271,10 +1324,12 @@ def _compare_dcp_reads(
                     mismatched_blocks.append(["*", page, block_id, "not moved"])
             else:
                 kind = DCP_PADDING if moved else DCP_UNTOUCHED
+            logical = group.first_logical_block + offset
+            identity = identity_of(group.group, logical) if identity_of else None
             for layer, view in views.items():
                 want = layer_pattern(
                     expected.remote_request_id, layer, page, view.shape[1],
-                    checker.tp_rank, None, checker.heads,
+                    checker.tp_rank, identity, checker.heads,
                 )
                 if wrong := _dcp_block(view, block_id, want, moved):
                     group_mismatched += wrong
