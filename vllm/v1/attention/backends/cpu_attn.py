@@ -357,6 +357,17 @@ class CPUAttentionBackendImpl(AttentionImpl):
             )
 
         vllm_config = get_current_vllm_config()
+        self._simulated_dcp = (
+            vllm_config.simulation_config.simulate_forward and self.dcp_world_size > 1
+        )
+        if self._simulated_dcp:
+            # The simulated runner keeps the sharded cache but runs no attention.
+            self.cp_kv_cache_interleave_size = (
+                vllm_config.parallel_config.cp_kv_cache_interleave_size
+            )
+            self.supports_dcp = True
+            self.can_return_lse_for_decode = True
+            self.need_to_return_lse_for_decode = True
         self.use_zentorch_sdpa = should_use_zentorch_sdpa(
             attn_type,
             vllm_config.model_config.dtype,
@@ -394,6 +405,10 @@ class CPUAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
 
         """
+        if self._simulated_dcp:
+            raise NotImplementedError(
+                "CPU attention with simulated DCP cannot execute an attention forward."
+            )
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"

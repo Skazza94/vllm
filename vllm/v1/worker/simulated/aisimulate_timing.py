@@ -49,6 +49,12 @@ GPU_SYSTEMS = {
 # data-parallel ranks times each one's tensor-parallel size.
 TENSOR_PARALLEL_SIZES = (1, 2, 4, 8)
 MAX_LOCAL_GPUS = 8
+GQA_DCP_TARGET = "Qwen/Qwen3-30B-A3B"
+GQA_DCP_TABLE_VERSION = "0.24.0"
+GQA_DCP_PREFIX_APPROXIMATION = (
+    "AISimulate models cached-context prefill with a KV gather; native "
+    "FlashAttention gathers Q and merges partial cached attention outputs"
+)
 # A published checkpoint's quantization (AISimulate's own inference from its
 # config) as the estimator's modes. Attention runs in BF16 in each.
 QUANT_MODES: dict[str | None, dict[str, str]] = {
@@ -513,8 +519,9 @@ class AisimulateTimingProvider:
     Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), or
     an MoE model's local data-parallel attention with expert parallelism
     (each rank tensor-parallel or not, up to 8 GPUs); decode context
-    parallelism of a dense MLA model inside its tensor-parallel group,
-    without data parallelism, with vLLM's default merge (`ag_rs`, no Q
+    parallelism of dense MLA, qualified sparse MLA or qualified GQA
+    inside its tensor-parallel group without data parallelism, with
+    vLLM's default merge (`ag_rs`, no Q
     replication). Anything else is refused, as are pipeline and prefill
     context parallelism, EPLB and speculative decoding other than
     DeepSeek-V3's or DeepSeek-V4's native single-module MTP. A multimodal
@@ -652,7 +659,17 @@ class AisimulateTimingProvider:
                 "bfloat16 (without DCP)."
             )
         kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4, dsa)
-        dcp = self._decode_context_parallel(vllm_config, kv_format)
+        dcp = self._decode_context_parallel(
+            vllm_config,
+            kv_format,
+            target=target,
+            system=system,
+            backend_version=backend_version,
+            quant_overridden=bool(quant_modes) or quant is not None,
+        )
+        gqa_dcp = dcp is not None and "native_attention_backend" in dcp
+        if gqa_dcp:
+            backend_version = GQA_DCP_TABLE_VERSION
 
         nextn, speculation = self._speculation(vllm_config, target_config, topology)
 
@@ -702,6 +719,15 @@ class AisimulateTimingProvider:
                 f"AISimulate resolved {target} on {system} with {topology} to "
                 f"estimation mode {mode!r}, not op_level."
             )
+        resolved = (diagnostics.get("provenance") or {}).get("config", {})
+        if gqa_dcp and (
+            resolved.get("backend_version") != GQA_DCP_TABLE_VERSION
+            or resolved.get("attention_backend") not in (None, "default")
+        ):
+            raise ValueError(
+                "GQA DCP requires the default AISimulate attention selector "
+                f"with vLLM {GQA_DCP_TABLE_VERSION} timing tables."
+            )
         probes = self._startup_probes(target, system, topology)
         try:
             version = importlib.metadata.version("aisimulate")
@@ -709,7 +735,6 @@ class AisimulateTimingProvider:
             version = getattr(aisimulate_core, "__version__", None)
         from vllm import __version__ as vllm_version
 
-        resolved = (diagnostics.get("provenance") or {}).get("config", {})
         modified = bool(quant_modes) or online is not None
         self._assumptions = {
             "provider": "aisimulate",
@@ -767,6 +792,7 @@ class AisimulateTimingProvider:
             "approximations": APPROXIMATIONS
             + ([V4_APPROXIMATION] if v4 else [])
             + ([MLA_PREFIX_APPROXIMATION] if plain_mla else [])
+            + ([GQA_DCP_PREFIX_APPROXIMATION] if gqa_dcp else [])
             + (MTP_APPROXIMATIONS if nextn else [])
             + (
                 [HYBRID_MTP_APPROXIMATION]
@@ -801,13 +827,20 @@ class AisimulateTimingProvider:
 
     @staticmethod
     def _decode_context_parallel(
-        vllm_config: "VllmConfig", kv_format: str
+        vllm_config: "VllmConfig",
+        kv_format: str,
+        *,
+        target: str,
+        system: str,
+        backend_version: str | None,
+        quant_overridden: bool,
     ) -> dict[str, Any] | None:
         """The SDK takes global context lengths and the DCP size alone. Its
         vLLM path gathers queries and merges the striped KV outputs with ag_rs.
         Sparse MLA uses the CPU simulation's packed FlashMLA cache layout.
         """
         from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            gqa_dcp_model,
             plain_mla,
             sparse_mla,
         )
@@ -820,6 +853,7 @@ class AisimulateTimingProvider:
 
         model = vllm_config.model_config
         sparse = sparse_mla(model)
+        gqa = gqa_dcp_model(model)
         problems = []
         if sparse:
             if not current_platform.is_cpu() or vllm_config.kv_transfer_config:
@@ -833,9 +867,54 @@ class AisimulateTimingProvider:
                 problems.append(
                     f"sparse MLA indexer KV cache {indexer_dtype} (not fp8)"
                 )
+        elif gqa:
+            if (
+                not current_platform.is_cpu()
+                or not vllm_config.simulation_config.simulate_forward
+                or vllm_config.simulation_config.timing != "aisimulate"
+                or vllm_config.kv_transfer_config is not None
+            ):
+                problems.append(
+                    "GQA outside one simulated CPU instance with AISimulate"
+                )
+            if target != GQA_DCP_TARGET:
+                problems.append(
+                    f"GQA timing target {target} (requires {GQA_DCP_TARGET})"
+                )
+            if system not in ("h100_sxm", "h200_sxm"):
+                problems.append(f"GQA system {system} (requires H100 or H200)")
+            if (pc.tensor_parallel_size, dcp) != (8, 2):
+                problems.append("GQA layout other than TP8/DCP2")
+            if (pc.cp_kv_cache_interleave_size, pc.dcp_kv_cache_interleave_size) != (
+                1,
+                1,
+            ):
+                problems.append("GQA interleave other than 1")
+            if kv_format != "bfloat16" or str(model.dtype) != "torch.bfloat16":
+                problems.append("GQA model or KV cache dtype other than BF16")
+            if quant_overridden or model.quantization is not None:
+                problems.append("GQA weight or timing quantization override")
+            if backend_version not in (None, GQA_DCP_TABLE_VERSION):
+                problems.append(
+                    f"GQA timing table version {backend_version} "
+                    f"(requires {GQA_DCP_TABLE_VERSION})"
+                )
+            ac = vllm_config.attention_config
+            if (
+                (ac.backend is not None and ac.backend.name != "FLASH_ATTN")
+                or ac.backend_per_kind
+                or ac.flash_attn_version not in (None, 3)
+                or ac.use_non_causal
+                or ac.use_prefill_query_quantization
+                or getattr(model.hf_text_config, "dual_chunk_attention_config", None)
+            ):
+                problems.append(
+                    "GQA attention override outside causal FlashAttention 3"
+                )
         elif not plain_mla(model):
             problems.append(
-                "a model other than dense or DeepSeek-V3.2-style sparse MLA"
+                "a model other than dense MLA, DeepSeek-V3.2-style sparse MLA "
+                "or qualified GQA"
             )
         if pc.data_parallel_size > 1:
             problems.append(f"data parallelism {pc.data_parallel_size}")
@@ -852,8 +931,9 @@ class AisimulateTimingProvider:
         if problems:
             raise ValueError(
                 f"The aisimulate timing provider times decode context parallelism "
-                f"(decode_context_parallel_size {dcp}) for dense MLA or packed "
-                "sparse MLA with dcp_comm_backend ag_rs and dcp_q_replicate off, "
+                f"(decode_context_parallel_size {dcp}) for dense MLA, packed "
+                "sparse MLA or qualified GQA with dcp_comm_backend ag_rs and "
+                "dcp_q_replicate off, "
                 "the estimator's forward-pass config setting the DCP size alone, "
                 f"not with {', '.join(problems)}."
             )
@@ -868,6 +948,15 @@ class AisimulateTimingProvider:
                 attention_backend="FLASHMLA_SPARSE",
                 kv_cache_format=kv_format,
                 indexer_kv_cache_dtype=indexer_dtype,
+            )
+        elif gqa:
+            record.update(
+                native_attention_backend="FLASH_ATTN",
+                native_flash_attn_version=3,
+                sdk_attention_selector="default",
+                sdk_backend_version=GQA_DCP_TABLE_VERSION,
+                kv_cache_format=kv_format,
+                interleave=1,
             )
         return record
 
@@ -1069,10 +1158,37 @@ class AisimulateTimingProvider:
         # The target's raw config through the local config's class: both
         # sides get the same defaults (a head size, layer types, KV heads).
         local_config = vllm_config.model_config.hf_text_config
-        local = _geometry(local_config, fields)
         # A multimodal wrapper's language model is its text config.
         target_text = target_config.get("text_config", target_config)
-        published = _geometry(type(local_config).from_dict(target_text), fields)
+        published_config = type(local_config).from_dict(target_text)
+        if (
+            target == GQA_DCP_TARGET
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            # A config with the same KV heads can still change the model work.
+            work_fields = (
+                "hidden_size",
+                "intermediate_size",
+                "moe_intermediate_size",
+                "num_experts",
+                "num_experts_per_tok",
+                "decoder_sparse_step",
+                "mlp_only_layers",
+                "vocab_size",
+                "tie_word_embeddings",
+            )
+            changes = [
+                name
+                for name in work_fields
+                if _resolved(local_config, name) != _resolved(published_config, name)
+            ]
+            if changes:
+                raise ValueError(
+                    "GQA DCP requires the published model's compute geometry; "
+                    f"local config changes {', '.join(changes)}."
+                )
+        local = _geometry(local_config, fields)
+        published = _geometry(published_config, fields)
         if fields is V4_FIELDS:
             target_class_config = type(local_config).from_dict(target_config)
             for name, config in (

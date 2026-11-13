@@ -150,9 +150,16 @@ simulated CPU instance with the packed FlashMLA cache (`fp8_ds_mla`) and
 the default FP8 indexer. FlashMLA requires fewer than 32 local query heads,
 the same padded head count before and after gathering, and HiSparse off.
 For GLM-5 on B200 this represents an explicit packed-cache deployment:
-native `auto` instead uses standard FP8 with FlashInfer. Compressed MLA,
-hybrids, attention without MLA, pipeline, prefill context, data and expert
-parallelism are outside this DCP scope.
+native `auto` instead uses standard FP8 with FlashInfer. Standalone CPU
+simulation also models GQA for Qwen3-30B-A3B at TP8/DCP2 on H100 or H200
+with BF16, interleave 1 and the same merge requirements. The native reference
+is FlashAttention 3; AISimulate uses its default attention selector and
+vLLM 0.24.0 tables. It models prefill over cached context with a KV gather;
+native FlashAttention gathers Q and merges the ranks' partial outputs.
+KV page size determines cache geometry; changing it did not change the
+estimates in the qualified queries. GQA DCP with KV transfers, compressed
+MLA, hybrids, and pipeline, prefill context, data and expert parallelism
+are outside this scope.
 
 Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,

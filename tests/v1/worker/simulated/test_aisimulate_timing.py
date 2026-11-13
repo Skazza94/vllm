@@ -2613,3 +2613,184 @@ def test_dcp_q_replication_follows_native_env_precedence(
             match += " from VLLM_DCP_Q_REPLICATE"
         with pytest.raises(ValueError, match=match):
             provider(config, gpu="h200", target_model=target)
+
+
+def _gqa_dcp_config(tmp_path, *, dcp=2, tp=8, **overrides):
+    from vllm.engine.arg_utils import EngineArgs
+
+    target = "Qwen/Qwen3-30B-A3B"
+    path = model_dir(tmp_path, "Qwen--Qwen3-30B-A3B", bundled_config(target))
+    kwargs = dict(
+        model=path,
+        skip_tokenizer_init=True,
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        dtype="bfloat16",
+        max_model_len=256,
+        block_size=32,
+        simulation_config={"simulate_forward": True, "timing": "aisimulate"},
+    )
+    return EngineArgs(**(kwargs | overrides)).create_engine_config()
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize("gpu", ["h100", "h200"])
+def test_gqa_dcp_uses_global_lengths_and_the_qualified_profile(tmp_path, gpu):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    target = "Qwen/Qwen3-30B-A3B"
+    step = sim_step(
+        0,
+        sim_req("chunk", 257, 2049, 4096),
+        sim_req("decode-a", 1, 1023, 1023),
+        sim_req("decode-b", 1, 2047, 2047),
+    )
+    metrics = {
+        "scheduled_requests": {
+            "num_prefill_requests": 1,
+            "sum_prefill_tokens": 257,
+            "var_prefill_length": 0,
+            "sum_prefill_kv_tokens": 2049,
+            "num_decode_requests": 2,
+            "sum_decode_kv_tokens": 3070,
+            "var_decode_kv_tokens": 262144,
+            "extend_lengths": [257, 1, 1],
+            "past_kv_lengths": [2049, 1023, 2047],
+        }
+    }
+    for size in (1, 2):
+        config = _gqa_dcp_config(tmp_path / str(size), dcp=size)
+        timing = provider(config, gpu=gpu, target_model=target)
+        record = timing.assumptions()["aisimulate"]
+        expected = dict(
+            model=target,
+            system=f"{gpu}_sxm",
+            backend="vllm",
+            backend_version="0.24.0",
+            worker_type="aggregated",
+            tp=8,
+            pp=1,
+            attention_dp=1,
+            dcp=2 if size == 2 else None,
+            cp_size=1,
+            moe_tp_size=8,
+            moe_ep_size=1,
+            nextn=0,
+            gemm_quant_mode="bfloat16", moe_quant_mode="bfloat16",
+            fmha_quant_mode="bfloat16", kvcache_quant_mode="bfloat16",
+            comm_quant_mode="half", estimation_mode="op_level",
+            database_mode="SILICON", fallback_policy="deny",
+        )
+        assert (record["source"], record["readiness"]) == ("aic", "ready")
+        assert record["target_model"] == target
+        assert all(
+            record["resolved_config"][key] == val for key, val in expected.items()
+        )
+        assert record["config"]["backend_version"] == ("0.24.0" if size == 2 else None)
+        assert record["resolved_config"]["attention_backend"] is None
+        if size == 2:
+            assert record["decode_context_parallel"] == {
+                "size": 2,
+                "comm_backend": "ag_rs",
+                "q_replicate": False,
+                "native_attention_backend": "FLASH_ATTN",
+                "native_flash_attn_version": 3,
+                "sdk_attention_selector": "default",
+                "sdk_backend_version": "0.24.0",
+                "kv_cache_format": "bfloat16",
+                "interleave": 1,
+            }
+            assert any(
+                "cached-context prefill with a KV gather" in note
+                for note in record["approximations"]
+            )
+        else:
+            assert record["decode_context_parallel"] is None
+        sdk = RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(**expected)
+        )
+        ms = sdk.estimate_forward_pass_time_ms(metrics)
+        assert ms > 0
+        assert timing.estimate(step).device_s * 1000 == pytest.approx(ms, rel=1e-9)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "engine_kwargs, timing_kwargs, reason",
+    [
+        ({}, {"gpu": "b200"}, "requires H100 or H200"),
+        ({"hf_overrides": {"num_experts_per_tok": 4}}, {}, "compute geometry"),
+        ({"dtype": "float16"}, {}, "model or KV cache dtype other than BF16"),
+        ({}, {"backend_version": "0.25.0"}, "requires 0.24.0"),
+        ({}, {"target_model": "Qwen/Qwen3-30B-A3B-FP8"}, "GQA timing target"),
+        (
+            {},
+            {"quant_modes": {"fmha_quant_mode": "fp8"}},
+            "timing quantization override",
+        ),
+        ({"dcp_comm_backend": "a2a"}, {}, "dcp_comm_backend a2a"),
+        ({"dcp_q_replicate": True}, {}, "dcp_q_replicate"),
+        ({"cp_kv_cache_interleave_size": 2}, {}, "GQA interleave other than 1"),
+        ({"dcp_kv_cache_interleave_size": 2}, {}, "GQA interleave other than 1"),
+        ({"kv_cache_dtype": "fp8"}, {}, "model or KV cache dtype other than BF16"),
+        (
+            {"attention_config": {"backend": "FLASHINFER"}},
+            {},
+            "causal FlashAttention 3",
+        ),
+        (
+            {"attention_config": {"flash_attn_version": 4}},
+            {},
+            "causal FlashAttention 3",
+        ),
+    ],
+)
+def test_gqa_dcp_refuses_unqualified_deployments(
+    tmp_path, engine_kwargs, timing_kwargs, reason
+):
+    config = _gqa_dcp_config(tmp_path, **engine_kwargs)
+    args = {"gpu": "h200", "target_model": "Qwen/Qwen3-30B-A3B"} | timing_kwargs
+    with pytest.raises(ValueError, match=reason):
+        provider(config, **args)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "tp, dcp, overrides, reason",
+    [
+        (4, 2, {}, "greater than the model's total number of KV heads"),
+        (8, 3, {}, "must be divisible by dcp_size"),
+        (8, 4, {}, "exceeds the maximum supported value"),
+        (
+            24,
+            4,
+            {"hf_overrides": {"num_attention_heads": 24}},
+            "query heads per KV head",
+        ),
+        (
+            8,
+            2,
+            {"simulation_config": {"simulate_forward": True, "timing": "linear"}},
+            "GQA DCP without timing aisimulate",
+        ),
+        (
+            8,
+            2,
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": "kv_both",
+                }
+            },
+            "a model other than dense MLA",
+        ),
+    ],
+)
+def test_gqa_dcp_keeps_native_head_and_simulator_scope_checks(
+    tmp_path, tp, dcp, overrides, reason
+):
+    with pytest.raises(ValueError, match=reason):
+        _gqa_dcp_config(tmp_path, tp=tp, dcp=dcp, **overrides)

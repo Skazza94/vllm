@@ -1236,3 +1236,250 @@ def test_simulate_forward_cpu_dcp_prefix_cache_chunked_prefill(
             (len(prompt) - hit - 80, hit + 80, 0),
         ]
         assert second.num_cached_tokens == hit
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
+    """Use the published Qwen3 geometry and inspect each real CPU worker."""
+    pytest.importorskip("aisimulate_core")
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+    from vllm import LLM
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.inputs import TokensPrompt
+
+    def rank_state(worker) -> dict:
+        import torch
+
+        from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        runner = worker.model_runner
+        kv = runner.kv_cache_config
+        tables = runner.block_tables
+        layers = [m for m in runner.model.modules() if isinstance(m, Attention)]
+        empty = torch.empty(0)
+        layer = layers[0]
+        try:
+            result = layer.impl.forward(layer, empty, empty, empty, empty, None, empty)
+        except NotImplementedError as exc:
+            forward = str(exc)
+        else:
+            assert result is empty  # The no-metadata warmup path is a no-op.
+            forward = None
+        specs = runner.get_kv_cache_spec()
+        (planned_bytes,) = {t.size for t in kv.kv_cache_tensors}
+        return {
+            "layers": len(layers),
+            "impl": sorted(
+                {
+                    (
+                        layer.get_attn_backend().get_name(),
+                        layer.get_attn_backend().supports_dcp(),
+                        layer.impl.dcp_world_size,
+                        layer.impl.dcp_rank,
+                        getattr(layer.impl, "supports_dcp", False),
+                        layer.impl.can_return_lse_for_decode,
+                        layer.impl.need_to_return_lse_for_decode,
+                        getattr(layer.impl, "cp_kv_cache_interleave_size", None),
+                        layer.impl.num_heads,
+                        layer.impl.num_kv_heads,
+                    )
+                    for layer in layers
+                }
+            ),
+            "forward_refusal": forward,
+            "spec_layers": len(specs),
+            "pages": sorted(
+                {
+                    (
+                        isinstance(s, FullAttentionSpec),
+                        s.block_size,
+                        s.page_size_bytes,
+                        s.num_kv_heads,
+                        s.head_size,
+                        str(s.dtype),
+                        s.dcp_sharded,
+                        resolve_dcp_kv_block_size(s, runner.dcp_size),
+                    )
+                    for s in specs.values()
+                }
+            ),
+            "block_table": (
+                tables.cp_size,
+                tables.cp_rank,
+                tables.cp_interleave,
+                tables.block_sizes,
+                tables.dcp_sharded.tolist(),
+            ),
+            "blocks": kv.num_blocks,
+            "planned_bytes": planned_bytes,
+            "allocated_tensors": len(runner.kv_caches),
+            "weight_device": next(runner.model.parameters()).device.type,
+        }
+
+    target = "Qwen/Qwen3-30B-A3B"
+    raw = bundled_config(target)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    lengths = [131, 153]
+    prompts = [TokensPrompt(prompt_token_ids=[7] * n) for n in lengths]
+    params = SamplingParams(max_tokens=3, ignore_eos=True, detokenize=False)
+    budget = 1 << 27
+    totals = {}
+    for dcp in (1, 2):
+        log = tmp_path / f"gqa-dcp{dcp}.jsonl"
+        llm = LLM(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            enforce_eager=True,
+            tensor_parallel_size=8,
+            decode_context_parallel_size=dcp,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=False,
+            block_size=32,
+            kv_cache_memory_bytes=budget,
+            max_model_len=256,
+            max_num_batched_tokens=128,
+            max_num_seqs=4,
+            enable_prefix_caching=False,
+            simulation_config={
+                "simulate_forward": True,
+                "timing": "aisimulate",
+                "timing_args": {"gpu": "h200", "target_model": target},
+                "log_path": str(log),
+            },
+        )
+        try:
+            outputs = llm.generate(prompts, params, use_tqdm=False)
+            assert all(o.finished for o in outputs)
+            assert [len(o.outputs[0].token_ids) for o in outputs] == [3, 3]
+            states = llm.collective_rpc(rank_state)
+            cache = llm.llm_engine.vllm_config.cache_config
+            assert cache.kv_cache_memory_bytes == budget
+            capacity = cache.kv_cache_size_tokens
+        finally:
+            llm.llm_engine.engine_core.shutdown()
+            del llm
+            cleanup_dist_env_and_memory()
+
+        assert len(states) == 8
+        print("GQA_DCP_WORKERS", json.dumps({"dcp": dcp, "states": states}))
+        for rank, state in enumerate(states):
+            active = dcp > 1
+            dcp_rank = rank % dcp
+            assert state["layers"] == state["spec_layers"] == raw["num_hidden_layers"]
+            assert state["impl"] == [
+                (
+                    "CPU_ATTN", False, dcp, dcp_rank, active, active, active,
+                    1 if active else None, 4, 1,
+                )
+            ]
+            if active:
+                assert state["forward_refusal"] == (
+                    "CPU attention with simulated DCP cannot execute "
+                    "an attention forward."
+                )
+            else:
+                assert state["forward_refusal"] is None
+            assert state["pages"] == [
+                (True, 32, 16384, 1, 128, "torch.bfloat16", True, 32 * dcp)
+            ]
+            assert state["block_table"] == (dcp, dcp_rank, 1, [32], [True])
+            assert state["weight_device"] == "meta"
+            assert state["allocated_tensors"] == 0
+            assert 0 < state["planned_bytes"] <= budget
+            assert state["blocks"] == states[0]["blocks"]
+            assert state["planned_bytes"] == states[0]["planned_bytes"]
+        totals[dcp] = (capacity, states[0]["blocks"], states[0]["planned_bytes"])
+
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+        assert timing["target_model"] == target
+        assert (timing["source"], timing["readiness"]) == ("aic", "ready")
+        assert timing["resolved_config"]["dcp"] == (2 if dcp == 2 else None)
+        assert timing["resolved_config"]["backend_version"] == "0.24.0"
+        sdk = RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(
+                model=target,
+                system="h200_sxm",
+                backend="vllm",
+                backend_version="0.24.0",
+                worker_type="aggregated",
+                tp=8,
+                dcp=2 if dcp == 2 else None,
+                cp_size=1,
+                moe_tp_size=8,
+                moe_ep_size=1,
+                gemm_quant_mode="bfloat16",
+                moe_quant_mode="bfloat16",
+                fmha_quant_mode="bfloat16",
+                kvcache_quant_mode="bfloat16",
+                comm_quant_mode="half",
+                estimation_mode="op_level",
+                database_mode="SILICON",
+                fallback_policy="deny",
+            )
+        )
+        first_context = {}
+        cached_prefill = False
+        direct_ms = []
+        for row in records:
+            if "step" not in row:
+                continue
+            reqs = row["step"]["requests"]
+            prefill = [q for q in reqs if q["is_prefill"]]
+            decode_contexts = [
+                q["num_computed_tokens"] for q in reqs if not q["is_prefill"]
+            ]
+            for q in reqs:
+                if not q["is_prefill"]:
+                    assert q["num_scheduled_tokens"] == 1
+                    first_context.setdefault(q["req_id"], q["num_computed_tokens"])
+            cached_prefill |= any(q["num_computed_tokens"] > 0 for q in prefill)
+            ms = sdk.estimate_forward_pass_time_ms(
+                {
+                    "scheduled_requests": {
+                        "num_prefill_requests": len(prefill),
+                        "sum_prefill_tokens": sum(
+                            q["num_scheduled_tokens"] for q in prefill
+                        ),
+                        "var_prefill_length": pvariance(
+                            [q["num_prompt_tokens"] for q in prefill] or [0]
+                        ),
+                        "sum_prefill_kv_tokens": sum(
+                            q["num_computed_tokens"] for q in prefill
+                        ),
+                        "num_decode_requests": len(decode_contexts),
+                        "sum_decode_kv_tokens": sum(decode_contexts),
+                        "var_decode_kv_tokens": pvariance(decode_contexts or [0]),
+                        "extend_lengths": [q["num_scheduled_tokens"] for q in reqs],
+                        "past_kv_lengths": [q["num_computed_tokens"] for q in reqs],
+                    }
+                }
+            )
+            assert ms > 0
+            assert row["cost"]["breakdown"]["aisimulate_ms"] == pytest.approx(
+                ms, rel=1e-9
+            )
+            direct_ms.append(ms)
+        assert sorted(first_context.values()) == lengths
+        assert cached_prefill
+        print(
+            "GQA_DCP_TIMING",
+            json.dumps(
+                {
+                    "dcp": dcp,
+                    "capacity": capacity,
+                    "first_decode_contexts": sorted(first_context.values()),
+                    "direct_ms": direct_ms,
+                }
+            ),
+        )
+
+    assert totals[1][1:] == totals[2][1:]
+    assert totals[2][0] == 2 * totals[1][0]

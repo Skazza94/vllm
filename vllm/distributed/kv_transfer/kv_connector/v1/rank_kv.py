@@ -166,15 +166,25 @@ def sparse_mla(model) -> bool:
     )
 
 
+def gqa_dcp_model(model) -> bool:
+    """The full-attention GQA model qualified for standalone CPU simulation."""
+    return (
+        model.architectures == ["Qwen3MoeForCausalLM"]
+        and not model.use_mla
+        and not model.is_hybrid
+        and model.get_sliding_window() is None
+    )
+
+
 def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]:
     """What of an instance's configuration falls outside the scope of decode
     context parallelism under simulated compute, either endpoint's when its
-    KV moves (`transfers`): dense MLA, or sparse MLA with AISimulate in one
-    instance. Both use tensor parallelism alone (no pipeline, prefill context
-    or data parallelism, no expert parallelism) and no speculative decoding.
-    Prefix caching is admitted with transfers too (its byte checks need the
-    same setting on both endpoints: their pages' patterns are content-seeded
-    exactly when it is on)."""
+    KV moves (`transfers`): dense MLA, or sparse MLA or GQA with AISimulate in
+    one instance. All use tensor parallelism alone (no pipeline, prefill
+    context or data parallelism, no expert parallelism) and no speculative
+    decoding. Prefix caching is admitted with transfers too (its byte checks
+    need the same setting on both endpoints: their pages' patterns are
+    content-seeded exactly when it is on)."""
     parallel = vllm_config.parallel_config
     problems = []
     model = vllm_config.model_config
@@ -185,6 +195,9 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
                     "a model other than dense MLA without AISimulate timing "
                     "(sparse MLA DCP requires timing aisimulate)"
                 )
+        elif not transfers and gqa_dcp_model(model):
+            if vllm_config.simulation_config.timing != "aisimulate":
+                problems.append("GQA DCP without timing aisimulate")
         elif transfers:
             problems.append(
                 "a model other than dense MLA (sparse or compressed MLA, a "
