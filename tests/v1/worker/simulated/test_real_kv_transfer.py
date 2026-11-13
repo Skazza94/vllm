@@ -1177,9 +1177,11 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_decode_context_parallelism_on_cpu_is_one_instances(mla_model_dir):
-    """A dense MLA model's DCP on CPU is a single instance's: a NIXL instance
-    with it, simulated transfers or real, is refused at startup."""
+def test_decode_context_parallelism_on_cpu_moves_kv_by_real_transfers_only(
+    mla_model_dir,
+):
+    """A dense MLA model's DCP on CPU builds alone; a NIXL instance with it
+    needs real transfers (simulated ones model no DCP slicing)."""
     from vllm.engine.arg_utils import EngineArgs
 
     def config(**kwargs):
@@ -1197,8 +1199,12 @@ def test_decode_context_parallelism_on_cpu_is_one_instances(mla_model_dir):
         "kv_role": "kv_producer",
         "kv_buffer_device": "cpu",
     }
-    with pytest.raises(ValueError, match="without a KV connector, not with the Nixl"):
-        config(decode_context_parallel_size=2, kv_transfer_config=nixl)
+    with pytest.raises(ValueError, match="not with kv_transfer_mode simulated"):
+        config(
+            decode_context_parallel_size=2,
+            kv_transfer_config=nixl,
+            enable_prefix_caching=False,
+        )
 
 
 def test_real_mode_allows_tensor_parallelism_and_dp_attention(
@@ -3350,6 +3356,796 @@ def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
     if logs:
         c["log"] = consumer_log
     return p, c
+
+
+# A P/D pair over NIXL of tensor-parallel instances, each rank a worker
+# process: what each rank holds and logs comes back by worker RPC and from
+# its step log. With decode context parallelism, a rank's blocks are global
+# pages (`kv_pattern.dcp_page`).
+DCP_PEER = r"""
+import json, os, sys, time
+
+def main():
+    role, model, kwargs, out, memory = sys.argv[1:6]
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    from vllm import LLM, SamplingParams
+    producer = role == "producer"
+    kwargs = json.loads(kwargs)
+    prompt_len = kwargs.pop("prompt_len")
+    check = kwargs.pop("check", True)
+    # Consumer: after NIXL reports a read done, change one byte of a payload
+    # page, write into a page it left (padding it did not move), or zero a
+    # padding page it moved in every layer (its sentinel).
+    corrupt = kwargs.pop("corrupt", None)
+    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+                  "timing": "linear", "timing_args": {"fixed_us": 100},
+                  "log_path": out + ".steps"}
+    if producer:
+        simulation["kv_pattern_fill"] = True
+    elif check:
+        simulation["kv_pattern_check"] = True
+    llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
+              max_model_len=256, kv_cache_memory_bytes=int(memory),
+              max_num_batched_tokens=64,
+              enable_prefix_caching=kwargs.pop("enable_prefix_caching", False),
+              enforce_eager=True, block_size=kwargs.pop("block_size", 16),
+              simulation_config=simulation,
+              kv_transfer_config={
+                  "kv_connector": "NixlConnector",
+                  "kv_role": "kv_producer" if producer else "kv_consumer",
+                  "kv_buffer_device": "cpu",
+                  "kv_connector_extra_config": {"backends": ["Mooncake"]}},
+              **kwargs)
+
+    def geometry(worker):
+        runner = worker.model_runner
+        return {"tp_rank": worker.rank,
+                "dcp": getattr(runner, "_dcp_geometry", None),
+                "dcp_size": runner.dcp_size, "dcp_rank": runner.dcp_rank}
+
+    ranks = llm.collective_rpc(geometry)
+    prompt = [{"prompt_token_ids": [5] * prompt_len}]
+    if producer:
+        handoff = {"kv_transfer_params": {"do_remote_decode": True}}
+        params = SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False,
+                                extra_args=handoff)
+        (output,) = llm.generate(prompt, params, use_tqdm=False)
+        with open(out + ".tmp", "w") as f:
+            json.dump({"ranks": ranks, "params": output.kv_transfer_params}, f)
+        os.rename(out + ".tmp", out)
+        # A producer frees a request's blocks once every reader notified it:
+        # its engine steps until nothing is left to clean up.
+        engine = llm.llm_engine.engine_core.engine_core
+        deadline = time.monotonic() + 300
+        while engine.scheduler.has_requests() and time.monotonic() < deadline:
+            engine.step()
+            time.sleep(0.02)
+        released = not engine.scheduler.has_requests()
+        while not os.path.exists(out + ".done"):
+            time.sleep(0.2)
+        with open(out + ".released", "w") as f:
+            json.dump({"released": released}, f)
+        return
+
+    if corrupt is not None:
+        def install(worker, mode, target):
+            if worker.rank != target:
+                return False
+            import torch
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+            from vllm.v1.worker.simulated.kv_pattern import SENTINEL, dcp_page
+            runner = worker.model_runner
+            checker = runner._kv_checker
+            connector = get_kv_transfer_group().connector_worker
+            done = connector.get_transfer_results
+
+            def get_transfer_results():
+                results = done()
+                for req_id in results.finished_recving or ():
+                    expected = checker.pending.get(req_id)
+                    if expected is None:
+                        continue
+                    (group,) = expected.groups
+                    tokens = checker.page_tokens[group.group]
+                    pages = -(-expected.remote_num_tokens // tokens)
+                    for offset, block in enumerate(group.block_ids):
+                        page = dcp_page(group.first_logical_block + offset,
+                                        checker.dcp_size, checker.dcp_rank)
+                        if (page < pages) != (mode == "payload"):
+                            continue
+                        groups = connector.kv_cache_config.transfer_groups
+                        names = groups[group.group].layer_names
+                        caches = [connector.device_kv_caches[n][block]
+                                  for n in names]
+                        data = caches[0].view(-1).view(torch.uint8)
+                        if mode == "payload":
+                            data[0] ^= 1
+                        elif bool((data == SENTINEL).all()) != (mode == "untouched"):
+                            continue
+                        elif mode == "untouched":
+                            data[0] = 1
+                        else:
+                            for cache in caches:
+                                cache.view(-1).view(torch.uint8).fill_(SENTINEL)
+                        runner._dcp_corrupted = [mode, page, int(block)]
+                        break
+                return results
+
+            connector.get_transfer_results = get_transfer_results
+            return True
+
+        mode, target = corrupt
+        assert any(llm.collective_rpc(install, args=(mode, target)))
+    with open(sys.argv[6]) as f:
+        remote = json.load(f)
+    params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
+                            extra_args={"kv_transfer_params": remote["params"]})
+    (output,) = llm.generate(prompt, params, use_tqdm=False)
+    corrupted = llm.collective_rpc(
+        lambda worker: getattr(worker.model_runner, "_dcp_corrupted", None))
+    with open(out, "w") as f:
+        json.dump({"ranks": ranks, "tokens": len(output.outputs[0].token_ids),
+                   "corrupted": corrupted}, f)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
+    """Run DCP_PEER's TP producer and consumer: their records, each rank's
+    step log records (`<role>` rank r), and the consumer's output."""
+    import socket
+    import subprocess
+    import sys
+
+    def free_ports(n):
+        # A rank's NIXL side channel is the base port plus its rank.
+        while True:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                base = sock.getsockname()[1]
+            try:
+                held = []
+                for port in range(base, base + n):
+                    sock = socket.socket()
+                    held.append(sock)
+                    sock.bind(("127.0.0.1", port))
+                return base
+            except OSError:
+                continue
+            finally:
+                for sock in held:
+                    sock.close()
+
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "config.json").write_text(json.dumps(config))
+    script = tmp_path / "dcp_peer.py"
+    script.write_text(DCP_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+
+    def command(role, own, out, memory, *extra):
+        return [
+            sys.executable,
+            str(script),
+            role,
+            str(tmp_path / "model"),
+            json.dumps(own),
+            str(out),
+            str(memory),
+            *extra,
+        ]
+
+    tp = max(
+        producer_kwargs.get("tensor_parallel_size", 1),
+        consumer_kwargs.get("tensor_parallel_size", 1),
+    )
+    producer = subprocess.Popen(
+        command("producer", producer_kwargs, produced, 8 * 1024**2),
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, producer.stdout.read()[-4000:]
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        consumer = subprocess.run(
+            command("consumer", consumer_kwargs, consumed, 12 * 1024**2, str(produced)),
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
+            timeout=600,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=120)
+        finally:
+            producer.kill()
+    c = json.loads(consumed.read_text()) if consumed.exists() else {}
+    c["log"] = consumer.stdout
+    p = json.loads(produced.read_text())
+    released = tmp_path / "producer.json.released"
+    p["released"] = (
+        json.loads(released.read_text())["released"] if released.exists() else None
+    )
+
+    def logs(out, ranks):
+        records = {}
+        for rank in range(ranks):
+            # `step_log_path`: the rank's suffix before the extension.
+            path = Path(f"{out}" + (f".tp{rank}" if rank else "") + ".steps")
+            records[rank] = (
+                [json.loads(line) for line in path.read_text().splitlines()]
+                if path.exists()
+                else []
+            )
+        return records
+
+    p["logs"] = logs(produced, producer_kwargs.get("tensor_parallel_size", 1))
+    c["logs"] = logs(consumed, consumer_kwargs.get("tensor_parallel_size", 1))
+    return p, c
+
+
+def dcp_pages(rank, dcp, blocks, pages):
+    """A DCP rank's blocks' global pages, split into the handoff's (payload)
+    and those past it."""
+    held = [k * dcp + rank for k in range(blocks)]
+    return [g for g in held if g < pages], [g for g in held if g >= pages]
+
+
+@pytest.mark.parametrize(
+    "producer_dcp, consumer_dcp",
+    [(1, 2), (2, 1), (2, 2), (1, 1)],
+    ids=["p1-d2", "p2-d1", "p2-d2", "p1-d1"],
+)
+@pytest.mark.parametrize("prompt_len", [64, 70, 10], ids=["even", "odd", "one-page"])
+def test_nixl_peers_move_mla_pages_by_global_position_under_dcp(
+    mla_model_dir, tmp_path, producer_dcp, consumer_dcp, prompt_len
+):
+    """DeepSeek-V3's latent between TP2 instances over NIXL, decode context
+    parallelism on either side or both (each side's DCP 1 or its TP, as vLLM
+    requires): every rank's blocks hold the global pages of its DCP rank
+    (rank r every DCP-th page from r), checked against the producer's
+    pattern of that page; the handoff's pages are payload, a later one
+    padding NIXL moved or left; each consumer rank reads from the producer
+    ranks NIXL's mapping names (a sharded producer: every rank holding part
+    of its slice); every rank completes, a rank with no page by the
+    notify-only path; every producer rank releases the request. 64 tokens are
+    4 pages of 16, 70 tokens 5 (an odd count), 10 tokens one."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    tp = 2
+    p, c = run_dcp_peers(
+        config,
+        {
+            "tensor_parallel_size": tp,
+            "decode_context_parallel_size": producer_dcp,
+            "prompt_len": prompt_len,
+        },
+        {
+            "tensor_parallel_size": tp,
+            "decode_context_parallel_size": consumer_dcp,
+            "prompt_len": prompt_len,
+        },
+        tmp_path,
+    )
+    assert c.get("tokens") == 2, c["log"][-4000:]
+    pages = -(-prompt_len // 16)
+    for role, side, dcp in (
+        ("producer", p, producer_dcp),
+        ("consumer", c, consumer_dcp),
+    ):
+        assert [r["dcp_size"] for r in side["ranks"]] == [dcp] * tp, role
+        assert [r["dcp_rank"] for r in side["ranks"]] == [r % dcp for r in range(tp)], (
+            role
+        )
+        for r in side["ranks"]:
+            if dcp > 1:
+                assert r["dcp"] == {
+                    "size": dcp,
+                    "rank": r["dcp_rank"],
+                    "page_tokens": [16],
+                    "scheduler_block_tokens": [16 * dcp],
+                    "interleave": 16,
+                }, role
+            else:
+                assert r["dcp"] is None, role
+    # Every producer rank released the request (all its readers notified it).
+    assert p["released"] is True
+    for rank, records in p["logs"].items():
+        done = [
+            req
+            for r in records
+            if "kv_events" in r
+            for req in r["kv_events"].get("sends_done", [])
+        ]
+        assert done, f"producer rank {rank} logged no finished send"
+    for rank in range(tp):
+        records = c["logs"][rank]
+        checks = [r["kv_check"] for r in records if "kv_check" in r]
+        assert len(checks) == 1, checks
+        (check,) = checks
+        assert check["ok"], check
+        dcp_rank = rank % consumer_dcp
+        loads = [
+            r["kv_transfers"]["load"]
+            for r in records
+            if "load" in r.get("kv_transfers", {})
+        ]
+        # Each READ: [bytes, seconds, before, descriptors, end, peer, plan].
+        peers = sorted({each[5] for load in loads for each in load["each"]})
+        moved = sum(load["bytes"] for load in loads)
+        # NIXL's sources (`compute_tp_mapping`, equal TP): a replicated
+        # producer's same rank; a sharded one, every rank whose slice falls
+        # in this rank's (all of them for a replicated consumer, else its own).
+        sources = (
+            [rank]
+            if producer_dcp == 1
+            else list(range(tp))
+            if consumer_dcp == 1
+            else [dcp_rank]
+        )
+        if consumer_dcp == 1 and producer_dcp == 1:
+            assert "dcp" not in check, check
+            assert check["bytes"] == moved and peers == sources, (check, loads)
+            continue
+        assert check["dcp"] == {
+            "size": consumer_dcp,
+            "rank": dcp_rank,
+            "remote_size": producer_dcp,
+            "remote_num_tokens": prompt_len,
+        }
+        (group,) = check["groups"]
+        payload, past = dcp_pages(
+            dcp_rank, consumer_dcp, len(check["block_ids"]), pages
+        )
+        assert group["payload_blocks"] == len(payload), (group, payload)
+        assert group["padding_blocks"] + group["untouched_blocks"] == len(past), (
+            group,
+            past,
+        )
+        # Checked bytes are the moved ones: payload and moved padding.
+        assert check["bytes"] == moved, (check, loads)
+        assert (
+            check["bytes"]
+            == (group["payload_blocks"] + group["padding_blocks"])
+            * group["block_bytes"]
+        )
+        if payload or group["padding_blocks"]:
+            assert peers and set(peers) <= set(sources), (peers, sources)
+        else:
+            # Nothing to move (one page, a DCP1 producer, rank 1): the
+            # notify-only path, no READ. Equal DCP sizes move a padding
+            # page there (NIXL slices without the handoff's page count).
+            assert not loads, loads
+        if prompt_len == 10 and dcp_rank == 1:
+            assert group["payload_blocks"] == 0
+            assert group["padding_blocks"] == (
+                1 if producer_dcp == consumer_dcp else 0
+            ), group
+
+
+@pytest.mark.parametrize(
+    "mode, producer_dcp, prompt_len",
+    [("payload", 1, 70), ("untouched", 1, 70), ("padding", 2, 10)],
+    ids=["payload", "untouched", "padding"],
+)
+def test_nixl_peers_dcp_checks_find_a_changed_page(
+    mla_model_dir, tmp_path, mode, producer_dcp, prompt_len
+):
+    """A byte changed in a payload page after NIXL moved it fails that page by
+    exactly one byte; a page NIXL left (past the handoff, on rank 1 of a DCP2
+    consumer of 70 tokens, 5 pages: its page 5 is not the producer's to
+    move) written into fails; a padding page NIXL moved (rank 1's page 1 of
+    one, DCP2 on both sides) zeroed in every layer fails as moved, though it
+    then holds what an untouched page would."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    p, c = run_dcp_peers(
+        config,
+        {
+            "tensor_parallel_size": 2,
+            "decode_context_parallel_size": producer_dcp,
+            "prompt_len": prompt_len,
+        },
+        {
+            "tensor_parallel_size": 2,
+            "decode_context_parallel_size": 2,
+            "prompt_len": prompt_len,
+            "corrupt": [mode, 1],
+        },
+        tmp_path,
+    )
+    assert c.get("tokens") == 2, c["log"][-4000:]
+    corrupted = [x for x in c["corrupted"] if x]
+    assert len(corrupted) == 1 and corrupted[0][0] == mode, c["corrupted"]
+    _, page, block = corrupted[0]
+    (bad,) = [r["kv_check"] for r in c["logs"][1] if "kv_check" in r]
+    (good,) = [r["kv_check"] for r in c["logs"][0] if "kv_check" in r]
+    assert good["ok"] and not bad["ok"], (good, bad)
+    assert {(m[1], m[2]) for m in bad["mismatched_blocks"]} >= {(page, block)}, bad
+    if mode == "payload":
+        assert bad["mismatched_bytes"] == 1, bad
+    if mode == "padding":
+        (group,) = bad["groups"]
+        assert (group["padding_blocks"], group["untouched_blocks"]) == (1, 0), bad
+        layers = {m[0] for m in bad["mismatched_blocks"]}
+        assert len(layers) == min(group["layers"], 16), bad
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, check",
+    [
+        ((2, 2), (1, 1), True),
+        ((2, 2), (1, 1), False),
+        ((1, 1), (2, 2), True),
+        ((1, 1), (2, 2), False),
+    ],
+    ids=[
+        "p-tp2-dcp2_d-tp1-checks",
+        "p-tp2-dcp2_d-tp1",
+        "p-tp1_d-tp2-dcp2-checks",
+        "p-tp1_d-tp2-dcp2",
+    ],
+)
+def test_nixl_peers_refuse_dcp_at_unequal_tp(
+    mla_model_dir, tmp_path, producer, consumer, check
+):
+    """Decode context parallelism pairs equal TP sizes: the consumer's
+    handshake refuses another, before any READ, when either side has DCP
+    (the producer's from its metadata), checks on or off."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    p, c = run_dcp_peers(
+        config,
+        {
+            "tensor_parallel_size": producer[0],
+            "decode_context_parallel_size": producer[1],
+            "prompt_len": 64,
+        },
+        {
+            "tensor_parallel_size": consumer[0],
+            "decode_context_parallel_size": consumer[1],
+            "prompt_len": 64,
+            "check": check,
+        },
+        tmp_path,
+    )
+    log = c["log"]
+    assert "pair decode context parallelism" in log, log[-4000:]
+    assert f"local TP {consumer[0]} and remote TP {producer[0]}" in log, log[-4000:]
+    loads = [
+        r
+        for records in c["logs"].values()
+        for r in records
+        if "load" in r.get("kv_transfers", {})
+    ]
+    assert not loads, loads
+
+
+@pytest.mark.parametrize(
+    "producer_dcp, consumer_dcp, prefix_side, check",
+    [
+        (1, 2, "producer", True),
+        (1, 2, "producer", False),
+        (2, 1, "consumer", True),
+        (2, 1, "consumer", False),
+    ],
+    ids=[
+        "p-dcp1-prefix_d-dcp2-checks",
+        "p-dcp1-prefix_d-dcp2",
+        "p-dcp2_d-dcp1-prefix-checks",
+        "p-dcp2_d-dcp1-prefix",
+    ],
+)
+def test_nixl_peers_refuse_prefix_caching_at_the_dcp1_endpoint(
+    mla_model_dir, tmp_path, producer_dcp, consumer_dcp, prefix_side, check
+):
+    """Prefix caching is off on both sides of a pair with decode context
+    parallelism, including the endpoint of DCP 1, whose own startup has
+    nothing to refuse: the consumer refuses at the handshake, before any
+    READ, a producer's from the scope its NIXL metadata states, its own from
+    its config, checks on or off."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    sides = {
+        role: {
+            "tensor_parallel_size": 2,
+            "decode_context_parallel_size": dcp,
+            "prompt_len": 64,
+            "enable_prefix_caching": role == prefix_side,
+        }
+        for role, dcp in (("producer", producer_dcp), ("consumer", consumer_dcp))
+    }
+    sides["consumer"]["check"] = check
+    p, c = run_dcp_peers(config, sides["producer"], sides["consumer"], tmp_path)
+    log = c["log"]
+    assert "pair decode context parallelism" in log, log[-4000:]
+    problem = "the peer's prefix caching" if prefix_side == "producer" else "prefix"
+    assert f"not with {problem}" in log, log[-4000:]
+    loads = [
+        r
+        for records in c["logs"].values()
+        for r in records
+        if "load" in r.get("kv_transfers", {})
+    ]
+    assert not loads, loads
+
+
+def dcp_engine_config(model, **kwargs):
+    """A TP2 NIXL consumer's config with real transfers under simulated
+    compute, `kwargs` over it."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    return EngineArgs(
+        **{
+            "model": model,
+            "skip_tokenizer_init": True,
+            "dtype": "bfloat16",
+            "max_model_len": 256,
+            "block_size": 16,
+            "enforce_eager": True,
+            "tensor_parallel_size": 2,
+            "enable_prefix_caching": False,
+            "kv_cache_memory_bytes": 8 * 1024**2,
+            "simulation_config": {"simulate_forward": True, "kv_transfer_mode": "real"},
+            "kv_transfer_config": {
+                "kv_connector": "NixlConnector",
+                "kv_role": "kv_consumer",
+                "kv_buffer_device": "cpu",
+            },
+            **kwargs,
+        }
+    ).create_engine_config()
+
+
+def test_dcp1_consumer_of_a_dcp_producer_refuses_data_and_expert_parallelism(
+    mla_model_dir,
+):
+    """A consumer of DCP 1 (its startup admits data and expert parallelism)
+    refuses a producer of DCP 2 for them at the handshake; a producer of
+    DCP 1 it pairs as before."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    config = dcp_engine_config(
+        mla_model_dir, data_parallel_size=2, enable_expert_parallel=True
+    )
+    refusal = simulated_tp_mismatch(config, 2, 2, nixl_consumer=True, remote_dcp_size=2)
+    assert refusal is not None
+    assert "data parallelism 2" in refusal and "expert parallelism" in refusal
+    assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=True) is None
+
+
+def agent_metadata(**changes):
+    """A NIXL peer's handshake metadata: one MLA region of 16-token blocks,
+    no decode context parallelism, in the simulated scope."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    return NixlAgentMetadata(
+        **{
+            "engine_id": "prefill",
+            "agent_metadata": b"agent",
+            "kv_caches_base_addr": [4096],
+            "device_id": 0,
+            "num_blocks": 8,
+            "block_lens": [16 * 576 * 2],
+            "block_strides": [16 * 576 * 2],
+            "kv_cache_layout": "NHD",
+            "block_size": 16,
+            "ssm_sizes": (0, 0),
+            "attn_backend_name": "CPU_MLA",
+            "physical_blocks_per_logical_kv_block": 1,
+            "simulated_scope": [],
+            **changes,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "local_dcp, local_page, peer, problem",
+    [
+        (2, (16, 1), {}, None),
+        (2, (16, 1), {"block_size": 32}, "block size"),
+        (2, (16, 2), {}, "kernel blocks a block"),
+        (2, (16, 1), {"physical_blocks_per_logical_kv_block": 2}, "kernel blocks"),
+        (1, (16, 1), {"dcp_size": 2, "block_size": 32}, "block size"),
+        (2, (16, 1), {"simulated_scope": ["prefix caching"]}, "the peer's prefix"),
+        (1, (16, 1), {"dcp_size": 2, "simulated_scope": None}, "no simulated scope"),
+        (1, (16, 2), {"block_size": 32, "simulated_scope": None}, None),
+    ],
+    ids=[
+        "dcp-pages",
+        "dcp-block-size",
+        "local-kernel-blocks",
+        "remote-kernel-blocks",
+        "remote-dcp-block-size",
+        "peer-prefix-caching",
+        "peer-scope-unknown",
+        "no-dcp",
+    ],
+)
+def test_dcp_peer_refusal_of_real_handshake_metadata(
+    mla_model_dir, local_dcp, local_page, peer, problem
+):
+    """The NIXL handshake's DCP guard (`dcp_peer_refusal`) on a peer's real
+    metadata, this instance's real config: with DCP on either side it pairs
+    only a peer of this instance's page, one kernel block each on both
+    sides, in scope as its metadata states; without DCP any peer."""
+    from vllm.v1.worker.simulated.kv_transfer import dcp_peer_refusal
+
+    config = dcp_engine_config(mla_model_dir, decode_context_parallel_size=local_dcp)
+    metadata = agent_metadata(**peer)
+    refusal = dcp_peer_refusal(config, local_dcp, local_page, 1, metadata)
+    if problem is None:
+        assert refusal is None
+    else:
+        assert refusal is not None and problem in refusal, refusal
+
+
+def test_dcp_peer_scope_survives_metadata_schema_evolution(mla_model_dir):
+    """`simulated_scope` over MessagePack, as NIXL's handshake encodes its
+    metadata: a payload of the schema without it decodes as None, which the
+    DCP guard refuses (an empty scope it pairs, a nonempty one it refuses);
+    the schema without it decodes a payload carrying it; DCP 1 on both sides
+    pairs a peer of either schema."""
+    import dataclasses
+
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import dcp_peer_refusal
+
+    def spec(f):
+        if f.default is not dataclasses.MISSING:
+            return f.name, f.type, dataclasses.field(default=f.default)
+        if f.default_factory is not dataclasses.MISSING:
+            return f.name, f.type, dataclasses.field(default_factory=f.default_factory)
+        return f.name, f.type
+
+    old_fields = [
+        f for f in dataclasses.fields(NixlAgentMetadata) if f.name != "simulated_scope"
+    ]
+    old_schema = dataclasses.make_dataclass(
+        "NixlAgentMetadata", [spec(f) for f in old_fields]
+    )
+    new = agent_metadata(dcp_size=2, simulated_scope=["prefix caching"])
+    old = old_schema(**{f.name: getattr(new, f.name) for f in old_fields})
+    encode = msgspec.msgpack.Encoder().encode
+
+    read_old = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(encode(old))
+    assert read_old.simulated_scope is None
+    assert read_old == dataclasses.replace(new, simulated_scope=None)
+    read_new = msgspec.msgpack.Decoder(old_schema).decode(encode(new))
+    assert read_new == old
+
+    dcp2 = dcp_engine_config(mla_model_dir, decode_context_parallel_size=2)
+    dcp1 = dcp_engine_config(mla_model_dir)
+    decode = msgspec.msgpack.Decoder(NixlAgentMetadata).decode
+    for scope, problem in ((None, "no simulated scope"), ([], None), (
+        ["prefix caching"], "the peer's prefix caching"
+    )):
+        payload = encode(dataclasses.replace(new, simulated_scope=scope))
+        refusal = dcp_peer_refusal(dcp2, 2, (16, 1), 2, decode(payload))
+        assert (refusal is None) if problem is None else problem in refusal, refusal
+    plain = dataclasses.replace(new, dcp_size=1)
+    old_plain = old_schema(**{f.name: getattr(plain, f.name) for f in old_fields})
+    assert dcp_peer_refusal(dcp1, 1, (16, 1), 1, decode(encode(old_plain))) is None
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, check",
+    [((32, 1), (16, 2), True), ((16, 2), (32, 1), False)],
+    ids=["p-block32-dcp1_d-block16-dcp2-checks", "p-block16-dcp2_d-block32-dcp1"],
+)
+def test_nixl_peers_refuse_another_page_size_under_dcp(
+    mla_model_dir, tmp_path, producer, consumer, check
+):
+    """With decode context parallelism on either side, a peer of another
+    page size (block size) is refused at the consumer's handshake, before
+    any READ, checks on or off."""
+    with open(Path(mla_model_dir) / "config.json") as f:
+        config = json.load(f)
+    sides = [
+        {
+            "tensor_parallel_size": 2,
+            "block_size": block,
+            "decode_context_parallel_size": dcp,
+            "prompt_len": 64,
+        }
+        for block, dcp in (producer, consumer)
+    ]
+    sides[1]["check"] = check
+    p, c = run_dcp_peers(config, *sides, tmp_path)
+    log = c["log"]
+    assert "must hold pages of this instance's tokens" in log, log[-4000:]
+    assert f"kernel blocks a block ({producer[0]}, 1), not ({consumer[0]}, 1)" in log
+    loads = [
+        r
+        for records in c["logs"].values()
+        for r in records
+        if "load" in r.get("kv_transfers", {})
+    ]
+    assert not loads, loads
+
+
+@pytest.mark.parametrize(
+    "kwargs, problem",
+    [
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "MooncakeConnector",
+                    "kv_role": "kv_consumer",
+                    "kv_buffer_device": "cpu",
+                }
+            },
+            "the MooncakeConnector connector",
+        ),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "NixlPushConnector",
+                    "kv_role": "kv_consumer",
+                    "kv_buffer_device": "cpu",
+                }
+            },
+            "the NixlPushConnector connector",
+        ),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": "kv_consumer",
+                    "kv_buffer_device": "cpu",
+                },
+                "enable_prefix_caching": True,
+            },
+            r"not with prefix caching\.",
+        ),
+    ],
+    ids=["mooncake", "nixl-push", "prefix-caching"],
+)
+def test_real_transfers_with_dcp_refuse_other_connectors_and_prefix_caching(
+    mla_model_dir, kwargs, problem
+):
+    """Real transfers with decode context parallelism: NIXL's pull connector,
+    prefix caching off; Mooncake's connector, which slices no page by DCP
+    rank, and NIXL's push connector are refused, as is prefix caching."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    with pytest.raises(ValueError, match=problem):
+        EngineArgs(
+            model=mla_model_dir,
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            max_model_len=256,
+            block_size=16,
+            enforce_eager=True,
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            kv_cache_memory_bytes=8 * 1024**2,
+            simulation_config={"simulate_forward": True, "kv_transfer_mode": "real"},
+            **kwargs,
+        ).create_engine_config()
 
 
 @pytest.mark.parametrize(

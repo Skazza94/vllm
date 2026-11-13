@@ -87,6 +87,12 @@ class Side:
     one switched network (``kv_network`` its name), rank r on its node's
     link r."""
 
+    decode_context_parallel_size: int = 1
+    """This instance's decode context parallelism (--decode-context-parallel-size):
+    1 or its TP size, as vLLM requires over NIXL; a dense MLA model at equal
+    TP sizes over NIXL, prefix caching off (`_check_dcp`). A rank's blocks
+    are then global pages, DCP rank r every DCP-th from r (`_dcp_audit`)."""
+
     def tp(self, server: "Server") -> int:
         return self.tensor_parallel_size or server.tensor_parallel_size
 
@@ -439,9 +445,74 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                              "name, a link per rank)")
         if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
             raise ValueError("unequal TP sizes without data parallelism")
+    _check_dcp(run)
     if run.server.connector == "mooncake":
         _check_write_tasks(run)
     return run
+
+
+def _decode_context_parallel_flags(side: Side) -> list[str]:
+    return (["--decode-context-parallel-size", str(side.decode_context_parallel_size)]
+            if side.decode_context_parallel_size > 1 else [])
+
+
+def plain_mla_of(model: Path) -> bool:
+    """A dense MLA model (one latent a layer, `kv_lora_rank`): not sparse MLA
+    (an indexer, `index_topk`), not DeepSeek-V4's caches, not a hybrid."""
+    try:
+        config = json.loads((Path(model) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    sources = (config, config.get("text_config") or {})
+    return (any(source.get("kv_lora_rank") for source in sources)
+            and not any("index_topk" in source for source in sources)
+            and not any(source.get("model_type") in ("deepseek_v4", "kimi_k3", "kimi_linear")
+                        for source in sources))
+
+
+def _check_dcp(run: Run) -> None:
+    """Decode context parallelism on either side: each side's DCP 1 or its TP
+    size (vLLM's rule over NIXL), a dense MLA model at equal TP sizes over
+    NIXL's pull connector, one instance a side without data parallelism, no
+    speculative decoding, prefix caching off; a decode rank reading several
+    producer ranks (prefill DCP above decode's) needs one switched KV
+    network, as at unequal TP sizes. The simulator checks the same scope at
+    startup and at the handshake."""
+    dcps = {role: side.decode_context_parallel_size for role, side in
+            (("prefill", run.prefill), ("decode", run.decode))}
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        dcp = dcps[role]
+        if not isinstance(dcp, int) or isinstance(dcp, bool) or dcp < 1:
+            raise ValueError(f"{role}: decode_context_parallel_size is a positive integer")
+        if dcp not in (1, side.tp(run.server)):
+            raise ValueError(f"{role}: decode_context_parallel_size is 1 or the instance's TP size "
+                             f"({side.tp(run.server)}) over NIXL, not {dcp}")
+    if max(dcps.values()) == 1:
+        return
+    problems = []
+    if run.server.connector != "nixl":
+        problems.append(f"the {run.server.connector} connector (NIXL's pull connector only: Mooncake's "
+                        "slices no page by DCP rank)")
+    if run.prefill.tp(run.server) != run.decode.tp(run.server):
+        problems.append(f"TP {run.prefill.tp(run.server)} and {run.decode.tp(run.server)} (equal sizes only)")
+    if run.prefill.instances or run.decode.instances or max(
+            run.prefill.data_parallel_size, run.decode.data_parallel_size) > 1:
+        problems.append("several instances or data parallelism")
+    if run.server.speculative is not None:
+        problems.append("speculative decoding")
+    if _prefix_caching_enabled(run) is not False:
+        problems.append("prefix caching (off: server.enable_prefix_caching false, or kv_check)")
+    if not plain_mla_of(run.model):
+        problems.append("the model's attention (a dense MLA model only)")
+    if dcps["prefill"] > dcps["decode"] and not (
+            isinstance(run.prefill.kv_network, str) and run.prefill.kv_network == run.decode.kv_network):
+        # A decode rank reads every producer rank's slice (`dcp_sources`):
+        # across ranks, as at unequal TP sizes.
+        problems.append("a sharded producer read by a coarser consumer on per-rank KV networks (one switched "
+                        "network for both instances: kv_network its name)")
+    if problems:
+        raise ValueError(f"decode context parallelism (prefill DCP {dcps['prefill']}, decode DCP "
+                         f"{dcps['decode']}) is not supported with {', '.join(problems)}")
 
 
 def _check_write_tasks(run: Run) -> None:
@@ -783,6 +854,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(side.tp(s)),
+        *_decode_context_parallel_flags(side),
         *(["--data-parallel-size", str(side.data_parallel_size), "--enable-expert-parallel"]
           if side.data_parallel_size > 1 else []),
         # Per-rank routing: an API server a rank, on ``port`` + rank.
@@ -1012,6 +1084,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
     unwritten: set[int] = set()
     # Instances' ranks without a moved series: given no request.
     idle: list[str] = []
+    # Decode ranks without a read series under decode context parallelism.
+    unread: set[int] = set()
+    dcp_pair = max(side.decode_context_parallel_size for side in sides.values()) > 1
     for role, side in sides.items():
         for (dp, tp), records in logs[role].items():
             at = where(dp, tp, side)
@@ -1162,6 +1237,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                         # increments its write series: `_hetero_tp` accepts
                         # the absence only for a proven idle replica.
                         unwritten.add(tp)
+                    elif dcp_pair and role == mover == "decode" and missing == [moved_counter]:
+                        # A DCP rank whose pages are all past every handoff
+                        # reads nothing: `_dcp_audit` accepts the absence only
+                        # for a proven notify-only rank.
+                        unread.add(tp)
                     else:
                         problems.append(f"{at}{role}'s TENT metrics lack {', '.join(missing)}")
                 registered = (counters or {}).get("tent_registered_buffer_bytes")
@@ -1225,6 +1305,10 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         # Each decode rank, with the producer ranks the native pairing gives it.
         hetero = _hetero_tp(run, sizes, logs, ranks, ports, unwritten)
         problems.extend(hetero.pop("problems"))
+    dcp = None
+    if dcp_pair:
+        dcp = _dcp_audit(run, sizes, logs, unread)
+        problems.extend(dcp.pop("problems"))
     for tp in range(sizes["decode"] if hetero else tp_size):
         at = where(None, tp)
         first = hetero["sources"][tp][0] if hetero else tp
@@ -1386,6 +1470,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                             for (dp, tp), summary in ranks[role].items()] for role in sides},
         "speculation": speculation,
         "hetero_tp": hetero,
+        "dcp": dcp,
         "hp_tcp_task_limit": hp_tcp_task_limit(run.server),
         "ttft_ms": {key: bench.get(f"{key}_ttft_ms") for key in ("mean", "median", "p99")},
         "tpot_ms": {key: bench.get(f"{key}_tpot_ms") for key in ("mean", "median", "p99")},
@@ -1704,7 +1789,7 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
                 problems.append(f"{request}'s 1-token window group {g['group']} checked {g['blocks']} blocks from "
                                 f"{g['first_logical_block']}, not 0 from {tokens // spec['block_size']} (a "
                                 f"block-aligned prompt's end)")
-            elif g["blocks"] < 1 and not skipped:
+            elif g["blocks"] < 1 and not skipped and not _dcp_notify_only(g):
                 problems.append(f"{request}'s group {g['group']} checked no blocks")
             if g["group"] in invalid:
                 pass  # its malformed layout is reported above
@@ -1742,6 +1827,15 @@ def _byte_check_problems(layout: dict, checks: list[dict], input_len: int,
             elif window is None and prompt is None:
                 problems.append(f"{request}'s group {g['group']} pages cannot be checked: decode logged no "
                                 "steps of it")
+            elif window is None and "payload_blocks" in g:
+                # Decode context parallelism: a rank holds the request's
+                # scheduler blocks (DCP pages each), its payload pages
+                # reconciled with the handoff in `_dcp_audit`.
+                dcp = int((check.get("dcp") or {}).get("size") or 1)
+                held = sum(int(g.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
+                if held != -(-tokens // (spec["block_size"] * dcp)):
+                    problems.append(f"{request}'s group {g['group']} holds {held} blocks, not the "
+                                    f"cdiv({tokens}, {spec['block_size']} * DCP {dcp}) of its prompt")
             elif window is None:
                 hit = g["first_logical_block"] if prefix else 0
                 if g["blocks"] != -(-tokens // spec["block_size"]) - hit:
@@ -1892,6 +1986,181 @@ def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | No
             return None, (f"a {kind} group has no KV head rule in a config with num_global_key_value_heads "
                           "(full-attention and sliding-window groups only)")
     return totals, None
+
+
+def dcp_sources(rank: int, tp: int, prefill_dcp: int, decode_dcp: int) -> list[int]:
+    """The producer ranks a decode rank reads from at equal TP sizes, as
+    NIXL's `compute_tp_mapping` maps them: a replicated producer (DCP 1) its
+    same rank; a sharded one, the ranks whose slices fall in this rank's
+    (`dcp_source_ranks`): all of them for a replicated consumer, else the
+    one of its DCP rank."""
+    if prefill_dcp == 1:
+        return [rank]
+    # A sharded consumer at most as fine as the producer (each side's DCP 1
+    # or its TP): the producer ranks of its DCP rank.
+    return [r for r in range(tp) if r % decode_dcp == rank % decode_dcp]
+
+
+def _dcp_notify_only(group: dict) -> bool:
+    """A DCP check's group of no page to move: all its blocks past the
+    handoff and untouched."""
+    return ("payload_blocks" in group and group.get("payload_blocks") == group.get("padding_blocks") == 0
+            and int(group.get("untouched_blocks") or 0) >= 1)
+
+
+def _dcp_pulls(records: list[dict]) -> tuple[dict[str, int], dict[str, int], set[str]]:
+    """A decode rank's pulls: each request's blocks as allocated when its
+    read was posted, each request's prompt tokens (the producer's handoff)
+    from its steps, and the requests whose reads finished."""
+    held: dict[str, int] = {}
+    prompts: dict[str, int] = {}
+    done: set[str] = set()
+    for record in records:
+        events = record.get("kv_events") or {}
+        for request in events.get("reads_posted") or []:
+            held.setdefault(request, len((events.get("allocated") or {}).get(request) or []))
+        done.update(events.get("reads_done") or [])
+        for step in (record.get("step") or {}).get("requests") or []:
+            if isinstance(step.get("num_prompt_tokens"), int):
+                prompts.setdefault(step["req_id"], step["num_prompt_tokens"])
+    return held, prompts, done
+
+
+def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = frozenset()) -> dict:
+    """Decode context parallelism at equal TP sizes (`_check_dcp`), each
+    rank's DCP rank its TP rank modulo the side's DCP size: every rank's
+    resolved geometry in its layout (one page size, the scheduler block DCP
+    pages, the interleave the page); each decode check's global pages (DCP
+    rank r's blocks pages k * DCP + r), those under the producer's handoff
+    (its tokens over the page) the payload, the others padding moved or
+    left; each READ of bytes from a producer rank `dcp_sources` names, each
+    load record its READs' count and bytes, a rank's checked bytes its read
+    ones (with ``kv_check``); every producer rank's sends done for every
+    request it held (each released once all its readers notified it). With
+    checks or without, each decode rank's pulls (`_dcp_pulls`) bound its read
+    bytes: at least its payload pages (those of its blocks under each
+    handoff), at most its blocks. A decode rank without a TENT read series
+    (`unread`) must be notify-only: no READ, no payload page, every read
+    finished, and (with ``kv_check``) its checks, at least one, of untouched
+    blocks alone."""
+    problems: list[str] = []
+    tp = sizes["decode"]
+    dcps = {"prefill": run.prefill.decode_context_parallel_size, "decode": run.decode.decode_context_parallel_size}
+    pages: dict[tuple[str, int], int | None] = {}
+    for role in ("prefill", "decode"):
+        for rank in range(sizes[role]):
+            layout = next((r["kv_layout"] for r in logs[role].get((0, rank), []) if "kv_layout" in r), None)
+            geometry = (layout or {}).get("decode_context_parallel")
+            dcp = dcps[role]
+            if dcp == 1:
+                if geometry is not None:
+                    problems.append(f"{role} rank {rank} logged decode context parallelism {geometry}, not none")
+                pages[(role, rank)] = None
+                continue
+            page = (geometry or {}).get("page_tokens") or [None]
+            want = {"size": dcp, "rank": rank % dcp, "page_tokens": page[:1],
+                    "scheduler_block_tokens": [page[0] * dcp] if isinstance(page[0], int) else None,
+                    "interleave": page[0]}
+            if geometry != want or not isinstance(page[0], int):
+                problems.append(f"{role} rank {rank}'s decode context parallelism is {geometry}, not {want}")
+            pages[(role, rank)] = page[0] if isinstance(page[0], int) else None
+    prefill_dcp, decode_dcp = dcps["prefill"], dcps["decode"]
+    evidence: dict = {"dcp": dcps, "ranks": {}}
+    accepted: list[int] = []
+    for rank in range(tp):
+        records = logs["decode"].get((0, rank), [])
+        dcp_rank = rank % decode_dcp
+        sources = dcp_sources(rank, tp, prefill_dcp, decode_dcp)
+        loads = [r["kv_transfers"]["load"] for r in records if "load" in (r.get("kv_transfers") or {})]
+        reads = [each for load in loads for each in load.get("each") or []]
+        for load in loads:
+            each = load.get("each") or []
+            if (load.get("count"), load.get("bytes")) != (len(each), sum(int(e[0] or 0) for e in each if e)):
+                problems.append(f"decode rank {rank}'s load of {load.get('count')} READ(s), {load.get('bytes')} "
+                                f"bytes, is not its {len(each)} READ(s)' sum")
+        unnamed = [each for each in reads if not each or int(each[0] or 0) > 0 and (
+            len(each) < 6 or type(each[5]) is not int or each[5] not in sources)]
+        if unnamed:
+            problems.append(f"decode rank {rank} has {len(unnamed)} READ(s) of no producer rank among "
+                            f"{sources}: {unnamed[0][:6]}")
+        peers = sorted({each[5] for each in reads if len(each) > 5 and type(each[5]) is int})
+        moved = sum(int(load.get("bytes") or 0) for load in loads)
+        valid = [r["kv_check"] for r in records if "kv_check" in r and "error" not in r["kv_check"]]
+        checked = sum(int(c.get("bytes") or 0) for c in valid)
+        if run.kv_check and checked != moved:
+            problems.append(f"decode rank {rank} checked {checked} bytes, not the {moved} it read")
+        notify_only = sum(1 for c in valid if (c.get("groups") or [])
+                          and all(_dcp_notify_only(g) for g in c["groups"]))
+        totals = {"payload": 0, "padding": 0, "untouched": 0, "padding_bytes": 0, "untouched_bytes": 0}
+        miscounted = False
+        page = next((p for p in (pages.get(("decode", rank)), pages.get(("prefill", rank))) if p), None)
+        for check in (r["kv_check"] for r in records if "kv_check" in r):
+            if "error" in check:
+                continue
+            found = check.get("dcp") or {}
+            tokens = found.get("remote_num_tokens")
+            if {key: found.get(key) for key in ("size", "rank", "remote_size")} != {
+                    "size": decode_dcp, "rank": dcp_rank, "remote_size": prefill_dcp} or not isinstance(tokens, int):
+                problems.append(f"decode rank {rank}'s check of {check.get('req_id')} is of decode context "
+                                f"parallelism {found}, not size {decode_dcp} rank {dcp_rank} from size {prefill_dcp}")
+                continue
+            for group in check.get("groups") or []:
+                held = sum(int(group.get(key) or 0) for key in ("payload_blocks", "padding_blocks", "untouched_blocks"))
+                handoff = -(-tokens // page) if page else None
+                payload = sum(1 for k in range(held) if handoff is not None and k * decode_dcp + dcp_rank < handoff)
+                if group.get("payload_blocks") != payload:
+                    miscounted = True
+                    problems.append(f"decode rank {rank}'s check of {check.get('req_id')} has "
+                                    f"{group.get('payload_blocks')} payload page(s), not the {payload} of its "
+                                    f"{held} block(s) under the handoff's {handoff} page(s)")
+                totals["payload"] += int(group.get("payload_blocks") or 0)
+                totals["padding"] += int(group.get("padding_blocks") or 0)
+                totals["untouched"] += int(group.get("untouched_blocks") or 0)
+                totals["padding_bytes"] += int(group.get("padding_bytes") or 0)
+                totals["untouched_bytes"] += int(group.get("untouched_bytes") or 0)
+        held, prompts, done = _dcp_pulls(records)
+        layout = next((r["kv_layout"] for r in records if "kv_layout" in r), None) or {}
+        groups = layout.get("groups") or []
+        block_bytes = (int(groups[0]["block_bytes"]) * int(groups[0]["layers"])
+                       if len(groups) == 1 and page else None)
+        payload_blocks = 0
+        if not held:
+            problems.append(f"decode rank {rank} logged no pull")
+        for request, blocks in held.items():
+            tokens = prompts.get(request)
+            if not blocks or tokens is None or not page:
+                problems.append(f"decode rank {rank}'s pull of {request} logged no allocated blocks, prompt or page")
+                continue
+            payload_blocks += sum(1 for k in range(blocks) if k * decode_dcp + dcp_rank < -(-tokens // page))
+        if block_bytes is None:
+            problems.append(f"decode rank {rank}'s layout is not one group of pages: {groups}")
+        elif not payload_blocks * block_bytes <= moved <= sum(held.values()) * block_bytes:
+            problems.append(f"decode rank {rank} read {moved} bytes, not between its {payload_blocks} payload "
+                            f"page(s) and its {sum(held.values())} block(s) of {block_bytes} bytes")
+        if unfinished := sorted(set(held) - done):
+            problems.append(f"decode rank {rank} finished {len(set(held) & done)} of its {len(held)} pull(s): "
+                            f"{unfinished[0]}")
+        proven = not reads and held and not payload_blocks and not unfinished and (
+            not run.kv_check or (valid and notify_only == len(valid) and not miscounted))
+        if rank in unread and not proven:
+            problems.append(f"decode rank {rank}'s TENT metrics lack tent_read_bytes_total, though it "
+                            f"posted {len(reads)} READ(s), {len(held)} pull(s) with {payload_blocks} payload "
+                            f"page(s), and {notify_only} of its {len(valid)} check(s) moved nothing")
+        elif rank in unread:
+            accepted.append(rank)
+        evidence["ranks"][rank] = {"dcp_rank": dcp_rank, "sources": sources, "peers": peers, "reads": len(reads),
+                                   "pulls": len(held), "payload_blocks": payload_blocks,
+                                   "notify_only": notify_only, **totals}
+    evidence["unread_accepted"] = accepted
+    for rank in range(sizes["prefill"]):
+        records = logs["prefill"].get((0, rank), [])
+        held = {req for r in records for req in ((r.get("kv_events") or {}).get("allocated") or {})}
+        done = {req for r in records for req in ((r.get("kv_events") or {}).get("sends_done") or [])}
+        evidence.setdefault("released", {})[rank] = [len(held & done), len(held)]
+        if held - done:
+            problems.append(f"prefill rank {rank} finished sending {len(held & done)} of the {len(held)} "
+                            "request(s) it held")
+    return {**evidence, "problems": problems}
 
 
 def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,

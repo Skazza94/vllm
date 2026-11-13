@@ -200,43 +200,34 @@ class SimulationConfig:
             load_config.load_format = "dummy"
             load_config.device = "meta"
 
-    @staticmethod
-    def _verify_cpu_decode_context_parallel(vllm_config: "VllmConfig") -> None:
+    def _verify_cpu_decode_context_parallel(self, vllm_config: "VllmConfig") -> None:
         """Decode context parallelism on CPU: a dense MLA model's (the CPU MLA
         backend keeps vLLM's DCP bookkeeping under a simulated forward, which
-        never runs its kernels), over tensor parallelism alone, one instance.
-        The CPU GQA backend returns no softmax LSE and has no DCP cache."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
+        never runs its kernels), over tensor parallelism alone: one instance,
+        or a P/D instance with real KV transfers over NIXL's pull connector,
+        prefix caching off (the peer's DCP is checked at the handshake,
+        `simulated_tp_mismatch`). The CPU GQA backend returns no softmax LSE
+        and has no DCP cache."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            dcp_scope_problems,
+        )
 
         parallel = vllm_config.parallel_config
-        problems = []
-        if not plain_mla(vllm_config.model_config):
-            problems.append(
-                "a model other than dense MLA (sparse or compressed MLA, a "
-                "hybrid, or attention without MLA)"
-            )
-        for name, size in (
-            ("pipeline parallelism", parallel.pipeline_parallel_size),
-            ("prefill context parallelism", parallel.prefill_context_parallel_size),
-            ("data parallelism", parallel.data_parallel_size),
-        ):
-            if size > 1:
-                problems.append(f"{name} {size}")
-        if parallel.enable_expert_parallel:
-            problems.append("expert parallelism")
-        if vllm_config.speculative_config is not None:
-            problems.append("speculative decoding")
-        if vllm_config.kv_transfer_config is not None:
-            problems.append(
-                f"the {vllm_config.kv_transfer_config.kv_connector} connector"
-            )
+        transfer = vllm_config.kv_transfer_config
+        problems = dcp_scope_problems(vllm_config, transfers=transfer is not None)
+        if transfer is not None:
+            if transfer.kv_connector != "NixlConnector":
+                problems.append(f"the {transfer.kv_connector} connector")
+            if self.kv_transfer_mode != "real":
+                problems.append(f"kv_transfer_mode {self.kv_transfer_mode}")
         if problems:
             raise ValueError(
                 "Simulated forward on CPU supports decode context parallelism "
                 f"(decode_context_parallel_size "
                 f"{parallel.decode_context_parallel_size}) for a dense MLA model "
-                "over tensor parallelism alone, without a KV connector, not "
-                f"with {', '.join(problems)}."
+                "over tensor parallelism alone, without a KV connector or with "
+                "real KV transfers over NixlConnector (pull) and prefix caching "
+                f"off, not with {', '.join(problems)}."
             )
 
     @staticmethod
@@ -399,6 +390,7 @@ class SimulationConfig:
         vLLM then sets), over Mooncake or over NIXL with the DS conv-state
         layout NIXL's state descriptors need. The native connector stays in
         place."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
@@ -456,7 +448,17 @@ class SimulationConfig:
         # ranks, with expert parallelism): each DP rank holds its own
         # requests' KV, paired with whichever DP rank serves the request on
         # the other instance.
-        if any(sizes[name] != 1 for name in ("PP", "PCP", "DCP")):
+        # Decode context parallelism: a dense MLA model over NIXL's pull
+        # connector, the scope `_verify_cpu_decode_context_parallel` checks
+        # (each rank's blocks are global pages, `kv_pattern.dcp_page`).
+        dcp_ok = (
+            sizes["DCP"] > 1
+            and kv_transfer.kv_connector == "NixlConnector"
+            and plain_mla(model)
+        )
+        if any(sizes[name] != 1 for name in ("PP", "PCP")) or (
+            sizes["DCP"] != 1 and not dcp_ok
+        ):
             parallel_sizes = ", ".join(f"{k}={v}" for k, v in sizes.items())
             problems.append(
                 "tensor parallelism and data-parallel attention at most, not "

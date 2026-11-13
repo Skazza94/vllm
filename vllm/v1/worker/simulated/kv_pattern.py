@@ -58,7 +58,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.worker.simulated.kv_transfer import layer_specs, requested_reads
+from vllm.v1.worker.simulated.kv_transfer import (
+    NixlReadDestinations,
+    layer_specs,
+    requested_reads,
+)
 from vllm.v1.worker.simulated import state_layout as sl
 
 if TYPE_CHECKING:
@@ -68,6 +72,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SENTINEL = 0
+
+
+def dcp_page(place: int, dcp_size: int, dcp_rank: int) -> int:
+    """The global page a decode context parallel rank's block holds, the
+    block at `place` among its request's blocks: vLLM's DCP interleave, which
+    NIXL resolves to the local page, gives rank r every DCP-th page from r."""
+    return place * dcp_size + dcp_rank
 
 
 def block_views(
@@ -695,6 +706,10 @@ class PatternFiller(_ContentPages):
     results: list[dict] = field(default_factory=list)
     step_writes: dict[int, str] = field(default_factory=dict)
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    """This rank's decode context parallelism: its blocks hold global pages
+    (`dcp_page`), each one's pattern that page's."""
 
     def __post_init__(self) -> None:
         self._groups = group_views(self.views, self.groups)
@@ -703,16 +718,29 @@ class PatternFiller(_ContentPages):
         _after_update(self, scheduler_output)
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
+        page = dcp_page(logical, self.dcp_size, self.dcp_rank)
         for layer, view in self._groups[group].items():
             view[block].copy_(
                 layer_pattern(
-                    req_id, layer, logical, view.shape[1], self.tp_rank, identity, self.heads
+                    req_id,
+                    layer,
+                    page,
+                    view.shape[1],
+                    self.tp_rank,
+                    identity,
+                    self.heads,
                 )
             )
 
     def _compare_block(self, req_id, group, logical, block, identity):
         return _compare_views(
-            self._groups[group], req_id, logical, block, self.tp_rank, identity, self.heads
+            self._groups[group],
+            req_id,
+            dcp_page(logical, self.dcp_size, self.dcp_rank),
+            block,
+            self.tp_rank,
+            identity,
+            self.heads,
         )
 
     def _extend(
@@ -780,6 +808,10 @@ class _Expected:
     remote_engine_id: str | None = None
     """The producer engine (NIXL), whose block size may be a divisor of
     this instance's."""
+    remote_dcp_size: int = 1
+    """The producer's decode context parallel size (NIXL)."""
+    remote_num_tokens: int | None = None
+    """The tokens whose KV the producer hands off (NIXL)."""
 
     @property
     def block_ids(self) -> list[int]:
@@ -1003,21 +1035,45 @@ class PatternChecker(_ConsumerPages):
     hits_due: list[tuple[str, list[int]]] = field(default_factory=list)
     written: dict[str, list[int]] = field(default_factory=dict)
     write_events: list[dict] = field(default_factory=list)
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    """This rank's decode context parallelism: its blocks hold global pages
+    (`dcp_page`)."""
+    page_tokens: Sequence[int] | None = None
+    """Each group's tokens a block (this rank's page): with decode context
+    parallelism on either side, the handoff's pages are the payload, a page
+    past them padding."""
+    destinations: NixlReadDestinations | None = None
+    """The blocks NIXL's READs write (with decode context parallelism, those
+    a check expects moved)."""
 
     def __post_init__(self) -> None:
         self._groups = group_views(self.views, self.groups)
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
+        page = dcp_page(logical, self.dcp_size, self.dcp_rank)
         for layer, view in self._groups[group].items():
             view[block].copy_(
                 layer_pattern(
-                    req_id, layer, logical, view.shape[1], self.tp_rank, identity, self.heads
+                    req_id,
+                    layer,
+                    page,
+                    view.shape[1],
+                    self.tp_rank,
+                    identity,
+                    self.heads,
                 )
             )
 
     def _compare_block(self, req_id, group, logical, block, identity):
         return _compare_views(
-            self._groups[group], req_id, logical, block, self.tp_rank, identity, self.heads
+            self._groups[group],
+            req_id,
+            dcp_page(logical, self.dcp_size, self.dcp_rank),
+            block,
+            self.tp_rank,
+            identity,
+            self.heads,
         )
 
     def before_step(self, scheduler_output: "SchedulerOutput") -> None:
@@ -1041,7 +1097,13 @@ class PatternChecker(_ConsumerPages):
                 for view in self._groups[group].values():
                     view[held] = SENTINEL
                 groups.append(_ExpectedGroup(group, first, list(block_ids)))
-            self.pending[read.req_id] = _Expected(read.remote_request_id, groups)
+            self.pending[read.req_id] = _Expected(
+                read.remote_request_id,
+                groups,
+                read.remote_engine_id,
+                read.remote_dcp_size,
+                read.remote_num_tokens,
+            )
             self._record_pull_start(read.req_id, groups)
 
     def after_step(self, kv_output: "KVConnectorOutput | None") -> list[dict]:
@@ -1058,9 +1120,12 @@ class PatternChecker(_ConsumerPages):
                 if invalid & set(expected.block_ids)
             )
         results = []
+        destinations = getattr(self, "destinations", None)
         for req_id in kv_output.failed_recving or set():
             expected = self.pending.pop(req_id, None)
             self.lost.discard(req_id)
+            if destinations is not None:
+                destinations.take(req_id)
             if expected is not None:
                 results.append(
                     {"req_id": req_id, "ok": False, "error": "receive failed"}
@@ -1071,6 +1136,8 @@ class PatternChecker(_ConsumerPages):
                 continue
             if req_id in self.lost:
                 self.lost.discard(req_id)
+                if destinations is not None:
+                    destinations.take(req_id)
                 results.append({"req_id": req_id, "ok": False, "error": "receive failed"})
             elif (result := self._finish(req_id, expected)) is not None:
                 results.append(result)
@@ -1083,6 +1150,9 @@ class PatternChecker(_ConsumerPages):
         """One request's result, its groups' nested: each group's blocks are
         compared over the group's layers, each (layer, block) once.
         `identity_of(group, logical)`: a block's content (prefix caching)."""
+        written = self.destinations.take(req_id) if self.destinations else None
+        if self.dcp_size > 1 or expected.remote_dcp_size > 1:
+            return _compare_dcp_reads(self, req_id, expected, written)
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
@@ -1135,6 +1205,121 @@ class PatternChecker(_ConsumerPages):
             "mismatched_blocks": mismatched_blocks[:16],
             "ok": mismatched_bytes == 0,
         }
+
+
+# Reads under decode context parallelism, classified by each block's global page.
+DCP_PAYLOAD, DCP_PADDING, DCP_UNTOUCHED = "payload", "padding", "untouched"
+
+
+def _dcp_block(view: torch.Tensor, block_id: int, want: torch.Tensor, written: bool):
+    """Wrong bytes of a block of one layer: a block NIXL wrote must hold its
+    page's pattern, any other the sentinel."""
+    got = view[block_id]
+    return int((got != want).sum()) if written else int((got != SENTINEL).sum())
+
+
+def _compare_dcp_reads(
+    checker, req_id: str, expected: "_Expected", written: list[set[int]] | None
+) -> dict:
+    """A read with decode context parallelism on either side, each local block
+    against its global page (`dcp_page`): the pages of the producer's
+    handoff (its tokens over this rank's page size) are the payload, each one
+    NIXL must write; a later page is the producer's allocation padding. A
+    block NIXL wrote (`written`, its READs' destinations by group) must hold
+    its page's pattern; any other, the sentinel: untouched padding, counted
+    apart. Payload and written padding are the bytes checked."""
+    if expected.remote_num_tokens is None or checker.page_tokens is None:
+        return {
+            "req_id": req_id,
+            "remote_request_id": expected.remote_request_id,
+            "ok": False,
+            "error": "a read with decode context parallelism names no handoff "
+            "token count or page size",
+        }
+    if written is None:
+        return {
+            "req_id": req_id,
+            "remote_request_id": expected.remote_request_id,
+            "ok": False,
+            "error": "NIXL posted no READ of this request's blocks by group",
+        }
+    groups = []
+    mismatched_blocks = []
+    for index, group in enumerate(expected.groups):
+        views = checker._groups[group.group]
+        tokens = checker.page_tokens[group.group]
+        pages = -(-expected.remote_num_tokens // tokens)
+        block_bytes = sum(view.shape[1] for view in views.values())
+        selected = written[index] if index < len(written) else set()
+        counts = {DCP_PAYLOAD: 0, DCP_PADDING: 0, DCP_UNTOUCHED: 0}
+        group_mismatched = 0
+        held = {b for b in group.block_ids if b != NULL_BLOCK_ID}
+        if stray := sorted(selected - held):
+            group_mismatched += len(stray)
+            mismatched_blocks.append(["*", None, stray[:16], "not this read's"])
+        for offset, block_id in enumerate(group.block_ids):
+            if block_id == NULL_BLOCK_ID:
+                continue
+            page = dcp_page(
+                group.first_logical_block + offset, checker.dcp_size, checker.dcp_rank
+            )
+            moved = block_id in selected
+            if page < pages:
+                kind = DCP_PAYLOAD
+                if not moved:
+                    group_mismatched += 1
+                    mismatched_blocks.append(["*", page, block_id, "not moved"])
+            else:
+                kind = DCP_PADDING if moved else DCP_UNTOUCHED
+            for layer, view in views.items():
+                want = layer_pattern(
+                    expected.remote_request_id, layer, page, view.shape[1],
+                    checker.tp_rank, None, checker.heads,
+                )
+                if wrong := _dcp_block(view, block_id, want, moved):
+                    group_mismatched += wrong
+                    mismatched_blocks.append([layer, page, block_id, wrong])
+            counts[kind] += 1
+        moved = counts[DCP_PAYLOAD] + counts[DCP_PADDING]
+        groups.append(
+            {
+                "group": group.group,
+                "first_logical_block": group.first_logical_block,
+                "blocks": moved,
+                "layers": len(views),
+                "block_bytes": block_bytes,
+                "bytes": moved * block_bytes,
+                "payload_blocks": counts[DCP_PAYLOAD],
+                "padding_blocks": counts[DCP_PADDING],
+                "padding_bytes": counts[DCP_PADDING] * block_bytes,
+                "untouched_blocks": counts[DCP_UNTOUCHED],
+                "untouched_bytes": counts[DCP_UNTOUCHED] * block_bytes,
+                "handoff_pages": pages,
+                "mismatched_bytes": group_mismatched,
+                **group_pattern(views, checker.heads),
+            }
+        )
+    mismatched_bytes = sum(group["mismatched_bytes"] for group in groups)
+    return {
+        "req_id": req_id,
+        "remote_request_id": expected.remote_request_id,
+        "blocks": sum(group["blocks"] for group in groups),
+        "block_ids": expected.block_ids,
+        "layers": sum(group["layers"] for group in groups),
+        "bytes": sum(group["bytes"] for group in groups),
+        "groups": groups,
+        "dcp": {
+            "size": checker.dcp_size,
+            "rank": checker.dcp_rank,
+            "remote_size": expected.remote_dcp_size,
+            "remote_num_tokens": expected.remote_num_tokens,
+        },
+        "padding_bytes": sum(group["padding_bytes"] for group in groups),
+        "untouched_bytes": sum(group["untouched_bytes"] for group in groups),
+        "mismatched_bytes": mismatched_bytes,
+        "mismatched_blocks": mismatched_blocks[:16],
+        "ok": mismatched_bytes == 0,
+    }
 
 
 # A model of several KV cache groups over NIXL (a hybrid's, or attention groups,

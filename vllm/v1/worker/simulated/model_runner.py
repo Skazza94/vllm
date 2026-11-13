@@ -53,6 +53,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
 )
 from vllm.v1.worker.simulated.state_layout import STATE_PATTERN, state_layout_record
 from vllm.v1.worker.simulated.kv_transfer import (
+    NixlReadDestinations,
     NixlReadPeers,
     ReadsInFlight,
     SimulatedTransfers,
@@ -70,6 +71,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     registered_block_bytes,
     scheduled_kv_events,
     simulated_kv_connector,
+    validate_dcp_peer,
 )
 from vllm.v1.worker.simulated.timing import (
     Clock,
@@ -209,6 +211,8 @@ class SimulatedModelRunner(GPUModelRunner):
         is_profiling: bool,
         kv_cache_allocation_context: AbstractContextManager | None,
     ) -> None:
+        if self.vllm_config.parallel_config.decode_context_parallel_size > 1:
+            self._dcp_geometry = self._resolved_dcp_geometry()
         if self._real_kv_transfer:
             model = self.vllm_config.model_config
             check_real_kv_groups(
@@ -265,6 +269,43 @@ class SimulatedModelRunner(GPUModelRunner):
             )
             self.kv_connector = connector
             self._kv_transfers = connector.transfers
+
+    def _resolved_dcp_geometry(self) -> dict:
+        """This rank's decode context parallelism as the engine resolved it
+        (the core sets the interleave after the model is built): its rank,
+        its tokens a page, the scheduler block's tokens and the interleave,
+        which over NIXL must be the page (a rank's blocks are whole global
+        pages). The MLA layers take the resolved interleave."""
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size
+
+        interleave = self.parallel_config.cp_kv_cache_interleave_size
+        specs = [g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups]
+        pages = sorted({spec.block_size for spec in specs})
+        spans = sorted(
+            {resolve_dcp_kv_block_size(spec, self.dcp_size) for spec in specs}
+        )
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is not None and transfer.kv_connector in NIXL_CONNECTORS and (
+            len(pages) != 1 or interleave != pages[0]
+        ):
+            raise ValueError(
+                "Simulated real KV transfers over NIXL with decode context "
+                "parallelism need one page size and the interleave resolved to "
+                f"it, not pages {pages} with interleave {interleave}."
+            )
+        for module in self.get_model().modules():
+            if isinstance(module, MLAAttention):
+                module.impl.cp_kv_cache_interleave_size = interleave
+        geometry = {
+            "size": self.dcp_size,
+            "rank": self.dcp_rank,
+            "page_tokens": pages,
+            "scheduler_block_tokens": spans,
+            "interleave": interleave,
+        }
+        logger.info("Decode context parallelism: %s.", geometry)
+        return geometry
 
     def load_model(self, *args, **kwargs) -> None:  # type: ignore[override]
         super().load_model(*args, **kwargs)
@@ -341,7 +382,13 @@ class SimulatedModelRunner(GPUModelRunner):
             if not native:
                 if sim.kv_pattern_fill:
                     self._kv_filler = PatternFiller(
-                        views, tp.rank_in_group, layers, chains, heads
+                        views,
+                        tp.rank_in_group,
+                        layers,
+                        chains,
+                        heads,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=self.dcp_rank,
                     )
                 if sim.kv_pattern_check:
                     self._kv_checker = PatternChecker(
@@ -351,6 +398,9 @@ class SimulatedModelRunner(GPUModelRunner):
                         self.kv_cache_config.transfer_group_ids,
                         chains,
                         heads,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=self.dcp_rank,
+                        page_tokens=[g.kv_cache_spec.block_size for g in groups],
                     )
                 logger.info(
                     "KV pattern %s over %d layers.",
@@ -376,6 +426,11 @@ class SimulatedModelRunner(GPUModelRunner):
         ):
             # Each READ's producer rank and slot, beside its telemetry.
             self._nixl_read_peers = NixlReadPeers(nixl_worker)
+            validate_dcp_peer(nixl_worker)
+            if isinstance(self._kv_checker, PatternChecker) and hasattr(
+                nixl_worker, "_read_blocks"
+            ):
+                self._kv_checker.destinations = NixlReadDestinations(nixl_worker)
         selection = None
         if native:
             # A hybrid's peer must hold its states as this instance does;
@@ -441,6 +496,7 @@ class SimulatedModelRunner(GPUModelRunner):
                        if getattr(nixl_worker, "simulated_transport", None) is not None else {}),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
+                    "decode_context_parallel": getattr(self, "_dcp_geometry", None),
                     # Its identity, and its place on the host (NIC, port).
                     "dp_rank": self.parallel_config.data_parallel_index,
                     "dp_local_rank": host_dp_ranks(self.parallel_config)[0],

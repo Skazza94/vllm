@@ -1531,7 +1531,6 @@ def test_the_real_package_times_dense_mla_decode_context_parallelism(tmp_path):
     assert (p.config["dcp"], p.config["worker_type"]) == (2, "aggregated")
     assert record["decode_context_parallel"] == {
         "size": 2,
-        "interleave": 1,
         "comm_backend": "ag_rs",
         "q_replicate": False,
     }

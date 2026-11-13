@@ -64,6 +64,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     bind_hp_tcp,
+    simulated_dcp_scope,
     simulated_tp_mismatch,
     this_rank_kv_address,
 )
@@ -1194,7 +1195,11 @@ class NixlBaseConnectorWorker:
         # Before any remote agent is added: a failed handshake fails the
         # requests waiting on it.
         if mismatch := simulated_tp_mismatch(
-            self.vllm_config, self.world_size, remote_tp_size, nixl_consumer=True
+            self.vllm_config,
+            self.world_size,
+            remote_tp_size,
+            nixl_consumer=True,
+            remote_dcp_size=remote_dcp_size,
         ):
             raise RuntimeError(mismatch)
         if self._is_csa_linear:
@@ -2013,6 +2018,7 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=self._packed_member_layouts,
+            simulated_scope=simulated_dcp_scope(self.vllm_config),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None

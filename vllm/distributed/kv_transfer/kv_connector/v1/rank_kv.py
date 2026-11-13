@@ -166,12 +166,62 @@ def sparse_mla(model) -> bool:
     )
 
 
+def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]:
+    """What of an instance's configuration falls outside the scope of decode
+    context parallelism under simulated compute, either endpoint's when its
+    KV moves (`transfers`): a dense MLA model over tensor parallelism alone
+    (no pipeline, prefill context or data parallelism, no expert
+    parallelism), no speculative decoding and, with transfers, no prefix
+    caching."""
+    parallel = vllm_config.parallel_config
+    problems = []
+    if not plain_mla(vllm_config.model_config):
+        problems.append(
+            "a model other than dense MLA (sparse or compressed MLA, a "
+            "hybrid, or attention without MLA)"
+        )
+    for name, size in (
+        ("pipeline parallelism", parallel.pipeline_parallel_size),
+        ("prefill context parallelism", parallel.prefill_context_parallel_size),
+        ("data parallelism", parallel.data_parallel_size),
+    ):
+        if size > 1:
+            problems.append(f"{name} {size}")
+    if parallel.enable_expert_parallel:
+        problems.append("expert parallelism")
+    if vllm_config.speculative_config is not None:
+        problems.append("speculative decoding")
+    if transfers and vllm_config.cache_config.enable_prefix_caching:
+        problems.append("prefix caching")
+    return problems
+
+
+def dcp_pair_refusal(local_dcp_size: int, remote_dcp_size: int, problems) -> str:
+    return (
+        "Simulated real KV transfers pair decode context parallelism (local DCP "
+        f"{local_dcp_size}, remote DCP {remote_dcp_size}) for a dense MLA model "
+        "over equal tensor parallelism alone on both sides, without speculative "
+        f"decoding or prefix caching, not with {', '.join(problems)}."
+    )
+
+
+def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
+    """An instance's `dcp_scope_problems` with real KV transfers under
+    simulated compute, which NIXL advertises for its peer to check whichever
+    side has decode context parallelism; None otherwise."""
+    sim = vllm_config.simulation_config
+    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+        return None
+    return dcp_scope_problems(vllm_config, transfers=True)
+
+
 def simulated_tp_mismatch(
     vllm_config: VllmConfig,
     local_tp_size: int,
     remote_tp_size: int,
     *,
     nixl_consumer: bool = False,
+    remote_dcp_size: int = 1,
 ) -> str | None:
     """Why a peer's tensor-parallel size cannot pair with ours, if it cannot:
     real KV transfers under simulated compute pair equal sizes, or unequal
@@ -184,9 +234,21 @@ def simulated_tp_mismatch(
     plain MLA (`plain_mla`: one latent, the same on every rank) or sparse MLA
     (`sparse_mla`: an indexer's keys beside it, the same on every rank too). NIXL's
     decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
-    larger producer whose KV heads are replicated; MLA's latent is exempt."""
+    larger producer whose KV heads are replicated; MLA's latent is exempt.
+    Decode context parallelism on either side (`remote_dcp_size` the peer's,
+    from NIXL's handshake) pairs equal TP sizes, this instance in
+    `dcp_scope_problems`'s scope whatever its own DCP size (the peer's
+    scope is checked from its NIXL metadata, `simulated_scope`)."""
     sim = vllm_config.simulation_config
     if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+        return None
+    local_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    if local_dcp_size > 1 or remote_dcp_size > 1:
+        problems = dcp_scope_problems(vllm_config, transfers=True)
+        if local_tp_size != remote_tp_size:
+            problems.append(f"local TP {local_tp_size} and remote TP {remote_tp_size}")
+        if problems:
+            return dcp_pair_refusal(local_dcp_size, remote_dcp_size, problems)
         return None
     if local_tp_size == remote_tp_size:
         return None

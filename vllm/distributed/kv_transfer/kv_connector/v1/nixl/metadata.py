@@ -81,6 +81,10 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Simulated real KV transfers: what of this instance's configuration falls
+    # outside the scope that pairs decode context parallelism (None: not
+    # simulated; `rank_kv.simulated_dcp_scope`).
+    simulated_scope: list[str] | None = None
 
 
 @dataclass

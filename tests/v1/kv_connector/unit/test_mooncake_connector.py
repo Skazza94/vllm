@@ -3190,6 +3190,7 @@ def _simulation_config(
         ),
         model_config=model,
         speculative_config=speculative,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         cache_config=SimpleNamespace(
             enable_prefix_caching=prefix_caching, mamba_ssm_cache_dtype=ssm_dtype
         ),

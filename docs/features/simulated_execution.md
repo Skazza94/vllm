@@ -143,8 +143,9 @@ other settings are rejected, GLM-5's defaults among them, which apply only
 with DCP on). On the CPU platform the CPU MLA backend keeps vLLM's DCP
 bookkeeping, whose kernels a simulation never runs: each DCP rank caches its
 share of every request's tokens, the scheduler's blocks spanning DCP times the
-local ones. It is supported there for one instance, over tensor parallelism
-alone, without a KV connector; other models (sparse or compressed MLA,
+local ones. It is supported there over tensor parallelism alone, for one
+instance or with real KV transfers over NIXL (see
+[Real KV transfers](#real-kv-transfers)); other models (sparse or compressed MLA,
 hybrids, attention without MLA, whose CPU backend returns no softmax LSE) are
 rejected. Pipeline and prefill context parallelism and EPLB are rejected, and
 so are models or layouts AISimulate has no timing for. Speculative decoding is timed for the native single-module MTP of
@@ -558,8 +559,28 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
       API server of its own (the port plus its rank) and an external router
       picks the rank on both instances; this needs NIXL, as
       `MooncakeConnector`'s bootstrap server is one an instance.
-* No pipeline or context parallelism, nor data parallelism of dense models
-  (independent engines).
+* No pipeline or prefill context parallelism, nor data parallelism of dense
+  models (independent engines).
+* Decode context parallelism for a dense MLA model over NIXL's pull
+  connector, at equal TP sizes, each instance's DCP 1 or its TP size, prefix
+  caching off. A DCP rank's blocks are the global pages vLLM gives it (rank
+  r every DCP-th page from r, the interleave NIXL resolves to the page), and
+  are filled and checked as those pages. The pages under the producer's
+  handoff are the payload; a later page (allocation padding) is moved by
+  NIXL or left untouched. Which blocks were moved is taken from the READs
+  NIXL posts, not from their contents: each block a READ wrote must hold its
+  page's pattern, and every other block the sentinel. The check counts each
+  kind apart (`payload_blocks`, `padding_blocks`, `untouched_blocks`). A
+  rank with an empty native READ selection takes NIXL's notify-only path
+  and reads nothing; a rank whose blocks all lie past the handoff may still
+  read allocation padding. Each rank's `kv_layout` record holds its resolved DCP
+  geometry. NIXL's handshake checks the peer's DCP, TP and page size. When
+  either side has DCP, it also checks both instances' scope, including the
+  side of DCP 1: this instance's from its config, the producer's from its
+  NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
+  (which slices no page by DCP rank), NIXL's push connector, prefix caching,
+  speculative decoding, pipeline, prefill context or data parallelism,
+  expert parallelism and unequal TP sizes, on either side.
 * Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
   forced to the CPU MLA kernel's 16.
 
@@ -685,9 +706,9 @@ the in-process executor) rather than the CPU platform's: an MLA model keeps
 its chunked prefill and prefix caching, and its blocks are not forced to the
 CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
 GPU's smallest: pass `--block-size` to match the deployment.
-Layers still pick the CPU platform's attention backends and kernels, which
-keep no decode-context-parallel cache: `--decode-context-parallel-size` above
-1 is refused there at startup.
+Layers still pick the CPU platform's attention backends and kernels:
+`--decode-context-parallel-size` above 1 builds for a dense MLA model only,
+whose CPU backend keeps vLLM's DCP bookkeeping in a simulation.
 Weight formats do not: a checkpoint published with quantized weights (FP8,
 MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
 DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, Kimi-K3's, the `-NVFP4` checkpoints) builds

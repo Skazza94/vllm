@@ -20,6 +20,7 @@ from vllm.config.simulation import KVTransferTiming
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlAgentMetadata,
     NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
@@ -37,6 +38,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    dcp_pair_refusal,
+    dcp_scope_problems,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -551,6 +556,97 @@ def refuse_foreign_state_geometry(worker) -> None:
     worker.add_remote_agent = add_remote_agent
 
 
+def dcp_peer_refusal(
+    vllm_config: VllmConfig,
+    local_dcp_size: int,
+    local_page: tuple[int, int],
+    remote_dcp_size: int,
+    metadata: NixlAgentMetadata,
+) -> str | None:
+    """Why a NIXL peer (its handshake `metadata`) cannot pair with this
+    instance (`local_page`: its block size and kernel blocks a block), if it
+    cannot. With decode context parallelism on either side both instances
+    must be in its scope (`dcp_scope_problems`: this one's from its config,
+    the peer's as its metadata states it, `simulated_scope`) and the peer
+    must hold pages of this instance's tokens, each block one page (no
+    kernel sub-blocks on either side): a rank's blocks are whole global
+    pages, and the checks pair them by that."""
+    remote_dcp = max(remote_dcp_size, metadata.dcp_size)
+    if local_dcp_size == 1 and remote_dcp == 1:
+        return None
+    problems = dcp_scope_problems(vllm_config, transfers=True)
+    scope = metadata.simulated_scope
+    if scope is None:
+        problems.append("a peer that states no simulated scope")
+    problems.extend(f"the peer's {problem}" for problem in scope or ())
+    if problems:
+        return dcp_pair_refusal(local_dcp_size, remote_dcp, problems)
+    remote = (metadata.block_size, metadata.physical_blocks_per_logical_kv_block)
+    if local_page != (remote[0], 1) or remote[1] != 1:
+        return (
+            "A NIXL peer with decode context parallelism (local DCP "
+            f"{local_dcp_size}, remote DCP {remote_dcp}) must hold pages of this "
+            "instance's tokens, one kernel block each: block size and kernel "
+            f"blocks a block {remote}, not {local_page}."
+        )
+    return None
+
+
+def validate_dcp_peer(worker) -> None:
+    """Refuse at the handshake, before any READ and whether bytes are checked
+    or not, a NIXL peer `dcp_peer_refusal` refuses."""
+    add = worker.add_remote_agent
+
+    def add_remote_agent(
+        metadata,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        remote_dcp_size=1,
+        *args,
+        **kwargs,
+    ):
+        local_page = (worker.block_size, worker._physical_blocks_per_logical_kv_block)
+        if refusal := dcp_peer_refusal(
+            worker.vllm_config, worker.dcp_size, local_page, remote_dcp_size, metadata
+        ):
+            raise ValueError(refusal)
+        return add(
+            metadata, remote_tp_rank, remote_tp_size, remote_dcp_size, *args, **kwargs
+        )
+
+    worker.add_remote_agent = add_remote_agent
+
+
+class NixlReadDestinations:
+    """The local blocks each READ NIXL posts writes, by request, as NIXL
+    selects them (`_read_blocks`'s spec): under decode context parallelism
+    the blocks a check expects moved, apart from those it must find
+    untouched; a notify-only READ names none. A request whose READs name
+    regions is recorded None."""
+
+    def __init__(self, worker) -> None:
+        self.blocks: dict[str, list[set[int]] | None] = {}
+        read = worker._read_blocks
+
+        def _read_blocks(*args, **kwargs):
+            spec = kwargs.get("read_spec", args[0] if args else None)
+            request = kwargs.get("request_id")
+            if spec.block_ids_by_region:
+                self.blocks[request] = None
+            elif (groups := self.blocks.setdefault(request, [])) is not None:
+                groups.extend(set() for _ in spec.local_block_ids[len(groups) :])
+                for group, ids in zip(groups, spec.local_block_ids):
+                    group.update(int(i) for i in ids)
+            return read(*args, **kwargs)
+
+        worker._read_blocks = _read_blocks
+
+    def take(self, req_id: str) -> list[set[int]] | None:
+        """A request's destinations by group, forgotten; None if NIXL posted
+        no READ for it or named regions."""
+        return self.blocks.pop(req_id, None)
+
+
 def validate_state_peer(worker, layout) -> None:
     """A hybrid's NIXL peer of another TP size must hold states of the same
     model at its own size: the peer's `ssm_sizes` (conv and SSM bytes, the
@@ -1010,6 +1106,11 @@ class RequestedRead:
     remote_block_counts: list[int] | None = None
     """The producer's blocks by group (NIXL): with a smaller producer block
     size, the sub-blocks of this instance's blocks it covers."""
+    remote_dcp_size: int = 1
+    """The producer's decode context parallel size (NIXL)."""
+    remote_num_tokens: int | None = None
+    """The tokens whose KV the producer hands off (NIXL): with decode context
+    parallelism, which global pages hold KV and which are padding."""
 
     @property
     def blocks(self) -> list[int]:
@@ -1047,6 +1148,8 @@ def requested_reads(metadata: object) -> list[RequestedRead]:
                     list(first) if first else [0] * len(groups),
                     value.remote.engine_id,
                     [len(group) for group in value.remote.block_ids],
+                    value.dcp_size,
+                    value.remote.num_tokens,
                 )
             )
     return reads

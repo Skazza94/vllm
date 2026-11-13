@@ -665,7 +665,7 @@ def test_simulate_forward_cpu_decode_context_parallel(tmp_path, monkeypatch) -> 
                     "kv_role": "kv_consumer",
                 }
             },
-            "the NixlConnector connector",
+            "kv_transfer_mode simulated",
         ),
         (
             "deepseek-v3",

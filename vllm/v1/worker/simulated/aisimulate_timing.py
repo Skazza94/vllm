@@ -828,9 +828,10 @@ class AisimulateTimingProvider:
                 "estimator's forward-pass config setting the DCP size alone, "
                 f"not with {', '.join(problems)}."
             )
+        # The interleave is resolved after this record is taken (NIXL sets
+        # it to the page); the runner records it (`_resolved_dcp_geometry`).
         return {
             "size": dcp,
-            "interleave": pc.cp_kv_cache_interleave_size,
             "comm_backend": pc.dcp_comm_backend,
             "q_replicate": bool(pc.dcp_q_replicate),
         }

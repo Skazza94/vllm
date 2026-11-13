@@ -3380,3 +3380,293 @@ class ModelTests(unittest.TestCase):
         with self.hub({"README.md": b"x"}), self.assertRaisesRegex(ValueError, "has no config.json"):
             self.models.resolve("org/empty", fetch=True)
         self.assertEqual(list((self.root / "models").glob("*/*/config.json")), [])
+
+
+DSV3_CONFIG = {"model_type": "deepseek_v3", "kv_lora_rank": 512, "qk_rope_head_dim": 64,
+               "num_hidden_layers": 61}
+
+
+def dcp_layout(rank: int, dcp: int, page: int = 16) -> str:
+    """A rank's layout record, with its resolved decode context parallelism."""
+    geometry = ({"size": dcp, "rank": rank % dcp, "page_tokens": [page],
+                 "scheduler_block_tokens": [page * dcp], "interleave": page} if dcp > 1 else None)
+    return line(kv_layout={"tp_rank": rank, "tp_size": 2, "block_bytes": 10, "bytes": 1600,
+                           "groups": [{"kind": "MLAAttentionSpec", "sliding_window": None, "block_size": page,
+                                       "layers": 1, "block_bytes": 10}],
+                           "decode_context_parallel": geometry})
+
+
+def dcp_pull(request: str, blocks: int, prompt: int) -> str:
+    """Decode's pull of a request of `prompt` tokens into `blocks` blocks, finished."""
+    req_id = f"cmpl-{request}-0-d"
+    return (line(kv_events={"allocated": {req_id: list(range(1, blocks + 1))}, "reads_posted": [req_id]})
+            + stepped(request, "d", prompt - 1, 1, prompt) + line(kv_events={"reads_done": [req_id]}))
+
+
+def dcp_check(request: str, rank: int, dcp: int, remote: int, tokens: int, blocks: int,
+              payload: int, padding: int = 0) -> dict:
+    """Decode's check of a request under decode context parallelism: its
+    payload, moved padding and untouched blocks of one group (10 bytes a block)."""
+    moved = payload + padding
+    return {"req_id": f"cmpl-{request}-0-d", "ok": True, "blocks": moved, "layers": 1, "bytes": moved * 10,
+            "groups": [{"group": 0, "blocks": moved, "bytes": moved * 10, "layers": 1,
+                        "payload_blocks": payload, "padding_blocks": padding,
+                        "untouched_blocks": blocks - moved, "padding_bytes": padding * 10,
+                        "untouched_bytes": (blocks - moved) * 10, "block_bytes": 10}],
+            "dcp": {"size": dcp, "rank": rank % dcp, "remote_size": remote, "remote_num_tokens": tokens},
+            "mismatched_bytes": 0}
+
+
+def dcp_read(peer: int, nbytes: int) -> str:
+    return line(kv_transfers={"load": {"count": 1, "bytes": nbytes,
+                                       "each": [[nbytes, 0.001, 0.0, 2, None, peer, None]]}})
+
+
+class DecodeContextParallelTests(unittest.TestCase):
+    def run_of(self, config: dict = DSV3_CONFIG, **sides) -> pd.Run:
+        with tempfile.TemporaryDirectory() as root:
+            model = Path(root) / "org--name" / "main"
+            model.mkdir(parents=True)
+            (model / "config.json").write_text(json.dumps(config))
+            raw = {"name": "t", "topology": "t", "model": "org/name", "client": "c",
+                   "control_network": "control", "router": {"gateway": "gw"},
+                   "prefill": {"node": "p", "kv_network": ["data0", "data1"]},
+                   "decode": {"node": "d", "kv_network": ["data0", "data1"],
+                              "decode_context_parallel_size": 2},
+                   "server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2}}
+            for key, value in sides.items():
+                raw[key] = {**raw[key], **value} if isinstance(raw.get(key), dict) else value
+            with mock.patch.object(pd.models, "MODELS", Path(root)):
+                return pd.parse(raw, Path(root) / "run.yaml")
+
+    def test_dcp_is_a_dense_mla_models_over_nixl_at_equal_tp(self) -> None:
+        run = self.run_of()
+        self.assertEqual((run.prefill.decode_context_parallel_size, run.decode.decode_context_parallel_size),
+                         (1, 2))
+        self.assertEqual(self.run_of(prefill={"decode_context_parallel_size": 2}).prefill
+                         .decode_context_parallel_size, 2)
+        switched = {"prefill": {"decode_context_parallel_size": 2, "kv_network": "kv"},
+                    "decode": {"decode_context_parallel_size": 1, "kv_network": "kv"}}
+        self.assertEqual(self.run_of(**switched).decode.kv_network, "kv")
+        with self.assertRaisesRegex(ValueError, "one switched network for both instances"):
+            self.run_of(prefill={"decode_context_parallel_size": 2}, decode={"decode_context_parallel_size": 1})
+        cases = {
+            "1 or the instance's TP size": {"decode": {"decode_context_parallel_size": 4}},
+            "positive integer": {"decode": {"decode_context_parallel_size": 0}},
+            "mooncake connector": {"server": {"timing": "zero", "connector": "mooncake",
+                                              "tensor_parallel_size": 2}},
+            "TP 1 and 2": {"prefill": {"tensor_parallel_size": 1, "kv_network": "data0"},
+                           "decode": {"kv_network": "data0"}},
+            "prefix caching": {"server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
+                                          "enable_prefix_caching": True}},
+            "prefix caching ": {"kv_check": False},
+            "data parallelism": {"decode": {"data_parallel_size": 2}},
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message.strip()):
+                self.run_of(**change)
+        for config in ({"model_type": "qwen3", "num_key_value_heads": 8},
+                       {**DSV3_CONFIG, "model_type": "deepseek_v32", "index_topk": 2048}):
+            with self.subTest(config=config["model_type"]), \
+                    self.assertRaisesRegex(ValueError, "a dense MLA model only"):
+                self.run_of(config)
+
+    def test_dcp_sources_follow_nixls_mapping(self) -> None:
+        self.assertEqual([pd.dcp_sources(r, 2, 1, 2) for r in range(2)], [[0], [1]])
+        self.assertEqual([pd.dcp_sources(r, 2, 2, 1) for r in range(2)], [[0, 1], [0, 1]])
+        self.assertEqual([pd.dcp_sources(r, 2, 2, 2) for r in range(2)], [[0], [1]])
+        self.assertEqual([pd.dcp_sources(r, 4, 4, 4) for r in range(4)], [[0], [1], [2], [3]])
+
+    PERFORMANCE = {"kv_check": False, "server": {"timing": "zero", "connector": "nixl", "tensor_parallel_size": 2,
+                                                 "enable_prefix_caching": False}}
+
+    def audit(self, decode: dict, prefill: dict | None = None, prefill_dcp: int = 1, decode_dcp: int = 2,
+              checks: bool = True, unread: frozenset = frozenset()):
+        # A coarser consumer reads across ranks: one switched network.
+        network = {"kv_network": "kv"} if prefill_dcp > decode_dcp else {}
+        run = self.run_of(prefill={"decode_context_parallel_size": prefill_dcp, **network},
+                          decode={"decode_context_parallel_size": decode_dcp, **network},
+                          **({} if checks else self.PERFORMANCE))
+
+        def records(text: str) -> list[dict]:
+            return [json.loads(x) for x in text.splitlines() if x]
+
+        held = line(kv_events={"allocated": {"cmpl-a-0-p": [1]}}) + line(kv_events={"sends_done": ["cmpl-a-0-p"]})
+        prefill = prefill or {r: dcp_layout(r, prefill_dcp) + held for r in range(2)}
+        logs = {"prefill": {(0, r): records(t) for r, t in prefill.items()},
+                "decode": {(0, r): records(t) for r, t in decode.items()}}
+        return pd._dcp_audit(run, {"prefill": 2, "decode": 2}, logs, unread)
+
+    def test_without_checks_the_pulls_bound_each_ranks_reads(self) -> None:
+        # 70 tokens, 5 pages: a DCP2 rank's 3 blocks hold 3 - r payload pages.
+        clean = {r: dcp_layout(r, 2) + dcp_pull("a", 3, 70) + dcp_read(r, (3 - r) * 10) for r in range(2)}
+        audit = self.audit(clean, checks=False)
+        self.assertEqual(audit["problems"], [])
+        self.assertEqual([audit["ranks"][r]["payload_blocks"] for r in range(2)], [3, 2])
+        unfinished = line(kv_events={"allocated": {"cmpl-a-0-d": [1, 2, 3]}, "reads_posted": ["cmpl-a-0-d"]})
+        cases = {
+            "decode rank 1 read 10 bytes, not between its 2 payload page(s) and its 3 block(s)": {
+                1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(1, 10)},
+            "decode rank 0 read 0 bytes, not between its 3 payload page(s)": {
+                0: dcp_layout(0, 2) + dcp_pull("a", 3, 70)},
+            "decode rank 1 finished 0 of its 1 pull(s)": {
+                1: dcp_layout(1, 2) + unfinished + stepped("a", "d", 69, 1, 70) + dcp_read(1, 20)},
+            "decode rank 1 logged no pull": {1: dcp_layout(1, 2) + dcp_read(1, 20)},
+            "1 READ(s) of no producer rank among [1]": {1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + line(
+                kv_transfers={"load": {"count": 1, "bytes": 20, "each": [[20, 0.001, 0.0, 2, None, None, None]]}})},
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message):
+                problems = self.audit({**clean, **change}, checks=False)["problems"]
+                self.assertTrue(any(message in p for p in problems), problems)
+        # A rank of payload without a read series is never accepted as notify-only.
+        problems = self.audit(clean, checks=False, unread=frozenset({1}))["problems"]
+        self.assertTrue(any("decode rank 1's TENT metrics lack tent_read_bytes_total" in p for p in problems),
+                        problems)
+
+    def test_each_rank_holds_its_global_pages_read_from_its_sources(self) -> None:
+        # 70 tokens: 5 pages of 16; a DCP2 rank's 3 blocks hold pages r, r+2, r+4.
+        clean = {r: dcp_layout(r, 2) + dcp_pull("a", 3, 70) + dcp_read(r, (3 - r) * 10)
+                 + line(kv_check=dcp_check("a", r, 2, 1, 70, 3, 3 - r)) for r in range(2)}
+        audit = self.audit(clean)
+        self.assertEqual(audit["problems"], [])
+        self.assertEqual(audit["ranks"][1], {"dcp_rank": 1, "sources": [1], "peers": [1], "reads": 1,
+                                             "pulls": 1, "payload_blocks": 2, "notify_only": 0, "payload": 2,
+                                             "padding": 0, "untouched": 1, "padding_bytes": 0,
+                                             "untouched_bytes": 10})
+        self.assertEqual(audit["released"], {0: [1, 1], 1: [1, 1]})
+        cases = {
+            "has 3 payload page(s), not the 2": {1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(1, 30)
+                                                 + line(kv_check=dcp_check("a", 1, 2, 1, 70, 3, 3))},
+            "1 READ(s) of no producer rank among [1]: [20, 0.001, 0.0, 2, None, 0]": {1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(0, 20)
+                                                             + line(kv_check=dcp_check("a", 1, 2, 1, 70, 3, 2))},
+            "not size 2 rank 1 from size 1": {1: dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(1, 20)
+                                              + line(kv_check=dcp_check("a", 1, 2, 2, 70, 3, 2))},
+            "decode rank 1's decode context parallelism is None": {
+                1: dcp_layout(1, 1) + dcp_pull("a", 3, 70) + dcp_read(1, 20) + line(kv_check=dcp_check("a", 1, 2, 1, 70, 3, 2))},
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message):
+                problems = self.audit({**clean, **change})["problems"]
+                self.assertTrue(any(message in p for p in problems), problems)
+        unreleased = {r: dcp_layout(r, 1) + line(kv_events={"allocated": {"cmpl-a-0-p": [1]}}) for r in range(2)}
+        problems = self.audit(clean, prefill=unreleased)["problems"]
+        self.assertTrue(any("prefill rank 0 finished sending 0 of the 1 request(s)" in p for p in problems), problems)
+
+    def test_every_read_names_a_source_and_sums_to_its_record(self) -> None:
+        clean = {r: dcp_layout(r, 2) + dcp_read(r, (3 - r) * 10)
+                 + line(kv_check=dcp_check("a", r, 2, 1, 70, 3, 3 - r)) for r in range(2)}
+        unnamed = line(kv_transfers={"load": {"count": 1, "bytes": 20,
+                                              "each": [[20, 0.001, 0.0, 2, None, None, None]]}})
+        miscounted = line(kv_transfers={"load": {"count": 2, "bytes": 20,
+                                                 "each": [[20, 0.001, 0.0, 2, None, 1, None]]}})
+        check = line(kv_check=dcp_check("a", 1, 2, 1, 70, 3, 2))
+        cases = {
+            "1 READ(s) of no producer rank among [1]": dcp_layout(1, 2) + dcp_pull("a", 3, 70) + unnamed + check,
+            "load of 2 READ(s), 20 bytes, is not its 1 READ(s)' sum": dcp_layout(1, 2) + dcp_pull("a", 3, 70) + miscounted + check,
+            "checked 20 bytes, not the 10 it read": dcp_layout(1, 2) + dcp_pull("a", 3, 70) + dcp_read(1, 10) + check,
+        }
+        for message, records in cases.items():
+            with self.subTest(message=message):
+                problems = self.audit({**clean, 1: records})["problems"]
+                self.assertTrue(any(message in p for p in problems), problems)
+
+    def one_page(self, payloads=(1, 0), reads=(dcp_read(0, 10), ""), read_series=(True, False),
+                 checks: bool = True, answered=(True, True)) -> dict:
+        """A complete verdict of one 10-token request (one 16-token page)
+        from prefill DCP 1 to decode DCP 2: rank 0 reads the page, rank 1
+        holds a block past the handoff, untouched (notify-only)."""
+        run = self.run_of(workload={"num_prompts": 1, "input_len": 10}, **({} if checks else self.PERFORMANCE))
+        layout = {"block_bytes": 10, "bytes": 1600, "groups": [
+            {"kind": "MLAAttentionSpec", "sliding_window": None, "block_size": 16, "layers": 1, "block_bytes": 10}]}
+
+        def ranked(rank: int, dcp: int) -> str:
+            record = json.loads(dcp_layout(rank, dcp))["kv_layout"]
+            return line(kv_layout={**record, **layout})
+
+        def checked(rank: int, payload: int) -> str:
+            check = dcp_check("a", rank, 2, 1, 10, 1, payload)
+            check["groups"][0]["first_logical_block"] = 0
+            return line(kv_check=check)
+
+        pull = line(kv_events={"allocated": {"cmpl-a-0-d": [1]}, "reads_posted": ["cmpl-a-0-d"]}) + line(
+            kv_events={"reads_done": ["cmpl-a-0-d"]})
+        prefill = [ranked(r, 1) + line(kv_events={"allocated": {"cmpl-a-0-p": [1]}})
+                   + stepped("a", "p", 0, 10, 10) + line(kv_events={"sends_done": ["cmpl-a-0-p"]}) for r in range(2)]
+        decode = [ranked(r, 2) + pull + stepped("a", "d", 9, 1, 10) + reads[r]
+                  + (checked(r, payloads[r]) if checks else "") for r in range(2)]
+        registered = {"tent_registered_buffer_bytes": 1600}
+        tents = {"prefill": [registered, registered],
+                 "decode": [None if not answered[r] else {**registered, "tent_read_bytes_total": 10 * payloads[r]}
+                            if read_series[r] else registered for r in range(2)]}
+        return pd.check({"completed": 1, "errors": [""]}, prefill, decode,
+                        {"control": 1, "data0": 200, "data1": 100}, run, tents)
+
+    def test_a_notify_only_rank_passes_the_complete_verdict(self) -> None:
+        verdict = self.one_page()
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["dcp"]["unread_accepted"], [1])
+        self.assertEqual((verdict["dcp"]["ranks"][1]["reads"], verdict["dcp"]["ranks"][1]["notify_only"]), (0, 1))
+        # Rank 0's page under the handoff missing: no READ, its block
+        # checked untouched, no read series.
+        missing = self.one_page(payloads=(0, 0), reads=("", ""), read_series=(False, False))
+        self.assertNotIn(0, missing["dcp"]["unread_accepted"])
+        cases = {
+            "decode rank 0's check of cmpl-a-0-d has 0 payload page(s), not the 1": missing,
+            "decode rank 0's TENT metrics lack tent_read_bytes_total, though it posted 0 READ(s)": missing,
+            # Rank 1 reads without a read series.
+            "decode rank 1's TENT metrics lack tent_read_bytes_total, though it posted 1 READ(s)": self.one_page(
+                payloads=(1, 1), reads=(dcp_read(0, 10), dcp_read(1, 10))),
+        }
+        for message, verdict in cases.items():
+            with self.subTest(message=message):
+                self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
+
+    def test_without_checks_a_notify_only_rank_passes_the_complete_verdict(self) -> None:
+        verdict = self.one_page(checks=False)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["dcp"]["unread_accepted"], [1])
+        self.assertEqual(verdict["dcp"]["ranks"][1]["payload_blocks"], 0)
+        # Rank 0's page under the handoff missing: no READ, no read series.
+        missing = self.one_page(reads=("", ""), read_series=(False, False), checks=False)
+        self.assertEqual(missing["dcp"]["unread_accepted"], [1])
+        cases = {
+            "decode rank 0 read 0 bytes, not between its 1 payload page(s)": missing,
+            "decode rank 0's TENT metrics lack tent_read_bytes_total, though it posted 0 READ(s), 1 pull(s) "
+            "with 1 payload page(s)": missing,
+            "decode's TENT metrics did not answer": self.one_page(checks=False, answered=(True, False)),
+        }
+        for message, verdict in cases.items():
+            with self.subTest(message=message):
+                self.assertTrue(any(message in p for p in verdict["problems"]), verdict["problems"])
+
+    def test_a_sharded_producers_ranks_all_feed_a_replicated_consumer(self) -> None:
+        # Producer DCP2 to consumer DCP1: each consumer rank holds every page,
+        # read from both producer ranks.
+        decode = {r: dcp_layout(r, 1) + dcp_pull("a", 5, 70) + dcp_read(0, 30) + dcp_read(1, 20)
+                  + line(kv_check=dcp_check("a", r, 1, 2, 70, 5, 5)) for r in range(2)}
+        audit = self.audit(decode, prefill_dcp=2, decode_dcp=1)
+        self.assertEqual(audit["problems"], [])
+        self.assertEqual([audit["ranks"][r]["peers"] for r in range(2)], [[0, 1], [0, 1]])
+
+    def test_the_server_is_launched_with_its_sides_dcp(self) -> None:
+        run = self.run_of()
+        flags = {role: pd._decode_context_parallel_flags(side) for role, side in
+                 (("prefill", run.prefill), ("decode", run.decode))}
+        self.assertEqual(flags, {"prefill": [], "decode": ["--decode-context-parallel-size", "2"]})
+
+    def test_a_dcp_ranks_check_holds_its_scheduler_blocks(self) -> None:
+        # 1060 tokens at 64 a page: 17 pages; a DCP2 rank holds
+        # cdiv(1060, 128) = 9 blocks, rank 1's last past the handoff.
+        layout = {"groups": [{"kind": "MLAAttentionSpec", "sliding_window": None, "block_size": 64,
+                              "layers": 1, "block_bytes": 10}]}
+
+        def problems(rank: int, payload: int, untouched: int) -> list[str]:
+            check = dcp_check("a", rank, 2, 1, 1060, payload + untouched, payload)
+            check["groups"][0]["first_logical_block"] = 0
+            return pd._byte_check_problems(layout, [check], 1060, {}, {"cmpl-a-0-d": 1060})
+
+        self.assertEqual(problems(0, 9, 0), [])
+        self.assertEqual(problems(1, 8, 1), [])
+        bad = problems(1, 8, 0)
+        self.assertTrue(any("holds 8 blocks, not the cdiv(1060, 64 * DCP 2)" in p for p in bad), bad)
