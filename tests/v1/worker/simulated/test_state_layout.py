@@ -381,7 +381,8 @@ def test_kimi_k3s_decode_rank_reads_its_latent_from_2r_and_each_kda_span_from_2r
     ]
     cut = [(0, 2, 0, K3_LATENT), (0, 3, 0, K3_LATENT // 2)]
     want = {first: cut + kda[first], second: kda[second]}
-    assert sl.coverage_problems(want, [_read(first, want[first]), _read(second, want[second])]) == []
+    reads = [_read(first, want[first]), _read(second, want[second])]
+    assert sl.coverage_problems(want, reads) == []
     v_of_second = sorted(kda[second])[2]
     cases = {
         "the latent from 2r + 1": [_read(first, kda[first]), _read(second, cut + kda[second])],
@@ -395,6 +396,133 @@ def test_kimi_k3s_decode_rank_reads_its_latent_from_2r_and_each_kda_span_from_2r
         ],
         "the recurrent state twice": [
             _read(first, want[first]), _read(second, kda[second]), _read(first, [sorted(kda[first])[3]])
+        ],
+    }
+    for name, reads in cases.items():
+        assert sl.coverage_problems(want, reads), name
+
+
+# The published Qwen3.5-27B's text config, the layout's source, as a real
+# `Qwen3_5TextConfig`: 64 layers, 48 gated delta-net and 16 full-attention
+# ones interleaved every fourth layer, 16 key heads and 48 value heads of
+# 128 (conv kernel 4), 4 attention KV heads of head_dim 256.
+QWEN3_5_27B_TEXT_CONFIG = None
+
+
+def _qwen3_5_27b_text_config():
+    global QWEN3_5_27B_TEXT_CONFIG
+    if QWEN3_5_27B_TEXT_CONFIG is None:
+        from transformers import Qwen3_5TextConfig
+
+        QWEN3_5_27B_TEXT_CONFIG = Qwen3_5TextConfig(
+            hidden_size=5120,
+            num_hidden_layers=64,
+            full_attention_interval=4,
+            layer_types=[
+                "full_attention" if layer % 4 == 3 else "linear_attention"
+                for layer in range(64)
+            ],
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=256,
+            linear_num_key_heads=16,
+            linear_num_value_heads=48,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            mamba_ssm_dtype="float32",
+        )
+    return QWEN3_5_27B_TEXT_CONFIG
+
+
+# The 27B's 4 attention KV heads of head_dim 256, K and V, BF16: 1,024 B a
+# token on a decode TP4 rank, an 800-token page of 819,200 B.
+QWEN3_5_27B_ATTENTION_PAGE = 819200
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_qwen3_5s_gdn_state_splits_tp_1_2_4_and_8(tp):
+    """The 27B geometry (16 key heads and 48 value heads of 128, conv kernel
+    4): the GDN layout splits over every TP size the unequal pairs use, conv
+    `Q|K|V` columns of 3 BF16 values, SSM heads of a 128x128 FP32 state."""
+    layout = sl.layout_from_config(_qwen3_5_27b_text_config(), 2, 4)
+    assert layout.family == "gdn"
+    assert layout.components == (("Q", 2048), ("K", 2048), ("V", 6144))
+    assert layout.ssm_heads == 48
+    assert layout.ssm_head_bytes == 128 * 128 * 4
+    assert layout.divides(tp)
+    assert layout.local_sizes(tp) == (61440 // tp, 3145728 // tp)
+
+
+def _qwen3_5_27b_state_rows(rank):
+    """Decode TP4 rank `rank`'s state rows, one per conv component then the
+    recurrent heads (`layout_from_config`, the published 27B's text
+    config)."""
+    layout = sl.layout_from_config(_qwen3_5_27b_text_config(), 2, 4)
+    return [
+        {
+            "region": 1, "offset": s.offset, "length": s.length, "state": True,
+            "heads": None, "span": s, "group": 1, "logical": True,
+        }
+        for s in layout.spans(rank, 4)
+    ]
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_qwen3_5s_decode_tp4_rank_reads_its_800_token_blocks_from_prefill_tp8(rank):
+    """Prefill TP8 (400-token attention blocks) -> decode TP4 (its 400
+    request aligned to 800: an attention page must cover a state's page). A
+    2,000-token prefill makes 5 producer attention blocks and 3 of the
+    consumer's: its 800-token pages are 819,200 B a page at TP 4 (one of 4
+    KV heads, head_dim 256, K and V, BF16), the last's tail half covered,
+    409,600 B NIXL zeroes on receive; attention comes from 2r alone, and
+    each of Q, K, V and the recurrent state's halves from 2r and 2r + 1,
+    once. Kimi-K3's rule (`test_kimi_k3s_decode_rank_reads_its_latent...`)
+    at the 27B's GDN components: 512 conv columns of 6 B a component per
+    rank, split in two over the producers, and 12 FP32 heads of 65,536."""
+    layout = sl.layout_from_config(_qwen3_5_27b_text_config(), 2, 4)
+    page = QWEN3_5_27B_ATTENTION_PAGE
+    attn = {
+        "region": 0, "offset": 0, "length": page, "state": False,
+        "heads": (rank,), "span": None, "group": 0, "logical": True,
+    }
+    state = _qwen3_5_27b_state_rows(rank)
+    attention = sl.expected_pieces([attn], [0, 1, 2], rank, 4, 8, layout, 4)
+    first, second = 2 * rank, 2 * rank + 1
+    assert attention == {
+        first: [(0, 0, 0, page), (0, 1, 0, page), (0, 2, 0, page)]
+    }
+    mba = sl.expected_pieces(state, [3], rank, 4, 8, layout, 4)
+    assert sorted(mba[first]) == [
+        (1, 3, 0, 1536), (1, 3, 3072, 1536), (1, 3, 6144, 4608), (1, 3, 15360, 393216)
+    ]
+    assert sorted(mba[second]) == [
+        (1, 3, 1536, 1536), (1, 3, 4608, 1536), (1, 3, 10752, 4608),
+        (1, 3, 408576, 393216),
+    ]
+    cut = [(0, 0, 0, page), (0, 1, 0, page), (0, 2, 0, page // 2)]
+    want = {first: cut + mba[first], second: mba[second]}
+    reads = [_read(first, want[first]), _read(second, want[second])]
+    assert sl.coverage_problems(want, reads) == []
+    v_of_second = sorted(mba[second])[2]
+    cases = {
+        "the attention from 2r + 1": [
+            _read(first, mba[first]), _read(second, cut + mba[second])
+        ],
+        "the uncovered half read": [
+            _read(first, attention[first] + mba[first]), _read(second, mba[second])
+        ],
+        "V missing from 2r + 1": [
+            _read(first, want[first]),
+            _read(second, [p for p in mba[second] if p != v_of_second]),
+        ],
+        "V from 2r instead of 2r + 1": [
+            _read(first, want[first] + [v_of_second]),
+            _read(second, [p for p in mba[second] if p != v_of_second]),
+        ],
+        "the recurrent state twice": [
+            _read(first, want[first]), _read(second, mba[second]),
+            _read(first, [sorted(mba[first])[3]]),
         ],
     }
     for name, reads in cases.items():

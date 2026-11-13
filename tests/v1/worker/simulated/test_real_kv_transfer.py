@@ -7,6 +7,7 @@ import math
 import os
 import re
 import time
+from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,10 @@ from vllm.platforms import current_platform
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cpu(), reason="Real KV transfers start with CPU buffers."
 )
+
+# The 27B fixtures read AISimulate's published model config; when the SDK is
+# absent the rest of this file must still collect and run.
+REAL = find_spec("aisimulate_core") is not None
 
 SIMULATED_NIXL = "vllm.v1.worker.simulated.kv_nixl"
 SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
@@ -345,6 +350,47 @@ QWEN3_5_MOE = {
 def qwen3_5_model_dir(tmp_path_factory):
     directory = tmp_path_factory.mktemp("tiny-qwen3-5-moe")
     (directory / "config.json").write_text(json.dumps(QWEN3_5_MOE))
+    return str(directory)
+
+
+_QWEN3_5_27B_CONFIG = None
+
+
+def qwen3_5_27b_config():
+    """The published Qwen3.5-27B configuration, the one AISimulate's bundled
+    configs carry (and its timing provider compares against)."""
+    global _QWEN3_5_27B_CONFIG
+    if _QWEN3_5_27B_CONFIG is None:
+        import aisimulate_core
+
+        path = os.path.join(
+            os.path.dirname(aisimulate_core.__file__),
+            "model_configs",
+            "Qwen--Qwen3.5-27B_config.json",
+        )
+        with open(path) as f:
+            _QWEN3_5_27B_CONFIG = json.load(f)
+    return _QWEN3_5_27B_CONFIG
+
+
+QWEN3_5_27B_AISIMULATE = {
+    "timing": "aisimulate",
+    "timing_args": {"gpu": "h100", "target_model": "Qwen/Qwen3.5-27B"},
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_27b_model_dir(tmp_path_factory):
+    """The published Qwen3.5-27B configuration, the one AISimulate's timing
+    provider compares against (16 key heads and 48 value heads of 128; 4
+    attention KV heads of head_dim 256, a page 4,096 B a token at TP 1 and
+    1,024 at TP 4; 48 gated delta-net layers beside 16 full attention
+    ones). Its attention blocks are 800 tokens (416 at TP 8; a page must
+    cover a state's page), 400 when asked at TP 8."""
+    directory = tmp_path_factory.mktemp("qwen3-5-27b")
+    if not REAL:
+        pytest.skip("the published Qwen3.5-27B config comes from AISimulate")
+    (directory / "config.json").write_text(json.dumps(qwen3_5_27b_config()))
     return str(directory)
 
 
@@ -1363,6 +1409,145 @@ def test_real_transfers_pair_kimi_k3_from_prefill_tp8_to_decode_tp4_over_nixl_on
     assert simulated_tp_mismatch(prefix, 4, 8, nixl_consumer=True).endswith(
         "Kimi-K3 at unequal TP sizes with prefix caching."
     )
+
+
+# The attention block each TP size gives Qwen3.5-27B, through the real engine
+# path (the model builds, AISimulate prices its steps, then the platform
+# aligns the hybrid's block size).
+ENGINE_BLOCK_SIZES = r"""
+import json, sys
+
+def main():
+    model, tp, block_size, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    from vllm import LLM
+    kwargs = {
+        "model": model,
+        "skip_tokenizer_init": True,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": tp,
+        "max_model_len": 4096,
+        "kv_cache_memory_bytes": 1 << 30,
+        "max_num_batched_tokens": 2048,
+        "language_model_only": True,
+        "enable_prefix_caching": False,
+        "enforce_eager": True,
+        "simulation_config": {
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "h100", "target_model": "Qwen/Qwen3.5-27B"},
+        },
+    }
+    if block_size != "auto":
+        kwargs["block_size"] = int(block_size)
+    llm = LLM(**kwargs)
+    config = llm.llm_engine.engine_core.engine_core.scheduler.kv_cache_config
+    (attn,) = [
+        g.kv_cache_spec.block_size for g in config.kv_cache_groups
+        if type(g.kv_cache_spec).__name__ == "FullAttentionSpec"
+    ]
+    with open(out, "w") as f:
+        json.dump(attn, f)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_27b_attention_block_sizes(qwen3_5_27b_model_dir, tmp_path_factory):
+    """The attention block each TP size picks for the published Qwen3.5-27B,
+    its engine, AISimulate timing and platform initialization for real: the
+    automatic size, and what an explicit 400 becomes."""
+    import subprocess
+    import sys
+
+    work = tmp_path_factory.mktemp("qwen3-5-27b-sizes")
+    script = work / "sizes.py"
+    script.write_text(ENGINE_BLOCK_SIZES)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "GLOO_SOCKET_IFNAME": "lo",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    out = {}
+    for tp in (1, 2, 4, 8):
+        for asked in ("auto", "400"):
+            result = work / f"sizes-{tp}-{asked}.json"
+            done = subprocess.run(
+                [sys.executable, str(script), qwen3_5_27b_model_dir,
+                 str(tp), asked, str(result)],
+                env=env, timeout=900,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            assert done.returncode == 0, done.stdout[-4000:]
+            out[(tp, asked)] = json.loads(result.read_text())
+    return out
+
+
+@pytest.mark.parametrize(
+    "tp, asked, want",
+    [
+        (1, "auto", 800), (2, "auto", 800), (4, "auto", 800), (8, "auto", 416),
+        (1, "400", 800), (2, "400", 800), (4, "400", 800), (8, "400", 400),
+    ],
+    ids=["tp1-auto", "tp2-auto", "tp4-auto", "tp8-auto",
+         "tp1-400", "tp2-400", "tp4-400", "tp8-400"],
+)
+def test_qwen3_5_27b_picks_its_attention_block_sizes(
+    qwen3_5_27b_attention_block_sizes, tp, asked, want
+):
+    """The published Qwen3.5-27B's attention blocks from the real
+    initialization (the CPU platform's simulated rule, the hybrid
+    alignment): automatic 800 at TP 1/2/4 and 416 at TP 8 (its 4 KV heads
+    replicated), an explicit 400 aligned back to 800 where a page must cover
+    a state's page and kept at TP 8 (its state page fits)."""
+    assert qwen3_5_27b_attention_block_sizes[(tp, asked)] == want
+
+
+def test_qwen3_5_27bs_attention_block_sizes_predict_the_tp_pairs(
+    qwen3_5_27b_model_dir, qwen3_5_27b_attention_block_sizes, ds_conv_layout
+):
+    """A size-derived prediction over the 12 directed unequal pairs of TP
+    1, 2, 4, 8, from the sizes the real initialization picked: the state-side
+    gate (`pairing_problem`, real engine configs) admits each — the GDN
+    layout splits over both sizes, the 4 KV heads split or replicate evenly —
+    and the handshake's block-size rule (`validate_state_peer`: this
+    instance's block or a divisor of it, checked before any READ, bytes
+    checked or not) pairs exactly the six without TP 8, all 800 blocks; TP
+    8's automatic 416 divides 800 neither way. The rule itself is
+    exercised at the real handshake by the refusal test (a larger producer
+    refused); the six TP8 verdicts await the e2e handshakes (stage 3)."""
+    from vllm.v1.worker.simulated import state_layout as sl
+
+    sizes = {
+        tp: qwen3_5_27b_attention_block_sizes[(tp, "auto")] for tp in (1, 2, 4, 8)
+    }
+    configs = {
+        tp: engine_config(
+            qwen3_5_27b_model_dir, dtype="bfloat16", tensor_parallel_size=tp
+        )
+        for tp in (1, 2, 4, 8)
+    }
+    layout = sl.layout_for(configs[1])
+    assert layout.family == "gdn" and sl.layout_for(configs[8]) == layout
+    accepted = {}
+    for prefill in (1, 2, 4, 8):
+        for decode in (1, 2, 4, 8):
+            if decode == prefill:
+                continue
+            assert sl.pairing_problem(configs[decode], decode, prefill) is None, (
+                decode, prefill
+            )
+            # The peer validator's own condition
+            # (`worker.block_size % metadata.block_size`), on the sizes the
+            # engine really picked: a prediction while the guard runs at TP 1.
+            accepted[(prefill, decode)] = sizes[decode] % sizes[prefill] == 0
+    assert accepted == {
+        (p, d): 8 not in (p, d)
+        for p in (1, 2, 4, 8) for d in (1, 2, 4, 8) if d != p
+    }
 
 
 def test_kimi_k3s_kda_state_dtypes_follow_kdas_own_rule(tmp_path_factory, ds_conv_layout):
@@ -2392,6 +2577,88 @@ def test_a_hybrid_peer_of_another_block_size_is_refused_whether_or_not_bytes_are
         del llm
 
 
+@pytest.mark.parametrize(
+    "flags, role",
+    [
+        ({}, "kv_producer"),
+        ({"kv_pattern_check": True}, "kv_consumer"),
+    ],
+    ids=["checks-off", "checks-on"],
+)
+def test_qwen3_5_27bs_peer_of_the_reverse_blocks_is_refused_before_a_read(
+    qwen3_5_27b_model_dir, tmp_path, monkeypatch, ds_conv_layout, flags, role
+):
+    """The published Qwen3.5-27B's peer validator, whether bytes are checked
+    or not, against a peer's real `NixlAgentMetadata` (built from this
+    worker's own registration, as the connector builds it): an instance of
+    800-token blocks refuses a producer of 1,600 (higher and no divisor —
+    the larger-producer arm the reverse pair's 800-into-400 arithmetic hits;
+    the 27B's exact reverse numbers are the stage-3 handshake) and one of
+    400 at equal TP, whose regions are another size's. Both refused at the
+    handshake, before any READ. AISimulate prices the steps."""
+    from vllm import LLM
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
+    llm = LLM(
+        model=qwen3_5_27b_model_dir,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=2600,
+        kv_cache_memory_bytes=1 << 30,
+        max_num_batched_tokens=2048,
+        block_size=400,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        language_model_only=True,
+        simulation_config={
+            "simulate_forward": True,
+            "kv_transfer_mode": "real",
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "h100", "target_model": "Qwen/Qwen3.5-27B"},
+            **({"log_path": str(tmp_path / "steps")} if flags else {}),
+            **flags,
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": role,
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    try:
+        worker = get_kv_transfer_group().connector_worker
+        # The 400 request above aligned to the attention page's cover of a
+        # state's page (the platform's hybrid alignment).
+        assert worker.block_size == 800
+        for remote, match in (
+            (worker.block_size * 2, "or a divisor of it"),
+            (worker.block_size // 2, "of equal TP holds its regions otherwise"),
+        ):
+            peer = NixlAgentMetadata(
+                engine_id="other-engine", agent_metadata=b"",
+                kv_caches_base_addr=[0], device_id=0,
+                num_blocks=worker.num_blocks,
+                block_lens=list(worker.block_len_per_layer),
+                block_strides=list(worker.block_stride_per_layer),
+                kv_cache_layout=worker.kv_cache_layout, block_size=remote,
+                ssm_sizes=tuple(worker._mamba_ssm_size),
+                attn_backend_name=worker.backend_name,
+                physical_blocks_per_logical_kv_block=(
+                    worker._physical_blocks_per_logical_kv_block
+                ),
+            )
+            with pytest.raises(ValueError, match=match):
+                worker.add_remote_agent(peer, 0, worker.world_size)
+    finally:
+        del llm
+
+
 # One side of a NIXL pair, in a process of its own (the connector is a
 # process-wide singleton): the producer serves one prompt and waits; the
 # consumer reads it, recording the native descriptor lists and transfers.
@@ -2413,9 +2680,16 @@ def main():
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer import get_kv_transfer_group
     producer = role == "producer"
-    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
-                  "timing": "linear", "timing_args": {"fixed_us": 100}}
     kwargs = json.loads(kwargs)
+    # The pair's timing: AISimulate where a case asks for it, the linear
+    # fixed-step the earlier peers ran on otherwise.
+    timing = kwargs.pop("timing", "linear")
+    timing_args = kwargs.pop(
+        "timing_args", {"fixed_us": 100} if timing == "linear" else {}
+    )
+    max_model_len = kwargs.pop("max_model_len", 256)
+    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+                  "timing": timing, "timing_args": timing_args}
     check = kwargs.pop("check", True)
     prompt_len = kwargs.pop("prompt_len", 200)
     # Consumer: a connector leaving a byte of a block's uncovered tail (one
@@ -2428,7 +2702,7 @@ def main():
     if speculative:
         simulation["spec_acceptance_rates"] = [0.7] * speculative["num_speculative_tokens"]
     llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
-              max_model_len=256, kv_cache_memory_bytes=int(memory),
+              max_model_len=max_model_len, kv_cache_memory_bytes=int(memory),
               max_num_batched_tokens=64, enable_prefix_caching=False,
               enforce_eager=True, simulation_config=simulation,
               kv_transfer_config={
@@ -2971,10 +3245,13 @@ def mtp(k):
         (MIMO_V2_FLASH, {}),
         (MIMO_V2_FLASH_UNEQUAL, {}),
         (KIMI_K3, {}),
+        # The published 27B config is resolved lazily: its file comes from
+        # AISimulate's bundled model configs, and collection must not need it.
+        (None, {"language_model_only": True, **QWEN3_5_27B_AISIMULATE}),
     ],
     ids=["nemotron-3-unequal", "qwen3.5", "qwen3.5-mtp-k1", "qwen3.5-mtp-k3", "deepseek-v3.2",
          "deepseek-v3.2-mtp-k1", "deepseek-v3.2-mtp-k3", "mimo-v2-flash", "mimo-v2-flash-unequal",
-         "kimi-k3"],
+         "kimi-k3", "qwen3.5-27b"],
 )
 def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     """A producer and a consumer of different pools (their own processes,
@@ -2982,7 +3259,17 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
     consumer's native READs pair, in order and with duplicates, each span of
     our selection of its blocks with the same region and offset of the
     producer's block at the same place, and its byte check passes."""
-    p, c = run_nixl_peers(config, kwargs, tmp_path)
+    published = config is None
+    if published:
+        if not REAL:
+            pytest.skip("the published Qwen3.5-27B config comes from AISimulate")
+        config = qwen3_5_27b_config()
+    p, c = run_nixl_peers(
+        config, kwargs, tmp_path,
+        memory=(
+            (512 << 20, 1 << 30) if published else (8 << 20, 12 << 20)
+        ),
+    )
     # Distinct pools and backing storage.
     assert p["num_blocks"] != c["num_blocks"]
     assert not set(p["bases"]) & set(c["bases"])
@@ -3294,7 +3581,10 @@ def test_nixl_peers_check_pages_completed_by_accepted_mtp_drafts(
         assert all(c["ok"] for c in c_checks), c_checks
 
 
-def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
+def run_nixl_peers(
+    config, kwargs, tmp_path, consumer_kwargs=None, logs=False,
+    memory=(8 << 20, 12 << 20),
+):
     """Run NIXL_PEER's producer and consumer; their JSON records (the
     consumer's with its output when `logs`)."""
     import socket
@@ -3326,7 +3616,7 @@ def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
                 json.dumps(own), str(out), str(memory), *extra]
 
     producer = subprocess.Popen(
-        run("producer", produced, 8 * 1024**2),
+        run("producer", produced, memory[0]),
         env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
     )
     try:
@@ -3336,7 +3626,7 @@ def run_nixl_peers(config, kwargs, tmp_path, consumer_kwargs=None, logs=False):
             assert time.monotonic() < deadline, "no producer output"
             time.sleep(0.5)
         consumer = subprocess.run(
-            run("consumer", consumed, 12 * 1024**2, str(produced)),
+            run("consumer", consumed, memory[1], str(produced)),
             env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
             timeout=600,
             stdout=subprocess.PIPE,

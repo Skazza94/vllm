@@ -524,11 +524,14 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           whose state splits over both sizes and whose KV heads split or
           replicate evenly on each side; where the two sizes give it
           different attention block sizes (Nemotron-3-Nano: 1056 tokens at
-          TP 4, 2112 at TP 2), only a decode block size that is a multiple
-          of the prefill's, as NIXL supports: each decode block read as
-          several prefill blocks, the states one to one, each attention
-          page read whole from one producer (NIXL splits no head slice at
-          a block-size ratio), without prefix caching for byte checks.
+          TP 4, 2112 at TP 2; Qwen3.5-27B: 800 at TP 1, 2 and 4, 416 at
+          TP 8, a requested 400 kept at TP 8 and aligned to 800 below it;
+          416 and 800 pair with neither), only a decode block size that is
+          a multiple of the prefill's, as NIXL supports: each decode block
+          read as several prefill blocks, the states one to one, each
+          attention page read whole from one producer (NIXL splits no head
+          slice at a block-size ratio), without prefix caching for byte
+          checks.
           This follows the simulated backend's FlashAttention-style kernel
           blocks (kernel block = attention block); a backend with small
           fixed kernel blocks (FlashInfer's), where NIXL pairs blocks by
