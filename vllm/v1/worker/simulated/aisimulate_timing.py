@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs
 from vllm.config.simulation import DSA_FP8_CACHE_DTYPES
 from vllm.logger import init_logger
 from vllm.v1.worker.simulated.timing import (
@@ -563,7 +564,6 @@ class AisimulateTimingProvider:
                 "modality, no multimodal embeddings)."
             )
         topology = self._topology(vllm_config)
-        dcp = self._decode_context_parallel(vllm_config)
         target, local_config = self._target(vllm_config, target_model)
         bundled = os.path.join(
             os.path.dirname(aisimulate_core.__file__),
@@ -646,11 +646,13 @@ class AisimulateTimingProvider:
             and vllm_config.cache_config.cache_dtype == "auto"
         ):
             raise ValueError(
-                "GLM-5 on B200 resolves kv_cache_dtype auto to its packed FP8 "
-                "sparse-MLA cache on the GPU and to BF16 on this host: pass "
-                "kv_cache_dtype fp8 (the deployment's default) or bfloat16."
+                "GLM-5 on B200 resolves kv_cache_dtype auto to standard FP8 "
+                "with FlashInfer on the GPU and to BF16 on CPU: pass "
+                "kv_cache_dtype fp8 (packed FlashMLA in CPU simulation) or "
+                "bfloat16 (without DCP)."
             )
         kv_format, kv_mode = self._kv_cache_mode(vllm_config, v4, dsa)
+        dcp = self._decode_context_parallel(vllm_config, kv_format)
 
         nextn, speculation = self._speculation(vllm_config, target_config, topology)
 
@@ -798,43 +800,76 @@ class AisimulateTimingProvider:
         )
 
     @staticmethod
-    def _decode_context_parallel(vllm_config: "VllmConfig") -> dict[str, Any] | None:
-        """Decode context parallelism as AISimulate prices it, None without:
-        a dense MLA model's, inside its tensor-parallel group. The estimator
-        takes the requests' global context lengths and stripes the decode
-        KV, adding the merge collectives; its forward-pass config sets the
-        DCP size alone, so it prices vLLM's default merge (all-gather and
-        reduce-scatter, the query all-gathered), and no other."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
+    def _decode_context_parallel(
+        vllm_config: "VllmConfig", kv_format: str
+    ) -> dict[str, Any] | None:
+        """The SDK takes global context lengths and the DCP size alone. Its
+        vLLM path gathers queries and merges the striped KV outputs with ag_rs.
+        Sparse MLA uses the CPU simulation's packed FlashMLA cache layout.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            plain_mla,
+            sparse_mla,
+        )
+        from vllm.platforms import current_platform
 
         pc = vllm_config.parallel_config
         dcp = pc.decode_context_parallel_size
         if dcp == 1:
             return None
+
+        model = vllm_config.model_config
+        sparse = sparse_mla(model)
         problems = []
-        if not plain_mla(vllm_config.model_config):
-            problems.append("a model other than dense MLA")
+        if sparse:
+            if not current_platform.is_cpu() or vllm_config.kv_transfer_config:
+                problems.append("sparse MLA outside one simulated CPU instance")
+            if kv_format != "fp8_ds_mla":
+                problems.append(
+                    f"sparse MLA KV cache {kv_format} (requires packed fp8_ds_mla)"
+                )
+            indexer_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
+            if indexer_dtype != "fp8":
+                problems.append(
+                    f"sparse MLA indexer KV cache {indexer_dtype} (not fp8)"
+                )
+        elif not plain_mla(model):
+            problems.append(
+                "a model other than dense or DeepSeek-V3.2-style sparse MLA"
+            )
         if pc.data_parallel_size > 1:
             problems.append(f"data parallelism {pc.data_parallel_size}")
         if pc.dcp_comm_backend != "ag_rs":
             problems.append(f"dcp_comm_backend {pc.dcp_comm_backend}")
-        if pc.dcp_q_replicate:
-            problems.append("dcp_q_replicate")
+        # Match DeepseekV2Attention: an explicitly set env var wins.
+        q_from_env = envs.is_set("VLLM_DCP_Q_REPLICATE")
+        q_replicate = (
+            envs.VLLM_DCP_Q_REPLICATE if q_from_env else bool(pc.dcp_q_replicate)
+        )
+        if q_replicate:
+            source = " from VLLM_DCP_Q_REPLICATE" if q_from_env else ""
+            problems.append(f"dcp_q_replicate{source}")
         if problems:
             raise ValueError(
                 f"The aisimulate timing provider times decode context parallelism "
-                f"(decode_context_parallel_size {dcp}) for a dense MLA model "
-                "with dcp_comm_backend ag_rs and dcp_q_replicate off, the "
-                "estimator's forward-pass config setting the DCP size alone, "
+                f"(decode_context_parallel_size {dcp}) for dense MLA or packed "
+                "sparse MLA with dcp_comm_backend ag_rs and dcp_q_replicate off, "
+                "the estimator's forward-pass config setting the DCP size alone, "
                 f"not with {', '.join(problems)}."
             )
-        # The interleave is resolved after this record is taken (NIXL sets
-        # it to the page); the runner records it (`_resolved_dcp_geometry`).
-        return {
+        # The runner records the resolved interleave after cache initialization.
+        record = {
             "size": dcp,
             "comm_backend": pc.dcp_comm_backend,
-            "q_replicate": bool(pc.dcp_q_replicate),
+            "q_replicate": q_replicate,
         }
+        if sparse:
+            record.update(
+                attention_backend="FLASHMLA_SPARSE",
+                kv_cache_format=kv_format,
+                indexer_kv_cache_dtype=indexer_dtype,
+            )
+        return record
 
     @staticmethod
     def _topology(vllm_config: "VllmConfig") -> dict[str, Any]:

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.v1.worker.simulated.utils import sim_req, sim_step
+from vllm.platforms import current_platform
 from vllm.v1.worker.simulated.timing import get_timing_provider
 
 REAL = importlib.util.find_spec("aisimulate_core") is not None
@@ -2404,3 +2405,211 @@ def test_modelopt_checkpoints_are_timed_with_their_own_precision(
     assert a["resolved_config"]["estimation_mode"] == "op_level"
     step = sim_step(0, sim_req("a", 1024, 0, 1024), sim_req("b", 1, 512, 512))
     assert p.estimate(step).device_s > 0
+
+
+def sparse_dcp_config(
+    tmp_path, target, tp, dcp, *, kv_cache_dtype="fp8_ds_mla", **kwargs
+):
+    """Use the published geometry without requiring GPU weight kernels."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    raw = bundled_config(target)
+    raw.pop("quantization_config", None)
+    directory = model_dir(tmp_path, "sparse-dcp", raw, derived=True)
+    return EngineArgs(
+        model=directory,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=4096,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        kv_cache_dtype=kv_cache_dtype,
+        simulation_config={"simulate_forward": True, "timing": "aisimulate"},
+        **kwargs,
+    ).create_engine_config()
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "target, gpu, tp, dcp, weight_mode, alias",
+    [
+        ("deepseek-ai/DeepSeek-V3.2", "h200", 8, 2, "fp8_block", "fp8"),
+        ("deepseek-ai/DeepSeek-V3.2", "h200", 8, 4, "fp8_block", "fp8_ds_mla"),
+        ("nvidia/GLM-5-NVFP4", "b200", 4, 2, "nvfp4", "fp8_e4m3"),
+        ("nvidia/GLM-5-NVFP4", "b200", 4, 4, "nvfp4", "fp8_ds_mla"),
+    ],
+)
+def test_sparse_mla_dcp_prices_global_lengths(
+    tmp_path, monkeypatch, target, gpu, tp, dcp, weight_mode, alias
+):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    reference_config = {
+        "model": target,
+        "system": f"{gpu}_sxm",
+        "backend": "vllm",
+        "worker_type": "aggregated",
+        "tp": tp,
+        "pp": 1,
+        "attention_dp": 1,
+        "dcp": dcp,
+        "moe_tp_size": tp,
+        "moe_ep_size": 1,
+        "cp_size": 1,
+        "gemm_quant_mode": weight_mode,
+        "moe_quant_mode": weight_mode,
+        "fmha_quant_mode": "bfloat16",
+        "kvcache_quant_mode": "fp8",
+        "comm_quant_mode": "half",
+        "nextn": 0,
+        "estimation_mode": "op_level",
+        "database_mode": "SILICON",
+        "fallback_policy": "deny",
+    }
+    query = {
+        "scheduled_requests": {
+            "num_prefill_requests": 1,
+            "sum_prefill_tokens": 257,
+            "var_prefill_length": 0,
+            "sum_prefill_kv_tokens": 2049,
+            "num_decode_requests": 2,
+            "sum_decode_kv_tokens": 3074,
+            "var_decode_kv_tokens": 256,
+            "extend_lengths": [257, 1, 1],
+            "past_kv_lengths": [2049, 1521, 1553],
+        }
+    }
+    step = sim_step(
+        0,
+        sim_req("chunk", 257, 2049, 3000),
+        sim_req("shorter", 1, 1521, 1500),
+        sim_req("longer", 1, 1553, 1500),
+    )
+    for size in (1, dcp):
+        config = sparse_dcp_config(
+            tmp_path / str(size),
+            target,
+            tp,
+            size,
+            kv_cache_dtype=alias,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=False,
+        )
+        p = provider(config, gpu=gpu, target_model=target)
+        timing = p.assumptions()["aisimulate"]
+        assert (timing["source"], timing["readiness"]) == ("aic", "ready")
+        assert timing["target_model"] == target
+        assert timing["kv_cache_format"] == "fp8_ds_mla"
+        assert timing["decode_context_parallel"] == (
+            {
+                "size": size,
+                "comm_backend": "ag_rs",
+                "q_replicate": False,
+                "attention_backend": "FLASHMLA_SPARSE",
+                "kv_cache_format": "fp8_ds_mla",
+                "indexer_kv_cache_dtype": "fp8",
+            }
+            if size > 1
+            else None
+        )
+        expected = {**reference_config, "dcp": size if size > 1 else None}
+        assert all(
+            timing["resolved_config"][key] == val for key, val in expected.items()
+        )
+        sdk = RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(**expected)
+        )
+        cost = p.estimate(step)
+        assert cost.device_s * 1000 == pytest.approx(
+            sdk.estimate_forward_pass_time_ms(query), rel=1e-9
+        )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "cache, gpu, overrides, problems",
+    [
+        (
+            "bfloat16",
+            "b200",
+            {"dcp_comm_backend": "ag_rs", "dcp_q_replicate": False},
+            ("requires packed fp8_ds_mla",),
+        ),
+        ("auto", "b200", {}, ("standard FP8 with FlashInfer", "packed FlashMLA")),
+        ("fp8", "b200", {}, ("dcp_comm_backend a2a", "dcp_q_replicate")),
+        (
+            "fp8",
+            "b200",
+            {
+                "dcp_comm_backend": "ag_rs",
+                "dcp_q_replicate": False,
+                "attention_config": {"indexer_kv_dtype": "mxfp4"},
+            },
+            ("indexer KV cache mxfp4",),
+        ),
+    ],
+)
+def test_sparse_mla_dcp_refuses_a_different_cache_or_merge(
+    tmp_path, monkeypatch, cache, gpu, overrides, problems
+):
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    target = "nvidia/GLM-5-NVFP4"
+    config = sparse_dcp_config(
+        tmp_path, target, 4, 2, kv_cache_dtype=cache, **overrides
+    )
+    with pytest.raises(ValueError) as failure:
+        provider(config, gpu=gpu, target_model=target)
+    for problem in problems:
+        assert problem in str(failure.value)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "sparse, env, config_flag, accepted",
+    [
+        (True, "1", False, False),
+        (True, "0", True, True),
+        (True, None, True, False),
+        (True, None, False, True),
+        (False, "1", False, False),
+        (False, "0", True, True),
+    ],
+)
+def test_dcp_q_replication_follows_native_env_precedence(
+    tmp_path, monkeypatch, sparse, env, config_flag, accepted
+):
+    if env is None:
+        monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", env)
+    if sparse:
+        target = "deepseek-ai/DeepSeek-V3.2"
+        config = sparse_dcp_config(
+            tmp_path,
+            target,
+            8,
+            2,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=config_flag,
+        )
+    else:
+        target = "deepseek-ai/DeepSeek-V3"
+        config = dcp_engine_config(tmp_path, target, 2, dcp_q_replicate=config_flag)
+    if accepted:
+        p = provider(config, gpu="h200", target_model=target)
+        assert (
+            p.assumptions()["aisimulate"]["decode_context_parallel"]["q_replicate"]
+            is False
+        )
+    else:
+        match = "dcp_q_replicate"
+        if env == "1":
+            match += " from VLLM_DCP_Q_REPLICATE"
+        with pytest.raises(ValueError, match=match):
+            provider(config, gpu="h200", target_model=target)

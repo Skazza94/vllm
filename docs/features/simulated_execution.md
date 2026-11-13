@@ -134,21 +134,27 @@ on a rank's GPUs, the experts over all of them; up to 8 GPUs, all on one
 host: launched by one server,
 or a server each by a multi-port supervisor,
 `--data-parallel-multi-port-external-lb`; ranks on other hosts are
-rejected). Decode context parallelism is timed for a dense MLA model
-(DeepSeek-V3's attention) inside its tensor-parallel group, without data
-parallelism: AISimulate takes the requests' global context lengths and prices
-each rank's share of the decode KV and the merge of the partial outputs, for
-vLLM's default merge (`dcp_comm_backend` `ag_rs`, `dcp_q_replicate` off;
-other settings are rejected, GLM-5's defaults among them, which apply only
-with DCP on). On the CPU platform the CPU MLA backend keeps vLLM's DCP
-bookkeeping, whose kernels a simulation never runs: each DCP rank caches its
-share of every request's tokens, the scheduler's blocks spanning DCP times the
-local ones. It is supported there over tensor parallelism alone, for one
-instance or with real KV transfers over NIXL (see
-[Real KV transfers](#real-kv-transfers)); other models (sparse or compressed MLA,
-hybrids, attention without MLA, whose CPU backend returns no softmax LSE) are
-rejected. Pipeline and prefill context parallelism and EPLB are rejected, and
-so are models or layouts AISimulate has no timing for. Speculative decoding is timed for the native single-module MTP of
+rejected). AISimulate times decode context parallelism (DCP) within a
+tensor-parallel group for dense MLA (for example, DeepSeek-V3) and for
+DeepSeek-V3.2-style sparse MLA (DeepSeek-V3.2 and GLM-5). It takes global
+context lengths and prices each rank's share of the decode KV and the merge
+of partial outputs. It requires `dcp_comm_backend` set to `ag_rs` and
+effective Q replication off: `VLLM_DCP_Q_REPLICATE`, when set, overrides
+`dcp_q_replicate`. GLM-5's native `a2a` with Q replication is not timed
+([issue #28](https://github.com/Skazza94/vllm-decaf/issues/28)).
+On CPU the simulator preserves vLLM's DCP cache bookkeeping and runs no
+attention kernels: the scheduler's blocks span DCP times the local pages.
+Dense MLA can also use real NIXL transfers (see
+[Real KV transfers](#real-kv-transfers)). Sparse MLA DCP is limited to one
+simulated CPU instance with the packed FlashMLA cache (`fp8_ds_mla`) and
+the default FP8 indexer. FlashMLA requires fewer than 32 local query heads,
+the same padded head count before and after gathering, and HiSparse off.
+For GLM-5 on B200 this represents an explicit packed-cache deployment:
+native `auto` instead uses standard FP8 with FlashInfer. Compressed MLA,
+hybrids, attention without MLA, pipeline, prefill context, data and expert
+parallelism are outside this DCP scope.
+
+Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as
 AISimulate's MTP depth: a decode step

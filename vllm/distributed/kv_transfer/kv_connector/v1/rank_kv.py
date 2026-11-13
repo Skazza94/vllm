@@ -169,17 +169,29 @@ def sparse_mla(model) -> bool:
 def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]:
     """What of an instance's configuration falls outside the scope of decode
     context parallelism under simulated compute, either endpoint's when its
-    KV moves (`transfers`): a dense MLA model over tensor parallelism alone
-    (no pipeline, prefill context or data parallelism, no expert
-    parallelism), no speculative decoding and, with transfers, no prefix
-    caching."""
+    KV moves (`transfers`): dense MLA, or sparse MLA with AISimulate in one
+    instance. Both use tensor parallelism alone (no pipeline, prefill context
+    or data parallelism, no expert parallelism) and no speculative decoding.
+    Transfers also require prefix caching off."""
     parallel = vllm_config.parallel_config
     problems = []
-    if not plain_mla(vllm_config.model_config):
-        problems.append(
-            "a model other than dense MLA (sparse or compressed MLA, a "
-            "hybrid, or attention without MLA)"
-        )
+    model = vllm_config.model_config
+    if not plain_mla(model):
+        if not transfers and sparse_mla(model):
+            if vllm_config.simulation_config.timing != "aisimulate":
+                problems.append(
+                    "a model other than dense MLA without AISimulate timing "
+                    "(sparse MLA DCP requires timing aisimulate)"
+                )
+        elif transfers:
+            problems.append(
+                "a model other than dense MLA (sparse or compressed MLA, a "
+                "hybrid, or attention without MLA)"
+            )
+        else:
+            problems.append(
+                "a model other than dense MLA or DeepSeek-V3.2-style sparse MLA"
+            )
     for name, size in (
         ("pipeline parallelism", parallel.pipeline_parallel_size),
         ("prefill context parallelism", parallel.prefill_context_parallel_size),

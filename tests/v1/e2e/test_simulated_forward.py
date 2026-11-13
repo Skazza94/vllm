@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from statistics import pvariance
 
 import pytest
 
@@ -708,3 +709,355 @@ def test_simulated_cpu_decode_context_parallel_scope(
     )
     with pytest.raises(ValueError, match=problem):
         args.create_engine_config()
+
+
+def _sparse_dcp_model(tmp_path, target):
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    raw = bundled_config(target)
+    raw.pop("quantization_config", None)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "DERIVED.md").write_text(
+        f"{target}: published geometry, quantization_config removed for meta weights."
+    )
+    return raw
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "target, gpu, tp, weight_mode",
+    [
+        ("deepseek-ai/DeepSeek-V3.2", "h200", 8, "fp8_block"),
+        ("nvidia/GLM-5-NVFP4", "b200", 4, "nvfp4"),
+    ],
+    ids=["deepseek-v32", "glm-5"],
+)
+def test_simulate_forward_cpu_sparse_mla_dcp(
+    tmp_path, monkeypatch, target, gpu, tp, weight_mode
+) -> None:
+    """Published DSA geometry keeps both KV roles sharded and times live steps."""
+    pytest.importorskip("aisimulate_core")
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from vllm import LLM
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.inputs import TokensPrompt
+
+    def rank_state(worker) -> dict:
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm.v1.attention.backends.mla.flashmla_sparse import (
+            FlashMLASparseMetadataBuilder,
+        )
+        from vllm.v1.attention.backends.mla.indexer import (
+            DeepseekV32IndexerMetadataBuilder,
+        )
+        from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size
+
+        runner = worker.model_runner
+        kv = runner.kv_cache_config
+        layers = [m for m in runner.model.modules() if isinstance(m, MLAAttention)]
+        builders = [
+            builder
+            for groups in runner.attn_groups
+            for group in groups
+            for builder in group.metadata_builders
+        ]
+        specs = runner.get_kv_cache_spec()
+        roles = {}
+        for role in ("sparse", "indexer"):
+            matching = [s for s in specs.values() if s.cache_role.value == role]
+            roles[role] = {
+                "layers": len(matching),
+                "pages": sorted(
+                    {
+                        (
+                            s.block_size,
+                            s.page_size_bytes,
+                            s.dcp_sharded,
+                            resolve_dcp_kv_block_size(s, runner.dcp_size),
+                        )
+                        for s in matching
+                    }
+                ),
+            }
+        # Every placement points into one shared backing buffer.
+        (planned_bytes,) = {t.size for t in kv.kv_cache_tensors}
+        return {
+            "dcp": (runner.dcp_size, runner.dcp_rank),
+            "roles": roles,
+            "blocks": kv.num_blocks,
+            "planned_bytes": planned_bytes,
+            "allocated_tensors": len(runner.kv_caches),
+            "weight_device": next(runner.model.parameters()).device.type,
+            "layers": sorted(
+                {
+                    (
+                        layer.get_attn_backend().get_name(),
+                        layer.impl.dcp_world_size,
+                        layer.impl.dcp_rank,
+                        layer.impl.can_return_lse_for_decode,
+                        layer.impl.need_to_return_lse_for_decode,
+                        layer.dcp_manager is not None,
+                    )
+                    for layer in layers
+                }
+            ),
+            "latent_metadata": sorted(
+                {
+                    (
+                        b.dcp_world_size,
+                        b.cp_kv_cache_interleave_size,
+                        b.fp8_use_mixed_batch,
+                    )
+                    for b in builders
+                    if isinstance(b, FlashMLASparseMetadataBuilder)
+                }
+            ),
+            "indexer_metadata": sorted(
+                {
+                    (b.dcp_world_size, b.dcp_rank, b.cp_kv_cache_interleave_size)
+                    for b in builders
+                    if isinstance(b, DeepseekV32IndexerMetadataBuilder)
+                }
+            ),
+        }
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    raw = _sparse_dcp_model(tmp_path, target)
+
+    prompts = [TokensPrompt(prompt_token_ids=[7] * n) for n in (67, 73)]
+    params = SamplingParams(max_tokens=3, ignore_eos=True, detokenize=False)
+    budget = 1 << 27
+    totals = {}
+    for dcp in (1, 2):
+        path = tmp_path / f"dcp{dcp}.jsonl"
+        llm = LLM(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            enforce_eager=True,
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=False,
+            kv_cache_dtype="fp8_ds_mla",
+            block_size=64,
+            kv_cache_memory_bytes=budget,
+            max_model_len=256,
+            max_num_batched_tokens=256,
+            max_num_seqs=4,
+            enable_prefix_caching=False,
+            simulation_config={
+                "simulate_forward": True,
+                "timing": "aisimulate",
+                "timing_args": {"gpu": gpu, "target_model": target},
+                "log_path": str(path),
+            },
+        )
+        try:
+            outputs = llm.generate(prompts, params, use_tqdm=False)
+            assert all(o.finished for o in outputs)
+            assert [len(o.outputs[0].token_ids) for o in outputs] == [3, 3]
+            states = llm.collective_rpc(rank_state)
+            capacity = llm.llm_engine.vllm_config.cache_config.kv_cache_size_tokens
+        finally:
+            llm.llm_engine.engine_core.shutdown()
+            del llm
+            cleanup_dist_env_and_memory()
+
+        assert len(states) == tp
+        for rank, state in enumerate(states):
+            dcp_rank = rank % dcp
+            assert state["dcp"] == (dcp, dcp_rank)
+            assert state["layers"] == [
+                ("CPU_SIMULATED_MLA_SPARSE", dcp, dcp_rank, True, dcp > 1, dcp > 1)
+            ]
+            assert state["latent_metadata"] == [(dcp, 1, True)]
+            assert state["indexer_metadata"] == [(dcp, dcp_rank, 1)]
+            assert state["weight_device"] == "meta"
+            assert state["allocated_tensors"] == 0  # Cache geometry is virtual.
+            roles = state["roles"]
+            assert roles["sparse"]["layers"] == raw["num_hidden_layers"]
+            assert 0 < roles["indexer"]["layers"] <= roles["sparse"]["layers"]
+            assert roles["sparse"]["pages"] == [(64, 64 * 656, True, 64 * dcp)]
+            assert roles["indexer"]["pages"] == [(64, 64 * 132, True, 64 * dcp)]
+            assert 0 < state["planned_bytes"] <= budget
+            assert state["blocks"] == states[0]["blocks"]
+            assert state["planned_bytes"] == states[0]["planned_bytes"]
+        totals[dcp] = (capacity, states[0]["blocks"], states[0]["planned_bytes"])
+
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+        assert timing["target_model"] == target
+        assert timing["kv_cache_format"] == "fp8_ds_mla"
+        assert (timing["source"], timing["readiness"]) == ("aic", "ready")
+        assert timing["resolved_config"]["estimation_mode"] == "op_level"
+        assert timing["resolved_config"]["dcp"] == (dcp if dcp > 1 else None)
+        assert timing["config"]["fallback_policy"] == "deny"
+
+        # The scheduler may start one request's decode while the other
+        # finishes prefill. Check each first decode independently.
+        first_context = {}
+        steps = [row for row in records if "step" in row]
+        for row in steps:
+            requests = row["step"]["requests"]
+            for request in requests:
+                if not request["is_prefill"]:
+                    assert request["num_scheduled_tokens"] == 1
+                    first_context.setdefault(
+                        request["req_id"], request["num_computed_tokens"]
+                    )
+        assert sorted(first_context.values()) == [67, 73]
+        sdk = RustForwardPassPerfModel.best_available(
+            ForwardPassPerfModelConfig(
+                model=target,
+                system=f"{gpu}_sxm",
+                backend="vllm",
+                worker_type="aggregated",
+                tp=tp,
+                dcp=dcp if dcp > 1 else None,
+                cp_size=1,
+                moe_tp_size=tp,
+                moe_ep_size=1,
+                gemm_quant_mode=weight_mode,
+                moe_quant_mode=weight_mode,
+                fmha_quant_mode="bfloat16",
+                kvcache_quant_mode="fp8",
+                comm_quant_mode="half",
+                estimation_mode="op_level",
+                database_mode="SILICON",
+                fallback_policy="deny",
+            )
+        )
+        direct_ms = []
+        for row in steps:
+            reqs = row["step"]["requests"]
+            prefill = [q for q in reqs if q["is_prefill"]]
+            decode_contexts = [
+                q["num_computed_tokens"] for q in reqs if not q["is_prefill"]
+            ]
+            ms = sdk.estimate_forward_pass_time_ms(
+                {
+                    "scheduled_requests": {
+                        "num_prefill_requests": len(prefill),
+                        "sum_prefill_tokens": sum(
+                            q["num_scheduled_tokens"] for q in prefill
+                        ),
+                        "var_prefill_length": pvariance(
+                            [q["num_prompt_tokens"] for q in prefill] or [0]
+                        ),
+                        "sum_prefill_kv_tokens": sum(
+                            q["num_computed_tokens"] for q in prefill
+                        ),
+                        "num_decode_requests": len(decode_contexts),
+                        "sum_decode_kv_tokens": sum(decode_contexts),
+                        "var_decode_kv_tokens": pvariance(decode_contexts or [0]),
+                        "extend_lengths": [q["num_scheduled_tokens"] for q in reqs],
+                        "past_kv_lengths": [q["num_computed_tokens"] for q in reqs],
+                    }
+                }
+            )
+            assert ms > 0
+            assert row["cost"]["breakdown"]["aisimulate_ms"] == pytest.approx(
+                ms, rel=1e-9
+            )
+            direct_ms.append(ms)
+        print(
+            "SPARSE_DCP_STATE",
+            json.dumps(
+                {
+                    "target": target,
+                    "tp": tp,
+                    "dcp": dcp,
+                    "capacity": capacity,
+                    "workers": states,
+                    "first_decode_contexts": sorted(first_context.values()),
+                    "direct_ms": direct_ms,
+                }
+            ),
+        )
+
+    assert totals[1][1:] == totals[2][1:]
+    assert totals[2][0] == 2 * totals[1][0]
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "timing, connector, reason",
+    [
+        ("linear", None, "sparse MLA DCP requires timing aisimulate"),
+        ("aisimulate", "NixlConnector", "a model other than dense MLA"),
+    ],
+)
+def test_simulated_cpu_sparse_mla_dcp_scope(tmp_path, timing, connector, reason):
+    """The sparse DCP exception never admits another timer or a KV connector."""
+    from tests.v1.worker.simulated.test_real_kv_transfer import DEEPSEEK_V32
+    from vllm.engine.arg_utils import EngineArgs
+
+    (tmp_path / "config.json").write_text(json.dumps(DEEPSEEK_V32))
+    transfer = (
+        {"kv_connector": connector, "kv_role": "kv_consumer"} if connector else None
+    )
+    with pytest.raises(ValueError, match=reason):
+        EngineArgs(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            max_model_len=256,
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            kv_transfer_config=transfer,
+            simulation_config={
+                "simulate_forward": True,
+                "timing": timing,
+                "kv_transfer_mode": "real" if connector else "simulated",
+            },
+        ).create_engine_config()
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "target, gpu, tp, dcp, reason",
+    [
+        ("nvidia/GLM-5-NVFP4", "b200", 2, 2, "mixed-batch fp8 path"),
+        (
+            "deepseek-ai/DeepSeek-V3.2",
+            "h200",
+            8,
+            8,
+            "DCP-gathered head counts to pad to the same fp8 decode kernel envelope",
+        ),
+    ],
+)
+def test_simulated_cpu_sparse_mla_dcp_keeps_native_head_limits(
+    tmp_path, monkeypatch, capfd, target, gpu, tp, dcp, reason
+):
+    """An SDK estimate cannot override native FlashMLA metadata limits."""
+    pytest.importorskip("aisimulate_core")
+    from vllm import LLM
+
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    _sparse_dcp_model(tmp_path, target)
+    with pytest.raises(RuntimeError, match="Engine core initialization failed"):
+        LLM(
+            model=str(tmp_path),
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            enforce_eager=True,
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+            dcp_comm_backend="ag_rs",
+            dcp_q_replicate=False,
+            kv_cache_dtype="fp8_ds_mla",
+            block_size=64,
+            kv_cache_memory_bytes=1 << 26,
+            max_model_len=256,
+            max_num_batched_tokens=256,
+            max_num_seqs=4,
+            enable_prefix_caching=False,
+            simulation_config={
+                "simulate_forward": True,
+                "timing": "aisimulate",
+                "timing_args": {"gpu": gpu, "target_model": target},
+            },
+        )
+    assert reason in capfd.readouterr().err
