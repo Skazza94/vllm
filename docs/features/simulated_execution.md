@@ -599,8 +599,12 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   offsetting its slice by it. Pages are then checked by their content, and
   a page past the prompt (padding) by its place and the content it follows;
   the byte checks need the same prefix-caching setting on both instances.
-  NIXL's handshake checks the peer's DCP, TP and page size. When
-  either side has DCP, it also checks both instances' scope, including the
+  NIXL's handshake checks the peer's DCP, TP and page size. With DCP on
+  either side, simulated NIXL transfers require matching P/D logical block
+  sizes and one kernel block per logical block. The simulator enforces both
+  requirements during the handshake. Upstream vLLM's NIXL connector also
+  rejects unequal logical block sizes; simulating kernel sub-blocks at equal
+  logical sizes remains follow-up work. When either side has DCP, it also checks both instances' scope, including the
   side of DCP 1: this instance's from its config, the producer's from its
   NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
   (which slices no page by DCP rank), NIXL's push connector,
