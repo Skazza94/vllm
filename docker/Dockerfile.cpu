@@ -509,8 +509,8 @@ RUN curl -fL --retry 3 -o /tmp/libfabric.tar.bz2 \
 
 ######################### KV TRANSFER (NIXL + MOONCAKE) #########################
 # Unpatched, pinned NIXL with Python bindings, UCX/TCP, LIBFABRIC/TCP and Mooncake/TENT
-# hp_tcp backends, for the CPU simulator's real KV transfers
-# (simulation_config.kv_transfer_mode=real) through the NixlConnector.
+# hp_tcp backends, for the CPU simulator's real KV transfers through the
+# NixlConnector.
 FROM base-arch AS kv-transfer-build
 
 # v0.3.14-rc1: the first Mooncake with TENT and its hp_tcp transport.

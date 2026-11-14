@@ -19,9 +19,9 @@ import torch.distributed as dist
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.simulation import DSA_MODEL_TYPES, NIXL_CONNECTORS
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dp_group, get_pp_group
+from vllm.config.simulation import DSA_MODEL_TYPES, NIXL_CONNECTORS, moves_real_kv
+from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import (
@@ -56,7 +56,6 @@ from vllm.v1.worker.simulated.kv_transfer import (
     NixlReadDestinations,
     NixlReadPeers,
     ReadsInFlight,
-    SimulatedTransfers,
     GroupAllocations,
     check_real_kv_groups,
     check_real_kv_layers,
@@ -70,12 +69,10 @@ from vllm.v1.worker.simulated.kv_transfer import (
     validate_state_peer,
     registered_block_bytes,
     scheduled_kv_events,
-    simulated_kv_connector,
     validate_dcp_peer,
 )
 from vllm.v1.worker.simulated.timing import (
     Clock,
-    RealClock,
     SimulatedAsyncOutput,
     StepCost,
     StepDescriptor,
@@ -147,7 +144,7 @@ class SimulatedModelRunner(GPUModelRunner):
         self.fallback_token_id = sim.fallback_token_id
         # Real KV transfers: real KV tensors that the native connector registers
         # and moves; only compute is simulated.
-        self._real_kv_transfer = sim.kv_transfer_mode == "real"
+        self._real_kv_transfer = moves_real_kv(vllm_config)
         self._kv_filler: PatternFiller | NativeFiller | None = None
         self._kv_checker: PatternChecker | NativeChecker | None = None
         # Real KV transfers: this step's lifecycle events, logged with the
@@ -173,7 +170,6 @@ class SimulatedModelRunner(GPUModelRunner):
         # When each pipeline stage's device becomes free; every rank models
         # the whole pipeline, so all agree on every deadline.
         self._stage_free_at = [0.0] * self.parallel_config.pipeline_parallel_size
-        self._kv_transfers: SimulatedTransfers | None = None
         self._last_output: SimulatedAsyncOutput | None = None
         self._parallel = parallel_summary(vllm_config)
         self._prompt_lens: dict[str, int] = {}
@@ -258,17 +254,6 @@ class SimulatedModelRunner(GPUModelRunner):
             len(self.kv_cache_config.kv_cache_groups),
             self.kv_cache_config.num_blocks,
         )
-        if not is_profiling and has_kv_transfer_group():
-            # This rank's copy streams wait for its own pipeline stage.
-            stage = get_pp_group().rank_in_group
-            connector = simulated_kv_connector(
-                self.vllm_config,
-                self.kv_cache_config,
-                self.clock,
-                device_free_at=lambda: self._stage_free_at[stage],
-            )
-            self.kv_connector = connector
-            self._kv_transfers = connector.transfers
 
     def _resolved_dcp_geometry(self) -> dict:
         """This rank's decode context parallelism as the engine resolved it
@@ -619,7 +604,6 @@ class SimulatedModelRunner(GPUModelRunner):
             # does not call sample_tokens().
             self.kv_connector.finish_forward()
             kv_output = self._post_forward(scheduler_output.finished_req_ids)
-            self._skip_to_transfer()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_output)
 
         batch_req_state, _ = self.gather_batch_req_state(scheduler_output, dummy_run)
@@ -832,17 +816,6 @@ class SimulatedModelRunner(GPUModelRunner):
         # Not while warming up (no step log): kernel compilation is slow.
         if self._stall_dump_s is not None and self.step_log is not None:
             faulthandler.dump_traceback_later(self._stall_dump_s, file=sys.stderr)
-
-    def _skip_to_transfer(self) -> None:
-        """With nothing to run, skip to the next KV transfer completion, but
-        not past the driver's next request arrival."""
-        if self._kv_transfers is None or isinstance(self.clock, RealClock):
-            return
-        if self._last_output is not None and not self._last_output.resolved:
-            return
-        t = self._kv_transfers.next_completion()
-        if t is not None:
-            self.clock.sleep_until(min(t, self.clock.horizon))
 
     def _run_pipeline(self, t_start: float, device_s: float) -> float:
         """Push a step entering stage 0 at `t_start` through balanced pipeline

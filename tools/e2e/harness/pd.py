@@ -796,7 +796,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
     if timing_args is None:
         timing_args = {"gpu": run.server.gpu} if run.server.timing == "aisimulate" else {}
     simulation = {"clock": "real", "timing": run.server.timing, "timing_args": timing_args,
-                  "log_path": STEP_LOG, "kv_transfer_mode": "real"}
+                  "log_path": STEP_LOG}
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
     spec = run.server.speculative

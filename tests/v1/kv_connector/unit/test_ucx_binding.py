@@ -103,7 +103,6 @@ def test_tcp_worker_binds_before_explicit_agent_creation(
     for _ in range(2):
         config = create_vllm_config()
         config.simulation_config.simulate_forward = True
-        config.simulation_config.kv_transfer_mode = "real"
         config.kv_transfer_config.kv_connector_extra_config.update(
             backends=[backend], num_threads=threads, rank_addresses=["10.110.0.1"]
         )

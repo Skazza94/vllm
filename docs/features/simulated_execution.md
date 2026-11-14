@@ -326,129 +326,13 @@ Only the output rank (last pipeline stage, first tensor-parallel rank) writes
 the step log. On CUDA hosts each rank binds its own device, using a few MB of
 its memory.
 
-### KV cache offloading
+### Real KV transfers
 
-CPU offloading by the `OffloadingConnector` (its CPU spec) runs with the real
-scheduler side, so the CPU cache's hits, evictions and load and store jobs are
-the real ones; a simulated worker replaces the copy streams. Each direction
-is a serial queue, a transfer starts once the device has finished the step
-running when it was submitted, and it takes `latency + bytes / bandwidth`.
-
-`kv_transfer_timing` gives the bandwidths in 1e9 bytes/s, with optional
-latencies:
-
-```python
-kv_transfer_config={
-    "kv_connector": "OffloadingConnector",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {"cpu_bytes_to_use": 32 << 30},
-},
-simulation_config={
-    "simulate_forward": True,
-    "timing": "replay",
-    "timing_args": {"path": "/tmp/real_steps.jsonl"},
-    "kv_transfer_timing": {"load_gbps": 25, "store_gbps": 25},
-},
-```
-
-A step log recorded with offloading also holds the transfers completed in
-each step; its path as `kv_transfer_timing` fits each direction's latency and
-bandwidth by least squares. A transfer's size is its blocks' KV page size,
-which overstates layouts where the real copy moves less (padded hybrid pages,
-canonical-layout stores split across ranks); rates fitted to the same model
-absorb this. A step that waits for stores the scheduler flushes pays the wait,
-which its recorded host time also includes.
-
-### Disaggregated prefill
-
-`vllm.v1.worker.simulated.disaggregated` runs prefill and decode instances
-connected by the `NixlConnector` (pull mode) in one process, in simulated
-time:
-
-```python
-from vllm.v1.worker.simulated.disaggregated import simulate_disaggregated
-
-result = simulate_disaggregated(
-    prefill_args,  # EngineArgs with simulate_forward and a timing provider
-    decode_args,
-    requests,      # TimedRequests
-    num_prefill=2,
-    num_decode=1,
-    handoff_latency_s=7e-3,
-)
-```
-
-`EngineArgs` built in Python take the generic scheduler defaults rather than
-`vllm serve`'s: set `max_num_batched_tokens` and `max_num_seqs` as the served
-instances have them. (`vllm bench sweep simulate` applies `vllm serve`'s
-defaults.)
-
-The driver plays the proxy: a request goes to a prefill instance with
-`max_tokens=1`, then to a decode instance with the `kv_transfer_params` it
-returned. Instances are picked round-robin or, with
-`routing="least_unfinished"`, by fewest unfinished requests;
-`handoff_latency_s` is the proxy's latency between the two. The connector's
-scheduler side is the real one; its worker side moves no data. A read takes
-`latency + bytes / bandwidth` at `kv_transfer_timing`'s load rate, reads
-queue on each instance's link, and a completed read frees the prefill
-instance's blocks. Leases do not expire, since heartbeats run on the wall
-clock. Each instance has one rank and its own virtual clock; the instance
-furthest behind steps next.
-
-Posting a step's reads holds a decode instance's engine thread. NIXL merges
-blocks consecutive on both instances into one descriptor per KV cache
-region, so posting slows once a decode instance's blocks scatter, after its
-KV cache has filled once. The simulation charges `post_us_per_read` per read
-plus `post_us_per_run` per run of consecutive blocks. A decode instance
-recorded with the real `NixlConnector` logs its reads and postings, and its
-step log as `kv_transfer_timing` fits the read rate and posting costs. Record
-until its KV cache has filled, or the cost of scattered reads is
-extrapolated.
-
-#### Served instances
-
-Simulated prefill and decode instances also run as servers, on the real
-clock, with tensor parallelism, behind any proxy:
-
-```bash
-VLLM_NIXL_SIDE_CHANNEL_PORT=5600 vllm serve Qwen/Qwen3-8B --port 8100 \
-  --tensor-parallel-size 2 --simulate-forward \
-  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer"}' \
-  --simulation-config '{"timing": "replay", "timing_args": {"path": "p.jsonl"}, "kv_transfer_timing": "d.jsonl"}'
-VLLM_NIXL_SIDE_CHANNEL_PORT=5700 vllm serve Qwen/Qwen3-8B --port 8200 \
-  --tensor-parallel-size 2 --simulate-forward \
-  --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}' \
-  --simulation-config '{"timing": "replay", "timing_args": {"path": "d.jsonl"}, "kv_transfer_timing": "d.jsonl"}'
-```
-
-A decode rank books its reads over ZMQ with the prefill ranks the real
-connector maps it to. Each prefill rank listens on a port derived from its
-instance's side-channel port and its rank, which must be free. The two
-instances' tensor parallelism may differ as with the real connector, and a
-request's reads from several ranks run concurrently. A read that cannot be
-booked, or a layout the real connector rejects, fails its request, which the
-decode instance then prefills itself. Pipeline parallelism (unsupported by
-the real pull connector), decode context parallelism and hybrid (Mamba)
-layouts are not modeled.
-
-#### Push mode and pipeline parallelism
-
-With the `NixlPushConnector`, a prefill instance with pipeline parallelism
-writes into a decode instance without it. As with the real connector, the
-proxy sends a request to both instances at once. Decode ranks register each
-request with their paired prefill ranks in every stage and forward their
-heartbeats; a prefill rank writes its share once the request is both
-finished and registered, and frees the blocks when its writes end or the
-lease of an unregistered request (a full prefix hit) expires. Here the
-prefill instance records the transfers, so fit `kv_transfer_timing` to its
-step log.
-
-#### Real KV transfers
-
-With `"kv_transfer_mode": "real"`, compute stays simulated but the KV cache
-is real: CPU tensors that a native connector (`NixlConnector`,
-`NixlPullConnector` or `MooncakeConnector`) registers and moves between the
-instances, so transfers take their actual time over the actual network. It
+Prefill and decode instances run as simulated servers behind any proxy. With
+a KV connector, compute stays simulated but the KV cache is real: CPU tensors
+that a native connector (`NixlConnector`, `NixlPullConnector` or
+`MooncakeConnector`) registers and moves between the instances, so transfers
+take their actual time over the actual network. It
 needs an explicit `kv_cache_memory_bytes`. Supported layouts:
 
 * Full-attention models, dense or MoE (experts hold no KV), and dense MLA
@@ -600,7 +484,7 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   a page past the prompt (padding) by its place and the content it follows;
   the byte checks need the same prefix-caching setting on both instances.
   NIXL's handshake checks the peer's DCP, TP and page size. With DCP on
-  either side, simulated NIXL transfers require matching P/D logical block
+  either side, NIXL transfers under simulated compute require matching P/D logical block
   sizes and one kernel block per logical block. The simulator enforces both
   requirements during the handshake. Upstream vLLM's NIXL connector also
   rejects unequal logical block sizes; simulating kernel sub-blocks at equal
@@ -778,12 +662,10 @@ and `tools/e2e/runs/example.yaml` document its options.
 * Pipeline stages are assumed balanced.
 * No LoRA, pooling or diffusion models, and speculative decoding without
   adaptive verification only.
-* Simulated KV transfer is limited to CPU offloading by the
-  `OffloadingConnector` and disaggregated prefill by the `NixlConnector`:
-  in-process instances in pull mode with one rank each; served instances in
-  pull mode without pipeline parallelism, or in push mode with it on the
-  prefill instance. For real transfers, see
-  [Real KV transfers](#real-kv-transfers).
+* KV connectors are the native NIXL pull connector and the Mooncake
+  connector, moving real KV between served instances (see
+  [Real KV transfers](#real-kv-transfers)); no KV offloading and no other
+  connector.
 * The `fast_forward` and `virtual` clocks need a single process with one
   rank; served and multi-rank simulations run on the real clock.
 * Token ids are not meaningful; only their counts are.

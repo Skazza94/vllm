@@ -15,10 +15,11 @@ import time
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import numpy as np
 
+from vllm.config.simulation import moves_real_kv
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.outputs import (
@@ -449,24 +450,19 @@ class _KNNTable:
         return StepCost(device_s=float(device_s), host_s=float(host_s))
 
 
-def load_step_log(
-    path: str, kind: Literal["step", "kv_transfers", "kv_post"] = "step"
-) -> list[dict[str, Any]]:
-    """The step records of a JSONL step log, or its records of completed KV
-    transfers (`kv_transfers`) or NIXL read postings (`kv_post`)."""
+def load_step_log(path: str) -> list[dict[str, Any]]:
+    """The step records of a JSONL step log."""
     lines = Path(path).read_text().splitlines()
     records = [json.loads(line) for line in lines if line.strip()]
-    if kind == "step":
-        # Every other record is a kv_ one (kv_transfers, kv_post, kv_check, ...),
-        # a `threads` one or the `timing` one.
-        return [
-            r
-            for r in records
-            if "threads" not in r
-            and "timing" not in r
-            and not any(key.startswith("kv_") for key in r)
-        ]
-    return [r for r in records if kind in r]
+    # Every other record is a kv_ one (kv_transfers, kv_check, ...), a
+    # `threads` one or the `timing` one.
+    return [
+        r
+        for r in records
+        if "threads" not in r
+        and "timing" not in r
+        and not any(key.startswith("kv_") for key in r)
+    ]
 
 
 def _record_cost(rec: dict[str, Any]) -> tuple[float, float]:
@@ -618,10 +614,6 @@ def get_timing_provider(
 
 
 class Clock(Protocol):
-    horizon: float
-    """When the driver of an in-process engine next has work for it (a
-    request arrival); an engine that is only waiting may skip ahead to it."""
-
     def now(self) -> float: ...
 
     def sleep_until(self, deadline: float) -> None: ...
@@ -630,8 +622,6 @@ class Clock(Protocol):
 class RealClock:
     """Wall clock: simulated steps take real time, so every existing metric,
     benchmark client and router sees realistic latencies."""
-
-    horizon = math.inf
 
     def now(self) -> float:
         return time.monotonic()
@@ -647,7 +637,6 @@ class VirtualClock:
 
     def __init__(self) -> None:
         self._now = 0.0
-        self.horizon = math.inf
 
     def now(self) -> float:
         return self._now
@@ -662,7 +651,6 @@ class FastForwardClock:
 
     def __init__(self) -> None:
         self._offset = 0.0
-        self.horizon = math.inf
 
     def now(self) -> float:
         return time.monotonic() + self._offset
@@ -744,7 +732,7 @@ def step_log_path(vllm_config: VllmConfig) -> str | None:
     if path is None:
         return None
     parallel_config = vllm_config.parallel_config
-    if simulation.kv_transfer_mode == "real":
+    if moves_real_kv(vllm_config):
         if not get_pp_group().is_last_rank:
             return None
     elif not is_output_rank() or (
@@ -777,7 +765,7 @@ def logs_steps(vllm_config: VllmConfig) -> bool:
 class StepLogWriter:
     """Appends one JSON line per simulated step, plus one per step in which
     KV connector transfers completed. The step records feed the `table` and
-    `replay` providers, the transfer records `kv_transfer_timing`."""
+    `replay` providers."""
 
     def __init__(self, path: str) -> None:
         self.path = Path(path)
@@ -874,14 +862,6 @@ class StepLogWriter:
     def write_kv_layout(self, layout: dict[str, object], t: float) -> None:
         """Append the KV cache as the connector registers it (`kv_layout`)."""
         rec = {"kv_layout": layout, "t": t}
-        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
-        self._f.flush()
-
-    def write_kv_post(self, reads: int, runs: int, seconds: float, t: float) -> None:
-        """Append the NIXL reads a decode rank posted in a step: their count,
-        runs of consecutive blocks (see `PostCost`) and the time posting took,
-        which the step's own record leaves out."""
-        rec = {"kv_post": {"reads": reads, "runs": runs, "seconds": seconds}, "t": t}
         self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
         self._f.flush()
 

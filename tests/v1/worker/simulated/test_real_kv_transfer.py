@@ -25,7 +25,6 @@ pytestmark = pytest.mark.skipif(
 # absent the rest of this file must still collect and run.
 REAL = find_spec("aisimulate_core") is not None
 
-SIMULATED_NIXL = "vllm.v1.worker.simulated.kv_nixl"
 SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 
 
@@ -521,11 +520,7 @@ def engine_config(model_dir, simulation=None, kv_transfer=None, **kwargs):
         "kv_cache_memory_bytes": 8 * 1024**2,
         "enable_prefix_caching": False,
         "enforce_eager": True,
-        "simulation_config": {
-            "simulate_forward": True,
-            "kv_transfer_mode": "real",
-            **(simulation or {}),
-        },
+        "simulation_config": {"simulate_forward": True, **(simulation or {})},
         "kv_transfer_config": {
             "kv_connector": "NixlConnector",
             "kv_role": "kv_consumer",
@@ -538,23 +533,14 @@ def engine_config(model_dir, simulation=None, kv_transfer=None, **kwargs):
 
 
 def test_real_mode_keeps_the_native_connector(model_dir):
+    from vllm.config.simulation import moves_real_kv
+
     config = engine_config(model_dir)
-    assert config.simulation_config.kv_transfer_mode == "real"
+    assert moves_real_kv(config)
     assert config.kv_transfer_config.kv_connector == "NixlConnector"
     # No module path: the connector factory resolves the native NIXL connector.
     assert config.kv_transfer_config.kv_connector_module_path is None
     assert config.parallel_config.worker_cls == SIMULATED_WORKER
-
-
-def test_simulated_mode_is_the_default_and_unchanged(model_dir):
-    config = engine_config(
-        model_dir,
-        simulation={"kv_transfer_mode": "simulated", "kv_transfer_timing": None},
-    )
-    assert config.kv_transfer_config.kv_connector_module_path == SIMULATED_NIXL
-    from vllm.config.simulation import SimulationConfig
-
-    assert SimulationConfig().kv_transfer_mode == "simulated"
 
 
 @pytest.mark.parametrize(
@@ -563,12 +549,11 @@ def test_simulated_mode_is_the_default_and_unchanged(model_dir):
         ({}, {"kv_connector": "NixlPushConnector"}, {}, "one of NixlConnector"),
         (
             {},
-            {"kv_connector_module_path": SIMULATED_NIXL},
+            {"kv_connector_module_path": "my_plugin.connector"},
             {},
             "without kv_connector_module_path",
         ),
         ({}, {"kv_buffer_device": "cuda"}, {}, "CPU KV buffers"),
-        ({"kv_transfer_timing": {"load_gbps": 1}}, {}, {}, "no kv_transfer_timing"),
         ({}, {}, {"kv_cache_memory_bytes": None}, "explicit kv_cache_memory_bytes"),
         ({"clock": "virtual"}, {}, {}, "the real clock"),
     ],
@@ -581,13 +566,13 @@ def test_real_mode_rejections(model_dir, simulation, kv_transfer, kwargs, error)
 @pytest.mark.parametrize(
     "simulation, kv_transfer, error",
     [
-        ({"kv_transfer_mode": "simulated", "kv_pattern_fill": True}, {}, "need kv_transfer_mode real"),
+        ({"simulate_forward": False, "kv_pattern_fill": True}, {}, "need simulate_forward and a kv_transfer_config"),
         ({"kv_pattern_fill": True}, {"kv_role": "kv_consumer"}, "kv_producer for kv_pattern_fill"),
         ({"kv_pattern_check": True, "log_path": "/tmp/steps"}, {"kv_role": "kv_producer"}, "kv_consumer for kv_pattern_check"),
         ({"kv_pattern_check": True}, {}, "log_path for kv_pattern_check"),
     ],
 )
-def test_pattern_options_need_real_mode_and_their_role(model_dir, simulation, kv_transfer, error):
+def test_pattern_options_need_real_transfers_and_their_role(model_dir, simulation, kv_transfer, error):
     with pytest.raises(ValueError, match=error):
         engine_config(model_dir, simulation, kv_transfer)
 
@@ -595,7 +580,6 @@ def test_pattern_options_need_real_mode_and_their_role(model_dir, simulation, kv
 def test_real_mode_allows_prefix_caching(model_dir, mla_model_dir):
     config = engine_config(model_dir, enable_prefix_caching=True)
     assert config.cache_config.enable_prefix_caching
-    assert config.simulation_config.kv_transfer_mode == "real"
     # With the pattern checks too: a block's pattern is then its content's.
     check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
     for model in (model_dir, mla_model_dir):
@@ -653,7 +637,6 @@ def test_simulated_blocks_need_a_multiple_of_16(model_dir):
 def test_real_mode_accepts_moe_and_dense_mla_models(moe_model_dir, mla_model_dir, tmp_path):
     config = engine_config(moe_model_dir)
     assert config.model_config.is_moe
-    assert config.simulation_config.kv_transfer_mode == "real"
     config = engine_config(mla_model_dir)
     assert config.model_config.use_mla
     # DeepSeek-V3.2: an indexer makes its MLA sparse.
@@ -1223,11 +1206,11 @@ def test_simulated_mla_keeps_the_gpu_deployments_settings(mla_model_dir):
         engine_config(mla_model_dir, block_size=8)
 
 
-def test_decode_context_parallelism_on_cpu_moves_kv_by_real_transfers_only(
+def test_decode_context_parallelism_on_cpu_builds_alone_and_over_nixl(
     mla_model_dir,
 ):
-    """A dense MLA model's DCP on CPU builds alone; a NIXL instance with it
-    needs real transfers (simulated ones model no DCP slicing)."""
+    """A dense MLA model's DCP on CPU builds alone and with the NIXL
+    connector, which moves its KV for real."""
     from vllm.engine.arg_utils import EngineArgs
 
     def config(**kwargs):
@@ -1245,12 +1228,13 @@ def test_decode_context_parallelism_on_cpu_moves_kv_by_real_transfers_only(
         "kv_role": "kv_producer",
         "kv_buffer_device": "cpu",
     }
-    with pytest.raises(ValueError, match="not with kv_transfer_mode simulated"):
-        config(
-            decode_context_parallel_size=2,
-            kv_transfer_config=nixl,
-            enable_prefix_caching=False,
-        )
+    parallel = config(
+        decode_context_parallel_size=2,
+        kv_transfer_config=nixl,
+        kv_cache_memory_bytes=8 * 1024**2,
+        enable_prefix_caching=False,
+    ).parallel_config
+    assert parallel.decode_context_parallel_size == 2
 
 
 def test_real_mode_allows_tensor_parallelism_and_dp_attention(
@@ -1654,15 +1638,9 @@ def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
         with pytest.raises(ValueError, match="Mooncake backend only"):
             _bind_rank_kv_address(config(backends, addresses), backends)
 
-    # Simulated transfers (no real KV) and ordinary execution are left alone.
+    # Ordinary execution is left alone.
     monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "10.100.0.1")
     before = os.environ[tent_config.ENV]
-    simulated = engine_config(
-        model_dir,
-        simulation={"kv_transfer_mode": "simulated"},
-        kv_transfer={"kv_connector_extra_config": {"rank_addresses": addresses}},
-        tensor_parallel_size=2,
-    )
     ordinary = VllmConfig(
         kv_transfer_config=KVTransferConfig(
             kv_connector="NixlConnector",
@@ -1670,30 +1648,30 @@ def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
             kv_connector_extra_config={"rank_addresses": addresses},
         )
     )
-    for vllm_config in (simulated, ordinary):
-        _bind_rank_kv_address(vllm_config, ["UCX"])
-        assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.100.0.1"
-        assert os.environ[tent_config.ENV] == before
+    _bind_rank_kv_address(ordinary, ["UCX"])
+    assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.100.0.1"
+    assert os.environ[tent_config.ENV] == before
 
 
 @pytest.mark.parametrize(
-    "mode, dp_index, dp_size, tp_rank, name, steps",
+    "connector, dp_index, dp_size, tp_rank, name, steps",
     [
-        ("real", 0, 1, 0, "steps.jsonl", True),
-        ("real", 0, 1, 1, "steps.tp1.jsonl", True),
-        ("simulated", 0, 1, 1, None, True),  # the output rank's log only
+        (True, 0, 1, 0, "steps.jsonl", True),
+        (True, 0, 1, 1, "steps.tp1.jsonl", True),
+        (False, 0, 1, 1, None, True),  # without KV transfers: the output rank's
         # MoE DP: DP rank 0 logs the joint steps, the others their own KV.
-        ("real", 0, 2, 0, "steps.jsonl", True),
-        ("real", 1, 2, 0, "steps.dp1.jsonl", False),
-        ("real", 1, 2, 1, "steps.dp1.tp1.jsonl", False),
-        ("simulated", 1, 2, 0, None, False),
+        (True, 0, 2, 0, "steps.jsonl", True),
+        (True, 1, 2, 0, "steps.dp1.jsonl", False),
+        (True, 1, 2, 1, "steps.dp1.tp1.jsonl", False),
+        (False, 1, 2, 0, None, False),
         # Dense DP: independent engines, each logging its own steps.
-        ("simulated", 2, 1, 0, "steps.dp2.jsonl", True),
+        (False, 2, 1, 0, "steps.dp2.jsonl", True),
     ],
 )
 def test_each_rank_logs_its_own_transfers(
-    monkeypatch, tmp_path, mode, dp_index, dp_size, tp_rank, name, steps
+    monkeypatch, tmp_path, connector, dp_index, dp_size, tp_rank, name, steps
 ):
+    from vllm.config import KVTransferConfig
     from vllm.distributed import parallel_state
     from vllm.v1.worker.simulated.timing import logs_steps, step_log_path
 
@@ -1702,8 +1680,13 @@ def test_each_rank_logs_its_own_transfers(
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
     config = SimpleNamespace(
         simulation_config=SimpleNamespace(
-            log_path=str(tmp_path / "steps.jsonl"), kv_transfer_mode=mode
+            log_path=str(tmp_path / "steps.jsonl"), simulate_forward=True
         ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_consumer"
+        )
+        if connector
+        else None,
         # Dense DP engines run as DP=1, keeping their index.
         parallel_config=SimpleNamespace(
             data_parallel_index=dp_index,
@@ -1715,19 +1698,9 @@ def test_each_rank_logs_its_own_transfers(
     assert logs_steps(config) is steps
 
 
-def test_real_mode_needs_a_connector(model_dir):
-    with pytest.raises(ValueError, match="needs a kv_transfer_config"):
-        engine_config(model_dir, kv_transfer_config=None)
-
-
-def test_real_mode_needs_simulated_execution(model_dir):
-    with pytest.raises(ValueError, match="needs simulate_forward"):
-        engine_config(model_dir, simulation={"simulate_forward": False})
-
-
 def test_real_mode_rejects_an_explicit_offloading_connector(model_dir):
-    """Regression: the simulated-only OffloadingConnector branch returned
-    before the real-mode checks, accepting the virtual clock."""
+    """An OffloadingConnector under simulated compute is refused, with every
+    other problem of the real-transfer checks."""
     with pytest.raises(ValueError, match="one of NixlConnector.*the real clock"):
         engine_config(
             model_dir,
@@ -1854,7 +1827,6 @@ def test_producer_writes_the_pattern_into_its_kv_tensors(any_model_dir, monkeypa
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -1920,7 +1892,6 @@ def test_a_producer_fills_each_groups_blocks_through_a_chunked_window(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -2024,7 +1995,6 @@ def test_a_hybrid_producer_fills_each_groups_pages_padding_included(
         language_model_only=model == "qwen3_5_model_dir",
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -2132,7 +2102,6 @@ def test_a_hybrids_cached_states_are_reused_as_written(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -2227,7 +2196,6 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -2548,7 +2516,6 @@ def test_a_hybrid_peer_of_another_block_size_is_refused_whether_or_not_bytes_are
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
             **({"log_path": str(tmp_path / "steps")} if flags else {}),
@@ -2618,7 +2585,6 @@ def test_qwen3_5_27bs_peer_of_the_reverse_blocks_is_refused_before_a_read(
         language_model_only=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "timing": "aisimulate",
             "timing_args": {"gpu": "h100", "target_model": "Qwen/Qwen3.5-27B"},
             **({"log_path": str(tmp_path / "steps")} if flags else {}),
@@ -2688,7 +2654,7 @@ def main():
         "timing_args", {"fixed_us": 100} if timing == "linear" else {}
     )
     max_model_len = kwargs.pop("max_model_len", 256)
-    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+    simulation = {"simulate_forward": True,
                   "timing": timing, "timing_args": timing_args}
     check = kwargs.pop("check", True)
     prompt_len = kwargs.pop("prompt_len", 200)
@@ -3134,7 +3100,6 @@ def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -3359,7 +3324,7 @@ def main():
     # Optional: more simulation fields, and (consumer) a byte of the last page
     # written at a step's completion flipped after the first request.
     corrupt = kwargs.pop("corrupt_completion_page", False)
-    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+    simulation = {"simulate_forward": True,
                   "timing": "linear", "timing_args": {"fixed_us": 100},
                   "log_path": out + ".steps",
                   ("kv_pattern_fill" if producer else "kv_pattern_check"): True,
@@ -3674,7 +3639,7 @@ def main():
     lease = kwargs.pop("kv_lease_duration", None)
     extra = {"backends": ["Mooncake"],
              **({"kv_lease_duration": lease} if lease else {})}
-    simulation = {"simulate_forward": True, "kv_transfer_mode": "real",
+    simulation = {"simulate_forward": True,
                   "timing": "linear", "timing_args": {"fixed_us": 100},
                   "log_path": out + ".steps"}
     if producer:
@@ -4337,7 +4302,7 @@ def dcp_engine_config(model, **kwargs):
             "tensor_parallel_size": 2,
             "enable_prefix_caching": False,
             "kv_cache_memory_bytes": 8 * 1024**2,
-            "simulation_config": {"simulate_forward": True, "kv_transfer_mode": "real"},
+            "simulation_config": {"simulate_forward": True},
             "kv_transfer_config": {
                 "kv_connector": "NixlConnector",
                 "kv_role": "kv_consumer",
@@ -4594,7 +4559,7 @@ def test_real_transfers_with_dcp_refuse_other_connectors(
             tensor_parallel_size=2,
             decode_context_parallel_size=2,
             kv_cache_memory_bytes=8 * 1024**2,
-            simulation_config={"simulate_forward": True, "kv_transfer_mode": "real"},
+            simulation_config={"simulate_forward": True},
             **kwargs,
         ).create_engine_config()
 
@@ -4633,8 +4598,7 @@ def test_real_mode_refuses_a_mixer_beside_attention_whatever_the_timing(
             enforce_eager=True,
             simulation_config={
                 "simulate_forward": True,
-                "kv_transfer_mode": "real",
-                "timing": "linear",
+                    "timing": "linear",
                 "timing_args": {"fixed_us": 100},
             },
             kv_transfer_config={
@@ -4674,7 +4638,6 @@ def test_real_mode_allocates_and_registers_cpu_kv_tensors(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
         },
@@ -4791,7 +4754,6 @@ def test_mla_blocks_stay_whole_on_any_host(mla_model_dir, monkeypatch, tmp_path,
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
             "log_path": str(log),
@@ -4824,8 +4786,8 @@ def test_mla_blocks_stay_whole_on_any_host(mla_model_dir, monkeypatch, tmp_path,
 
 @pytest.mark.parametrize("real", [True, False])
 def test_runner_uses_native_kv_tensors_only_in_real_mode(monkeypatch, real):
-    """Real mode allocates and registers KV tensors, zeroes new blocks and
-    applies copy-on-write through the native runner; simulated mode does none."""
+    """Real KV transfers allocate and register KV tensors, zero new blocks and
+    apply copy-on-write through the native runner; without them none is done."""
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.simulated.model_runner import SimulatedModelRunner
 
@@ -4848,9 +4810,6 @@ def test_runner_uses_native_kv_tensors_only_in_real_mode(monkeypatch, real):
     runner.kv_cache_config = type("Config", (), {"kv_cache_groups": [], "num_blocks": 0})
     runner.kv_caches = []
     runner.device = "cpu"
-    monkeypatch.setattr(
-        "vllm.v1.worker.simulated.model_runner.has_kv_transfer_group", lambda: False
-    )
     runner.initialize_kv_cache_tensors(
         is_profiling=False, kv_cache_allocation_context=None
     )
@@ -4962,7 +4921,6 @@ def test_tensor_parallel_ranks_register_and_log_their_own_kv(
         tensor_parallel_size=2,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -5011,7 +4969,6 @@ def test_dp_attention_ranks_log_their_own_kv_apart_from_the_joint_steps(
     stand_in_connector(recording_connector)
     log = tmp_path / "steps.jsonl"
     simulation = {
-        "kv_transfer_mode": "real",
         "kv_pattern_fill": True,
         "timing": "linear",
         "timing_args": {"fixed_us": 100},
@@ -5148,7 +5105,6 @@ def test_a_slower_rank_holds_the_request_until_its_load_finishes(
         tensor_parallel_size=2,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "timing": "linear",
             "timing_args": {"fixed_us": 2000},
             "log_path": str(log),
@@ -5324,7 +5280,6 @@ def test_nixl_two_attention_groups_are_seeded_by_their_global_heads(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             "kv_pattern_fill": True,
             "timing": "linear",
             "timing_args": {"fixed_us": 100},
@@ -5420,7 +5375,6 @@ def test_nixl_attention_groups_take_a_peer_of_another_tp_size(
         enforce_eager=True,
         simulation_config={
             "simulate_forward": True,
-            "kv_transfer_mode": "real",
             **({"kv_pattern_fill": True} if fill else {}),
             "timing": "linear",
             "timing_args": {"fixed_us": 100},

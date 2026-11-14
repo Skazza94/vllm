@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 _SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 _RECORDING_WORKER = "vllm.v1.worker.simulated.recording.RecordingWorker"
-# Native connectors that move real KV under kv_transfer_mode real: NIXL's
+# Native connectors that move real KV under simulated compute: NIXL's
 # decode-pulled READs, or Mooncake's prefill-written transfers.
 NIXL_CONNECTORS = ("NixlConnector", "NixlPullConnector")
 REAL_KV_CONNECTORS = (*NIXL_CONNECTORS, "MooncakeConnector")
@@ -40,32 +40,14 @@ DSA_MODEL_TYPES = ("deepseek_v32", "glm_moe_dsa")
 DSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_ds_mla")
 
 
-@config
-class KVTransferTiming:
-    """Duration of simulated KV transfers: `latency + bytes / bandwidth`."""
-
-    load_gbps: float | None = Field(default=None, gt=0)
-    """Load bandwidth, 1e9 bytes/s (required): from the CPU cache when
-    offloading, from a prefill instance under disaggregated prefill."""
-
-    load_latency_us: float = Field(default=0.0, ge=0)
-    """Latency of a load."""
-
-    store_gbps: float | None = Field(default=None, gt=0)
-    """Store bandwidth to the CPU cache, 1e9 bytes/s (offloading only)."""
-
-    store_latency_us: float = Field(default=0.0, ge=0)
-    """Latency of a store."""
-
-    post_us_per_read: float = Field(default=0.0, ge=0)
-    """Host time a NIXL decode rank spends posting a read."""
-
-    post_us_per_run: float = Field(default=0.0, ge=0)
-    """Additional posting time per run of blocks consecutive on both sides."""
-
-    def __post_init__(self) -> None:
-        if self.load_gbps is None:
-            raise ValueError("kv_transfer_timing needs load_gbps.")
+def moves_real_kv(vllm_config: "VllmConfig") -> bool:
+    """Whether this instance moves real KV: simulated compute with a KV
+    connector, which registers real KV cache tensors and moves them between
+    instances."""
+    return (
+        vllm_config.simulation_config.simulate_forward
+        and vllm_config.kv_transfer_config is not None
+    )
 
 
 @config
@@ -99,16 +81,6 @@ class SimulationConfig:
     spec_acceptance_rates: list[float] | str | None = None
     """Per-position draft acceptance probabilities (the last one repeats), or
     a step log recorded with speculative decoding to estimate them from."""
-
-    kv_transfer_timing: KVTransferTiming | str | None = None
-    """Simulated KV transfer timing, or a step log recorded with the
-    connector to fit it from."""
-
-    kv_transfer_mode: Literal["simulated", "real"] = "simulated"
-    """`simulated`: the NIXL connector's worker side is modeled and moves no
-    data; `kv_transfer_timing` gives the transfer times. `real`: a native
-    connector (`REAL_KV_CONNECTORS`) registers real KV cache tensors and moves
-    them between instances, while compute stays simulated."""
 
     kv_pattern_fill: bool = False
     """Real KV transfers, prefill instance: write a deterministic pattern into
@@ -155,18 +127,14 @@ class SimulationConfig:
                 raise ValueError("record_step_timing needs a CUDA-alike platform.")
             if parallel.worker_cls == "auto":
                 parallel.worker_cls = _RECORDING_WORKER
-        if (self.kv_pattern_fill or self.kv_pattern_check) and (
-            self.kv_transfer_mode != "real"
+        if (self.kv_pattern_fill or self.kv_pattern_check) and not (
+            moves_real_kv(vllm_config)
         ):
             raise ValueError(
-                "kv_pattern_fill and kv_pattern_check need kv_transfer_mode real."
+                "kv_pattern_fill and kv_pattern_check need simulate_forward and a "
+                "kv_transfer_config: they check real KV transfers."
             )
         if not self.simulate_forward:
-            if self.kv_transfer_mode == "real":
-                raise ValueError(
-                    "kv_transfer_mode real applies to simulated execution; it "
-                    "needs simulate_forward."
-                )
             return
 
         if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
@@ -213,11 +181,8 @@ class SimulationConfig:
         parallel = vllm_config.parallel_config
         transfer = vllm_config.kv_transfer_config
         problems = dcp_scope_problems(vllm_config, transfers=transfer is not None)
-        if transfer is not None:
-            if transfer.kv_connector != "NixlConnector":
-                problems.append(f"the {transfer.kv_connector} connector")
-            if self.kv_transfer_mode != "real":
-                problems.append(f"kv_transfer_mode {self.kv_transfer_mode}")
+        if transfer is not None and transfer.kv_connector != "NixlConnector":
+            problems.append(f"the {transfer.kv_connector} connector")
         if problems:
             raise ValueError(
                 "Simulated forward on CPU supports decode context parallelism "
@@ -292,55 +257,15 @@ class SimulationConfig:
         ]
 
     def _verify_kv_transfer(self, vllm_config: "VllmConfig") -> None:
-        if self.kv_transfer_mode == "real":
-            # Before any simulated-only branch, so none of them can skip it.
+        """A KV connector under simulated compute moves real KV; KV
+        offloading, which would install one, is refused."""
+        if vllm_config.kv_transfer_config is not None:
             self._verify_real_kv_transfer(vllm_config)
-            return
-        kv_transfer = vllm_config.kv_transfer_config
-        if kv_transfer is None:
-            return
-        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
-        from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-        from vllm.v1.worker.simulated import kv_nixl
-
-        connector = kv_transfer.kv_connector
-        if connector == "OffloadingConnector":
-            spec = OffloadingSpecFactory.get_spec_cls(
-                kv_transfer.kv_connector_extra_config
-            )
-            if not issubclass(spec, CPUOffloadingSpec):
-                raise ValueError(
-                    f"Simulated KV offloading supports CPU offloading, not "
-                    f"{spec.__name__}."
-                )
-            return
-        if connector not in kv_nixl.SIMULATED_CONNECTORS:
+        elif (size := vllm_config.cache_config.kv_offloading_size) is not None:
             raise ValueError(
-                f"Simulated forward does not support the {connector} connector."
+                f"Simulated forward does not support KV offloading "
+                f"(kv_offloading_size {size})."
             )
-        if kv_transfer.kv_role not in ("kv_producer", "kv_consumer"):
-            raise ValueError(
-                "Simulated disaggregated prefill needs kv_role kv_producer or "
-                f"kv_consumer, not {kv_transfer.kv_role}."
-            )
-        if vllm_config.parallel_config.decode_context_parallel_size > 1:
-            raise ValueError(
-                "Simulated disaggregated prefill does not support decode "
-                "context parallelism."
-            )
-        if self.clock == "fast_forward" or (
-            connector == kv_nixl.NixlPushConnector.__name__ and self.clock != "real"
-        ):
-            raise ValueError(
-                f"Simulated {connector} does not support the {self.clock} clock."
-            )
-        module_path = kv_transfer.kv_connector_module_path
-        if module_path not in (None, kv_nixl.__name__):
-            raise ValueError(
-                "Simulated forward replaces the NIXL connector's worker side; "
-                f"kv_connector_module_path {module_path} cannot be set."
-            )
-        kv_transfer.kv_connector_module_path = kv_nixl.__name__
 
     def check_pattern_request(
         self,
@@ -392,12 +317,7 @@ class SimulationConfig:
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
-        if kv_transfer is None:
-            raise ValueError(
-                "kv_transfer_mode real needs a kv_transfer_config with one of "
-                + ", ".join(REAL_KV_CONNECTORS)
-                + "."
-            )
+        assert kv_transfer is not None
         problems = []
         if vllm_config.cache_config.kv_offloading_size is not None:
             # Validated before VllmConfig turns it into an offloading
@@ -422,10 +342,6 @@ class SimulationConfig:
             )
         if self.clock != "real":
             problems.append(f"the real clock, not {self.clock}")
-        if self.kv_transfer_timing is not None:
-            problems.append(
-                "no kv_transfer_timing: transfers take their actual time"
-            )
         cache = vllm_config.cache_config
         if cache.kv_cache_memory_bytes is None:
             problems.append("an explicit kv_cache_memory_bytes")
@@ -549,5 +465,7 @@ class SimulationConfig:
             problems.append("log_path for kv_pattern_check's results")
         if problems:
             raise ValueError(
-                "kv_transfer_mode real currently needs " + "; ".join(problems) + "."
+                "Real KV transfers under simulated forward currently need "
+                + "; ".join(problems)
+                + "."
             )

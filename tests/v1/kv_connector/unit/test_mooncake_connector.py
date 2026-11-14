@@ -3149,7 +3149,6 @@ async def test_an_mla_producer_replica_answers_without_a_payload():
 
 def _simulation_config(
     simulate_forward=True,
-    kv_transfer_mode="real",
     *,
     mla=False,
     hybrid=False,
@@ -3185,9 +3184,8 @@ def _simulation_config(
         get_total_num_kv_heads=lambda: kv_heads,
     )
     return SimpleNamespace(
-        simulation_config=SimpleNamespace(
-            simulate_forward=simulate_forward, kv_transfer_mode=kv_transfer_mode
-        ),
+        simulation_config=SimpleNamespace(simulate_forward=simulate_forward),
+        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector"),
         model_config=model,
         speculative_config=speculative,
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -3294,11 +3292,9 @@ def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
     assert simulated_tp_mismatch(replicated, 2, 8) is None
     assert simulated_tp_mismatch(replicated, 8, 2, nixl_consumer=True) is None
     assert simulated_tp_mismatch(replicated, 2, 4, nixl_consumer=True) is None
-    # Simulated transfers move no KV; real deployments keep Mooncake's
-    # heterogeneous TP.
+    # Real deployments keep Mooncake's heterogeneous TP.
     sparse = {"mla": True, "model_type": "deepseek_v32", "dsa": True}
-    assert simulated_tp_mismatch(_simulation_config(kv_transfer_mode="simulated", **sparse), 2, 1) is None
-    assert simulated_tp_mismatch(_simulation_config(False, "simulated", **sparse), 2, 1) is None
+    assert simulated_tp_mismatch(_simulation_config(False, **sparse), 2, 1) is None
 
 
 def test_simulated_real_transfers_pair_unequal_tp_with_sliding_window_layers():

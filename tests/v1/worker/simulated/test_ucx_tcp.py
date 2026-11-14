@@ -136,7 +136,7 @@ def test_worker_uses_tp_and_local_dp_rank(
         rank_kv, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
     config = NS(
-        simulation_config=NS(simulate_forward=True, kv_transfer_mode="real"),
+        simulation_config=NS(simulate_forward=True),
         parallel_config=NS(
             data_parallel_size=dp_size,
             data_parallel_rank_local=dp_rank,

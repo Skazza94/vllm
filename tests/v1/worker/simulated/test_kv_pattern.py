@@ -1812,7 +1812,7 @@ def test_requests_outside_the_lifecycle_fail_closed():
 def test_pattern_checks_with_prefix_caching_take_token_prompts_only(request_kwargs, refused):
     from vllm.config.simulation import SimulationConfig
 
-    sim = SimulationConfig(kv_transfer_mode="real", kv_pattern_check=True)
+    sim = SimulationConfig(kv_pattern_check=True)
     plain = {"lora_request": None, "cache_salt": None, "prompt_embeds": None, "mm_features": None}
     sim.check_pattern_request(True, **plain)
     sim.check_pattern_request(False, **(plain | request_kwargs))

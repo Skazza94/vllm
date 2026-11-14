@@ -22,6 +22,7 @@ import regex as re
 import torch
 import zmq
 
+from vllm.config.simulation import moves_real_kv
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -140,8 +141,7 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
     hp_tcp binds there, as MooncakeConnector's ranks do. UCX resolves the
     selected IPv4 address to an interface and restricts its transport to TCP.
     The handshake stays on the instance's side channel."""
-    sim = vllm_config.simulation_config
-    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+    if not moves_real_kv(vllm_config):
         return
     if list(backends) not in (["Mooncake"], ["LIBFABRIC"], ["UCX"]):
         raise ValueError(
@@ -796,11 +796,8 @@ class NixlBaseConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
-        sim = vllm_config.simulation_config
         managed_libfabric = (
-            sim.simulate_forward
-            and sim.kv_transfer_mode == "real"
-            and self.nixl_backends == ["LIBFABRIC"]
+            moves_real_kv(vllm_config) and self.nixl_backends == ["LIBFABRIC"]
         )
         if managed_libfabric and vllm_config.model_config.enable_sleep_mode:
             raise ValueError("Managed LIBFABRIC/TCP does not support sleep mode")
@@ -833,8 +830,7 @@ class NixlBaseConnectorWorker:
                 },
             )
         self.simulated_transport = None
-        sim = vllm_config.simulation_config
-        if sim.simulate_forward and sim.kv_transfer_mode == "real":
+        if moves_real_kv(vllm_config):
             from .simulated_tcp import agent_evidence
 
             self.simulated_transport = agent_evidence(

@@ -11,6 +11,7 @@ import os
 
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
+from vllm.config.simulation import moves_real_kv
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -235,8 +236,7 @@ def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
     """An instance's `dcp_scope_problems` with real KV transfers under
     simulated compute, which NIXL advertises for its peer to check whichever
     side has decode context parallelism; None otherwise."""
-    sim = vllm_config.simulation_config
-    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+    if not moves_real_kv(vllm_config):
         return None
     return dcp_scope_problems(vllm_config, transfers=True)
 
@@ -267,8 +267,7 @@ def simulated_tp_mismatch(
     `TransferTopology.dcp_source_ranks`), this instance in
     `dcp_scope_problems`'s scope whatever its own DCP size (the peer's
     scope is checked from its NIXL metadata, `simulated_scope`)."""
-    sim = vllm_config.simulation_config
-    if not (sim.simulate_forward and sim.kv_transfer_mode == "real"):
+    if not moves_real_kv(vllm_config):
         return None
     local_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     if local_dcp_size > 1 or remote_dcp_size > 1:

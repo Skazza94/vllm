@@ -167,18 +167,9 @@ vllm bench sweep simulate \
 Each run is saved as `summary.json` with the metrics of `vllm bench serve`, so [the plots](#visualization) work on the results. Each combination's best run is saved as `result.json` with `max_request_rate`, and `slo_summary.csv` ranks the combinations by output throughput per GPU.
 
 - **`--frontend-latency-ms`**: the server latency outside the engine core (HTTP, API server), added to TTFT and end-to-end latency. Calibrate it as the real minus the simulated median TTFT at a rate without queueing.
-- **Disaggregated deployments**: `_num_prefill` and `_num_decode` simulate that many prefill and decode instances (NIXL pull mode, one rank each). Keys prefixed with `_prefill.` or `_decode.` apply to one role, such as `_prefill.simulation_config.timing_args.path`. `--handoff-latency-ms` is the proxy's time from a finished prefill to the decode instance. `gpu_count` counts all instances (pass `--gpu-count-var gpu_count` to `plot_pareto`).
+- **`--fill-kv-caches`**: uses up the engine's KV cache once before a combination's first run, so that the runs see a long-running server's scattered KV blocks.
 
-    ```json
-    [
-        {"_benchmark_name": "1p2d", "_num_prefill": 1, "_num_decode": 2},
-        {"_benchmark_name": "2p1d", "_num_prefill": 2, "_num_decode": 1}
-    ]
-    ```
-
-- **`--fill-kv-caches`**: uses up each instance's KV cache once before a combination's first run, so that the runs see a long-running server's scattered KV blocks, which slow a disaggregated decode instance's reads.
-
-A replayed step larger than any recorded one is underestimated. Each run reports such lookups (`timing_lookups_outside_range`), and the sweep warns about runs with many, so record under the heaviest load the search will simulate. Fit `kv_transfer_timing` to a recording where transfers rarely overlap, as the simulated link adds contention itself.
+A replayed step larger than any recorded one is underestimated. Each run reports such lookups (`timing_lookups_outside_range`), and the sweep warns about runs with many, so record under the heaviest load the search will simulate.
 
 !!! note
     The simulated clocks need a single-rank engine, so multi-rank combinations need `"clock": "real"` and run in real time. `--max-concurrency` and multimodal datasets are not supported, nor are ramp-up and timed traces with `--slo`.

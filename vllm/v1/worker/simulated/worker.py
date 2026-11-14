@@ -14,6 +14,7 @@ if current_platform.is_cpu():
     # cpu_worker.py; must precede its import.
     import vllm.v1.worker.cpu.shm  # noqa: F401
 
+from vllm.config.simulation import moves_real_kv
 from vllm.config.vllm import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
@@ -110,10 +111,10 @@ class SimulatedWorker(Worker):
             return super().get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        # Engines simulated in one process (disaggregated instances) each
-        # build their own connector, which is a process global.
+        # Engines simulated in one process each build their own connector,
+        # which is a process global.
         kv_transfer_state.set_kv_transfer_group(None)
-        if self.vllm_config.simulation_config.kv_transfer_mode == "real":
+        if moves_real_kv(self.vllm_config):
             _rank_tent_metrics_port(self.vllm_config)
         before = _thread_ids()
         # The attention backend's kernel block sizes depend on the simulation.

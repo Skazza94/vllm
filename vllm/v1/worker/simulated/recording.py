@@ -30,7 +30,6 @@ from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector, KVConnector
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_worker import Worker
-from vllm.v1.worker.simulated.kv_transfer import completed_transfers, nixl_reads
 from vllm.v1.worker.simulated.timing import (
     StepCost,
     StepDescriptor,
@@ -80,16 +79,6 @@ class _RecordedOutput(AsyncModelRunnerOutput):
         return self.inner.get_kv_connector_output()
 
 
-def _write_transfers(
-    writer: StepLogWriter, output: ModelRunnerOutput | AsyncModelRunnerOutput | None
-) -> None:
-    """Log the KV transfers this rank saw complete in the step."""
-    if isinstance(output, ModelRunnerOutput):
-        transfers = completed_transfers(output.kv_connector_output)
-        if transfers:
-            writer.write_transfers(transfers, time.perf_counter())
-
-
 def _num_accepted(
     descriptor: StepDescriptor, output: ModelRunnerOutput
 ) -> tuple[int, ...] | None:
@@ -104,7 +93,8 @@ def _num_accepted(
 
 
 class _TimedKVConnector(ActiveKVConnector):
-    """Times the reads a NIXL decode rank posts (see `PostCost`)."""
+    """Times the reads a NIXL decode rank posts, which hold its engine thread:
+    the step's record leaves them out."""
 
     def __init__(
         self,
@@ -118,13 +108,15 @@ class _TimedKVConnector(ActiveKVConnector):
     def _start_load_kv(self) -> None:
         metadata = self.kv_connector._get_connector_metadata()
         assert isinstance(metadata, NixlConnectorMetadata)
-        num_reads, num_runs = nixl_reads(metadata)
-        if not num_reads:
+        if not any(
+            meta.remote is not None and any(meta.local_block_ids)
+            for meta in metadata.reqs_to_recv.values()
+        ):
             return super()._start_load_kv()
         self.recorder._posting_started()
         t = time.perf_counter()
         super()._start_load_kv()
-        self.recorder._posted(num_reads, num_runs, time.perf_counter() - t, t)
+        self.recorder._posted(time.perf_counter() - t)
 
 
 class _RecordingModelRunner(GPUModelRunnerV2):
@@ -182,11 +174,9 @@ class RecordingWorker(Worker):
             self._post_event = torch.cuda.Event(enable_timing=True)
             self._post_event.record(torch.cuda.current_stream(self.device))
 
-    def _posted(self, reads: int, runs: int, seconds: float, t: float) -> None:
+    def _posted(self, seconds: float) -> None:
         if self._sampling:
             self._post_s += seconds
-        if self._writer is not None:
-            self._writer.write_kv_post(reads, runs, seconds, t)
 
     def execute_model(self, scheduler_output):  # type: ignore[override]
         if self._unwritten:
@@ -197,10 +187,7 @@ class RecordingWorker(Worker):
             scheduler_output, self._prompt_lens, self._step_index, self._parallel
         )
         if scheduler_output.total_num_scheduled_tokens == 0:
-            output = super().execute_model(scheduler_output)
-            if self._writer is not None:
-                _write_transfers(self._writer, output)
-            return output
+            return super().execute_model(scheduler_output)
         self._step_index += 1
         if self._syncs_dp():
             descriptor = gather_dp_step(descriptor)
@@ -255,7 +242,6 @@ class RecordingWorker(Worker):
 
     def _resolve(self, record: _StepRecord, output: ModelRunnerOutput) -> None:
         assert self._writer is not None
-        _write_transfers(self._writer, output)
         record.num_accepted = _num_accepted(record.descriptor, output)
         record.resolved = True
         # Outputs are taken in step order: earlier steps still unresolved

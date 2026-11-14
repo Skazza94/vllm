@@ -6,7 +6,6 @@ its outputs."""
 from __future__ import annotations
 
 import heapq
-import math
 import time
 import weakref
 from collections.abc import Sequence
@@ -233,8 +232,6 @@ def run(
         for i, ts in enumerate(turns)
     ]
     clock = engine_clock(engine)
-    # Drop the horizon an aborted run on this engine may have left.
-    clock.horizon = math.inf
     wall_start = time.perf_counter()
     t0 = clock.now()
     # (arrival time, request index, turn index, prompt), earliest first.
@@ -267,8 +264,6 @@ def run(
             clock.sleep_until(t0 + frontend_latency_s + pending[0][0])
             continue
 
-        # Lets an engine waiting only on its own transfers skip ahead.
-        clock.horizon = t0 + frontend_latency_s + pending[0][0] if pending else math.inf
         before = clock.now()
         outputs = engine.step()
         t = clock.now() - t0

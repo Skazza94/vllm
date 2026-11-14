@@ -107,8 +107,9 @@ def _sweep(tmp_path, serve_params, output_len, simulation_config, *options):
 
 @needs_simulation
 def test_sweep_simulate_slo(tmp_path) -> None:
-    """A larger batch meets the TTFT SLO at a higher request rate, and the
-    results are written where the sweep plots read them."""
+    """A larger batch meets the TTFT SLO at a higher request rate, after the
+    KV cache was filled once, and the results are written where the sweep
+    plots read them."""
     exp = _sweep(
         tmp_path,
         [{"max_num_seqs": 2}, {"max_num_seqs": 16}],
@@ -119,6 +120,7 @@ def test_sweep_simulate_slo(tmp_path) -> None:
         },
         "--slo",
         "p99_ttft_ms=50",
+        "--fill-kv-caches",
         "-j",
         "2",
     )
@@ -127,47 +129,10 @@ def test_sweep_simulate_slo(tmp_path) -> None:
         comb_dir = exp / f"SERVE--max_num_seqs={max_num_seqs}"
         result = json.loads((comb_dir / "result.json").read_text())
         assert result["p99_ttft_ms"] <= 50
+        assert result["kv_caches_filled"]
         max_rates[max_num_seqs] = result["max_request_rate"]
         runs = [json.loads(p.read_text()) for p in comb_dir.rglob("summary.json")]
         assert len(runs) > 3
         assert all(run["completed"] == 40 for (run,) in runs)
     assert 0 < max_rates[2] < max_rates[16]
     assert (exp / "summary.csv").exists() and (exp / "slo_summary.csv").exists()
-
-
-@needs_simulation
-def test_sweep_simulate_disaggregated(tmp_path) -> None:
-    """A second decode instance raises the SLO-meeting rate of a decode-bound
-    workload, with filled KV caches and a read posting cost."""
-    exp = _sweep(
-        tmp_path,
-        [
-            {"_benchmark_name": "1p1d", "_num_prefill": 1, "_num_decode": 1},
-            {"_benchmark_name": "1p2d", "_num_prefill": 1, "_num_decode": 2},
-        ],
-        32,
-        {
-            "timing": "linear",
-            "timing_args": {"fixed_us": 1000, "decode_us_per_req": 300},
-            "kv_transfer_timing": {
-                "load_gbps": 10,
-                "post_us_per_read": 100,
-                "post_us_per_run": 50,
-            },
-        },
-        "--slo",
-        "mean_tpot_ms=4",
-        "--fill-kv-caches",
-        "--handoff-latency-ms",
-        "1",
-    )
-    results = {
-        name: json.loads((exp / f"SERVE--{name}" / "result.json").read_text())
-        for name in ("1p1d", "1p2d")
-    }
-    assert [r["gpu_count"] for r in results.values()] == [2, 3]
-    assert all(r["kv_caches_filled"] for r in results.values())
-    assert all(
-        r["mean_tpot_ms"] <= 4 and r["completed"] == 40 for r in results.values()
-    )
-    assert 0 < results["1p1d"]["max_request_rate"] < results["1p2d"]["max_request_rate"]

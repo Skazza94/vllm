@@ -36,7 +36,7 @@ spec:
         # CPU buffers, moved between pods by vLLM's NIXL connector.
         - --simulate-forward
         - --simulation-config
-        - '{"clock": "real", "timing": "aisimulate", "timing_args": {"gpu": "h100"}, "kv_transfer_mode": "real"}'
+        - '{"clock": "real", "timing": "aisimulate", "timing_args": {"gpu": "h100"}}'
         - --kv-transfer-config
         - '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"]}}'
         # The modeled deployment's KV budget and limits.

@@ -39,8 +39,18 @@ SIMULATED_FORWARD_MODELS = [
                     "kv_role": "kv_both",
                 }
             },
-            "ExampleConnector connector",
+            "not ExampleConnector",
         ),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "OffloadingConnector",
+                    "kv_role": "kv_both",
+                }
+            },
+            "not OffloadingConnector",
+        ),
+        ({"kv_offloading_size": 1.0}, "does not support KV offloading"),
         (
             {"simulation_config": {"clock": "virtual"}, "tensor_parallel_size": 2},
             "supports one rank",
@@ -325,99 +335,6 @@ def test_simulate_offline_sessions() -> None:
     assert second.ttft == pytest.approx(1000e-6 + 20 * 10e-6)
 
 
-def test_simulate_offline_kv_offloading(tmp_path) -> None:
-    """A prompt evicted from the GPU KV cache is loaded back from the CPU
-    cache: its request waits exactly for the modeled load, then prefills only
-    its last token."""
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.v1.worker.simulated.offline import TimedRequest, simulate
-
-    step_s, load_gbps = 1e-3, 100
-    log = tmp_path / "steps.jsonl"
-    args = EngineArgs(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        # 1056 tokens of Qwen3-0.6B KV cache (28 layers x 8 KV heads x 128
-        # dims x K and V x 2 bytes = 114688 bytes per token).
-        kv_cache_memory_bytes=1056 * 114688,
-        kv_transfer_config={
-            "kv_connector": "OffloadingConnector",
-            "kv_role": "kv_both",
-            "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
-        },
-        simulation_config={
-            "simulate_forward": True,
-            "clock": "virtual",
-            "timing": "linear",
-            "timing_args": {"fixed_us": step_s * 1e6},
-            "kv_transfer_timing": {"load_gbps": load_gbps, "store_gbps": load_gbps},
-            "log_path": str(log),
-        },
-    )
-    params = SamplingParams(max_tokens=4, ignore_eos=True)
-    a, b = list(range(1000, 1640)), list(range(5000, 5960))
-    # b evicts most of a from the GPU cache, but not from the CPU cache.
-    result = simulate(
-        args,
-        [TimedRequest(a, params, 0.0), TimedRequest(b, params, 1.0)]
-        + [TimedRequest(a, params, 2.0)],
-    )
-
-    records = [json.loads(line) for line in log.read_text().splitlines()]
-    [load] = [
-        r["kv_transfers"]["load"]
-        for r in records
-        if "load" in r.get("kv_transfers", {})
-    ]
-    # The third request's first step runs all of its prefill. Clock times are
-    # absolute, and the first step starts when the first request arrives.
-    steps = [r for r in records if "step" in r]
-    step = next(r for r in steps if r["t_start"] >= steps[0]["t_start"] + 2.0)
-    assert [
-        (r["num_scheduled_tokens"], r["num_computed_tokens"])
-        for r in step["step"]["requests"]
-    ] == [(1, 639)]
-    assert result.requests[2].ttft == pytest.approx(
-        load["bytes"] / (load_gbps * 1e9) + step_s
-    )
-
-
-def test_simulate_disaggregated_prefill() -> None:
-    """A request is prefilled on the prefill instance, its KV read by the
-    decode instance in the modeled time, and decoded there."""
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.v1.worker.simulated.disaggregated import simulate_disaggregated
-    from vllm.v1.worker.simulated.offline import TimedRequest
-
-    load_gbps = 10
-    args = EngineArgs(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=2048,
-        kv_cache_memory_bytes=1024**3,
-        simulation_config={
-            "simulate_forward": True,
-            "timing": "linear",
-            "timing_args": {"fixed_us": 1000, "prefill_us_per_token": 10},
-            "kv_transfer_timing": {"load_gbps": load_gbps},
-        },
-    )
-    params = SamplingParams(max_tokens=4, ignore_eos=True)
-    requests = [
-        TimedRequest(list(range(1000, 1640)), params, 0.0),
-        TimedRequest(list(range(3000, 3320)), params, 0.5),
-    ]
-    result = simulate_disaggregated(args, args, requests)
-
-    for request in result.requests:
-        prompt = request.num_prompt_tokens
-        prefill_s = (1000 + 10 * prompt) * 1e-6
-        # Qwen3-0.6B's KV is 114688 bytes per token.
-        read_s = prompt * 114688 / (load_gbps * 1e9)
-        # The decode instance recomputes the last prompt token.
-        assert request.ttft == pytest.approx(prefill_s + read_s + 1010e-6)
-        assert request.num_output_tokens == 4
-
-
 class AcceptAllDrafts:
     """Timing provider that accepts every draft, overriding the rates."""
 
@@ -658,16 +575,6 @@ def test_simulate_forward_cpu_decode_context_parallel(tmp_path, monkeypatch) -> 
         # GQA at a layout vLLM itself allows: DCP <= TP / KV heads.
         ("gpt-oss", {}, "a model other than dense MLA"),
         ("deepseek-v3.2", {}, "a model other than dense MLA"),
-        (
-            "deepseek-v3",
-            {
-                "kv_transfer_config": {
-                    "kv_connector": "NixlConnector",
-                    "kv_role": "kv_consumer",
-                }
-            },
-            "kv_transfer_mode simulated",
-        ),
         (
             "deepseek-v3",
             {
@@ -1006,11 +913,7 @@ def test_simulated_cpu_sparse_mla_dcp_scope(tmp_path, timing, connector, reason)
             tensor_parallel_size=2,
             decode_context_parallel_size=2,
             kv_transfer_config=transfer,
-            simulation_config={
-                "simulate_forward": True,
-                "timing": timing,
-                "kv_transfer_mode": "real" if connector else "simulated",
-            },
+            simulation_config={"simulate_forward": True, "timing": timing},
         ).create_engine_config()
 
 
